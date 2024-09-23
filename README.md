@@ -1,6 +1,6 @@
 # TapeXPlayer
 
-TapeXPlayer is a specialized video player designed for scientific analysis and research purposes. It combines the functionality of a traditional video player with advanced features for precise frame-by-frame analysis, timecode display, and variable speed playback.
+TapeXPlayer is a specialized video player designed for scientific analysis and research purposes. It combines the functionality of a traditional video (tape)player with advanced features for precise frame-by-frame analysis, timecode display, and variable speed playback.
 
 ## Features
 
