@@ -9,9 +9,6 @@ TapeXPlayer is a specialized video player designed for scientific analysis and r
 - Reverse playback capability
 - Real-time timecode display in HH:MM:SS:FF format
 - Debug mode for visualizing frame decoding status
-- Volume control
-- Support for high-resolution video files
-- Efficient frame caching and memory management
 
 ## System Requirements
 
@@ -19,7 +16,6 @@ TapeXPlayer is a specialized video player designed for scientific analysis and r
 - SDL2 library
 - FFmpeg libraries (libavcodec, libavformat, libavutil, libswresample, libswscale)
 - GStreamer library
-- CMake (for building)
 
 ## Building the Project
 
