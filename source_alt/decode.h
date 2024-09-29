@@ -79,7 +79,7 @@ public:
 };
 
 std::vector<FrameInfo> createFrameIndex(const char* filename);
-bool convertToLowRes(const char* filename, const char* outputFilename);
+bool convertToLowRes(const char* filename, std::string& outputFilename);
 bool fillIndexWithLowResFrames(const char* filename, std::vector<FrameInfo>& frameIndex);
 bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame);
 bool decodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd);
@@ -91,4 +91,4 @@ std::future<void> asyncCleanFrames(FrameCleaner& cleaner, int startFrame, int en
 void printMemoryUsage();
 
 void clearHighResFrames(std::vector<FrameInfo>& frameIndex);
-void removeHighResFrames(std::vector<FrameInfo>& frameIndex, int start, int end);
+void removeHighResFrames(std::vector<FrameInfo>& frameIndex, int start, int end, int highResStart, int highResEnd);

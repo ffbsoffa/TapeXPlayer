@@ -382,3 +382,37 @@ void stop_jog() {
         target_playback_rate.store(0.0);
     }
 }
+
+void seek_to_time(double target_time) {
+    if (target_time < 0) {
+        target_time = 0;
+    } else if (target_time > total_duration.load()) {
+        target_time = total_duration.load();
+    }
+
+    size_t target_index = static_cast<size_t>(target_time * audio_buffer.size() / total_duration.load());
+    audio_buffer_index = target_index;
+    current_audio_time.store(target_time);
+    seek_performed.store(true);  // Добавьте эту строку
+    std::cout << "Seek to time: " << format_time(target_time, original_fps.load()) << std::endl;
+}
+
+double parse_timecode(const std::string& timecode) {
+    std::string padded_timecode = timecode + std::string(8 - timecode.length(), '0');
+
+    int hours = std::stoi(padded_timecode.substr(0, 2));
+    int minutes = std::stoi(padded_timecode.substr(2, 2));
+    int seconds = std::stoi(padded_timecode.substr(4, 2));
+    int frames = std::stoi(padded_timecode.substr(6, 2));
+
+    if (hours > 23 || minutes > 59 || seconds > 59) {
+        throw std::runtime_error("Invalid timecode: hours, minutes, or seconds out of range");
+    }
+
+    double fps = original_fps.load();
+    if (frames >= fps) {
+        throw std::runtime_error("Invalid timecode: frames exceed FPS");
+    }
+
+    return hours * 3600.0 + minutes * 60.0 + seconds + frames / fps;
+}

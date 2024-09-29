@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <openssl/evp.h>
+#include <pwd.h>
 
 namespace fs = std::filesystem;
 
@@ -42,7 +43,7 @@ std::string generateFileId(const char* filename) {
 }
 
 bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame) {
-    const int numThreads = 1; // Фиксируем количество потоков
+    const int numThreads = 2; // Фиксируем количество потоков
     std::vector<std::thread> threads;
     std::atomic<bool> success{true};
 
@@ -63,17 +64,12 @@ bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, 
             return;
         }
 
+        // Пытаемся найти декодер VideoToolbox
         videoStream = av_find_best_stream(formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
         if (videoStream < 0) {
             avformat_close_input(&formatContext);
             success = false;
             return;
-        }
-
-        // Попытка найти декодер VideoToolbox
-        const AVCodec* hwCodec = avcodec_find_decoder_by_name("h264_videotoolbox");
-        if (hwCodec) {
-            codec = hwCodec;
         }
 
         codecContext = avcodec_alloc_context3(codec);
@@ -83,9 +79,6 @@ bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, 
             return;
         }
 
-        codecContext->thread_count = std::thread::hardware_concurrency(); // Используем все доступные ядра
-        codecContext->thread_type = FF_THREAD_FRAME; // Или FF_THREAD_SLICE для некоторых кодеков
-
         if (avcodec_parameters_to_context(codecContext, formatContext->streams[videoStream]->codecpar) < 0) {
             avcodec_free_context(&codecContext);
             avformat_close_input(&formatContext);
@@ -93,7 +86,11 @@ bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, 
             return;
         }
 
+        // Отключаем аппаратное ускорение
+        codecContext->hw_device_ctx = nullptr;
+
         if (avcodec_open2(codecContext, codec, nullptr) < 0) {
+            std::cerr << "Не удалось открыть кодек" << std::endl;
             avcodec_free_context(&codecContext);
             avformat_close_input(&formatContext);
             success = false;
@@ -126,11 +123,11 @@ bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, 
                         break;
                     }
 
-                    if (frame->pts >= startPts && currentFrame <= threadEndFrame) {
+                    if (frame->pts >= startPts && currentFrame <= threadEndFrame && currentFrame < frameIndex.size()) {
                         std::lock_guard<std::mutex> lock(frameIndex[currentFrame].mutex);
                         if (!frameIndex[currentFrame].is_decoding) {
                             frameIndex[currentFrame].is_decoding = true;
-                            // Декодируем кадр
+                            
                             double seconds = frame->pts * av_q2d(timeBase);
                             int64_t milliseconds = seconds * 1000;
 
@@ -187,7 +184,7 @@ std::vector<FrameInfo> createFrameIndex(const char* filename) {
 
     int videoStream = av_find_best_stream(formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (videoStream < 0) {
-        std::cerr << "Видеопоток не найден" << std::endl;
+        std::cerr << "Видеопоток не айден" << std::endl;
         avformat_close_input(&formatContext);
         return frameIndex;
     }
@@ -214,11 +211,21 @@ std::vector<FrameInfo> createFrameIndex(const char* filename) {
     return frameIndex;
 }
 
+std::string getCachePath() {
+    const char* homeDir;
+    if ((homeDir = getenv("HOME")) == NULL) {
+        homeDir = getpwuid(getuid())->pw_dir;
+    }
+    std::string cachePath = std::string(homeDir) + "/Library/Caches/TapeXPlayer";
+    return cachePath;
+}
 
-bool convertToLowRes(const char* filename, const char* outputFilename) {
-    // Создаем папку cache, если она не существует
-    const char* cacheDir = "cache";
-    mkdir(cacheDir, 0777);
+bool convertToLowRes(const char* filename, std::string& outputFilename) {
+    // Получаем путь к директории кэша
+    std::string cacheDir = getCachePath();
+    
+    // Создаем директорию кэша, если она не существует
+    fs::create_directories(cacheDir);
 
     // Генерируем уникальный ID для файла
     std::string fileId = generateFileId(filename);
@@ -228,20 +235,19 @@ bool convertToLowRes(const char* filename, const char* outputFilename) {
     }
 
     // Формируем имя кэш-файла
-    std::string cachePath = std::string(cacheDir) + "/" + fileId + "_lowres.mp4";
+    std::string cachePath = cacheDir + "/" + fileId + "_lowres.mp4";
 
     // Проверяем, существует ли уже файл в кэше
-    if (access(cachePath.c_str(), F_OK) != -1) {
+    if (fs::exists(cachePath)) {
         std::cout << "Найден кэшированный файл низкого разрешения: " << cachePath << std::endl;
-        // Копируем кэшированный файл в outputFilename
-        fs::copy_file(cachePath, outputFilename, fs::copy_options::overwrite_existing);
+        outputFilename = cachePath;
         return true;
     }
 
     // Получаем информацию о разрешении исходного видео
     char probe_cmd[1024];
     snprintf(probe_cmd, sizeof(probe_cmd),
-             "ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=width,height -of csv=p=0 %s",
+             "ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=width,height -of csv=p=0 \"%s\"",
              filename);
     
     FILE* pipe = popen(probe_cmd, "r");
@@ -265,9 +271,9 @@ bool convertToLowRes(const char* filename, const char* outputFilename) {
     // Формируем команду для конвертации
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-             "ffmpeg -i %s -c:v libx264 -crf 23 -preset ultrafast "
+             "ffmpeg -i \"%s\" -c:v libx264 -crf 23 -preset ultrafast "
              "-vf scale=%d:%d "
-             "-y %s",
+             "-y \"%s\"",
              filename, new_width, new_height, cachePath.c_str());
     
     std::cout << "Начинаем конвертацию в низкое разрешение..." << std::endl;
@@ -278,20 +284,20 @@ bool convertToLowRes(const char* filename, const char* outputFilename) {
     }
     std::cout << "Конвертация в низкое разрешение завершена успешно" << std::endl;
 
-    // Копируем созданный кэш-файл в outputFilename
-    fs::copy_file(cachePath, outputFilename, fs::copy_options::overwrite_existing);
+    // Обновляем outputFilename
+    outputFilename = cachePath;
 
     // Ограничиваем количество кэшированных файлов
-    std::vector<fs::directory_entry> cacheFiles;
+    std::vector<fs::path> cacheFiles;
     for (const auto& entry : fs::directory_iterator(cacheDir)) {
         if (entry.path().extension() == ".mp4") {
-            cacheFiles.push_back(entry);
+            cacheFiles.push_back(entry.path());
         }
     }
 
     // Сортируем файлы по времени последнего доступа (от старых к новым)
     std::sort(cacheFiles.begin(), cacheFiles.end(),
-              [](const fs::directory_entry& a, const fs::directory_entry& b) {
+              [](const fs::path& a, const fs::path& b) {
                   return fs::last_write_time(a) < fs::last_write_time(b);
               });
 
@@ -546,6 +552,9 @@ std::future<void> asyncDecodeFrameRange(const char* filename, std::vector<FrameI
         for (int i = startFrame; i <= endFrame && i < frameIndex.size(); ++i) {
             if (frameIndex[i].frame) {
                 frameIndex[i].type = FrameInfo::FULL_RES;
+                // std::cout << "Кадр " << i << " успешно декодирован в высоком разрешении" << std::endl;
+            } else {
+                // std::cout << "Не удалось декодировать кадр " << i << " в высоком разрешении" << std::endl;
             }
         }
     });
@@ -595,19 +604,5 @@ void RingBuffer::movePlayhead(int delta) {
         playhead = size - 1;
     } else {
         playhead = newPlayhead;
-    }
-}
-
-// Добавьте эту функцию
-void removeHighResFrames(std::vector<FrameInfo>& frameIndex, int start, int end) {
-    for (int i = start; i <= end && i < frameIndex.size(); ++i) {
-        if (frameIndex[i].type == FrameInfo::FULL_RES) {
-            frameIndex[i].frame.reset();
-            if (frameIndex[i].low_res_frame) {
-                frameIndex[i].type = FrameInfo::LOW_RES;
-            } else {
-                frameIndex[i].type = FrameInfo::EMPTY;
-            }
-        }
     }
 }

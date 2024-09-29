@@ -11,7 +11,7 @@ extern std::atomic<double> current_audio_time;
 extern std::atomic<int> current_video_frame;
 extern SDL_Window* window;
 extern SDL_Renderer* renderer;
-
+extern std::atomic<bool> seek_performed;
 extern std::atomic<double> playback_rate;
 extern std::atomic<double> target_playback_rate;  // Добавьте эту строку
 extern std::atomic<double> previous_playback_rate;  // Добавьте эту строку
@@ -41,5 +41,8 @@ extern const double JOG_SPEED;
 void start_jog_forward();
 void start_jog_backward();
 void stop_jog();
+
+void seek_to_time(double target_time);
+double parse_timecode(const std::string& timecode);
 
 #endif // COMMON_H
