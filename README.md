@@ -10,7 +10,7 @@ TapeXPlayer is written in C++ using the **FFmpeg**, **SDL**, **GStreamer**, and 
 - Supports multiple video formats thanks to the **FFmpeg** library.
 - Minimal system resource consumption at high playback speeds.
 
-[Watch the demo video](https://www.youtube.com/watch?v=Mm4c1lp7Gz0))
+![Watch the demo video](https://www.youtube.com/watch?v=Mm4c1lp7Gz0)
 
 
 ### Running the Program
