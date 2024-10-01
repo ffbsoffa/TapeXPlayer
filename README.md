@@ -1,5 +1,5 @@
 # TapeXPlayer
-TapeXPlayer is a video player developed as a simulation of media playback on magnetic tapes, based on the philosophy of professional Betacam video recorders. The program is designed for scientific purposes, particularly for frame-by-frame film analysis.
+**TapeXPlayer** is a video player developed as a simulation of media playback on magnetic tapes, based on the philosophy of professional Betacam video recorders. The program is designed for scientific purposes, particularly for frame-by-frame film analysis.
 ![TapeXPlayer 2024-10-01 05-21-52](https://github.com/user-attachments/assets/e47e35d5-a984-4cf0-928d-e46e38ca0eb0)
 ### Key Features
 TapeXPlayer is written in C++ using the **FFmpeg**, **SDL**, **GStreamer**, and **OpenSSH 3.0** libraries. Additionally, it uses the [Spleen font](https://github.com/fcambus/spleen/tree/master), distributed under the BSD2-ClauseLicense. The primary goal of the program is to adapt the functionality of professional video recorders for use on modern computers. TapeXPlayer helps to thoroughly examine the video sequence, simplifying frame-by-frame analysis and playback control. This version is intended for Mac computers running on Apple Silicon & Intel.
