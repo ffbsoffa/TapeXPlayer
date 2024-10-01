@@ -45,7 +45,7 @@ Example:
 - **FFmpeg** — for decoding and encoding video and audio.
 - **SDL** — for cross-platform multimedia capabilities.
 - **OpenSSH 3.0** — for file generation with unique identifiers, optimizing workload.
-- **SPLIN Font** — used under BSD2-ClauseLicense.
+- [**Spleen Font**](https://github.com/fcambus/spleen/tree/master) — used under BSD2-ClauseLicense
 
 ### Contributions and Contact:
 If you'd like to contribute to the project or need consultation, feel free to reach out at **mail@ffbsoffa.org**. Contributions are welcome through pull requests.
