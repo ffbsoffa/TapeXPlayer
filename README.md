@@ -27,6 +27,7 @@ Example:
 ### Important Notes
 - TapeXPlayer creates cached versions of the video to ensure smooth playback and seeking. The cache is saved at the following path: `/Users/<username>/Library/Caches/TapeXPlayer`. Make sure there is enough free space on the disk to store the cache.
 - The program may have issues with video formats other than H.264 or files with a resolution higher than 1080p.
+- Video playback may experience lag when running the program on Intel processors. For the best experience, it is recommended to use computers with Apple Silicon processors.
 
 ### Controls:
 - **Spacebar** — Play/Pause.
