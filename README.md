@@ -8,7 +8,7 @@ TapeXPlayer is written in C++ using the **FFmpeg**, **SDL**, **GStreamer**, and 
 - Smooth playback forward and backward with shuttle control up to 16x speed, with minimal CPU and memory usage.
 - Fast seek by timecode.
 - Supports multiple video formats thanks to the **FFmpeg** library.
-- Minimal system resource consumption at high playback speeds.
+- Minimal system resource consumption at high playback speeds (expected: ~132% CPU @ 16x shuttle, and ~27-41% CPU – playback @ 1x).
 
 [Watch the demo video](https://www.youtube.com/watch?v=Mm4c1lp7Gz0)
 
