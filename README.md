@@ -3,7 +3,7 @@
 **TapeXPlayer** is a video player developed as a like-simulation of media playback on magnetic tapes, based on the philosophy of professional Betacam video recorders. The program is designed for scientific purposes, particularly for frame-by-frame analysis of films.
 
 ### Key Features
-TapeXPlayer is written in C++ using the **FFmpeg**, **SDL**, **GStreamer**, and **OpenSSH 3.0** libraries. Additionally, it uses the **SPLIN** font, distributed under the BSD2-ClauseLicense. The primary goal of the program is to adapt the functionality of professional video recorders for use on modern computers. TapeXPlayer helps to thoroughly examine the video sequence, simplifying frame-by-frame analysis and playback control. This version is intended for Apple computers running on M1, M2, and M3 processors.
+TapeXPlayer is written in C++ using the **FFmpeg**, **SDL**, **GStreamer**, and **OpenSSH 3.0** libraries. Additionally, it uses the **SPLIN** font, distributed under the BSD2-ClauseLicense. The primary goal of the program is to adapt the functionality of professional video recorders for use on modern computers. TapeXPlayer helps to thoroughly examine the video sequence, simplifying frame-by-frame analysis and playback control. This version is intended for Mac computers running on Apple Silicon & Intel.
 
 - Smooth playback forward and backward with shuttle control up to 16x speed, with minimal CPU and memory usage.
 - Fast seek by timecode.
