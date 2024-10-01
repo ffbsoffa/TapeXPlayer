@@ -1,118 +1,47 @@
 # TapeXPlayer
 
-TapeXPlayer is a specialized video player designed for scientific analysis and research purposes. It combines the functionality of a traditional video (tape)player with advanced features for precise frame-by-frame analysis, timecode display, and variable speed playback.
+**TapeXPlayer** is a video player developed as a like-simulation of media playback on magnetic tapes, based on the philosophy of professional Betacam video recorders. The program is designed for scientific purposes, particularly for frame-by-frame analysis of films.
 
-## Features
+### Key Features
+TapeXPlayer is written in C++ using the **FFmpeg**, **SDL**, **GStreamer**, and **OpenSSH 3.0** libraries. Additionally, it uses the **SPLIN** font, distributed under the BSD2-ClauseLicense. The primary goal of the program is to adapt the functionality of professional video recorders for use on modern computers. TapeXPlayer helps to thoroughly examine the video sequence, simplifying frame-by-frame analysis and playback control. This version is intended for Apple computers running on M1, M2, and M3 processors.
 
-- High-precision video playback with frame-accurate seeking
-- Variable speed playback (0.25x to 16x) with smooth transitions
-- Reverse playback capability
-- Real-time timecode display in HH:MM:SS:FF format
-- Debug mode for visualizing frame decoding status
+- Smooth playback forward and backward with shuttle control up to 16x speed, with minimal CPU and memory usage.
+- Fast seek by timecode.
+- Supports multiple video formats thanks to the **FFmpeg** library.
+- Minimal system resource consumption at high playback speeds.
 
-## System Requirements
-
-- C++17 compatible compiler
-- SDL2 library
-- FFmpeg libraries (libavcodec, libavformat, libavutil, libswresample, libswscale)
-- GStreamer library
-
-## Building the Project
-
-1. Ensure you have all the required libraries installed on your system.
-2. Clone the repository:
-   ```
-   git clone https://github.com/yourusername/TapeXPlayer.git
-   cd TapeXPlayer
-   ```
-3. Create a build directory and run CMake:
-   ```
-   mkdir build
-   cd build
-   cmake ..
-   ```
-4. Build the project:
-   ```
-   make
-   ```
-
-## Usage
-
-To run TapeXPlayer, use the following command:
-
+### Running the Program
+Run the program via the command line using the following format:
 ```
-./TapeXPlayer <path_to_video_file>
+./TapeXPlayer <path to video file>
 ```
 
-### Controls
+Example:
+```
+./TapeXPlayer test.mp4
+```
 
-- **Space**: Play/Pause
-- **Left Arrow**: Toggle reverse playback
-- **Up Arrow**: Increase playback speed (2x, 4x, 8x, 16x)
-- **Down Arrow**: Decrease playback speed (1/2x, 1/4x)
-- **+**: Increase volume
-- **-**: Decrease volume
-- **D**: Toggle debug mode
-- **Q**: Quit the application
+### Important Notes
+- TapeXPlayer creates cached versions of the video to ensure smooth playback and seeking. The cache is saved at the following path: `/Users/<username>/Library/Caches/TapeXPlayer`. Make sure there is enough free space on the disk to store the cache.
+- The program may have issues with video formats other than H.264 or files with a resolution higher than 1080p.
 
-### Display Information
+### Controls:
+- **Spacebar** — Play/Pause.
+- **G** — Switch to frame seek mode based on timecode. Enter time in the following format: HHMMSSFF (hours, minutes, seconds, frames).
+- **Up/Down Arrows** — Control playback speed (from normal to 16x).
+- **Left Arrow** — Change playback direction (forward/backward).
+- **Shift + Left/Right Arrows** — Slow-motion playback (jog mode).
 
-The player displays the following information in real-time:
+### System Requirements
+- Mac with Apple Silicon (or Intel)
+- macOS 11.0 (Big Sur) or newer
 
-- Current timecode (HH:MM:SS:FF)
-- Playback speed
-- Playback direction (Forward/Reverse)
-- Current frame number
-- Playback status (Playing/Paused)
-- Debug mode status (ON/OFF)
+### Libraries and Dependencies:
+- **GStreamer** — for multimedia framework support.
+- **FFmpeg** — for decoding and encoding video and audio.
+- **SDL** — for cross-platform multimedia capabilities.
+- **OpenSSH 3.0** — for file generation with unique identifiers, optimizing workload.
+- **SPLIN Font** — used under BSD2-ClauseLicense.
 
-### Debug Mode
-
-When debug mode is enabled, a color-coded bar at the bottom of the video display shows the status of frame decoding:
-
-- Red: Empty frames (not yet decoded)
-- Blue: Low-resolution frames
-- Green: Full-resolution frames
-
-The white vertical line indicates the current playback position.
-
-## Performance Considerations
-
-TapeXPlayer is designed to handle high-resolution video files efficiently. However, performance may vary depending on your system specifications and the video file characteristics. For optimal performance:
-
-1. Ensure your system meets or exceeds the minimum requirements.
-2. Use SSDs for faster file access.
-3. Close unnecessary background applications.
-4. For extremely large files, consider pre-processing the video to a more manageable resolution or codec.
-
-## Known Limitations
-
-- The player currently supports a limited range of video codecs. Check FFmpeg documentation for supported formats.
-- Extremely high resolution videos (e.g., 8K) may experience performance issues on lower-end systems.
-- The player is optimized for scientific analysis and may not provide the same level of performance as general-purpose media players for casual viewing.
-
-## Troubleshooting
-
-If you encounter issues:
-
-1. Ensure all required libraries are correctly installed and up to date.
-2. Check that the video file is not corrupted and is in a supported format.
-3. Try running the player with a different video file to isolate file-specific issues.
-4. Check the console output for any error messages or warnings.
-
-## Contributing
-
-Contributions to TapeXPlayer are welcome. Please follow these steps:
-
-1. Fork the repository.
-2. Create a new branch for your feature or bug fix.
-3. Commit your changes with clear, descriptive commit messages.
-4. Push your branch and submit a pull request.
-
-## License
-
-TapeXPlayer is released under the [MIT License](LICENSE).
-
-## Contact
-
-For questions, suggestions, or support, please open an issue on the GitHub repository or contact the maintainer at [your-email@example.com].
+### Contributions and Contact:
+If you'd like to contribute to the project or need consultation, feel free to reach out at **mail@ffbsoffa.org**. Contributions are welcome through pull requests.
