@@ -47,4 +47,4 @@ Example:
 - [**Spleen Font**](https://github.com/fcambus/spleen/tree/master) — used under BSD2-ClauseLicense
 
 ### Contributions and Contact:
-If you'd like to contribute to the project or need consultation, feel free to reach out at **mail@ffbsoffa.org**. Contributions are welcome through pull requests.
+If you'd like to contribute to the project, feel free to reach out at **mail@ffbsoffa.org**. Contributions are welcome through pull requests.
