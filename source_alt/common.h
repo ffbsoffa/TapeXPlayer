@@ -44,4 +44,12 @@ void stop_jog();
 void seek_to_time(double target_time);
 double parse_timecode(const std::string& timecode);
 
+struct SeekInfo {
+    std::atomic<bool> requested{false};
+    std::atomic<double> time{0.0};
+    std::atomic<bool> completed{false};
+};
+
+extern SeekInfo seekInfo;
+
 #endif // COMMON_H

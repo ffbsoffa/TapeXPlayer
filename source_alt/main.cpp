@@ -12,6 +12,7 @@
 #include <sys/resource.h>
 #include "decode.h"
 #include "common.h"
+#include "display.h"
 #include "fontdata.h"
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,9 @@
 #include <limits.h>
 #include <random>
 #include <chrono>
+#include <sstream>
+#include <iomanip>
+#include "nfd.hpp"
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -40,8 +44,6 @@ std::atomic<double> original_fps(0.0);
 std::atomic<bool> shouldExit(false);
 std::atomic<float> volume(1.0f);
 
-// Declaration of visualizeFrameIndex function
-void visualizeFrameIndex(const std::vector<FrameInfo>& frameIndex);
 
 // Add this at the beginning of the file, after other global variables
 bool showIndex = false;
@@ -56,175 +58,15 @@ bool waiting_for_timecode = false;
 // Add this at the beginning of the file, after other global variables
 std::atomic<bool> seek_performed(false);
 
-void updateVisualization(SDL_Renderer* renderer, const std::vector<FrameInfo>& frameIndex, int currentFrame, int bufferStart, int bufferEnd, int highResStart, int highResEnd, bool enableHighResDecode) {
-    if (!showIndex) return; // If index should not be displayed, exit the function
+// Add these includes at the beginning of the file
+#include <future>
+#include <atomic>
 
-    int totalFrames = frameIndex.size();
-    int windowWidth, windowHeight;
-    SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
-    
-    int indexHeight = 5; // Reduce the height of the index bar to 5 pixels
-    double frameWidth = static_cast<double>(windowWidth) / totalFrames;
+// Add these global variables
+std::atomic<bool> is_force_decoding(false);
+std::future<void> force_decode_future;
 
-    // Clear only the top part of the screen for the index
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-    SDL_Rect indexRect = {0, 0, windowWidth, indexHeight};
-    SDL_RenderFillRect(renderer, &indexRect);
-
-    // Render frame index
-    for (int i = 0; i < totalFrames; ++i) {
-        SDL_Rect rect;
-        rect.x = static_cast<int>(i * frameWidth);
-        rect.y = 0; // Draw at the top of the screen
-        rect.w = std::max(1, static_cast<int>(frameWidth));
-        rect.h = indexHeight;
-
-        // Remove high resolution check
-        // if (enableHighResDecode && i >= highResStart && i <= highResEnd) {
-        //     SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255); // Green for high-res frames
-        // } else 
-        if (i >= bufferStart && i <= bufferEnd) {
-            switch (frameIndex[i].type) {
-                case FrameInfo::EMPTY:
-                    SDL_SetRenderDrawColor(renderer, 64, 64, 64, 255); // Dark gray for empty frames
-                    break;
-                case FrameInfo::LOW_RES:
-                    SDL_SetRenderDrawColor(renderer, 0, 128, 255, 255); // Light blue for low-res
-                    break;
-                case FrameInfo::FULL_RES:
-                    SDL_SetRenderDrawColor(renderer, 255, 255, 0, 255); // Yellow for high-res
-                    break;
-            }
-        } else {
-            SDL_SetRenderDrawColor(renderer, 32, 32, 32, 255); // Very dark gray for frames outside the buffer
-        }
-
-        SDL_RenderFillRect(renderer, &rect);
-    }
-
-    // Render current frame (playhead)
-    SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255); // Red color for the playhead
-    SDL_Rect currentFrameRect = {
-        static_cast<int>(currentFrame * frameWidth),
-        0,
-        std::max(2, static_cast<int>(frameWidth)), // Minimum width of 2 pixels for visibility
-        indexHeight
-    };
-    SDL_RenderFillRect(renderer, &currentFrameRect);
-}
-
-void printMemoryUsage() {
-    struct rusage usage;
-    if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        std::cout << "Memory usage: " << usage.ru_maxrss << " KB" << std::endl;
-    }
-}
-
-void displayCurrentFrame(SDL_Renderer* renderer, const FrameInfo& frameInfo, bool enableHighResDecode, double playbackRate, double currentTime, double totalDuration) {
-    std::lock_guard<std::mutex> lock(frameInfo.mutex);
-    if (frameInfo.is_decoding) {
-        return;
-    }
-
-    if ((!enableHighResDecode && !frameInfo.low_res_frame) || (enableHighResDecode && !frameInfo.frame && !frameInfo.low_res_frame)) {
-        return;
-    }
-
-    AVFrame* frame = (enableHighResDecode && frameInfo.frame) ? frameInfo.frame.get() : frameInfo.low_res_frame.get();
-    
-    if (!frame) {
-        return;
-    }
-
-    // Create texture from AVFrame
-    SDL_Texture* texture = SDL_CreateTexture(
-        renderer,
-        SDL_PIXELFORMAT_YV12,
-        SDL_TEXTUREACCESS_STREAMING,
-        frame->width,
-        frame->height
-    );
-
-    if (!texture) {
-        std::cout << "Error creating texture: " << SDL_GetError() << std::endl;
-        return;
-    }
-
-    // Check if we need to convert the image to black and white
-    const double threshold = 0.5; // Threshold in seconds
-    bool makeBlackAndWhite = std::abs(playbackRate) >= 12.0 && 
-                             currentTime >= threshold && 
-                             (totalDuration - currentTime) >= threshold;
-
-    if (makeBlackAndWhite) {
-        // Create temporary buffer for Y-component
-        std::vector<uint8_t> y_plane(frame->linesize[0] * frame->height);
-        
-        // Copy Y-component
-        for (int y = 0; y < frame->height; ++y) {
-            std::memcpy(y_plane.data() + y * frame->linesize[0], frame->data[0] + y * frame->linesize[0], frame->width);
-        }
-
-        // Fill U and V components with average value (128)
-        std::vector<uint8_t> uv_plane(frame->linesize[1] * frame->height / 2, 128);
-
-        SDL_UpdateYUVTexture(
-            texture,
-            NULL,
-            y_plane.data(),
-            frame->linesize[0],
-            uv_plane.data(),
-            frame->linesize[1],
-            uv_plane.data(),
-            frame->linesize[2]
-        );
-    } else {
-        SDL_UpdateYUVTexture(
-            texture,
-            NULL,
-            frame->data[0],
-            frame->linesize[0],
-            frame->data[1],
-            frame->linesize[1],
-            frame->data[2],
-            frame->linesize[2]
-        );
-    }
-
-    // Display texture while maintaining aspect ratio
-    int windowWidth, windowHeight;
-    SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
-    
-    float videoAspectRatio = static_cast<float>(frame->width) / frame->height;
-    float windowAspectRatio = static_cast<float>(windowWidth) / windowHeight;
-    
-    SDL_Rect dstRect;
-    if (videoAspectRatio > windowAspectRatio) {
-        dstRect.w = windowWidth;
-        dstRect.h = static_cast<int>(windowWidth / videoAspectRatio);
-        dstRect.x = 0;
-        dstRect.y = (windowHeight - dstRect.h) / 2;
-    } else {
-        dstRect.h = windowHeight;
-        dstRect.w = static_cast<int>(windowHeight * videoAspectRatio);
-        dstRect.y = 0;
-        dstRect.x = (windowWidth - dstRect.w) / 2;
-    }
-    
-    // Add very soft jitter effect only vertically at increased playback speed or pause
-    if (std::abs(playbackRate) > 1.0 || std::abs(playbackRate) < 0.5) {
-        static std::mt19937 generator(std::chrono::system_clock::now().time_since_epoch().count());
-        std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
-        
-        float jitter = distribution(generator);
-        if (std::abs(jitter) > 0.97f) {  // Apply jitter only in 10% of cases
-            dstRect.y += (jitter > 0) ? 1 : -1;
-        }
-    }
-    
-    SDL_RenderCopy(renderer, texture, NULL, &dstRect);
-    SDL_DestroyTexture(texture);
-}
+std::mutex frameIndexMutex;
 
 // Function declarations from mainau.cpp
 void start_audio(const char* filename);
@@ -232,165 +74,13 @@ std::string generateTXTimecode(double time);
 
 void smooth_speed_change();
 
-// Global variables for playback control
+SeekInfo seekInfo;
+
 std::atomic<bool> audio_initialized(false);
 std::thread audio_thread;
 std::thread speed_change_thread;
 
-void get_video_dimensions(const char* filename, int* width, int* height) {
-    AVFormatContext* formatContext = avformat_alloc_context();
-    if (avformat_open_input(&formatContext, filename, NULL, NULL) != 0) {
-        std::cerr << "Could not open file" << std::endl;
-        return;
-    }
-    
-    if (avformat_find_stream_info(formatContext, NULL) < 0) {
-        std::cerr << "Could not find stream information" << std::endl;
-        avformat_close_input(&formatContext);
-        return;
-    }
-    
-    int videoStream = -1;
-    for (unsigned int i = 0; i < formatContext->nb_streams; i++) {
-        if (formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            videoStream = i;
-            break;
-        }
-    }
-    
-    if (videoStream == -1) {
-        std::cerr << "Could not find video stream" << std::endl;
-        avformat_close_input(&formatContext);
-        return;
-    }
-    
-    *width = formatContext->streams[videoStream]->codecpar->width;
-    *height = formatContext->streams[videoStream]->codecpar->height;
-    
-    avformat_close_input(&formatContext);
-}
-
-// Add these includes at the beginning of the file
-#include <sstream>
-#include <iomanip>
-
-// Add this function before main()
-void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double playbackRate, bool isReverse, double currentTime, int frameNumber) {
-    if (!showOSD) return;
-
-    int windowWidth, windowHeight;
-    SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
-
-    // Create black background for OSD
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-    SDL_Rect osdRect = {0, windowHeight - 30, windowWidth, 30};
-    SDL_RenderFillRect(renderer, &osdRect);
-
-    // Prepare text for left part
-    std::string leftText;
-    if (jog_forward.load() || jog_backward.load()) {
-        leftText = "JOG";
-    } else if (std::abs(playbackRate) < 0.01) {
-        leftText = "STILL";
-    } else if (std::abs(playbackRate) > 1.0) {
-        leftText = "SHUTTLE";
-    } else if (std::abs(playbackRate) > 0.0) {
-        leftText = "PLAY";
-    } else {
-        leftText = "STILL";
-    }
-
-    // Prepare timecode
-    std::string timecode = "00:00:00:00";
-    if (waiting_for_timecode) {
-        for (size_t i = 0; i < input_timecode.length() && i < 8; ++i) {
-            size_t pos = i + (i / 2);  // Account for colon positions
-            timecode[pos] = input_timecode[i];
-        }
-    } else {
-        int hours = static_cast<int>(currentTime / 3600);
-        int minutes = static_cast<int>((currentTime - hours * 3600) / 60);
-        int seconds = static_cast<int>(currentTime) % 60;
-        int frames = static_cast<int>((currentTime - static_cast<int>(currentTime)) * original_fps.load());
-
-        std::stringstream timecodeStream;
-        timecodeStream << std::setfill('0') << std::setw(2) << hours << ":"
-                       << std::setfill('0') << std::setw(2) << minutes << ":"
-                       << std::setfill('0') << std::setw(2) << seconds << ":"
-                       << std::setfill('0') << std::setw(2) << frames;
-        timecode = timecodeStream.str();
-    }
-
-    // Prepare text for right part
-    std::string rightText = isReverse ? "REV" : "FWD";
-    if (jog_forward.load() || jog_backward.load()) {
-    } else if (std::abs(playbackRate) > 1.0) {
-        int roundedSpeed = std::round(std::abs(playbackRate));
-        rightText += " " + std::to_string(roundedSpeed) + "x";
-    }
-
-    // Render text
-    SDL_Color textColor = {255, 255, 255, 255};  // White color
-    SDL_Color grayColor = {128, 128, 128, 255};  // Gray color for inactive digits during timecode input
-
-    SDL_Surface* leftSurface = TTF_RenderText_Solid(font, leftText.c_str(), textColor);
-    SDL_Texture* leftTexture = SDL_CreateTextureFromSurface(renderer, leftSurface);
-    SDL_Rect leftRect = {10, windowHeight - 30 + (30 - leftSurface->h) / 2, leftSurface->w, leftSurface->h};
-    SDL_RenderCopy(renderer, leftTexture, NULL, &leftRect);
-
-    // Render timecode
-    int charWidth = 0;
-    int charHeight = 0;
-    TTF_SizeText(font, "0", &charWidth, &charHeight);  // Get size of one character
-    int totalWidth = charWidth * 11;  // 8 digits + 3 colons
-    int xPos = (windowWidth - totalWidth) / 2;
-    int yPos = windowHeight - 30 + (30 - charHeight) / 2;
-
-    for (size_t i = 0; i < timecode.length(); ++i) {
-        char c[2] = {timecode[i], '\0'};
-        SDL_Color color;
-        if (waiting_for_timecode) {
-            if (i % 3 == 2) {  // Colons
-                color = grayColor;
-            } else {
-                // Check if this character has been entered
-                size_t inputIndex = i - (i / 3);  // Index in input_timecode
-                color = (inputIndex < input_timecode.length()) ? textColor : grayColor;
-            }
-        } else {
-            color = textColor;
-        }
-        
-        SDL_Surface* charSurface = TTF_RenderText_Solid(font, c, color);
-        SDL_Texture* charTexture = SDL_CreateTextureFromSurface(renderer, charSurface);
-        SDL_Rect charRect = {xPos, yPos, charSurface->w, charSurface->h};
-        SDL_RenderCopy(renderer, charTexture, NULL, &charRect);
-        xPos += charWidth;
-        SDL_FreeSurface(charSurface);
-        SDL_DestroyTexture(charTexture);
-    }
-
-    SDL_Surface* rightSurface = TTF_RenderText_Solid(font, rightText.c_str(), textColor);
-    SDL_Texture* rightTexture = SDL_CreateTextureFromSurface(renderer, rightSurface);
-    SDL_Rect rightRect = {windowWidth - rightSurface->w - 10, windowHeight - 30 + (30 - rightSurface->h) / 2, rightSurface->w, rightSurface->h};
-    SDL_RenderCopy(renderer, rightTexture, NULL, &rightRect);
-
-    // Free resources
-    SDL_FreeSurface(leftSurface);
-    SDL_DestroyTexture(leftTexture);
-    SDL_FreeSurface(rightSurface);
-    SDL_DestroyTexture(rightTexture);
-}
-
-// Add this function before main()
-int getUpdateInterval(double playbackRate) {
-    if (playbackRate < 0.9) return std::numeric_limits<int>::max(); // Don't decode
-    if (playbackRate <= 1.0) return 5000;
-    if (playbackRate <= 2.0) return 2500;
-    if (playbackRate <= 4.0) return 1000;
-    if (playbackRate <= 8.0) return 500;
-    return 100; // For speed 16x and higher
-}
+extern void cleanup_audio();
 
 void initializeBuffer(const char* lowResFilename, std::vector<FrameInfo>& frameIndex, int currentFrame, int bufferSize) {
     int bufferStart = std::max(0, currentFrame - bufferSize / 2);
@@ -399,72 +89,9 @@ void initializeBuffer(const char* lowResFilename, std::vector<FrameInfo>& frameI
     asyncDecodeLowResRange(lowResFilename, frameIndex, bufferStart, bufferEnd, currentFrame, currentFrame).wait();
 }
 
-// In removeHighResFrames function
-void removeHighResFrames(std::vector<FrameInfo>& frameIndex, int start, int end, int highResStart, int highResEnd) {
-    for (int i = start; i <= end && i < frameIndex.size(); ++i) {
-        if (frameIndex[i].type == FrameInfo::FULL_RES) {
-            // Add check to not remove frames in the current high-res zone
-            if (i < highResStart || i > highResEnd) {
-                // std::cout << "Removing high-res frame " << i << std::endl;
-                frameIndex[i].frame.reset();
-                frameIndex[i].type = FrameInfo::LOW_RES;
-            }
-        }
-    }
-}
-
 void log(const std::string& message) {
     static std::ofstream logFile("TapeXPlayer.log", std::ios::app);
     logFile << message << std::endl;
-}
-
-// Add this function before main()
-void renderRewindEffect(SDL_Renderer* renderer, double playbackRate, double currentTime, double totalDuration) {
-    int windowWidth, windowHeight;
-    SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
-
-    // Check if we need to render the effect
-    if (std::abs(playbackRate) <= 1.1) return;
-
-    // Check if we're not at the beginning or end of the file
-    const double threshold = 0.1; // Threshold in seconds
-    if (currentTime < threshold || (totalDuration - currentTime) < threshold) return;
-
-    // Base number of stripes at speed just above 1.1x
-    double baseNumStripes = 1.0;
-    // Smoothly increase the number of stripes as speed increases
-    double speedFactor = std::max(0.0, std::abs(playbackRate) - 1.1);
-    double numStripesFloat = baseNumStripes + std::sqrt(speedFactor) * 2.0;
-    int numStripes = static_cast<int>(std::round(numStripesFloat));
-    numStripes = std::min(numStripes, 10); // Limit maximum number of stripes
-
-    // Base stripe height (thickest at speed just above 1.1x)
-    int baseStripeHeight = windowHeight / baseNumStripes;
-    // Decrease stripe height as speed increases
-    int stripeHeight = static_cast<int>(baseStripeHeight / (std::abs(playbackRate) / 0.2));
-    stripeHeight = std::max(stripeHeight, 10); // Minimum stripe height
-
-    // Stripe movement speed (pixels per frame)
-    // Increase base speed and make it dependent on window height
-    int baseSpeed = windowHeight / 3; // Base speed for speed just above 1.1x
-    int speed = static_cast<int>(baseSpeed * (std::abs(playbackRate) / 1.1));
-
-    // Stripe offset (changes over time)
-    static int offset = 0;
-    offset = (offset + speed) % windowHeight;
-
-    // Stripe color (gray, opaque)
-    SDL_SetRenderDrawColor(renderer, 128, 128, 128, 255);
-
-    for (int i = 0; i < numStripes; ++i) {
-        SDL_Rect stripeRect;
-        stripeRect.x = 0;
-        stripeRect.y = windowHeight - (i * (windowHeight / numStripes) + offset) % windowHeight;
-        stripeRect.w = windowWidth;
-        stripeRect.h = stripeHeight;
-
-        SDL_RenderFillRect(renderer, &stripeRect);
-    }
 }
 
 int main(int argc, char* argv[]) {
@@ -475,13 +102,104 @@ int main(int argc, char* argv[]) {
     }
     log("Current working directory: " + std::string(getcwd(NULL, 0)));
 
+    std::string filename;
+    bool fileSelected = false;
+
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <path_to_video_file>" << std::endl;
+        // No file provided as argument, show blue screen and then file dialog
+        if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+            std::cerr << "SDL initialization error: " << SDL_GetError() << std::endl;
+            return 1;
+        }
+
+        // Initialize TTF
+        if (TTF_Init() == -1) {
+            std::cerr << "SDL_ttf initialization error: " << TTF_GetError() << std::endl;
+            return 1;
+        }
+
+        SDL_Window* window = SDL_CreateWindow("TapeXPlayer", 
+            SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 
+            1280, 720,  // Default size, can be adjusted
+            SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+        if (!window) {
+            std::cerr << "Window creation error: " << SDL_GetError() << std::endl;
+            SDL_Quit();
+            return 1;
+        }
+
+        SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        if (!renderer) {
+            std::cerr << "Renderer creation error: " << SDL_GetError() << std::endl;
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return 1;
+        }
+
+        // Load font
+        SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
+        TTF_Font* font = TTF_OpenFontRW(rw, 1, 24);
+        if (!font) {
+            std::cerr << "Error loading font from memory: " << TTF_GetError() << std::endl;
+            return 1;
+        }
+
+        // Render blue background
+        SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255);
+        SDL_RenderClear(renderer);
+
+        // Render OSD
+        renderOSD(renderer, font, false, 0.0, false, 0.0, 0, true, false, "", 0.0, false, false);
+
+        SDL_RenderPresent(renderer);
+
+        // Wait for a short time to show the blue screen
+        SDL_Delay(1000);  // Wait for 1 second
+
+        // Open file dialog
+        NFD::Guard nfdGuard;
+        if (NFD::Init() != NFD_OKAY) {
+            std::cerr << "Error initializing NFD: " << NFD::GetError() << std::endl;
+            log("Error initializing NFD: " + std::string(NFD::GetError()));
+        } else {
+            NFD::UniquePath outPath;
+            nfdfilteritem_t filterItem[1] = { { "Video files", "mp4,avi,mov,mkv" } };
+            nfdresult_t result = NFD::OpenDialog(outPath, filterItem, 1);
+            
+            if (result == NFD_OKAY) {
+                filename = outPath.get();
+                std::cout << "File selected: " << filename << std::endl;
+                log("File selected via dialog: " + filename);
+                fileSelected = true;
+            } else if (result == NFD_CANCEL) {
+                std::cout << "User canceled file selection." << std::endl;
+                log("User canceled file selection");
+            } else {
+                std::cerr << "Error: " << NFD::GetError() << std::endl;
+                log("Error in file dialog: " + std::string(NFD::GetError()));
+            }
+        }
+
+        // Clean up
+        TTF_CloseFont(font);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        TTF_Quit();
+        SDL_Quit();
+
+        if (!fileSelected) {
+            return 0;
+        }
+    } else {
+        filename = argv[1];
+    }
+
+    if (filename.empty()) {
+        std::cerr << "No file selected. Exiting." << std::endl;
+        log("No file selected. Exiting.");
         return 1;
     }
 
-    std::string filename = argv[1];
-    
     // Handle file path for macOS
     if (filename.find("/Volumes/") == 0) {
         // Path is already absolute, leave as is
@@ -520,7 +238,7 @@ int main(int argc, char* argv[]) {
     // Initialize buffer after conversion
     initializeBuffer(lowResFilename.c_str(), frameIndex, 0, ringBufferCapacity);
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         std::cerr << "SDL initialization error: " << SDL_GetError() << std::endl;
         return 1;
     }
@@ -572,33 +290,48 @@ SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
         std::cout << "Renderer created with VSync" << std::endl;
     }
 
-    RingBuffer ringBuffer(ringBufferCapacity);
-    FrameCleaner frameCleaner(frameIndex);
-
-    int currentFrame = 0;
-    bool isPlaying = false;
     bool enableHighResDecode = true;
-    std::chrono::steady_clock::time_point lastFrameTime;
-    std::chrono::steady_clock::time_point lastBufferUpdateTime = std::chrono::steady_clock::now();
-    std::chrono::steady_clock::time_point now;
 
     const int highResWindowSize = 500;  // Size of high-res window
-    std::future<void> lowResFuture;
-    std::future<void> highResFuture;
-    std::future<void> secondaryCleanFuture;
 
     const int TARGET_FPS = 60;
     const int FRAME_DELAY = 1000 / TARGET_FPS;
 
     // Initialize audio
-    audio_thread = std::thread(start_audio, filename.c_str());
+    bool audio_started = false;
+    for (int attempt = 0; attempt < 3 && !audio_started; ++attempt) {
+        std::cout << "Attempting to start audio (attempt " << attempt + 1 << " of 3)" << std::endl;
+        audio_thread = std::thread([&filename, &audio_started]() {
+            start_audio(filename.c_str());
+        });
+        audio_thread.join();  // Ждем завершения потока
+        
+        audio_started = !quit.load();  // Если quit не установлен, считаем, чт аудио запустилось успешно
+        
+        if (!audio_started) {
+            std::cout << "Audio failed to start, retrying..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(1));  // Небольшая пауза перед следующей попыткой
+        }
+    }
+
+    if (!audio_started) {
+        std::cerr << "Failed to start audio after 3 attempts. Exiting." << std::endl;
+        return 1;
+    }
+
     speed_change_thread = std::thread(smooth_speed_change);
 
     bool fps_received = false;
     bool duration_received = false;
 
-    std::chrono::steady_clock::time_point lastLowResUpdateTime = std::chrono::steady_clock::now();
-    std::chrono::steady_clock::time_point lastHighResUpdateTime = std::chrono::steady_clock::now();
+    previous_playback_rate.store(playback_rate.load());
+
+    std::atomic<int> currentFrame(0);
+    std::atomic<bool> isPlaying(false);
+    std::thread decodingThread(manageVideoDecoding, std::ref(filename), std::ref(lowResFilename), 
+                               std::ref(frameIndex), std::ref(currentFrame),
+                               ringBufferCapacity, highResWindowSize,
+                               std::ref(isPlaying));
 
     while (!shouldExit) {
         // Check if FPS value is ready
@@ -687,7 +420,7 @@ SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
                             }
                             break;
                         case SDLK_UP:
-                            target_playback_rate.store(std::min(target_playback_rate.load() * 2.0, 16.0));
+                            target_playback_rate.store(std::min(target_playback_rate.load() * 2.0, 18.0));
                             break;
                         case SDLK_DOWN:
                             target_playback_rate.store(std::max(target_playback_rate.load() / 2.0, 0.125));
@@ -734,163 +467,46 @@ SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
             }
         }
 
-        // Check if seek operation was performed
-        if (seek_performed.load()) {
-            // Get current time after seek
-            double currentTime = current_audio_time.load();
-            currentFrame = static_cast<int>(currentTime * original_fps.load()) % frameIndex.size();
-
-            // Reinitialize buffer
-            initializeBuffer(lowResFilename.c_str(), frameIndex, currentFrame, ringBufferCapacity);
-
-            // Reset seek flag
-            seek_performed.store(false);
-
-            // Reset last update times
-            lastLowResUpdateTime = std::chrono::steady_clock::now();
-            lastHighResUpdateTime = std::chrono::steady_clock::now();
-        }
-
-        // Buffer update
-        int bufferStart = std::max(0, currentFrame - static_cast<int>(ringBufferCapacity / 2));
-        int bufferEnd = std::min(bufferStart + static_cast<int>(ringBufferCapacity) - 1, static_cast<int>(frameIndex.size()) - 1);
-
-        // Define high-res window boundaries
-        int highResStart = std::max(0, currentFrame - highResWindowSize / 2);
-        int highResEnd = std::min(static_cast<int>(frameIndex.size()) - 1, currentFrame + highResWindowSize / 2);
-
-        bool isInHighResZone = (currentFrame >= highResStart && currentFrame <= highResEnd);
-
-        now = std::chrono::steady_clock::now();
-        auto timeSinceLastLowResUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLowResUpdateTime);
-        auto timeSinceLastHighResUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHighResUpdateTime);
-
-        double currentPlaybackRate = std::abs(playback_rate.load());
-        int lowResUpdateInterval = getUpdateInterval(currentPlaybackRate);
-        int highResUpdateInterval = getUpdateInterval(currentPlaybackRate) / 2;
-
-        // Determine if high-res frames should be decoded
-        bool shouldDecodeHighRes = currentPlaybackRate < 2.0 && enableHighResDecode;
-
-        // Low-res frame decoding loop
-        if (timeSinceLastLowResUpdate.count() >= lowResUpdateInterval) {
-            bool needLowResUpdate = false;
-            for (int i = bufferStart; i <= bufferEnd; ++i) {
-                if (frameIndex[i].type == FrameInfo::EMPTY) {
-                    needLowResUpdate = true;
-                    break;
-                }
-            }
-
-            if (needLowResUpdate) {
-                if (!lowResFuture.valid() || lowResFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-                    lowResFuture = asyncDecodeLowResRange(lowResFilename.c_str(), frameIndex, bufferStart, bufferEnd, highResStart, highResEnd);
-                    lastLowResUpdateTime = now;
-                }
-            }
-        }
-
-        // High-res frame decoding loop
-        if (shouldDecodeHighRes && timeSinceLastHighResUpdate.count() >= highResUpdateInterval) {
-            bool needHighResUpdate = false;
-            for (int i = highResStart; i <= highResEnd; ++i) {
-                if (frameIndex[i].type != FrameInfo::FULL_RES) {
-                    needHighResUpdate = true;
-                    break;
-                }
-            }
-
-            if (needHighResUpdate) {
-                if (!highResFuture.valid() || highResFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-                    highResFuture = asyncDecodeFrameRange(filename.c_str(), frameIndex, highResStart, highResEnd);
-                    lastHighResUpdateTime = now;
-                }
-            }
-        } else if (currentPlaybackRate >= 2.0) {
-            // If playback speed >= 2x, remove high-res frames
-            removeHighResFrames(frameIndex, 0, frameIndex.size() - 1, -1, -1);
-        }
-
-        // Remove high-res frames outside the window
-        removeHighResFrames(frameIndex, 0, highResStart - 1, highResStart, highResEnd);
-        removeHighResFrames(frameIndex, highResEnd + 1, frameIndex.size() - 1, highResStart, highResEnd);
-
-        // Check and reset frame type if it's outside the high-res window
-        for (int i = 0; i < frameIndex.size(); ++i) {
-            if (i < highResStart || i > highResEnd) {
-                if (frameIndex[i].type == FrameInfo::FULL_RES && !frameIndex[i].is_decoding) {
-                    frameIndex[i].frame.reset();
-                    frameIndex[i].type = frameIndex[i].low_res_frame ? FrameInfo::LOW_RES : FrameInfo::EMPTY;
-                }
-            }
-        }
-
-        // Clear low-res frames outside the buffer
-        for (int i = 0; i < frameIndex.size(); ++i) {
-            if (i < bufferStart || i > bufferEnd) {
-                if (frameIndex[i].type == FrameInfo::LOW_RES && !frameIndex[i].is_decoding) {
-                    frameIndex[i].low_res_frame.reset();
-                    frameIndex[i].type = FrameInfo::EMPTY;
-                }
-            }
-        }
-
-        // Update current frame based on current audio time
+        // Обновляем currentFrame на основе текущего ремени аудио
         double currentTime = current_audio_time.load();
-        currentFrame = static_cast<int>(currentTime * original_fps.load()) % frameIndex.size();
+        int newCurrentFrame = static_cast<int>(currentTime * original_fps.load()) % frameIndex.size();
+        currentFrame.store(newCurrentFrame);
 
-        // Clear the entire screen
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        SDL_RenderClear(renderer);
-
-        // Display current frame
-        displayCurrentFrame(renderer, frameIndex[currentFrame], isInHighResZone && enableHighResDecode, std::abs(playback_rate.load()), currentTime, total_duration.load());
-
-        double effectPlaybackRate = playback_rate.load();
-        if (std::abs(effectPlaybackRate) >= 2.0) {
-            renderRewindEffect(renderer, effectPlaybackRate, currentTime, total_duration.load());
+        // Проверяем завершение seek
+        if (seekInfo.completed.load()) {
+            seekInfo.completed.store(false);
+            seek_performed.store(false);
         }
 
-        // Update frame index visualization
-        if (showIndex) {
-            updateVisualization(renderer, frameIndex, currentFrame, bufferStart, bufferEnd, highResStart, highResEnd, enableHighResDecode);
-        }
-
-        // Render OSD
-        if (showOSD) {
-            renderOSD(renderer, font, isPlaying, playback_rate.load(), is_reverse.load(), currentTime, currentFrame);
-        }
-
+displayFrame(renderer, frameIndex, newCurrentFrame, enableHighResDecode, playback_rate.load(), currentTime, total_duration.load(), showIndex, showOSD, font, isPlaying, is_reverse.load(), waiting_for_timecode, input_timecode, original_fps.load(), jog_forward, jog_backward, ringBufferCapacity, highResWindowSize);
         SDL_RenderPresent(renderer);
-
-        if (isPlaying) {
-            now = std::chrono::steady_clock::now();
-            auto frameDuration = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFrameTime);
-            double fps = 1000.0 / frameDuration.count();
-        }
 
         // Limit frame rate
         Uint32 frameTime = SDL_GetTicks() - frameStart;
         if (frameTime < FRAME_DELAY) {
             SDL_Delay(FRAME_DELAY - frameTime);
         }
+
+        // Обработка запроса на поиск
+        if (seek_performed.load()) {
+            seekInfo.time.store(current_audio_time.load());
+            seekInfo.requested.store(true);
+            seekInfo.completed.store(false);
+            seek_performed.store(false);
+        }
     }
 
     // Finish work
     shouldExit = true;
+    quit = true;
 
-    // Complete asynchronous tasks
-    if (lowResFuture.valid()) {
-        lowResFuture.wait();
-    }
-    if (highResFuture.valid()) {
-        highResFuture.wait();
-    }
-    if (secondaryCleanFuture.valid()) {
-        secondaryCleanFuture.wait();
-    }
+    // Cleanup audio before joining threads
+    cleanup_audio();
 
     // Finish threads
+    if (decodingThread.joinable()) {
+        decodingThread.join();
+    }
     if (audio_thread.joinable()) {
         audio_thread.join();
     }
@@ -912,3 +528,4 @@ SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
 
     return 0;
 }
+

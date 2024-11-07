@@ -1,4 +1,5 @@
 #include "decode.h"
+#include "common.h"
 #include <iostream>
 #include <unistd.h>
 #include <filesystem>
@@ -10,6 +11,8 @@
 #include <pwd.h>
 
 namespace fs = std::filesystem;
+
+// Добавьте в начало файла, после включений
 
 std::string generateFileId(const char* filename) {
     EVP_MD_CTX *mdctx;
@@ -64,7 +67,6 @@ bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, 
             return;
         }
 
-        // Try to find VideoToolbox decoder
         videoStream = av_find_best_stream(formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
         if (videoStream < 0) {
             avformat_close_input(&formatContext);
@@ -86,7 +88,6 @@ bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, 
             return;
         }
 
-        // Disable hardware acceleration
         codecContext->hw_device_ctx = nullptr;
 
         if (avcodec_open2(codecContext, codec, nullptr) < 0) {
@@ -98,8 +99,11 @@ bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, 
         }
 
         AVRational timeBase = formatContext->streams[videoStream]->time_base;
-        int64_t startPts = frameIndex[threadStartFrame].pts;
-        av_seek_frame(formatContext, videoStream, startPts, AVSEEK_FLAG_BACKWARD);
+        double frameDuration = av_q2d(formatContext->streams[videoStream]->avg_frame_rate);
+        frameDuration = 1.0 / frameDuration;
+
+        int64_t startTime = frameIndex[threadStartFrame].time_ms;
+        av_seek_frame(formatContext, videoStream, startTime * timeBase.den / (timeBase.num * 1000), AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(codecContext);
 
         AVPacket* packet = av_packet_alloc();
@@ -123,19 +127,20 @@ bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, 
                         break;
                     }
 
-                    if (frame->pts >= startPts && currentFrame <= threadEndFrame && currentFrame < frameIndex.size()) {
+                    double frameTime = frame->pts * av_q2d(timeBase);
+                    int64_t frameTimeMs = frameTime * 1000;
+
+                    if (frameTimeMs >= startTime && currentFrame <= threadEndFrame && currentFrame < frameIndex.size()) {
                         std::lock_guard<std::mutex> lock(frameIndex[currentFrame].mutex);
                         if (!frameIndex[currentFrame].is_decoding) {
                             frameIndex[currentFrame].is_decoding = true;
                             
-                            double seconds = frame->pts * av_q2d(timeBase);
-                            int64_t milliseconds = seconds * 1000;
-
                             frameIndex[currentFrame].frame = std::shared_ptr<AVFrame>(av_frame_clone(frame), [](AVFrame* f) { av_frame_free(&f); });
                             frameIndex[currentFrame].pts = frame->pts;
                             frameIndex[currentFrame].relative_pts = frame->pts - formatContext->streams[videoStream]->start_time;
-                            frameIndex[currentFrame].time_ms = milliseconds;
+                            frameIndex[currentFrame].time_ms = frameTimeMs;
                             frameIndex[currentFrame].type = FrameInfo::FULL_RES;
+                            frameIndex[currentFrame].time_base = timeBase;
                             frameIndex[currentFrame].is_decoding = false;
                         }
                         currentFrame++;
@@ -262,11 +267,14 @@ bool convertToLowRes(const char* filename, std::string& outputFilename) {
     int new_width = width / 2;
     int new_height = height / 2;
 
+    // Ensure even dimensions
+    new_width += new_width % 2;
+    new_height += new_height % 2;
 
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
              "ffmpeg -i \"%s\" -c:v libx264 -crf 23 -preset ultrafast "
-             "-vf scale=%d:%d "
+             "-vf \"scale=%d:%d,scale=trunc(iw/2)*2:trunc(ih/2)*2\" "
              "-y \"%s\"",
              filename, new_width, new_height, cachePath.c_str());
     
@@ -344,6 +352,8 @@ bool fillIndexWithLowResFrames(const char* filename, std::vector<FrameInfo>& fra
         return false;
     }
 
+    AVRational streamTimeBase = formatContext->streams[videoStream]->time_base;
+
     AVPacket* packet = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
 
@@ -367,10 +377,12 @@ bool fillIndexWithLowResFrames(const char* filename, std::vector<FrameInfo>& fra
                 if (frameCount < frameIndex.size()) {
                     frameIndex[frameCount].low_res_frame = std::shared_ptr<AVFrame>(av_frame_clone(frame), [](AVFrame* f) { av_frame_free(&f); });
                     frameIndex[frameCount].type = FrameInfo::LOW_RES;
+                    frameIndex[frameCount].time_base = streamTimeBase;
                 } else {
                     frameIndex.push_back(FrameInfo{});
                     frameIndex.back().low_res_frame = std::shared_ptr<AVFrame>(av_frame_clone(frame), [](AVFrame* f) { av_frame_free(&f); });
                     frameIndex.back().type = FrameInfo::LOW_RES;
+                    frameIndex.back().time_base = streamTimeBase;
                 }
 
                 frameCount++;
@@ -446,8 +458,11 @@ bool decodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex,
         }
 
         AVRational timeBase = formatContext->streams[videoStream]->time_base;
-        int64_t startPts = frameIndex[threadStartFrame].pts;
-        av_seek_frame(formatContext, videoStream, startPts, AVSEEK_FLAG_BACKWARD);
+        double frameDuration = av_q2d(formatContext->streams[videoStream]->avg_frame_rate);
+        frameDuration = 1.0 / frameDuration;
+
+        int64_t startTime = frameIndex[threadStartFrame].time_ms;
+        av_seek_frame(formatContext, videoStream, startTime * timeBase.den / (timeBase.num * 1000), AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(codecContext);
 
         AVPacket* packet = av_packet_alloc();
@@ -471,21 +486,22 @@ bool decodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex,
                         break;
                     }
 
-                    if (frame->pts >= startPts && currentFrame <= threadEndFrame && currentFrame < frameIndex.size()) {
+                    double frameTime = frame->pts * av_q2d(timeBase);
+                    int64_t frameTimeMs = frameTime * 1000;
+
+                    if (frameTimeMs >= startTime && currentFrame <= threadEndFrame && currentFrame < frameIndex.size()) {
                         if (currentFrame >= highResStart && currentFrame <= highResEnd) {
                             currentFrame++;
                             continue;
                         }
 
                         if (frameIndex[currentFrame].type == FrameInfo::EMPTY) {
-                            double seconds = frame->pts * av_q2d(timeBase);
-                            int64_t milliseconds = seconds * 1000;
-
                             frameIndex[currentFrame].low_res_frame = std::shared_ptr<AVFrame>(av_frame_clone(frame), [](AVFrame* f) { av_frame_free(&f); });
                             frameIndex[currentFrame].pts = frame->pts;
                             frameIndex[currentFrame].relative_pts = frame->pts - formatContext->streams[videoStream]->start_time;
-                            frameIndex[currentFrame].time_ms = milliseconds;
+                            frameIndex[currentFrame].time_ms = frameTimeMs;
                             frameIndex[currentFrame].type = FrameInfo::LOW_RES;
+                            frameIndex[currentFrame].time_base = timeBase;
                         }
                         currentFrame++;
                     }
@@ -513,6 +529,20 @@ bool decodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex,
     }
 
     return success;
+}
+
+// In removeHighResFrames function
+void removeHighResFrames(std::vector<FrameInfo>& frameIndex, int start, int end, int highResStart, int highResEnd) {
+    for (int i = start; i <= end && i < frameIndex.size(); ++i) {
+        if (frameIndex[i].type == FrameInfo::FULL_RES) {
+            // Add check to not remove frames in the current high-res zone
+            if (i < highResStart || i > highResEnd) {
+                // std::cout << "Removing high-res frame " << i << std::endl;
+                frameIndex[i].frame.reset();
+                frameIndex[i].type = FrameInfo::LOW_RES;
+            }
+        }
+    }
 }
 
 FrameCleaner::FrameCleaner(std::vector<FrameInfo>& fi) : frameIndex(fi) {}
@@ -592,4 +622,152 @@ void RingBuffer::movePlayhead(int delta) {
     } else {
         playhead = newPlayhead;
     }
+}
+
+// Add this new function after the main function
+void manageVideoDecoding(const std::string& filename, const std::string& lowResFilename, 
+                         std::vector<FrameInfo>& frameIndex, std::atomic<int>& currentFrame,
+                         const size_t ringBufferCapacity, const int highResWindowSize,
+                         std::atomic<bool>& isPlaying) {
+
+
+    std::chrono::steady_clock::time_point lastFrameTime;
+    std::chrono::steady_clock::time_point lastBufferUpdateTime = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point now;
+
+    std::future<void> lowResFuture;
+    std::future<void> highResFuture;
+    std::future<void> secondaryCleanFuture;
+
+    std::chrono::steady_clock::time_point lastLowResUpdateTime = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastHighResUpdateTime = std::chrono::steady_clock::now();
+
+    auto getUpdateInterval = [](double playbackRate) {
+        if (playbackRate < 0.9) return std::numeric_limits<int>::max(); // Don't decode
+        if (playbackRate <= 1.0) return 5000;
+        if (playbackRate <= 2.0) return 2500;
+        if (playbackRate <= 4.0) return 800;
+        if (playbackRate <= 8.0) return 600;
+        if (playbackRate <= 10.0) return 400;
+        return 200; // For speed 16x and higher
+    };
+
+    while (!shouldExit) {
+        int currentFrameValue = currentFrame.load();
+        double currentTime = current_audio_time.load();
+        double currentPlaybackRate = std::abs(playback_rate.load());
+
+        if (isPlaying.load()) {
+            now = std::chrono::steady_clock::now();
+            auto frameDuration = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFrameTime);
+            double fps = 1000.0 / frameDuration.count();
+        }
+
+        // Обработка запроса на поиск
+        if (seekInfo.requested.load()) {
+            double seekTime = seekInfo.time.load();
+            int seekFrame = static_cast<int>(seekTime * original_fps.load()) % frameIndex.size();
+            
+            // Очистка буфера
+            int clearStart = std::max(0, seekFrame - static_cast<int>(ringBufferCapacity / 2));
+            int clearEnd = std::min(clearStart + static_cast<int>(ringBufferCapacity) - 1, static_cast<int>(frameIndex.size()) - 1);
+            for (int i = clearStart; i <= clearEnd; ++i) {
+                frameIndex[i].frame.reset();
+                frameIndex[i].low_res_frame.reset();
+                frameIndex[i].type = FrameInfo::EMPTY;
+            }
+
+            currentFrame.store(seekFrame);
+            current_audio_time.store(seekTime);
+            seekInfo.requested.store(false);
+            seekInfo.completed.store(true);
+
+            // Форсируем декодирование кадров после seek
+            lowResFuture = asyncDecodeLowResRange(lowResFilename.c_str(), frameIndex, clearStart, clearEnd, seekFrame, seekFrame);
+            if (currentPlaybackRate < 2.0) {
+                highResFuture = asyncDecodeFrameRange(filename.c_str(), frameIndex, seekFrame, std::min(seekFrame + highResWindowSize, static_cast<int>(frameIndex.size()) - 1));
+            }
+        }
+
+        // Обновляем currentFrame на основе текущего времени аудио
+        int newCurrentFrame = static_cast<int>(currentTime * original_fps.load()) % frameIndex.size();
+        currentFrame.store(newCurrentFrame);
+
+        // Обновление интервалов декодирования
+        int lowResUpdateInterval = getUpdateInterval(currentPlaybackRate);
+        int highResUpdateInterval = lowResUpdateInterval / 2;
+
+
+        // Буфер обновления
+        int bufferStart = std::max(0, currentFrameValue - static_cast<int>(ringBufferCapacity / 2));
+        int bufferEnd = std::min(bufferStart + static_cast<int>(ringBufferCapacity) - 1, static_cast<int>(frameIndex.size()) - 1);
+
+        // Определение границ окна высокого разршения
+        int highResStart = std::max(0, currentFrameValue - highResWindowSize / 2);
+        int highResEnd = std::min(static_cast<int>(frameIndex.size()) - 1, currentFrameValue + highResWindowSize / 2);
+
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        auto timeSinceLastLowResUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLowResUpdateTime);
+        auto timeSinceLastHighResUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHighResUpdateTime);
+
+        // Low-res frame decoding
+        if (timeSinceLastLowResUpdate.count() >= lowResUpdateInterval) {
+            if (!lowResFuture.valid() || lowResFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                lowResFuture = asyncDecodeLowResRange(lowResFilename.c_str(), frameIndex, bufferStart, bufferEnd, highResStart, highResEnd);
+                lastLowResUpdateTime = now;
+            }
+        }
+
+        // High-res frame decoding
+        bool shouldDecodeHighRes = currentPlaybackRate < 2.0;
+        if (shouldDecodeHighRes && timeSinceLastHighResUpdate.count() >= highResUpdateInterval) {
+            bool needHighResUpdate = false;
+            for (int i = highResStart; i <= highResEnd; ++i) {
+                if (frameIndex[i].type != FrameInfo::FULL_RES) {
+                    needHighResUpdate = true;
+                    break;
+                }
+            }
+
+            if (needHighResUpdate) {
+                if (!highResFuture.valid() || highResFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                    highResFuture = asyncDecodeFrameRange(filename.c_str(), frameIndex, highResStart, highResEnd);
+                    lastHighResUpdateTime = now;
+                }
+            }
+        } else if (currentPlaybackRate >= 2.0) {
+            removeHighResFrames(frameIndex, 0, frameIndex.size() - 1, -1, -1);
+        }
+
+        // Remove high-res frames outside the window
+        removeHighResFrames(frameIndex, 0, highResStart - 1, highResStart, highResEnd);
+        removeHighResFrames(frameIndex, highResEnd + 1, frameIndex.size() - 1, highResStart, highResEnd);
+
+        // Check and reset frame type if it's outside the high-res window
+        for (int i = 0; i < frameIndex.size(); ++i) {
+            if (i < highResStart || i > highResEnd) {
+                if (frameIndex[i].type == FrameInfo::FULL_RES && !frameIndex[i].is_decoding) {
+                    frameIndex[i].frame.reset();
+                    frameIndex[i].type = frameIndex[i].low_res_frame ? FrameInfo::LOW_RES : FrameInfo::EMPTY;
+                }
+            }
+        }
+
+        // Clear low-res frames outside the buffer
+        for (int i = 0; i < frameIndex.size(); ++i) {
+            if (i < bufferStart || i > bufferEnd) {
+                if (frameIndex[i].type == FrameInfo::LOW_RES && !frameIndex[i].is_decoding) {
+                    frameIndex[i].low_res_frame.reset();
+                    frameIndex[i].type = FrameInfo::EMPTY;
+                }
+            }
+        }
+
+        // Небольшая задержка для предотвращения активного ожидания
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // Wait for any ongoing decoding to finish before exiting
+    if (lowResFuture.valid()) lowResFuture.wait();
+    if (highResFuture.valid()) highResFuture.wait();
 }

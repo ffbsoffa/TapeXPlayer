@@ -27,6 +27,7 @@ struct FrameInfo {
     } type;
     bool is_decoding;
     mutable std::mutex mutex;
+    AVRational time_base;
 
     FrameInfo() : pts(0), relative_pts(0), time_ms(0), type(EMPTY), is_decoding(false) {}
     
@@ -53,6 +54,8 @@ struct FrameInfo {
     }
 };
 
+extern std::vector<FrameInfo> frameIndex;
+
 struct RingBuffer {
     std::vector<FrameInfo> buffer;
     size_t capacity;
@@ -77,7 +80,7 @@ public:
     FrameCleaner(std::vector<FrameInfo>& fi);
     void cleanFrames(int startFrame, int endFrame);
 };
-
+extern std::vector<FrameInfo> globalFrameIndex;
 std::vector<FrameInfo> createFrameIndex(const char* filename);
 bool convertToLowRes(const char* filename, std::string& outputFilename);
 bool fillIndexWithLowResFrames(const char* filename, std::vector<FrameInfo>& frameIndex);
@@ -92,3 +95,18 @@ void printMemoryUsage();
 
 void clearHighResFrames(std::vector<FrameInfo>& frameIndex);
 void removeHighResFrames(std::vector<FrameInfo>& frameIndex, int start, int end, int highResStart, int highResEnd);
+
+// Добавьте это объявление в конец файла, перед закрывающим #endif
+void manageVideoDecoding(const std::string& filename, const std::string& lowResFilename, 
+                         std::vector<FrameInfo>& frameIndex, std::atomic<int>& currentFrame,
+                         const size_t ringBufferCapacity, const int highResWindowSize,
+                         std::atomic<bool>& isPlaying);
+
+// Добавьте в начало файла, после существующих включений
+#include <atomic>
+
+// Добавьте перед объявлением функции manageVideoDecoding
+extern std::atomic<bool> shouldExit;
+extern std::atomic<double> current_audio_time;
+extern std::atomic<double> playback_rate;
+extern std::atomic<double> original_fps;

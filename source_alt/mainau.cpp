@@ -5,7 +5,7 @@ extern "C" {
     #include <libavutil/opt.h>
     #include <libavutil/channel_layout.h>
 }
-#include <SDL2/SDL.h>
+#include <portaudio.h>
 #include <iostream>
 #include <vector>
 #include <atomic>
@@ -16,11 +16,13 @@ extern "C" {
 #include <iomanip>
 #include <gst/gst.h>
 #include "common.h"
+#include <random>
+#include <nfd.hpp>
 
 std::vector<float> audio_buffer;
 size_t audio_buffer_index = 0;
-SDL_AudioDeviceID audioDevice;
 std::atomic<bool> decoding_finished{false};
+std::atomic<bool> decoding_completed{false};
 
 extern std::atomic<bool> quit;
 extern std::atomic<double> playback_rate;
@@ -33,23 +35,95 @@ std::atomic<bool> jog_forward(false);
 std::atomic<bool> jog_backward(false);
 const double JOG_SPEED = 0.25;
 
+std::atomic<int> sample_rate{44100};
+
+PaStream* stream = nullptr;
+
 void smooth_speed_change() {
     const double normal_step = 0.3;
-    const double pause_step = 0.8;
+    const double pause_step = 1;
     const int normal_interval = 4;
-    const int pause_interval = 6;
+    const int pause_interval = 4;
+    const double overshoot_speed = 1.2;
+    const int overshoot_duration = 175; // миллисекунды
+
+    static int resume_count = 0;
+    static int overshoot_interval = 0;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(7, 10);
 
     while (!quit.load()) {
         double current = playback_rate.load();
         double target = target_playback_rate.load();
+        float current_volume = volume.load();
+
+        // Управление громкостью при низких скоростях
+        if (current <= 0.15) {
+            // Линейное уменьшение громкости от 100% при 0.15x до 0% при 0x
+            float volume_multiplier = current / 0.15f;
+            volume.store(current_volume * volume_multiplier);
+        } else if (current > 0.15 && current_volume < 1.0f) {
+            // Восстановление громкости при увеличении скорости
+            volume.store(1.0f);
+        }
+
+        // Управление громкостью при высоких скоростях
+        if (current >= 7.0) {
+            float volume_multiplier;
+            if (current >= 18.0) {
+                volume_multiplier = 0.15f;
+            } else {
+                // Линейная интерполяция между 100% при 7x и 15% при 18x
+                float t = (current - 7.0f) / (18.0f - 7.0f);
+                volume_multiplier = 1.0f - (t * 0.85f); // 0.85 = 1.0 - 0.15
+            }
+            volume.store(volume_multiplier);
+        }
 
         bool is_pausing = (target == 0.0 && current > 0.0);
+        bool is_resuming = (current == 0.0 && target > 0.0);
         bool is_jogging = jog_forward.load() || jog_backward.load();
 
         double max_step = is_pausing ? pause_step : (is_jogging ? JOG_SPEED : normal_step);
         int interval = is_pausing ? pause_interval : normal_interval;
 
-        if (current != target || is_jogging) {
+        if (is_resuming) {
+            resume_count++;
+            bool do_overshoot = (resume_count >= overshoot_interval);
+
+            if (do_overshoot) {
+                // Реализация краткой секвенции при снятии паузы
+                auto start_time = std::chrono::steady_clock::now();
+                while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start_time).count() < overshoot_duration) {
+                    double progress = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start_time).count()) / overshoot_duration;
+                    
+                    if (progress < 0.7) {
+                        // Ускорение до overshoot_speed за первые 70% времени
+                        playback_rate.store(progress * overshoot_speed / 0.7);
+                    } else {
+                        // Замедление до 1x за оставшиеся 30% времени
+                        playback_rate.store(overshoot_speed + (progress - 0.7) * (1.0 - overshoot_speed) / 0.3);
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                resume_count = 0;
+                overshoot_interval = dis(gen); // Генерируем новый интервал
+            } else {
+                // Плавное возобновление без overshoot
+                double step = 0.1;
+                while (current < 1.0) {
+                    current += step;
+                    if (current > 1.0) current = 1.0;
+                    playback_rate.store(current);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+            playback_rate.store(1.0);
+        } else if (current != target || is_jogging) {
             double diff = target - current;
             double interpolated_step = std::min(max_step, std::abs(diff) * 0.1);
             
@@ -76,54 +150,77 @@ void toggle_pause() {
     }
 }
 
-void audio_callback(void*, Uint8* stream, int len) {
-    float* float_stream = reinterpret_cast<float*>(stream);
-    int float_len = len / sizeof(float);
-    SDL_setenv("SDL_AUDIODRIVER", "coreaudio", 1);
+void check_audio_stream(AVFormatContext* format_ctx, int audio_stream_index) {
+    AVStream* audio_stream = format_ctx->streams[audio_stream_index];
+    AVCodecParameters* codecpar = audio_stream->codecpar;
 
-    SDL_memset(stream, 0, len);
+    std::cout << "Audio stream details:" << std::endl;
+    std::cout << "  Codec: " << avcodec_get_name(codecpar->codec_id) << std::endl;
+    std::cout << "  Sample rate: " << codecpar->sample_rate << " Hz" << std::endl;
+    std::cout << "  Channels: " << codecpar->ch_layout.nb_channels << std::endl;
+    std::cout << "  Bit rate: " << codecpar->bit_rate << " bps" << std::endl;
+    std::cout << "  Duration: " << av_rescale_q(audio_stream->duration, audio_stream->time_base, {1, AV_TIME_BASE}) / 1000000.0 << " seconds" << std::endl;
+}
 
-    if (audio_buffer_index >= audio_buffer.size() || audio_buffer_index < 0) {
-        quit.store(true);
-        return;
-    }
+static int patestCallback(const void *inputBuffer, void *outputBuffer,
+                          unsigned long framesPerBuffer,
+                          const PaStreamCallbackTimeInfo* timeInfo,
+                          PaStreamCallbackFlags statusFlags,
+                          void *userData) {
+    float *out = (float*)outputBuffer;
+    (void) inputBuffer; // Prevent unused variable warning
 
     double rate = playback_rate.load();
     if (rate == 0.0) {
-        SDL_memset(stream, 0, len);
-        return;
+        for (unsigned int i = 0; i < framesPerBuffer * 2; i++) {
+            *out++ = 0.0f;
+        }
+        return paContinue;
     }
 
     float current_volume = volume.load();
     double position = audio_buffer_index;
     const int window_size = 4;
 
-    for (int i = 0; i < float_len; ++i) {
+    for (unsigned int i = 0; i < framesPerBuffer; i++) {
         if (is_reverse.load()) {
-            position -= rate;
+            position = std::max(0.0, position - rate);
         } else {
-            position += rate;
+            position = std::min(static_cast<double>(audio_buffer.size() - window_size), position + rate);
         }
 
         if (position < 0 || position >= audio_buffer.size() - window_size) {
-            float_stream[i] = 0.0f;
+            *out++ = 0.0f;
+            *out++ = 0.0f;
         } else {
-            float sum = 0.0f;
+            float sum_left = 0.0f;
+            float sum_right = 0.0f;
             for (int j = 0; j < window_size; ++j) {
                 size_t index = static_cast<size_t>(position) + j;
                 float weight = 1.0f - std::abs(j - (window_size / 2.0f - 0.5f)) / (window_size / 2.0f);
-                sum += audio_buffer[index] * weight;
+                sum_left += audio_buffer[index * 2] * weight;
+                sum_right += audio_buffer[index * 2 + 1] * weight;
             }
-            float_stream[i] = (sum / window_size) * current_volume;
+            *out++ = (sum_left / window_size) * current_volume;
+            *out++ = (sum_right / window_size) * current_volume;
         }
     }
 
+    // Ограничиваем позицию в пределах буфера
     audio_buffer_index = static_cast<size_t>(position);
-    if (audio_buffer_index >= audio_buffer.size() || audio_buffer_index < 0) {
-        audio_buffer_index = 0;
-    }
 
-    current_audio_time.store(static_cast<double>(audio_buffer_index) / audio_buffer.size() * total_duration.load(), std::memory_order_release);
+    // Более точное вычисление времени с ограничением
+    double time_per_sample = 1.0 / sample_rate.load();
+    double elapsed_time = audio_buffer_index * time_per_sample;
+    double total_time = (audio_buffer.size() / 2) * time_per_sample; // Предполагаем стерео аудио
+    double adjusted_total_time = total_time - 0.1; // Уменьшаем общую длительность на 0.1 секунды
+
+    // Ограничиваем elapsed_time пределами файла с учетом уменьшенной длительности
+    elapsed_time = std::max(0.0, std::min(elapsed_time, adjusted_total_time));
+
+    current_audio_time.store(elapsed_time, std::memory_order_release);
+
+    return paContinue;
 }
 
 void decode_audio(const char* filename) {
@@ -131,10 +228,13 @@ void decode_audio(const char* filename) {
     AVCodecContext* audio_codec_ctx = nullptr;
     const AVCodec* audio_codec = nullptr;
     AVFrame* frame = nullptr;
-    AVPacket packet;
+    AVPacket* packet = av_packet_alloc();
     int audio_stream_index = -1;
 
     try {
+        std::cout << "Starting audio decoding..." << std::endl;
+        std::cout << "FFmpeg version: " << av_version_info() << std::endl;
+
         if (avformat_open_input(&format_ctx, filename, nullptr, nullptr) != 0) {
             throw std::runtime_error("Could not open file");
         }
@@ -142,10 +242,21 @@ void decode_audio(const char* filename) {
             throw std::runtime_error("Could not find stream information");
         }
 
+        for (unsigned int i = 0; i < format_ctx->nb_streams; i++) {
+            std::cout << "Stream #" << i << " type: " 
+                      << av_get_media_type_string(format_ctx->streams[i]->codecpar->codec_type) 
+                      << ", codec: " << avcodec_get_name(format_ctx->streams[i]->codecpar->codec_id) << std::endl;
+        }
+
         audio_stream_index = av_find_best_stream(format_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &audio_codec, 0);
         if (audio_stream_index < 0) {
             throw std::runtime_error("Could not find audio stream");
         }
+
+        std::cout << "Audio stream index: " << audio_stream_index << std::endl;
+        std::cout << "Audio codec: " << avcodec_get_name(audio_codec->id) << std::endl;
+
+        check_audio_stream(format_ctx, audio_stream_index);
 
         audio_codec_ctx = avcodec_alloc_context3(audio_codec);
         if (!audio_codec_ctx) {
@@ -165,22 +276,80 @@ void decode_audio(const char* filename) {
             throw std::runtime_error("Could not allocate frame");
         }
 
-        while (av_read_frame(format_ctx, &packet) >= 0 && !quit.load()) {
-            if (packet.stream_index == audio_stream_index) {
-                if (avcodec_send_packet(audio_codec_ctx, &packet) == 0) {
-                    while (avcodec_receive_frame(audio_codec_ctx, frame) == 0) {
+        std::cout << "Audio decoding setup complete, starting to read frames..." << std::endl;
+
+        // Устанавливаем частоту дискретизации из файла
+        sample_rate.store(audio_codec_ctx->sample_rate);
+        std::cout << "Audio sample rate: " << sample_rate.load() << " Hz" << std::endl;
+
+        // Добавляем небольшую задержку перед началом декодирования
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        int frame_count = 0;
+        int packet_count = 0;
+        int ret;
+        while ((ret = av_read_frame(format_ctx, packet)) >= 0 && !quit.load()) {
+            if (packet->stream_index == audio_stream_index) {
+                packet_count++;
+                ret = avcodec_send_packet(audio_codec_ctx, packet);
+                if (ret < 0) {
+                    std::cerr << "Error sending packet for decoding: " << av_err2str(ret) << std::endl;
+                    continue;
+                }
+
+                while (ret >= 0) {
+                    ret = avcodec_receive_frame(audio_codec_ctx, frame);
+                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                        break;
+                    } else if (ret < 0) {
+                        std::cerr << "Error during decoding: " << av_err2str(ret) << std::endl;
+                        break;
+                    }
+
+                    // Проверяем формат аудио и обрабатываем его соответствующим образом
+                    if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLTP) {
+                        // Плавающий формат с разделенными каналами
                         for (int i = 0; i < frame->nb_samples; ++i) {
                             for (int ch = 0; ch < frame->ch_layout.nb_channels; ++ch) {
-                                audio_buffer.push_back(reinterpret_cast<float*>(frame->data[ch])[i]);
+                                float sample = reinterpret_cast<float*>(frame->data[ch])[i];
+                                audio_buffer.push_back(sample);
                             }
                         }
+                    } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16P) {
+                        for (int i = 0; i < frame->nb_samples; ++i) {
+                            for (int ch = 0; ch < frame->ch_layout.nb_channels; ++ch) {
+                                int16_t sample = reinterpret_cast<int16_t*>(frame->data[ch])[i];
+                                audio_buffer.push_back(sample / 32768.0f);
+                            }
+                        }
+                    } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16) {
+                        int16_t* samples = reinterpret_cast<int16_t*>(frame->data[0]);
+                        for (int i = 0; i < frame->nb_samples * frame->ch_layout.nb_channels; ++i) {
+                            audio_buffer.push_back(samples[i] / 32768.0f);
+                        }
+                    } else {
+                        std::cerr << "Unsupported audio format: " << av_get_sample_fmt_name(audio_codec_ctx->sample_fmt) << std::endl;
+                    }
+
+                    frame_count++;
+                    if (frame_count % 1000 == 0) {
+                        std::cout << "Decoded " << frame_count << " audio frames" << std::endl;
                     }
                 }
             }
-            av_packet_unref(&packet);
+            av_packet_unref(packet);
+            if (packet_count % 1000 == 0) {
+                std::cout << "Processed " << packet_count << " packets" << std::endl;
+            }
         }
 
+        if (ret < 0 && ret != AVERROR_EOF) {
+            std::cerr << "Error reading frame: " << av_err2str(ret) << std::endl;
+        }
+
+        std::cout << "Audio decoding finished. Total frames: " << frame_count << ", Total packets: " << packet_count << std::endl;
         decoding_finished.store(true);
+        decoding_completed.store(true);  // Добавьте эту строку
     }
     catch (const std::exception& e) {
         std::cerr << "Decoding error: " << e.what() << std::endl;
@@ -190,57 +359,67 @@ void decode_audio(const char* filename) {
     if (frame) av_frame_free(&frame);
     if (audio_codec_ctx) avcodec_free_context(&audio_codec_ctx);
     if (format_ctx) avformat_close_input(&format_ctx);
+    av_packet_free(&packet);
 }
 
 void start_audio(const char* filename) {
     try {
-        AVFormatContext* format_ctx = nullptr;
-        if (avformat_open_input(&format_ctx, filename, nullptr, nullptr) != 0) {
-            throw std::runtime_error("Failed to open input file");
+        std::cout << "Starting audio initialization..." << std::endl;
+
+        PaError err;
+        err = Pa_Initialize();
+        if (err != paNoError) {
+            throw std::runtime_error("PortAudio error: " + std::string(Pa_GetErrorText(err)));
         }
 
-        if (avformat_find_stream_info(format_ctx, nullptr) < 0) {
-            avformat_close_input(&format_ctx);
-            throw std::runtime_error("Failed to find stream information");
+        PaStream *stream;
+        PaStreamParameters outputParameters;
+
+        outputParameters.device = Pa_GetDefaultOutputDevice();
+        if (outputParameters.device == paNoDevice) {
+            throw std::runtime_error("No default output device.");
+        }
+        outputParameters.channelCount = 2;
+        outputParameters.sampleFormat = paFloat32;
+        outputParameters.suggestedLatency = Pa_GetDeviceInfo(outputParameters.device)->defaultLowOutputLatency;
+        outputParameters.hostApiSpecificStreamInfo = NULL;
+
+        // Начинаем декодирование аудио в отдельном потоке
+        std::thread decoding_thread([filename]() {
+            decode_audio(filename);
+        });
+        decoding_thread.detach();  // Отсоединяем поток, чтобы он работал независимо
+
+        // Ждем короткое время, чтобы декодирование успело начаться
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        err = Pa_OpenStream(
+            &stream,
+            NULL, // No input
+            &outputParameters,
+            sample_rate.load(), // Use the current sample rate
+            256,   // Frames per buffer
+            paClipOff,
+            patestCallback,
+            NULL); // No user data
+
+        if (err != paNoError) {
+            throw std::runtime_error("PortAudio error: " + std::string(Pa_GetErrorText(err)));
         }
 
-        int audio_stream_index = av_find_best_stream(format_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-        if (audio_stream_index < 0) {
-            avformat_close_input(&format_ctx);
-            throw std::runtime_error("Failed to find audio stream");
+        err = Pa_StartStream(stream);
+        if (err != paNoError) {
+            throw std::runtime_error("PortAudio error: " + std::string(Pa_GetErrorText(err)));
         }
 
-        int sample_rate = format_ctx->streams[audio_stream_index]->codecpar->sample_rate;
-        avformat_close_input(&format_ctx);
-
-        SDL_AudioSpec want, have;
-        SDL_zero(want);
-        want.freq = sample_rate;
-        want.format = AUDIO_F32SYS;
-        want.channels = 2;
-        want.samples = 1024;
-        want.callback = audio_callback;
-
-        audioDevice = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
-        if (audioDevice == 0) {
-            throw std::runtime_error("Failed to open audio device");
-        }
+        std::cout << "Audio device opened successfully" << std::endl;
 
         audio_buffer_index = 0;
         current_audio_time.store(0.0);
         playback_rate.store(0.0);
         target_playback_rate.store(0.0);
 
-        std::thread decoding_thread(decode_audio, filename);
-        decoding_thread.detach();
-
-        SDL_PauseAudioDevice(audioDevice, 0);
-
-        while (!quit.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-
-        SDL_CloseAudioDevice(audioDevice);
+        std::cout << "Audio playback started. Decoding continues in background." << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "Audio Error: " << e.what() << std::endl;
         quit.store(true);
@@ -276,7 +455,17 @@ double get_original_fps() {
 
 std::string generateTXTimecode(double time) {
     double fps = original_fps.load();
+    double total_dur = total_duration.load();
+
+    // Жестко ограничиваем время длительностью файла
+    time = std::min(std::max(time, 0.0), total_dur);
+
     int64_t total_frames = static_cast<int64_t>(std::round(time * fps));
+    int64_t max_frames = static_cast<int64_t>(std::floor(total_dur * fps));
+
+    // Жеско ограничиваем количество кадров
+    total_frames = std::min(total_frames, max_frames);
+
     int hours = static_cast<int>(total_frames / (3600 * fps));
     int minutes = static_cast<int>((total_frames / (60 * fps))) % 60;
     int seconds = static_cast<int>((total_frames / fps)) % 60;
@@ -374,7 +563,7 @@ void seek_to_time(double target_time) {
         target_time = total_duration.load();
     }
 
-    size_t target_index = static_cast<size_t>(target_time * audio_buffer.size() / total_duration.load());
+    size_t target_index = static_cast<size_t>(target_time * sample_rate.load());
     audio_buffer_index = target_index;
     current_audio_time.store(target_time);
     seek_performed.store(true);
@@ -398,4 +587,13 @@ double parse_timecode(const std::string& timecode) {
     }
 
     return hours * 3600.0 + minutes * 60.0 + seconds + frames / fps;
+}
+
+void cleanup_audio() {
+    if (stream) {
+        Pa_StopStream(stream);
+        Pa_CloseStream(stream);
+        stream = nullptr;
+    }
+    Pa_Terminate();
 }
