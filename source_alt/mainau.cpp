@@ -45,8 +45,7 @@ void smooth_speed_change() {
     const int normal_interval = 4;
     const int pause_interval = 4;
     const double overshoot_speed = 1.2;
-    const int overshoot_duration = 175; // миллисекунды
-
+    const int overshoot_duration = 175; 
     static int resume_count = 0;
     static int overshoot_interval = 0;
     std::random_device rd;
@@ -58,25 +57,20 @@ void smooth_speed_change() {
         double target = target_playback_rate.load();
         float current_volume = volume.load();
 
-        // Управление громкостью при низких скоростях
         if (current <= 0.15) {
-            // Линейное уменьшение громкости от 100% при 0.15x до 0% при 0x
             float volume_multiplier = current / 0.15f;
             volume.store(current_volume * volume_multiplier);
         } else if (current > 0.15 && current_volume < 1.0f) {
-            // Восстановление громкости при увеличении скорости
             volume.store(1.0f);
         }
 
-        // Управление громкостью при высоких скоростях
         if (current >= 7.0) {
             float volume_multiplier;
             if (current >= 18.0) {
                 volume_multiplier = 0.15f;
             } else {
-                // Линейная интерполяция между 100% при 7x и 15% при 18x
                 float t = (current - 7.0f) / (18.0f - 7.0f);
-                volume_multiplier = 1.0f - (t * 0.85f); // 0.85 = 1.0 - 0.15
+                volume_multiplier = 1.0f - (t * 0.85f); 
             }
             volume.store(volume_multiplier);
         }
@@ -111,9 +105,8 @@ void smooth_speed_change() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
                 resume_count = 0;
-                overshoot_interval = dis(gen); // Генерируем новый интервал
+                overshoot_interval = dis(gen); 
             } else {
-                // Плавное возобновление без overshoot
                 double step = 0.1;
                 while (current < 1.0) {
                     current += step;
@@ -168,7 +161,7 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
                           PaStreamCallbackFlags statusFlags,
                           void *userData) {
     float *out = (float*)outputBuffer;
-    (void) inputBuffer; // Prevent unused variable warning
+    (void) inputBuffer; 
 
     double rate = playback_rate.load();
     if (rate == 0.0) {
@@ -206,16 +199,14 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
         }
     }
 
-    // Ограничиваем позицию в пределах буфера
     audio_buffer_index = static_cast<size_t>(position);
 
-    // Более точное вычисление времени с ограничением
+
     double time_per_sample = 1.0 / sample_rate.load();
     double elapsed_time = audio_buffer_index * time_per_sample;
-    double total_time = (audio_buffer.size() / 2) * time_per_sample; // Предполагаем стерео аудио
-    double adjusted_total_time = total_time - 0.1; // Уменьшаем общую длительность на 0.1 секунды
+    double total_time = (audio_buffer.size() / 2) * time_per_sample; 
+    double adjusted_total_time = total_time - 0.1; 
 
-    // Ограничиваем elapsed_time пределами файла с учетом уменьшенной длительности
     elapsed_time = std::max(0.0, std::min(elapsed_time, adjusted_total_time));
 
     current_audio_time.store(elapsed_time, std::memory_order_release);
@@ -278,11 +269,9 @@ void decode_audio(const char* filename) {
 
         std::cout << "Audio decoding setup complete, starting to read frames..." << std::endl;
 
-        // Устанавливаем частоту дискретизации из файла
         sample_rate.store(audio_codec_ctx->sample_rate);
         std::cout << "Audio sample rate: " << sample_rate.load() << " Hz" << std::endl;
 
-        // Добавляем небольшую задержку перед началом декодирования
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         int frame_count = 0;
@@ -306,9 +295,7 @@ void decode_audio(const char* filename) {
                         break;
                     }
 
-                    // Проверяем формат аудио и обрабатываем его соответствующим образом
                     if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLTP) {
-                        // Плавающий формат с разделенными каналами
                         for (int i = 0; i < frame->nb_samples; ++i) {
                             for (int ch = 0; ch < frame->ch_layout.nb_channels; ++ch) {
                                 float sample = reinterpret_cast<float*>(frame->data[ch])[i];
@@ -349,7 +336,7 @@ void decode_audio(const char* filename) {
 
         std::cout << "Audio decoding finished. Total frames: " << frame_count << ", Total packets: " << packet_count << std::endl;
         decoding_finished.store(true);
-        decoding_completed.store(true);  // Добавьте эту строку
+        decoding_completed.store(true);  
     }
     catch (const std::exception& e) {
         std::cerr << "Decoding error: " << e.what() << std::endl;
@@ -388,20 +375,19 @@ void start_audio(const char* filename) {
         std::thread decoding_thread([filename]() {
             decode_audio(filename);
         });
-        decoding_thread.detach();  // Отсоединяем поток, чтобы он работал независимо
+        decoding_thread.detach(); 
 
-        // Ждем короткое время, чтобы декодирование успело начаться
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         err = Pa_OpenStream(
             &stream,
-            NULL, // No input
+            NULL, 
             &outputParameters,
-            sample_rate.load(), // Use the current sample rate
-            256,   // Frames per buffer
+            sample_rate.load(), 
+            256,   
             paClipOff,
             patestCallback,
-            NULL); // No user data
+            NULL); 
 
         if (err != paNoError) {
             throw std::runtime_error("PortAudio error: " + std::string(Pa_GetErrorText(err)));
