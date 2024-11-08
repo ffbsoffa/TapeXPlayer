@@ -17,7 +17,10 @@ Run the program via the command line using the following format:
 ```
 ./TapeXPlayer <path to video file>
 ```
-or via dialog box
+or 
+```
+./TapeXPlayer
+```
 
 ### Important Notes
 - TapeXPlayer creates low-res cached versions of the video to ensure smooth playback and seeking. The cache is saved at the following path: `/Users/<username>/Library/Caches/TapeXPlayer`. Make sure there is enough free space on the disk to store the cache.
