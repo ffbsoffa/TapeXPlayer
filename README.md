@@ -43,7 +43,7 @@ or
 - **SDL** — for cross-platform multimedia capabilities and display.
 - **OpenSSH 3.0** — for file generation with unique identifiers, optimizing workload.
 - [**Spleen Font**](https://github.com/fcambus/spleen/tree/master) — used under BSD2-ClauseLicense
-- [**Native File Dialog Extended**](https://github.com/btzy/nativefiledialog-extended)
+- [**Native File Dialog Extended**](https://github.com/btzy/nativefiledialog-extended) - used under Zlib licence
 
 ### Contributions and Contact:
 If you'd like to contribute to the project, feel free to reach out at **mail@ffbsoffa.org**. Contributions are welcome through pull requests.
