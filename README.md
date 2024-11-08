@@ -23,7 +23,7 @@ or
 ```
 
 ### Important Notes
-- TapeXPlayer creates low-res cached versions of the video to ensure smooth playback and seeking. The cache is saved at the following path: `/Users/<username>/Library/Caches/TapeXPlayer`. Make sure there is enough free space on the disk to store the cache.
+- TapeXPlayer creates low-res cached versions of the video to ensure smooth playback and seeking. The cache is saved at the following path: `/Users/<username>/Library/Caches/TapeXPlayer`. Make sure there is enough free space on the disk to store the cache. The number of cached files is limited to 3.
 
 ### Controls:
 - **Spacebar** — Play/Pause.
