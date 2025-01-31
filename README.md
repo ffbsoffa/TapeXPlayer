@@ -14,6 +14,52 @@ TapeXPlayer is written in C++ using the **FFmpeg**, **SDL**, **GStreamer**, and 
 [Watch the demo video](https://www.youtube.com/watch?v=Mm4c1lp7Gz0)
 
 
+### Installation
+
+#### Prerequisites
+1. Install Homebrew if not already installed:
+```
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+2. For Apple Silicon (M1/M2) Macs, install required libraries:
+```
+brew install ffmpeg gstreamer glib sdl2 sdl2_ttf rtmidi portaudio openssl@3
+```
+
+3. For Intel Macs, run the following commands:
+```
+arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+arch -x86_64 /usr/local/bin/brew install ffmpeg gstreamer glib sdl2 sdl2_ttf rtmidi portaudio openssl@3
+```
+
+#### Building from Source
+1. Clone the repository:
+```
+git clone https://github.com/yourusername/TapeXPlayer.git
+cd TapeXPlayer
+```
+
+2. Build the project:
+```
+make clean
+make
+```
+
+The build process will create a Universal Binary compatible with both Apple Silicon and Intel processors.
+
+#### Verifying the Installation
+1. Check that the binary supports both architectures:
+```
+lipo -info TapeXPlayer
+```
+Should output: "Architectures in the fat file: TapeXPlayer are: x86_64 arm64"
+
+2. Test the program:
+```
+./TapeXPlayer
+```
+
 ### Running the Program
 Run the program via the command line using the following format:
 ```
