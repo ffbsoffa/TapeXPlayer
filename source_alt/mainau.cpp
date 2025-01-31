@@ -87,7 +87,7 @@ void smooth_speed_change() {
             bool do_overshoot = (resume_count >= overshoot_interval);
 
             if (do_overshoot) {
-                // Реализация краткой секвенции при снятии паузы
+                // Implementation of a brief sequence when unpausing
                 auto start_time = std::chrono::steady_clock::now();
                 while (std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - start_time).count() < overshoot_duration) {
@@ -95,10 +95,10 @@ void smooth_speed_change() {
                         std::chrono::steady_clock::now() - start_time).count()) / overshoot_duration;
                     
                     if (progress < 0.7) {
-                        // Ускорение до overshoot_speed за первые 70% времени
+                        // Acceleration to overshoot_speed in first 70% of time
                         playback_rate.store(progress * overshoot_speed / 0.7);
                     } else {
-                        // Замедление до 1x за оставшиеся 30% времени
+                        // Deceleration to 1x in remaining 30% of time
                         playback_rate.store(overshoot_speed + (progress - 0.7) * (1.0 - overshoot_speed) / 0.3);
                     }
                     

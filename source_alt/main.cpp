@@ -23,6 +23,7 @@
 #include <sstream>
 #include <iomanip>
 #include "nfd.hpp"
+#include "remote_control.h"
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -33,54 +34,41 @@ extern "C" {
 std::mutex cout_mutex;
 std::atomic<bool> quit(false);
 std::atomic<double> current_audio_time(0.0);
-
 std::atomic<double> playback_rate(1.0);
 std::atomic<double> target_playback_rate(1.0);
 std::atomic<bool> is_reverse(false);
 std::atomic<bool> is_seeking(false);
-
 std::atomic<double> total_duration(0.0);
 std::atomic<double> original_fps(0.0);
 std::atomic<bool> shouldExit(false);
 std::atomic<float> volume(1.0f);
-
-
-// Add this at the beginning of the file, after other global variables
+std::array<double, 5> memoryMarkers = {-1, -1, -1, -1, -1}; // -1 means marker is not set
 bool showIndex = false;
 bool showOSD = true;
-
 std::atomic<double> previous_playback_rate(1.0);
-
-// Add these lines at the beginning of the file, after other global variables
 std::string input_timecode;
 bool waiting_for_timecode = false;
-
-// Add this at the beginning of the file, after other global variables
 std::atomic<bool> seek_performed(false);
-
-// Add these includes at the beginning of the file
-#include <future>
-#include <atomic>
-
-// Add these global variables
 std::atomic<bool> is_force_decoding(false);
 std::future<void> force_decode_future;
-
 std::mutex frameIndexMutex;
-
-// Function declarations from mainau.cpp
 void start_audio(const char* filename);
 std::string generateTXTimecode(double time);
-
 void smooth_speed_change();
-
 SeekInfo seekInfo;
-
 std::atomic<bool> audio_initialized(false);
 std::thread audio_thread;
 std::thread speed_change_thread;
-
 extern void cleanup_audio();
+
+// Functions to access playback rate variables
+std::atomic<double>& get_playback_rate() {
+    return playback_rate;
+}
+
+std::atomic<double>& get_target_playback_rate() {
+    return target_playback_rate;
+}
 
 void initializeBuffer(const char* lowResFilename, std::vector<FrameInfo>& frameIndex, int currentFrame, int bufferSize) {
     int bufferStart = std::max(0, currentFrame - bufferSize / 2);
@@ -94,6 +82,35 @@ void log(const std::string& message) {
     logFile << message << std::endl;
 }
 
+std::string get_current_timecode() {
+    static char timecode[12];  // HH:MM:SS:FF\0
+    
+    // Get current playback time in seconds
+    double current_time = current_audio_time.load();
+    
+    // Convert to HH:MM:SS:FF format
+    int total_seconds = static_cast<int>(current_time);
+    int hours = total_seconds / 3600;
+    int minutes = (total_seconds % 3600) / 60;
+    int seconds = total_seconds % 60;
+    
+    // Calculate frames (FF) from fractional part of time
+    // Use real video FPS
+    double fps = original_fps.load();
+    if (fps <= 0) fps = 30.0;  // Use 30 as default value if FPS is not yet defined
+    
+    int frames = static_cast<int>((current_time - total_seconds) * fps);
+    
+    // Make sure frame number doesn't exceed fps-1
+    frames = std::min(frames, static_cast<int>(fps) - 1);
+    
+    // Format string
+    snprintf(timecode, sizeof(timecode), "%02d:%02d:%02d:%02d", 
+             hours, minutes, seconds, frames);
+    
+    return std::string(timecode);
+}
+
 int main(int argc, char* argv[]) {
     log("Program started");
     log("Number of arguments: " + std::to_string(argc));
@@ -101,6 +118,13 @@ int main(int argc, char* argv[]) {
         log("Argument " + std::to_string(i) + ": " + argv[i]);
     }
     log("Current working directory: " + std::string(getcwd(NULL, 0)));
+
+    // Initialize remote control
+    RemoteControl remote_control;
+    if (!remote_control.initialize()) {
+        std::cerr << "Warning: Failed to initialize remote control" << std::endl;
+        log("Warning: Failed to initialize remote control");
+    }
 
     std::string filename;
     bool fileSelected = false;
@@ -334,6 +358,11 @@ SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
                                std::ref(isPlaying));
 
     while (!shouldExit) {
+        // Process remote commands at the start of each frame
+        if (remote_control.is_initialized()) {
+            remote_control.process_commands();
+        }
+
         // Check if FPS value is ready
         if (!fps_received && fps_future.valid()) {
             std::future_status status = fps_future.wait_for(std::chrono::seconds(0));
@@ -447,6 +476,29 @@ SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
                             break;
                         case SDLK_g:
                             waiting_for_timecode = true;
+                            break;
+                        case SDLK_1:
+                        case SDLK_2:
+                        case SDLK_3:
+                        case SDLK_4:
+                        case SDLK_5:
+                            {
+                                // Проверяем, не находимся ли мы в режиме ввода таймкода
+                                if (!waiting_for_timecode) {
+                                    int markerIndex = e.key.keysym.sym - SDLK_1;
+                                    if (e.key.keysym.mod & KMOD_ALT) {
+                                        // Установка маркера
+                                        memoryMarkers[markerIndex] = current_audio_time.load();
+                                        std::cout << "Marker " << (markerIndex + 1) << " set at " 
+                                                << generateTXTimecode(memoryMarkers[markerIndex]) << std::endl;
+                                    } else {
+                                        // Переход к маркеру
+                                        if (memoryMarkers[markerIndex] >= 0) {
+                                            seek_to_time(memoryMarkers[markerIndex]);
+                                        }
+                                    }
+                                }
+                            }
                             break;
                     }
                 }

@@ -302,7 +302,7 @@ bool convertToLowRes(const char* filename, std::string& outputFilename) {
                   return fs::last_write_time(a) < fs::last_write_time(b);
               });
 
-    while (cacheFiles.size() > 3) {
+    while (cacheFiles.size() > 4) {
         fs::remove(cacheFiles[0]);
         cacheFiles.erase(cacheFiles.begin());
     }

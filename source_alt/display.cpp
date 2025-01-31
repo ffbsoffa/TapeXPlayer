@@ -248,7 +248,7 @@ void displayCurrentFrame(SDL_Renderer* renderer, const FrameInfo& frameInfo, boo
         // Линейная интерполяция от 2 до 6 пикселей
         double t = (absPlaybackRate - 4.0) / 12.0;
         jitterAmplitude = 1.4 + t * 4.0;
-    } else if (absPlaybackRate >= 18.0) {
+    } else if (absPlaybackRate >= 20.0) {
         jitterAmplitude = 6.0;
     }
 
@@ -373,124 +373,225 @@ void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double pl
     SDL_DestroyTexture(rightTexture);
 }
 
-void renderRewindEffect(SDL_Renderer* renderer, double playbackRate, double currentTime, double totalDuration, int fps) {
+void renderRewindEffect(SDL_Renderer* renderer, double playbackRate, double currentTime, double totalDuration, int fps, const SDL_Rect* videoRect = nullptr) {
     int windowWidth, windowHeight;
     SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
 
     // Check if we need to render the effect
-    if (playbackRate > 0.9 && playbackRate < 1.2) return;
+    if (playbackRate < 0.2 || (playbackRate > 0.9 && playbackRate < 1.2)) return;
 
     // Check if we're not at the beginning or end of the file
-    const double threshold = 0.1; // Threshold in seconds
+    const double threshold = 0.1;
     if (currentTime < threshold || (totalDuration - currentTime) < threshold) return;
 
-    // Base parameters
-    double baseDuration = 1.5; // 1.5 seconds for one stripe to pass at 2x speed
-    int baseStripeCount = 3;
-    int maxStripeCount = 14;
-    int maxStripeHeight = static_cast<int>(windowHeight * 0.75); // 75% от высоты окна (720 пикселей при высоте 1080)
-    int midStripeHeight = 50; // Высота полоски на скорости 2x
-    int minStripeHeight = 12; // Минимальная высота полоски на высоких скоростях
+    // Use video dimensions if available, otherwise use window dimensions
+    int effectWidth = videoRect ? videoRect->w : windowWidth;
+    int effectHeight = videoRect ? videoRect->h : windowHeight;
+    int effectX = videoRect ? videoRect->x : 0;
+    int effectY = videoRect ? videoRect->y : 0;
 
-    // Calculate current parameters
-    double speedFactor = std::abs(playbackRate) / 2.0;
+    // Base parameters scaled to video height instead of window height
+    const double resolutionScale = static_cast<double>(effectHeight) / 1080.0;
+    const int maxStripeHeight = static_cast<int>(720 * resolutionScale);
+    const int baseStripeHeight = static_cast<int>(85 * resolutionScale);
+    const int baseStripeSpacing = static_cast<int>(450 * resolutionScale);
+    const int minStripeSpacing = static_cast<int>(48 * resolutionScale);
+    const int minStripeHeight = static_cast<int>(6 * resolutionScale);
+    const int midStripeHeight = static_cast<int>(50 * resolutionScale);
+
+// Calculate stripe parameters based on speed
+    int stripeHeight, stripeSpacing;
     
-    // Calculate stripe height
-    int stripeHeight;
-    if (playbackRate >= 1.2 && playbackRate < 2.0) {
-        // Плавный переход от 720 пикселей до 50 пикселей
-        double t = (playbackRate - 1.2) / 0.8; // 0.8 = 2.0 - 1.2
-        stripeHeight = static_cast<int>(maxStripeHeight * (1 - t) + midStripeHeight * t);
-    } else if (playbackRate >= 2.0) {
-        // Для скоростей 2x и выше используем существующую логику
-        if (speedFactor <= 1.0) { // 2x playback speed
-            stripeHeight = midStripeHeight;
-        } else if (speedFactor <= 2.0) { // Between 2x and 4x
-            double t = (speedFactor - 1.0) / 1.0;
-            stripeHeight = static_cast<int>(midStripeHeight - t * (midStripeHeight - minStripeHeight));
+    if ((playbackRate >= 0.2 && playbackRate < 0.9) || (playbackRate >= 1.2 && playbackRate < 2.0)) {
+        // Эффект перекрытия как для замедленного, так и для ускоренного воспроизведения
+        double t;
+        if (playbackRate < 0.9) {
+            // Для замедленного воспроизведения
+            t = (playbackRate - 0.2) / 0.7; // 0.7 = 0.9 - 0.2
         } else {
-            // Gradual decrease for speeds above 4x
-            double t = std::min(1.0, (speedFactor - 2.0) / 6.0);
-            stripeHeight = static_cast<int>(minStripeHeight - t * (minStripeHeight - 12));
+            // Для ускоренного воспроизведения
+            t = (playbackRate - 1.2) / 0.8; // 0.8 = 2.0 - 1.2
         }
+        t = t * t * (3 - 2 * t); // Сглаживание для обоих случаев
+        stripeHeight = static_cast<int>(maxStripeHeight * (1 - t) + midStripeHeight * t);
+        stripeSpacing = baseStripeSpacing;
+    } else if (playbackRate >= 2.0 && playbackRate < 4.0) {
+        stripeHeight = baseStripeHeight;
+        stripeSpacing = baseStripeSpacing;
+    } else if (playbackRate >= 3.5 && playbackRate < 14.0) {
+        double t = (playbackRate - 4.0) / 10.0;
+        t = std::pow(t, 0.7);
+        
+        stripeHeight = static_cast<int>(baseStripeHeight * (1.0 - t) + minStripeHeight * t);
+        stripeSpacing = static_cast<int>(baseStripeSpacing * (1.0 - t) + minStripeSpacing * t);
     } else {
-        // Для скоростей меньше 1.2x используем максимальную высоту
-        stripeHeight = maxStripeHeight;
+        stripeHeight = minStripeHeight;
+        stripeSpacing = minStripeSpacing;
     }
 
-    // Calculate cycle parameters
-    int cycleHeight = windowHeight + stripeHeight;
-    
-    // For high speeds, use a very slow cycle
+    // Calculate number of stripes based on spacing
+    int stripeCount = (windowHeight + stripeSpacing) / stripeSpacing;
+
+    // Completely reworked cycle progress calculation
     double cycleProgress;
-    if (speedFactor > 8.0) {
-        // Use 59.94 FPS for the cycle, slightly slower than 60 FPS
-        double slowCycleDuration = 1.0 / 59.94;
-        cycleProgress = std::fmod(currentTime, slowCycleDuration) / slowCycleDuration;
-    } else {
-        double cycleTime = std::fmod(currentTime, baseDuration);
-        cycleProgress = cycleTime / baseDuration;
+    const double baseDuration = 1.5;
+
+if (playbackRate >= 14.0) {
+    // Ускоряем движение для высоких скоростей
+    double speedFactor = std::pow(playbackRate/14.0, 1.2) * 4.02; // Увеличили множитель с 2.5 до 4.0
+    
+    // Добавляем дополнительное ускорение после 16x
+    if (playbackRate >= 16.0) {
+        speedFactor *= 1.0 + (playbackRate - 16.0) * 0.417; // Ещё больше ускоряем для 16x-18x
+    }
+    
+    double highSpeedCycleDuration = 1.0 / (fps * speedFactor);
+    cycleProgress = std::fmod(currentTime, highSpeedCycleDuration) / highSpeedCycleDuration;
+} else if (playbackRate >= 12.0) {
+        // Переходная зона (12x-14x) - подготовка к ускорению
+        double t = (playbackRate - 12.0) / 2.0;
+        double speedMultiplier = 0.4 + t * 0.6;
+        double transitionDuration = baseDuration / (playbackRate * speedMultiplier);
+        cycleProgress = std::fmod(currentTime, transitionDuration) / transitionDuration;
+} else if (playbackRate >= 3.5) {
+    // Средние скорости (3.5x-12x) - очень медленное увеличение скорости
+    double normalizedSpeed = (playbackRate - 3.5) / 8.5; // 0 to 1 в диапазоне 3.5x-12x
+    
+    // Уменьшаем базовый множитель и делаем более медленную прогрессию
+    double speedMultiplier = 0.08 + (std::pow(normalizedSpeed, 3) * 0.15); // Кубическая прогрессия с меньшими значениями
+    
+    // Дополнительное замедление для нижней части диапазона
+    if (playbackRate < 8.0) {
+        speedMultiplier *= 0.7; // Замедляем еще больше в начале диапазона
+    }
+    
+    double mediumSpeedDuration = baseDuration / (playbackRate * speedMultiplier);
+    cycleProgress = std::fmod(currentTime, mediumSpeedDuration) / mediumSpeedDuration;
+} else {
+        // Низкие скорости (до 3.5x)
+        double speedFactor = std::min(playbackRate / 2.0, 2.0);
+        double adjustedDuration = baseDuration / speedFactor;
+        cycleProgress = std::fmod(currentTime, adjustedDuration) / adjustedDuration;
     }
 
-    // Logarithmic increase in stripe count
-    int stripeCount = std::min(maxStripeCount, 
-        static_cast<int>(baseStripeCount * std::log2(speedFactor + 1)));
+    // Enable alpha blending
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(renderer, 128, 128, 128, 255);
+
+    // Create a clip rectangle for the video area
+    if (videoRect) {
+        SDL_Rect clipRect = *videoRect;
+        SDL_RenderSetClipRect(renderer, &clipRect);
+    }
 
     // Render stripes
     for (int i = 0; i < stripeCount; ++i) {
-        double stripeOffset = std::fmod(cycleProgress * cycleHeight + i * (cycleHeight / stripeCount), cycleHeight);
-        int y = static_cast<int>(stripeOffset) - stripeHeight;
+        double baseOffset = cycleProgress * stripeSpacing + i * stripeSpacing;
+        
+        // Упрощаем вариацию высоты
+        double heightVariation = (rand() % 21 - 10) * resolutionScale;
+        if (playbackRate >= 14.0) {
+            heightVariation = 0; // Убираем вариацию на высоких скоростях для стабильности
+        }
+        
+        int currentStripeHeight = static_cast<int>(stripeHeight + heightVariation);
+        currentStripeHeight = std::max(currentStripeHeight, minStripeHeight);
 
-        // Add variation to stripe height, but not for very large stripes
-        int maxVariation = (stripeHeight < windowHeight / 2) ? static_cast<int>(stripeHeight * 0.2) : 0;
-        int variationHeight = (rand() % (2 * maxVariation + 1)) - maxVariation;
-        int currentStripeHeight = std::max(minStripeHeight, stripeHeight + variationHeight);
+        // Calculate position relative to video area
+        double stripeOffset = std::fmod(baseOffset, effectHeight + stripeSpacing);
+        int y = effectY + static_cast<int>(stripeOffset) - currentStripeHeight;
 
-        SDL_Rect stripeRect = {0, y, windowWidth, currentStripeHeight};
 
-        // Only render if the stripe is at least partially visible
-        if (y < windowHeight && y + currentStripeHeight > 0) {
-            // Render main stripe
-            SDL_SetRenderDrawColor(renderer, 128, 128, 128, 255);
+        if (y < effectY + effectHeight && y + currentStripeHeight > effectY) {
+            // Простой однопроходный рендеринг непрозрачных полос
+            SDL_Rect stripeRect = {effectX, y, effectWidth, currentStripeHeight};
             SDL_RenderFillRect(renderer, &stripeRect);
-
-            // Render "snow" effect only if the stripe is not covering the whole screen
-            if (currentStripeHeight < windowHeight) {
-                int snowCount = windowWidth / 150; // Немного увеличиваем количество снежков
+        
+            // Для эффекта снега включаем альфа-блендинг
+            if (currentStripeHeight < effectHeight) {
+                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+                double snowMultiplier = std::min(2.5, std::abs(playbackRate) / 8.0);
+                int snowCount = static_cast<int>(effectWidth / (150.0 / snowMultiplier));
+                
                 for (int j = 0; j < snowCount; ++j) {
-                    int snowX = rand() % windowWidth;
-                    int snowWidth = 10; // Ширина всегда 1 пиксель
-                    int snowHeight = 2; // Высота всегда 1 пиксель
-                    int blurLength = 20 + (rand() % 21); // Длина размытия от 15 до 30 пикселей
+                    int snowX = effectX + (rand() % effectWidth);
+                    int snowHeight = (playbackRate >= 14.0) ? 1 : 2;
+                    int blurLength = static_cast<int>(15 + (rand() % 16) * (1.0 + std::abs(playbackRate) * 0.05));
                     
-                    // Рисуем снежок с размытием
                     for (int w = 0; w < blurLength; ++w) {
                         double intensity;
                         if (w == 0) {
-                            intensity = 1.0; // Полная яркость для первого пикселя
+                            intensity = 1.0;
                         } else {
                             double blurProgress = static_cast<double>(w) / blurLength;
-                            intensity = 1.0 - pow(blurProgress, 0.3); // Более плавное затухание
+                            intensity = 1.0 - pow(blurProgress, 0.35);
                         }
                         
-                        int alpha = static_cast<int>(255 * intensity);
-                        int grayValue = 128 + static_cast<int>(127 * intensity); // От белого к серому
-                        SDL_SetRenderDrawColor(renderer, grayValue, grayValue, grayValue, alpha);
+                        int snowAlpha = static_cast<int>(255 * intensity);
+                        int grayValue = 128 + static_cast<int>(127 * intensity);
+                        
+                        SDL_SetRenderDrawColor(renderer, grayValue, grayValue, grayValue, snowAlpha);
                         SDL_Rect pixelRect = {snowX + w, y, 1, snowHeight};
-                        if (pixelRect.y >= 0 && pixelRect.y < windowHeight && pixelRect.x < windowWidth) {
+                        if (pixelRect.y >= effectY && pixelRect.y < effectY + effectHeight && 
+                            pixelRect.x >= effectX && pixelRect.x < effectX + effectWidth) {
                             SDL_RenderFillRect(renderer, &pixelRect);
                         }
                     }
                 }
+                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
             }
         }
+    }
+
+    // Reset clip rectangle
+    if (videoRect) {
+        SDL_RenderSetClipRect(renderer, NULL);
     }
 }
 
 void displayFrame(SDL_Renderer* renderer, const std::vector<FrameInfo>& frameIndex, int newCurrentFrame, bool enableHighResDecode, double playbackRate, double currentTime, double totalDuration, bool showIndex, bool showOSD, TTF_Font* font, bool isPlaying, bool isReverse, bool waitingForTimecode, const std::string& inputTimecode, double originalFps, bool jogForward, bool jogBackward, size_t ringBufferCapacity, int highResWindowSize) {
-    // чистка всего экрана черным ветом
+    // чистка всего экрана черным цветом
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
+
+    // В начале функции после получения размеров окна
+    int windowWidth, windowHeight;
+    SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
+
+    // Сохраняем размеры видео в статических переменных
+    static int lastVideoWidth = 0;
+    static int lastVideoHeight = 0;
+    static float lastAspectRatio = 16.0f/9.0f; // По умолчанию 16:9
+
+    SDL_Rect videoRect = {0, 0, windowWidth, windowHeight}; // Инициализация
+
+    // Получаем текущий кадр и обновляем размеры, если он есть
+    AVFrame* frame = nullptr;
+    if (frameIndex[newCurrentFrame].type != FrameInfo::EMPTY) {
+        if (frameIndex[newCurrentFrame].type == FrameInfo::FULL_RES && frameIndex[newCurrentFrame].frame) {
+            frame = frameIndex[newCurrentFrame].frame.get();
+        } else if (frameIndex[newCurrentFrame].type == FrameInfo::LOW_RES && frameIndex[newCurrentFrame].low_res_frame) {
+            frame = frameIndex[newCurrentFrame].low_res_frame.get();
+        }
+    }
+
+    // Обновляем сохраненные размеры, если есть кадр
+    if (frame) {
+        lastVideoWidth = frame->width;
+        lastVideoHeight = frame->height;
+        lastAspectRatio = static_cast<float>(frame->width) / frame->height;
+    }
+
+    // Вычисляем размеры видео, используя сохраненное соотношение сторон
+    if (windowWidth / lastAspectRatio <= windowHeight) {
+        videoRect.w = windowWidth;
+        videoRect.h = static_cast<int>(windowWidth / lastAspectRatio);
+    } else {
+        videoRect.h = windowHeight;
+        videoRect.w = static_cast<int>(windowHeight * lastAspectRatio);
+    }
+    videoRect.x = (windowWidth - videoRect.w) / 2;
+    videoRect.y = (windowHeight - videoRect.h) / 2;
 
     // Отображаем текущий кадр
     if (frameIndex[newCurrentFrame].type != FrameInfo::EMPTY) {
@@ -498,19 +599,19 @@ void displayFrame(SDL_Renderer* renderer, const std::vector<FrameInfo>& frameInd
             (frameIndex[newCurrentFrame].type == FrameInfo::LOW_RES && frameIndex[newCurrentFrame].low_res_frame)) {
             displayCurrentFrame(renderer, frameIndex[newCurrentFrame], enableHighResDecode, std::abs(playbackRate), currentTime, totalDuration);
         } else {
-            // Если кдр помече как не пустой, но данные отсутстуют, отображаем заглушку
+            // Если кадр помечен как не пустой, но данные отсутствуют, отображаем заглушку
             SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
             SDL_RenderFillRect(renderer, NULL);
         }
     } else {
-        // Если кадр пустой, оображаем заглушку
+        // Если кадр пустой, отображаем заглушку
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderFillRect(renderer, NULL);
     }
 
     double effectPlaybackRate = playbackRate;
     if (std::abs(effectPlaybackRate) >= 1.1) {
-        renderRewindEffect(renderer, effectPlaybackRate, currentTime, totalDuration, static_cast<int>(originalFps));
+        renderRewindEffect(renderer, effectPlaybackRate, currentTime, totalDuration, static_cast<int>(originalFps), &videoRect);
     }
 
     // Update frame index visualization
@@ -521,39 +622,6 @@ void displayFrame(SDL_Renderer* renderer, const std::vector<FrameInfo>& frameInd
         int highResEnd = std::min(static_cast<int>(frameIndex.size()) - 1, newCurrentFrame + highResWindowSize / 2);
         updateVisualization(renderer, frameIndex, newCurrentFrame, bufferStart, bufferEnd, highResStart, highResEnd, enableHighResDecode);
     }
-
-    // Закомментированная отладочная информация
-  /* 
-    if (showOSD && font) {
-        const FrameInfo& currentFrameInfo = frameIndex[newCurrentFrame];
-        std::stringstream debugInfo;
-        debugInfo << std::fixed << std::setprecision(3);
-        
-        double indexPtsSeconds = currentFrameInfo.pts * av_q2d(currentFrameInfo.time_base);
-        double lowPtsSeconds = currentFrameInfo.low_res_frame ? currentFrameInfo.low_res_frame->pts * av_q2d(currentFrameInfo.time_base) : -1;
-        double highPtsSeconds = currentFrameInfo.frame ? currentFrameInfo.frame->pts * av_q2d(currentFrameInfo.time_base) : -1;
-        double timeMsSeconds = currentFrameInfo.time_ms / 1000.0;
-
-        debugInfo << "Frame: " << newCurrentFrame 
-                  << " | Index PTS: " << indexPtsSeconds << "s"
-                  << " | Time (ms): " << timeMsSeconds << "s"
-                  << " | Low PTS: " << lowPtsSeconds << "s"
-                  << " | High PTS: " << highPtsSeconds << "s";
-
-        SDL_Color debugColor = {255, 255, 0, 255};  // Yellow color for debug info
-        SDL_Surface* debugSurface = TTF_RenderText_Solid(font, debugInfo.str().c_str(), debugColor);
-        SDL_Texture* debugTexture = SDL_CreateTextureFromSurface(renderer, debugSurface);
-
-        int windowWidth, windowHeight;
-        SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
-
-        SDL_Rect debugRect = {10, windowHeight - 60, debugSurface->w, debugSurface->h};
-        SDL_RenderCopy(renderer, debugTexture, NULL, &debugRect);
-
-        SDL_FreeSurface(debugSurface);
-        SDL_DestroyTexture(debugTexture);
-    }
-    */
 
     // Render OSD
     if (showOSD) {

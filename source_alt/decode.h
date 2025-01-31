@@ -14,6 +14,13 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+// External atomic variables
+extern std::atomic<bool> shouldExit;
+extern std::atomic<double> current_audio_time;
+extern std::atomic<double> playback_rate;
+extern std::atomic<double> original_fps;
+
+// Frame information structure
 struct FrameInfo {
     int64_t pts;
     int64_t relative_pts;
@@ -54,8 +61,11 @@ struct FrameInfo {
     }
 };
 
+// Global frame index
 extern std::vector<FrameInfo> frameIndex;
+extern std::vector<FrameInfo> globalFrameIndex;
 
+// Ring buffer for frame management
 struct RingBuffer {
     std::vector<FrameInfo> buffer;
     size_t capacity;
@@ -72,6 +82,7 @@ struct RingBuffer {
     void movePlayhead(int delta);
 };
 
+// Frame cleanup management
 class FrameCleaner {
 private:
     std::vector<FrameInfo>& frameIndex;
@@ -80,33 +91,26 @@ public:
     FrameCleaner(std::vector<FrameInfo>& fi);
     void cleanFrames(int startFrame, int endFrame);
 };
-extern std::vector<FrameInfo> globalFrameIndex;
+
+// Frame index and decoding functions
 std::vector<FrameInfo> createFrameIndex(const char* filename);
 bool convertToLowRes(const char* filename, std::string& outputFilename);
 bool fillIndexWithLowResFrames(const char* filename, std::vector<FrameInfo>& frameIndex);
 bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame);
 bool decodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd);
 
+// Asynchronous operations
 std::future<void> asyncDecodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd);
 std::future<void> asyncDecodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame);
 std::future<void> asyncCleanFrames(FrameCleaner& cleaner, int startFrame, int endFrame);
 
+// Memory management
 void printMemoryUsage();
-
 void clearHighResFrames(std::vector<FrameInfo>& frameIndex);
 void removeHighResFrames(std::vector<FrameInfo>& frameIndex, int start, int end, int highResStart, int highResEnd);
 
-// Добавьте это объявление в конец файла, перед закрывающим #endif
+// Video decoding management
 void manageVideoDecoding(const std::string& filename, const std::string& lowResFilename, 
-                         std::vector<FrameInfo>& frameIndex, std::atomic<int>& currentFrame,
-                         const size_t ringBufferCapacity, const int highResWindowSize,
-                         std::atomic<bool>& isPlaying);
-
-// Добавьте в начало файла, после существующих включений
-#include <atomic>
-
-// Добавьте перед объявлением функции manageVideoDecoding
-extern std::atomic<bool> shouldExit;
-extern std::atomic<double> current_audio_time;
-extern std::atomic<double> playback_rate;
-extern std::atomic<double> original_fps;
+                        std::vector<FrameInfo>& frameIndex, std::atomic<int>& currentFrame,
+                        const size_t ringBufferCapacity, const int highResWindowSize,
+                        std::atomic<bool>& isPlaying);
