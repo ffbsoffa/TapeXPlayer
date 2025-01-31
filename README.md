@@ -36,7 +36,7 @@ arch -x86_64 /usr/local/bin/brew install ffmpeg gstreamer glib sdl2 sdl2_ttf rtm
 #### Building from Source
 1. Clone the repository:
 ```
-git clone https://github.com/yourusername/TapeXPlayer.git
+git clone https://github.com/ffbsoffa/TapeXPlayer.git
 cd TapeXPlayer
 ```
 
