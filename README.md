@@ -98,10 +98,9 @@ or
 - [**Spleen Font**](https://github.com/fcambus/spleen/tree/master) — used under BSD2-ClauseLicense
 - [**Native File Dialog Extended**](https://github.com/btzy/nativefiledialog-extended) - used under Zlib licence
 
-### External API Integration
+### External API Integration (Initial)
 TapeXPlayer now provides an API for third-party applications, enabling:
 - Remote control of playback functions
-- Access to timeline and Memory Locations
 - Integration with custom workflows and automation systems
 
 ### Contributions and Contact:
