@@ -9,6 +9,7 @@
 #include <mutex>
 #include <condition_variable>
 #include "RtMidi.h"
+#include "common.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -50,7 +51,17 @@ struct RemoteCommand {
     };
     int32_t status;        // 4 bytes
     char timecode[12];     // 12 bytes
-    char padding[4];       // 4 bytes for alignment
+    
+    // Combine flags with current speed to save space
+    union {
+        struct {
+            uint8_t is_playing : 1;    // Playback flag
+            uint8_t is_reverse : 1;    // Reverse direction flag
+            uint8_t reserved : 6;      // Reserved for future flags
+            uint8_t padding[3];        // Alignment padding
+        } flags;
+        float current_rate;            // 4 bytes (overlaps with flags)
+    };
 };
 #pragma pack(pop)
 
@@ -77,6 +88,13 @@ public:
     bool initialize();
     void process_commands();
     bool is_initialized() const { return initialized; }
+
+    // Add new functions for MIDI device management
+    std::vector<std::string> get_input_devices() const;
+    std::vector<std::string> get_output_devices() const;
+    bool select_device(const std::string& device_name, bool is_input);
+    std::string get_current_input_device() const;
+    std::string get_current_output_device() const;
 
 private:
     bool create_shared_memory();
@@ -133,4 +151,7 @@ private:
     std::unique_ptr<RtMidiOut> midi_out;
     bool hui_initialized;
     std::string last_timecode;
+
+    std::string current_input_device;
+    std::string current_output_device;
 }; 

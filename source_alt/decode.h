@@ -27,10 +27,12 @@ struct FrameInfo {
     int64_t time_ms;
     std::shared_ptr<AVFrame> frame;
     std::shared_ptr<AVFrame> low_res_frame;
+    std::shared_ptr<AVFrame> cached_frame;
     enum FrameType {
         EMPTY,
         LOW_RES,
-        FULL_RES
+        FULL_RES,
+        CACHED
     } type;
     bool is_decoding;
     mutable std::mutex mutex;
@@ -40,7 +42,7 @@ struct FrameInfo {
     
     FrameInfo(const FrameInfo& other) 
         : pts(other.pts), relative_pts(other.relative_pts), time_ms(other.time_ms),
-          frame(other.frame), low_res_frame(other.low_res_frame), type(other.type) {
+          frame(other.frame), low_res_frame(other.low_res_frame), cached_frame(other.cached_frame), type(other.type) {
         std::lock_guard<std::mutex> lock(other.mutex);
         is_decoding = other.is_decoding;
     }
@@ -54,6 +56,7 @@ struct FrameInfo {
             time_ms = other.time_ms;
             frame = other.frame;
             low_res_frame = other.low_res_frame;
+            cached_frame = other.cached_frame;
             type = other.type;
             is_decoding = other.is_decoding;
         }
@@ -61,9 +64,37 @@ struct FrameInfo {
     }
 };
 
+// Intermediate buffer for frame transfer between decoder and display
+struct FrameBuffer {
+    std::shared_ptr<AVFrame> lastFrame;
+    int frameIndex;
+    FrameInfo::FrameType frameType;
+    AVRational timeBase;
+    std::mutex mutex;
+
+    FrameBuffer() : frameIndex(-1), frameType(FrameInfo::EMPTY) {}
+
+    void updateFrame(const std::shared_ptr<AVFrame>& newFrame, int index, FrameInfo::FrameType type, const AVRational& tb) {
+        std::lock_guard<std::mutex> lock(mutex);
+        lastFrame = newFrame;
+        frameIndex = index;
+        frameType = type;
+        timeBase = tb;
+    }
+
+    std::shared_ptr<AVFrame> getFrame(int& outIndex, FrameInfo::FrameType& outType, AVRational& outTimeBase) {
+        std::lock_guard<std::mutex> lock(mutex);
+        outIndex = frameIndex;
+        outType = frameType;
+        outTimeBase = timeBase;
+        return lastFrame;
+    }
+};
+
 // Global frame index
 extern std::vector<FrameInfo> frameIndex;
 extern std::vector<FrameInfo> globalFrameIndex;
+extern FrameBuffer frameBuffer; // Global intermediate buffer
 
 // Ring buffer for frame management
 struct RingBuffer {
@@ -92,17 +123,25 @@ public:
     void cleanFrames(int startFrame, int endFrame);
 };
 
+// Define a progress callback type
+typedef void (*ProgressCallback)(int progress);
+
 // Frame index and decoding functions
 std::vector<FrameInfo> createFrameIndex(const char* filename);
-bool convertToLowRes(const char* filename, std::string& outputFilename);
+bool convertToLowRes(const char* filename, std::string& outputFilename, ProgressCallback progressCallback = nullptr);
 bool fillIndexWithLowResFrames(const char* filename, std::vector<FrameInfo>& frameIndex);
 bool decodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame);
-bool decodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd);
+bool decodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd, bool skipHighResWindow = true);
+bool decodeCachedFrames(const char* filename, std::vector<FrameInfo>& frameIndex, int step = 10);
+
+// Initialize buffer with progress reporting
+void initializeBuffer(const char* lowResFilename, std::vector<FrameInfo>& frameIndex, int currentFrame, int bufferSize, ProgressCallback progressCallback = nullptr);
 
 // Asynchronous operations
-std::future<void> asyncDecodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd);
+std::future<void> asyncDecodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd, bool skipHighResWindow = true);
 std::future<void> asyncDecodeFrameRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame);
 std::future<void> asyncCleanFrames(FrameCleaner& cleaner, int startFrame, int endFrame);
+std::future<void> asyncDecodeCachedFrames(const char* filename, std::vector<FrameInfo>& frameIndex, int step = 10);
 
 // Memory management
 void printMemoryUsage();
@@ -114,3 +153,11 @@ void manageVideoDecoding(const std::string& filename, const std::string& lowResF
                         std::vector<FrameInfo>& frameIndex, std::atomic<int>& currentFrame,
                         const size_t ringBufferCapacity, const int highResWindowSize,
                         std::atomic<bool>& isPlaying);
+
+// New functions
+bool isURL(const std::string& str);
+bool downloadVideoFromURL(const std::string& url, std::string& outputFilename);
+void registerTempFileForCleanup(const std::string& filePath);
+void cleanupTempFiles();
+bool processMediaSource(const std::string& source, std::string& processedFilePath);
+std::string generateURLId(const std::string& url);

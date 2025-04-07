@@ -1,5 +1,6 @@
 #include "decode.h"
 #include "common.h"
+#include "display.h"
 #include <iostream>
 #include <unistd.h>
 #include <filesystem>
@@ -9,10 +10,14 @@
 #include <sys/stat.h>
 #include <openssl/evp.h>
 #include <pwd.h>
+#include <regex>
+#include <cstdio>
+#include <cstdlib>
 
 namespace fs = std::filesystem;
 
-// Добавьте в начало файла, после включений
+// Глобальный промежуточный буфер
+FrameBuffer frameBuffer;
 
 std::string generateFileId(const char* filename) {
     EVP_MD_CTX *mdctx;
@@ -224,7 +229,7 @@ std::string getCachePath() {
     return cachePath;
 }
 
-bool convertToLowRes(const char* filename, std::string& outputFilename) {
+bool convertToLowRes(const char* filename, std::string& outputFilename, ProgressCallback progressCallback) {
     std::string cacheDir = getCachePath();
     
     fs::create_directories(cacheDir);
@@ -240,73 +245,70 @@ bool convertToLowRes(const char* filename, std::string& outputFilename) {
     if (fs::exists(cachePath)) {
         std::cout << "Found cached low-resolution file: " << cachePath << std::endl;
         outputFilename = cachePath;
+        if (progressCallback) {
+            progressCallback(100); // Indicate completion
+        }
         return true;
     }
 
-
-    char probe_cmd[1024];
-    snprintf(probe_cmd, sizeof(probe_cmd),
-             "ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=width,height -of csv=p=0 \"%s\"",
-             filename);
+    // Create FFmpeg command for low-res conversion
+    std::string command = "ffmpeg -y -i \"" + std::string(filename) + "\" -vf \"scale=640:-1\" -c:v libx264 -crf 23 -preset veryfast -c:a aac -b:a 128k \"" + cachePath + "\" 2>&1";
     
-    FILE* pipe = popen(probe_cmd, "r");
+    FILE* pipe = popen(command.c_str(), "r");
     if (!pipe) {
-        std::cerr << "Error executing ffprobe" << std::endl;
+        std::cerr << "Error executing FFmpeg command" << std::endl;
         return false;
     }
+
+    char buffer[128];
+    std::string result = "";
     
-    int width, height;
-    if (fscanf(pipe, "%d,%d", &width, &height) != 2) {
-        std::cerr << "Error reading video dimensions" << std::endl;
-        pclose(pipe);
-        return false;
-    }
-    pclose(pipe);
-
-
-    int new_width = width / 2;
-    int new_height = height / 2;
-
-    // Ensure even dimensions
-    new_width += new_width % 2;
-    new_height += new_height % 2;
-
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd),
-             "ffmpeg -i \"%s\" -c:v libx264 -crf 23 -preset ultrafast "
-             "-vf \"scale=%d:%d,scale=trunc(iw/2)*2:trunc(ih/2)*2\" "
-             "-y \"%s\"",
-             filename, new_width, new_height, cachePath.c_str());
-    
-    std::cout << "Starting conversion to low resolution..." << std::endl;
-    int result = system(cmd);
-    if (result != 0) {
-        std::cerr << "Error converting video to low resolution" << std::endl;
-        return false;
-    }
-    std::cout << "Low resolution conversion completed successfully" << std::endl;
-
-
-    outputFilename = cachePath;
-
- 
-    std::vector<fs::path> cacheFiles;
-    for (const auto& entry : fs::directory_iterator(cacheDir)) {
-        if (entry.path().extension() == ".mp4") {
-            cacheFiles.push_back(entry.path());
+    // Read FFmpeg output to track progress
+    while (!feof(pipe)) {
+        if (fgets(buffer, 128, pipe) != NULL) {
+            result += buffer;
+            
+            // Parse FFmpeg output to estimate progress
+            if (progressCallback) {
+                // Look for time= in the output
+                std::string output(buffer);
+                size_t timePos = output.find("time=");
+                if (timePos != std::string::npos) {
+                    // Extract time information
+                    std::string timeStr = output.substr(timePos + 5, 11); // "00:00:00.00"
+                    
+                    // Convert time to seconds
+                    int hours = 0, minutes = 0, seconds = 0;
+                    float milliseconds = 0;
+                    sscanf(timeStr.c_str(), "%d:%d:%d.%f", &hours, &minutes, &seconds, &milliseconds);
+                    float currentTime = hours * 3600 + minutes * 60 + seconds + milliseconds / 100;
+                    
+                    // Estimate progress (assuming we know total duration)
+                    // Since we don't know the total duration here, we'll use a heuristic
+                    // This is a simplified approach - in a real implementation, you might want to 
+                    // first determine the total duration of the video
+                    int progress = std::min(int(currentTime / 3 * 100), 99); // Cap at 99% until complete
+                    progressCallback(progress);
+                }
+            }
         }
     }
-
-    std::sort(cacheFiles.begin(), cacheFiles.end(),
-              [](const fs::path& a, const fs::path& b) {
-                  return fs::last_write_time(a) < fs::last_write_time(b);
-              });
-
-    while (cacheFiles.size() > 4) {
-        fs::remove(cacheFiles[0]);
-        cacheFiles.erase(cacheFiles.begin());
+    
+    int status = pclose(pipe);
+    if (status != 0) {
+        std::cerr << "FFmpeg command failed with status " << status << std::endl;
+        return false;
     }
 
+    outputFilename = cachePath;
+    
+    // Register the file for cleanup
+    registerTempFileForCleanup(cachePath);
+    
+    if (progressCallback) {
+        progressCallback(100); // Indicate completion
+    }
+    
     return true;
 }
 
@@ -404,7 +406,7 @@ bool fillIndexWithLowResFrames(const char* filename, std::vector<FrameInfo>& fra
     return true;
 }
 
-bool decodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd) {
+bool decodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd, bool skipHighResWindow) {
     const int numThreads = 2; 
     std::vector<std::thread> threads;
     std::atomic<bool> success{true};
@@ -490,19 +492,23 @@ bool decodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex,
                     int64_t frameTimeMs = frameTime * 1000;
 
                     if (frameTimeMs >= startTime && currentFrame <= threadEndFrame && currentFrame < frameIndex.size()) {
-                        if (currentFrame >= highResStart && currentFrame <= highResEnd) {
-                            currentFrame++;
-                            continue;
-                        }
-
-                        if (frameIndex[currentFrame].type == FrameInfo::EMPTY) {
+                        // Вместо пропуска кадров в окне high-res, проверяем наличие low-res кадра
+                        std::lock_guard<std::mutex> lock(frameIndex[currentFrame].mutex);
+                        
+                        // Декодируем low-res кадр, если его еще нет, независимо от того, находится ли кадр в окне high-res
+                        if (!frameIndex[currentFrame].low_res_frame) {
                             frameIndex[currentFrame].low_res_frame = std::shared_ptr<AVFrame>(av_frame_clone(frame), [](AVFrame* f) { av_frame_free(&f); });
                             frameIndex[currentFrame].pts = frame->pts;
                             frameIndex[currentFrame].relative_pts = frame->pts - formatContext->streams[videoStream]->start_time;
                             frameIndex[currentFrame].time_ms = frameTimeMs;
-                            frameIndex[currentFrame].type = FrameInfo::LOW_RES;
                             frameIndex[currentFrame].time_base = timeBase;
+                            
+                            // Обновляем тип только если текущий тип EMPTY
+                            if (frameIndex[currentFrame].type == FrameInfo::EMPTY) {
+                                frameIndex[currentFrame].type = FrameInfo::LOW_RES;
+                            }
                         }
+                        
                         currentFrame++;
                     }
                 }
@@ -539,7 +545,14 @@ void removeHighResFrames(std::vector<FrameInfo>& frameIndex, int start, int end,
             if (i < highResStart || i > highResEnd) {
                 // std::cout << "Removing high-res frame " << i << std::endl;
                 frameIndex[i].frame.reset();
-                frameIndex[i].type = FrameInfo::LOW_RES;
+                // Проверяем наличие low_res или cached кадров
+                if (frameIndex[i].low_res_frame) {
+                    frameIndex[i].type = FrameInfo::LOW_RES;
+                } else if (frameIndex[i].cached_frame) {
+                    frameIndex[i].type = FrameInfo::CACHED;
+                } else {
+                    frameIndex[i].type = FrameInfo::EMPTY;
+                }
             }
         }
     }
@@ -555,13 +568,18 @@ void FrameCleaner::cleanFrames(int startFrame, int endFrame) {
             if (frameIndex[i].low_res_frame) {
                 frameIndex[i].low_res_frame.reset();
             }
-            frameIndex[i].type = FrameInfo::EMPTY;
+            // Не удаляем cached_frame
+            if (frameIndex[i].cached_frame) {
+                frameIndex[i].type = FrameInfo::CACHED;
+            } else {
+                frameIndex[i].type = FrameInfo::EMPTY;
+            }
         }
     }
 
-std::future<void> asyncDecodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd) {
+std::future<void> asyncDecodeLowResRange(const char* filename, std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd, bool skipHighResWindow) {
     return std::async(std::launch::async, [=, &frameIndex]() {
-        decodeLowResRange(filename, frameIndex, startFrame, endFrame, highResStart, highResEnd);
+        decodeLowResRange(filename, frameIndex, startFrame, endFrame, highResStart, highResEnd, skipHighResWindow);
     });
 }
 
@@ -580,6 +598,175 @@ std::future<void> asyncDecodeFrameRange(const char* filename, std::vector<FrameI
 std::future<void> asyncCleanFrames(FrameCleaner& cleaner, int startFrame, int endFrame) {
     return std::async(std::launch::async, [&cleaner, startFrame, endFrame]() {
         cleaner.cleanFrames(startFrame, endFrame);
+    });
+}
+
+bool decodeCachedFrames(const char* filename, std::vector<FrameInfo>& frameIndex, int step) {
+    // Проверяем, все ли кадры уже кэшированы
+    bool allFramesCached = true;
+    int totalFrames = frameIndex.size();
+    int cachedCount = 0;
+    
+    // Подсчитываем количество уже кэшированных кадров
+    for (int i = 0; i < totalFrames; i += step) {
+        if (i < frameIndex.size()) {
+            std::lock_guard<std::mutex> lock(frameIndex[i].mutex);
+            if (frameIndex[i].cached_frame) {
+                cachedCount++;
+            } else {
+                allFramesCached = false;
+            }
+        }
+    }
+    
+    // Если все кадры уже кэшированы, выходим
+    if (allFramesCached) {
+        std::cout << "All frames already cached (" << cachedCount << " frames). Skipping cache update." << std::endl;
+        return true;
+    }
+    
+    // Если кэшировано более 95% кадров, тоже выходим
+    int expectedCachedFrames = (totalFrames + step - 1) / step; // Округление вверх
+    if (cachedCount >= expectedCachedFrames * 0.95) {
+        std::cout << "Most frames already cached (" << cachedCount << " of " << expectedCachedFrames << "). Skipping cache update." << std::endl;
+        return true;
+    }
+    
+    // Продолжаем с обычным кэшированием
+    AVFormatContext* formatContext = nullptr;
+    AVCodecContext* codecContext = nullptr;
+    const AVCodec* codec = nullptr;
+    int videoStream;
+
+    if (avformat_open_input(&formatContext, filename, nullptr, nullptr) != 0) {
+        std::cerr << "Failed to open file for cached frames" << std::endl;
+        return false;
+    }
+
+    if (avformat_find_stream_info(formatContext, nullptr) < 0) {
+        std::cerr << "Failed to find stream information for cached frames" << std::endl;
+        avformat_close_input(&formatContext);
+        return false;
+    }
+
+    videoStream = av_find_best_stream(formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+    if (videoStream < 0) {
+        std::cerr << "Video stream not found for cached frames" << std::endl;
+        avformat_close_input(&formatContext);
+        return false;
+    }
+
+    // Получаем FPS видео
+    AVRational frameRate = formatContext->streams[videoStream]->avg_frame_rate;
+    double fps = av_q2d(frameRate);
+    
+    // Адаптируем шаг кэширования в зависимости от FPS
+    int adaptedStep = step;
+    if (fps > 0) {
+        // Устанавливаем шаг в зависимости от FPS
+        if (fps >= 59.0 && fps <= 60.0) {
+            adaptedStep = 12; // Для 60 fps (и 59.94)
+        } else if (fps >= 49.0 && fps <= 50.0) {
+            adaptedStep = 10; // Для 50 fps
+        } else if (fps >= 29.0 && fps <= 30.0) {
+            adaptedStep = 6;  // Для 30 fps (и 29.97)
+        } else if (fps >= 24.0 && fps <= 25.0) {
+            adaptedStep = 5;  // Для 25 fps и 24 fps
+        } else if (fps >= 23.0 && fps < 24.0) {
+            adaptedStep = 4;  // Для 23.976 fps
+        } else {
+            // Для других значений FPS используем формулу
+            adaptedStep = static_cast<int>(fps / 5.0);
+            adaptedStep = std::max(3, adaptedStep); // Минимум 3 кадра
+            adaptedStep = std::min(15, adaptedStep); // Максимум 15 кадров
+        }
+        
+        std::cout << "Video FPS: " << fps << ", adapted cache step: " << adaptedStep << std::endl;
+    }
+
+    codecContext = avcodec_alloc_context3(codec);
+    if (!codecContext) {
+        avformat_close_input(&formatContext);
+        return false;
+    }
+
+    codecContext->thread_count = std::thread::hardware_concurrency();
+    codecContext->thread_type = FF_THREAD_FRAME;
+
+    if (avcodec_parameters_to_context(codecContext, formatContext->streams[videoStream]->codecpar) < 0) {
+        avcodec_free_context(&codecContext);
+        avformat_close_input(&formatContext);
+        return false;
+    }
+
+    if (avcodec_open2(codecContext, codec, nullptr) < 0) {
+        avcodec_free_context(&codecContext);
+        avformat_close_input(&formatContext);
+        return false;
+    }
+
+    AVRational timeBase = formatContext->streams[videoStream]->time_base;
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+
+    int frameCount = 0;
+    while (av_read_frame(formatContext, packet) >= 0 && !shouldExit) {
+        if (packet->stream_index == videoStream) {
+            int ret = avcodec_send_packet(codecContext, packet);
+            if (ret < 0) {
+                av_packet_unref(packet);
+                continue;
+            }
+
+            while (ret >= 0) {
+                ret = avcodec_receive_frame(codecContext, frame);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    break;
+                } else if (ret < 0) {
+                    break;
+                }
+
+                // Используем адаптированный шаг вместо фиксированного
+                if (frameCount % adaptedStep == 0 && frameCount < frameIndex.size()) {
+                    double frameTime = frame->pts * av_q2d(timeBase);
+                    int64_t frameTimeMs = frameTime * 1000;
+
+                    std::lock_guard<std::mutex> lock(frameIndex[frameCount].mutex);
+                    if (!frameIndex[frameCount].cached_frame) {
+                        frameIndex[frameCount].cached_frame = std::shared_ptr<AVFrame>(av_frame_clone(frame), [](AVFrame* f) { av_frame_free(&f); });
+                        frameIndex[frameCount].pts = frame->pts;
+                        frameIndex[frameCount].relative_pts = frame->pts - formatContext->streams[videoStream]->start_time;
+                        frameIndex[frameCount].time_ms = frameTimeMs;
+                        frameIndex[frameCount].time_base = timeBase;
+                        
+                        // Устанавливаем тип CACHED только если нет кадра более высокого качества
+                        if (frameIndex[frameCount].type == FrameInfo::EMPTY) {
+                            frameIndex[frameCount].type = FrameInfo::CACHED;
+                        }
+                    }
+                }
+                frameCount++;
+                if (frameCount % 100 == 0) {
+                    std::cout << "Processed " << frameCount << " frames for caching\r" << std::flush;
+                }
+            }
+        }
+        av_packet_unref(packet);
+    }
+
+    std::cout << "\nTotal processed " << frameCount << " frames for caching" << std::endl;
+
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codecContext);
+    avformat_close_input(&formatContext);
+
+    return true;
+}
+
+std::future<void> asyncDecodeCachedFrames(const char* filename, std::vector<FrameInfo>& frameIndex, int step) {
+    return std::async(std::launch::async, [=, &frameIndex]() {
+        decodeCachedFrames(filename, frameIndex, step);
     });
 }
 
@@ -637,20 +824,58 @@ void manageVideoDecoding(const std::string& filename, const std::string& lowResF
 
     std::future<void> lowResFuture;
     std::future<void> highResFuture;
+    std::future<void> cachedFramesFuture;
     std::future<void> secondaryCleanFuture;
 
     std::chrono::steady_clock::time_point lastLowResUpdateTime = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastHighResUpdateTime = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastCachedUpdateTime = std::chrono::steady_clock::now();
+    bool cachedFramesInitialized = false;
+
+    bool was_speed_reset_requested = false;
 
     auto getUpdateInterval = [](double playbackRate) {
         if (playbackRate < 0.9) return std::numeric_limits<int>::max(); // Don't decode
-        if (playbackRate <= 1.0) return 5000;
-        if (playbackRate <= 2.0) return 2500;
-        if (playbackRate <= 4.0) return 800;
-        if (playbackRate <= 8.0) return 600;
-        if (playbackRate <= 10.0) return 400;
-        return 200; // For speed 16x and higher
+        if (playbackRate >= 12.0) return std::numeric_limits<int>::max(); // Don't decode at high speeds (changed from 10.0 to 12.0)
+        if (playbackRate <= 1.0) return 8000; // Еще больше уменьшаем интервал для нормальной скорости
+        if (playbackRate <= 2.0) return 6000;  // Уменьшаем интервал для скорости до 2x
+        if (playbackRate <= 4.0) return 3000;  // Уменьшаем интервал для скорости до 4x
+        if (playbackRate <= 8.0) return 1250;  // Уменьшаем интервал для скорости до 8x
+        return 1000; // Уменьшаем интервал для скорости 8x-12x
     };
+
+    // Инициализация кэшированных кадров при запуске
+    if (!cachedFramesFuture.valid() || cachedFramesFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        std::cout << "Initializing cached frames..." << std::endl;
+        // Используем адаптивный шаг, основанный на FPS видео
+        int adaptiveStep = 10;  // Значение по умолчанию
+        double fps = original_fps.load();
+        if (fps > 0) {
+            // Устанавливаем шаг в зависимости от FPS
+            if (fps >= 59.0 && fps <= 60.0) {
+                adaptiveStep = 12; // Для 60 fps (и 59.94)
+            } else if (fps >= 49.0 && fps <= 50.0) {
+                adaptiveStep = 10; // Для 50 fps
+            } else if (fps >= 29.0 && fps <= 30.0) {
+                adaptiveStep = 6;  // Для 30 fps (и 29.97)
+            } else if (fps >= 24.0 && fps <= 25.0) {
+                adaptiveStep = 5;  // Для 25 fps и 24 fps
+            } else if (fps >= 23.0 && fps < 24.0) {
+                adaptiveStep = 4;  // Для 23.976 fps
+            } else {
+                // Для других значений FPS используем формулу
+                adaptiveStep = static_cast<int>(fps / 5.0);
+                adaptiveStep = std::max(3, adaptiveStep); // Минимум 3 кадра
+                adaptiveStep = std::min(15, adaptiveStep); // Максимум 15 кадров
+            }
+            
+            std::cout << "Video FPS: " << fps << ", adapted cache step: " << adaptiveStep << std::endl;
+        }
+        cachedFramesFuture = asyncDecodeCachedFrames(lowResFilename.c_str(), frameIndex, adaptiveStep);
+    }
+
+    // Добавим флаг, который будет отслеживать, были ли кадры полностью кэшированы
+    bool fullyCached = false;
 
     while (!shouldExit) {
         int currentFrameValue = currentFrame.load();
@@ -674,7 +899,10 @@ void manageVideoDecoding(const std::string& filename, const std::string& lowResF
             for (int i = clearStart; i <= clearEnd; ++i) {
                 frameIndex[i].frame.reset();
                 frameIndex[i].low_res_frame.reset();
-                frameIndex[i].type = FrameInfo::EMPTY;
+                // Не очищаем cached_frame при поиске
+                if (frameIndex[i].type != FrameInfo::CACHED) {
+                    frameIndex[i].type = FrameInfo::EMPTY;
+                }
             }
 
             currentFrame.store(seekFrame);
@@ -683,9 +911,55 @@ void manageVideoDecoding(const std::string& filename, const std::string& lowResF
             seekInfo.completed.store(true);
 
             // Форсируем декодирование кадров после seek
-            lowResFuture = asyncDecodeLowResRange(lowResFilename.c_str(), frameIndex, clearStart, clearEnd, seekFrame, seekFrame);
+            // Отключаем декодирование low-res кадров при скорости 10x и выше
+            if (currentPlaybackRate < 10.0) {
+                // Всегда декодируем low-res кадры, даже в окне high-res
+                lowResFuture = asyncDecodeLowResRange(lowResFilename.c_str(), frameIndex, clearStart, clearEnd, seekFrame, seekFrame, false);
+            }
             if (currentPlaybackRate < 2.0) {
                 highResFuture = asyncDecodeFrameRange(filename.c_str(), frameIndex, seekFrame, std::min(seekFrame + highResWindowSize, static_cast<int>(frameIndex.size()) - 1));
+            }
+        }
+
+        // Обработка запроса на сброс скорости
+        if (speed_reset_requested.load()) {
+            was_speed_reset_requested = true;
+            speed_reset_requested.store(false);
+            
+            // Принудительное обновление low-res буфера для текущего кадра
+            int currentFrameValue = currentFrame.load();
+            std::cout << "Speed reset requested, forcing low-res decoding around frame " << currentFrameValue << std::endl;
+            
+            // Расширенный диапазон буфера при сбросе скорости
+            int resetBufferStart = std::max(0, currentFrameValue - static_cast<int>(ringBufferCapacity * 0.5));
+            int resetBufferEnd = std::min(static_cast<int>(frameIndex.size()) - 1, 
+                                       currentFrameValue + static_cast<int>(ringBufferCapacity * 0.5));
+            
+            // Форсировать декодирование в фоновом режиме
+            lowResFuture = asyncDecodeLowResRange(lowResFilename.c_str(), frameIndex, 
+                                                 resetBufferStart, resetBufferEnd, 
+                                                 currentFrameValue, currentFrameValue, true);
+            
+            // Также запускаем декодирование high-res для более плавного перехода
+            int highResStart = std::max(0, currentFrameValue - highResWindowSize / 2);
+            int highResEnd = std::min(static_cast<int>(frameIndex.size()) - 1, 
+                                   currentFrameValue + highResWindowSize / 2);
+            
+            highResFuture = asyncDecodeFrameRange(filename.c_str(), frameIndex, highResStart, highResEnd);
+            
+            lastLowResUpdateTime = std::chrono::steady_clock::now();
+            lastHighResUpdateTime = std::chrono::steady_clock::now();
+        }
+
+        // После цикла if (was_speed_reset_requested) с небольшой задержкой сбрасываем флаг
+        if (was_speed_reset_requested) {
+            static auto reset_start_time = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - reset_start_time).count();
+            
+            if (elapsed > 2000) { // 2 секунды для декодирования
+                was_speed_reset_requested = false;
+                reset_start_time = std::chrono::steady_clock::now();
             }
         }
 
@@ -695,8 +969,8 @@ void manageVideoDecoding(const std::string& filename, const std::string& lowResF
 
         // Обновление интервалов декодирования
         int lowResUpdateInterval = getUpdateInterval(currentPlaybackRate);
-        int highResUpdateInterval = lowResUpdateInterval / 2;
-
+        int highResUpdateInterval = lowResUpdateInterval;
+        int cachedUpdateInterval = 60000; // Обновление кэшированных кадров каждую минуту
 
         // Буфер обновления
         int bufferStart = std::max(0, currentFrameValue - static_cast<int>(ringBufferCapacity / 2));
@@ -709,12 +983,133 @@ void manageVideoDecoding(const std::string& filename, const std::string& lowResF
         std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
         auto timeSinceLastLowResUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLowResUpdateTime);
         auto timeSinceLastHighResUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHighResUpdateTime);
+        auto timeSinceLastCachedUpdate = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCachedUpdateTime);
+
+        // Проверяем, нужно ли очистить low-res кадры при высокой скорости
+        static bool wasHighSpeed = false;
+        bool isHighSpeed = currentPlaybackRate >= 12.0;
+        
+        if (isHighSpeed && !wasHighSpeed) {
+            // Переход на высокую скорость - очищаем low-res кадры
+            std::cout << "Switching to high speed mode, clearing low-res frames..." << std::endl;
+            for (int i = 0; i < frameIndex.size(); ++i) {
+                if (frameIndex[i].type == FrameInfo::LOW_RES && !frameIndex[i].is_decoding) {
+                    frameIndex[i].low_res_frame.reset();
+                    // Проверяем наличие cached кадров
+                    if (frameIndex[i].cached_frame) {
+                        frameIndex[i].type = FrameInfo::CACHED;
+                    } else {
+                        frameIndex[i].type = FrameInfo::EMPTY;
+                    }
+                }
+            }
+        }
+        wasHighSpeed = isHighSpeed;
+
+        // Проверка и инициализация кэшированных кадров
+        if (!cachedFramesInitialized) {
+            if (cachedFramesFuture.valid() && cachedFramesFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                std::cout << "Cached frames initialization completed" << std::endl;
+                cachedFramesInitialized = true;
+            }
+        }
+
+        // Периодическое обновление кэшированных кадров
+        if (cachedFramesInitialized && !fullyCached && timeSinceLastCachedUpdate.count() >= cachedUpdateInterval) {
+            if (!cachedFramesFuture.valid() || cachedFramesFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                // Проверяем, нужно ли обновлять кэш
+                bool needsUpdate = false;
+                
+                // Проверяем, есть ли некэшированные кадры
+                int step = 10; // Базовый шаг
+                double fps = original_fps.load();
+                if (fps > 0) {
+                    // Устанавливаем шаг в зависимости от FPS
+                    if (fps >= 59.0 && fps <= 60.0) {
+                        step = 12;
+                    } else if (fps >= 49.0 && fps <= 50.0) {
+                        step = 10;
+                    } else if (fps >= 29.0 && fps <= 30.0) {
+                        step = 6;
+                    } else if (fps >= 24.0 && fps <= 25.0) {
+                        step = 5;
+                    } else if (fps >= 23.0 && fps < 24.0) {
+                        step = 4;
+                    } else {
+                        step = static_cast<int>(fps / 5.0);
+                        step = std::max(3, step);
+                        step = std::min(15, step);
+                    }
+                }
+                
+                // Проверяем выборочно кадры
+                int sampleSize = std::min(100, static_cast<int>(frameIndex.size()));
+                int uncachedCount = 0;
+                
+                for (int i = 0; i < sampleSize; i++) {
+                    int frameIdx = (i * frameIndex.size()) / sampleSize;
+                    if (frameIdx % step == 0) {
+                        std::lock_guard<std::mutex> lock(frameIndex[frameIdx].mutex);
+                        if (!frameIndex[frameIdx].cached_frame) {
+                            uncachedCount++;
+                        }
+                    }
+                }
+                
+                // Если более 5% выборки не кэшировано, обновляем кэш
+                if (uncachedCount > sampleSize * 0.05) {
+                    std::cout << "Updating cached frames... (" << uncachedCount << " uncached frames in sample)" << std::endl;
+                    
+                    int adaptiveStep = step;
+                    cachedFramesFuture = asyncDecodeCachedFrames(lowResFilename.c_str(), frameIndex, adaptiveStep);
+                    lastCachedUpdateTime = now;
+                } else {
+                    std::cout << "Cache is up to date. No update needed." << std::endl;
+                    fullyCached = true; // Помечаем, что кэш полный
+                }
+            }
+        }
 
         // Low-res frame decoding
         if (timeSinceLastLowResUpdate.count() >= lowResUpdateInterval) {
-            if (!lowResFuture.valid() || lowResFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-                lowResFuture = asyncDecodeLowResRange(lowResFilename.c_str(), frameIndex, bufferStart, bufferEnd, highResStart, highResEnd);
-                lastLowResUpdateTime = now;
+            // Отключаем декодирование low-res кадров при скорости 12x и выше (изменено с 10x на 12x)
+            if (currentPlaybackRate < 12.0) {
+                if (!lowResFuture.valid() || lowResFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                    // Расширяем буфер для low-res кадров при нормальной скорости
+                    int extendedBufferStart = bufferStart;
+                    int extendedBufferEnd = bufferEnd;
+                    
+                    // Увеличиваем размер буфера для всех скоростей до 8x
+                    if (currentPlaybackRate <= 8.0) {
+                        // Чем ниже скорость, тем больше буфер
+                        float bufferMultiplier = 1.0f;
+                        if (currentPlaybackRate <= 1.0) {
+                            bufferMultiplier = 0.5f; // 50% от ringBufferCapacity в каждую сторону
+                        } else if (currentPlaybackRate <= 2.0) {
+                            bufferMultiplier = 0.4f; // 40% от ringBufferCapacity в каждую сторону
+                        } else if (currentPlaybackRate <= 4.0) {
+                            bufferMultiplier = 0.3f; // 30% от ringBufferCapacity в каждую сторону
+                        } else {
+                            bufferMultiplier = 0.2f; // 20% от ringBufferCapacity в каждую сторону
+                        }
+                        
+                        // Учитываем направление движения для асимметричного буфера
+                        bool isForward = playback_rate.load() >= 0;
+                        if (isForward) {
+                            // Больше кадров впереди, чем позади
+                            extendedBufferStart = std::max(0, bufferStart - static_cast<int>(ringBufferCapacity * bufferMultiplier * 0.3f));
+                            extendedBufferEnd = std::min(static_cast<int>(frameIndex.size()) - 1, bufferEnd + static_cast<int>(ringBufferCapacity * bufferMultiplier * 0.7f));
+                        } else {
+                            // Больше кадров позади, чем впереди
+                            extendedBufferStart = std::max(0, bufferStart - static_cast<int>(ringBufferCapacity * bufferMultiplier * 0.7f));
+                            extendedBufferEnd = std::min(static_cast<int>(frameIndex.size()) - 1, bufferEnd + static_cast<int>(ringBufferCapacity * bufferMultiplier * 0.3f));
+                        }
+                    }
+                    
+                    // Всегда декодируем low-res кадры, даже в окне high-res
+                    lowResFuture = asyncDecodeLowResRange(lowResFilename.c_str(), frameIndex, extendedBufferStart, extendedBufferEnd, highResStart, highResEnd, false);
+                    lastLowResUpdateTime = now;
+                }
             }
         }
 
@@ -748,7 +1143,14 @@ void manageVideoDecoding(const std::string& filename, const std::string& lowResF
             if (i < highResStart || i > highResEnd) {
                 if (frameIndex[i].type == FrameInfo::FULL_RES && !frameIndex[i].is_decoding) {
                     frameIndex[i].frame.reset();
-                    frameIndex[i].type = frameIndex[i].low_res_frame ? FrameInfo::LOW_RES : FrameInfo::EMPTY;
+                    // Проверяем наличие low_res или cached кадров
+                    if (frameIndex[i].low_res_frame) {
+                        frameIndex[i].type = FrameInfo::LOW_RES;
+                    } else if (frameIndex[i].cached_frame) {
+                        frameIndex[i].type = FrameInfo::CACHED;
+                    } else {
+                        frameIndex[i].type = FrameInfo::EMPTY;
+                    }
                 }
             }
         }
@@ -758,7 +1160,149 @@ void manageVideoDecoding(const std::string& filename, const std::string& lowResF
             if (i < bufferStart || i > bufferEnd) {
                 if (frameIndex[i].type == FrameInfo::LOW_RES && !frameIndex[i].is_decoding) {
                     frameIndex[i].low_res_frame.reset();
-                    frameIndex[i].type = FrameInfo::EMPTY;
+                    // Проверяем наличие cached кадров
+                    if (frameIndex[i].cached_frame) {
+                        frameIndex[i].type = FrameInfo::CACHED;
+                    } else {
+                        frameIndex[i].type = FrameInfo::EMPTY;
+                    }
+                }
+            }
+        }
+
+        // Обновляем промежуточный буфер с текущим кадром
+        if (currentFrameValue >= 0 && currentFrameValue < frameIndex.size()) {
+            // При высоких скоростях (>= 10x) ищем ближайший кэшированный кадр
+            if (currentPlaybackRate >= 10.0) {
+                // Определяем направление движения
+                bool isForward = playback_rate.load() >= 0;
+                int step = isForward ? 1 : -1;
+                int searchRange = 20; // Диапазон поиска кэшированных кадров
+                int foundCachedFrame = -1;
+                
+                // Ищем ближайший кэшированный кадр в направлении движения
+                for (int i = 0; i < searchRange; ++i) {
+                    int checkFrame = currentFrameValue + (i * step);
+                    
+                    // Проверяем границы
+                    if (checkFrame < 0 || checkFrame >= frameIndex.size()) {
+                        continue;
+                    }
+                    
+                    std::lock_guard<std::mutex> lock(frameIndex[checkFrame].mutex);
+                    if (!frameIndex[checkFrame].is_decoding && 
+                        frameIndex[checkFrame].cached_frame && 
+                        (frameIndex[checkFrame].type == FrameInfo::CACHED || 
+                         frameIndex[checkFrame].type == FrameInfo::LOW_RES || 
+                         frameIndex[checkFrame].type == FrameInfo::FULL_RES)) {
+                        foundCachedFrame = checkFrame;
+                        break;
+                    }
+                }
+                
+                // Если нашли кэшированный кадр, используем его
+                if (foundCachedFrame != -1) {
+                    std::lock_guard<std::mutex> lock(frameIndex[foundCachedFrame].mutex);
+                    if (frameIndex[foundCachedFrame].cached_frame) {
+                        frameBuffer.updateFrame(
+                            frameIndex[foundCachedFrame].cached_frame, 
+                            foundCachedFrame, 
+                            FrameInfo::CACHED, 
+                            frameIndex[foundCachedFrame].time_base
+                        );
+                    }
+                } else {
+                    // Если не нашли кэшированный кадр, используем текущий кадр
+                    const FrameInfo& currentFrameInfo = frameIndex[currentFrameValue];
+                    std::lock_guard<std::mutex> lock(currentFrameInfo.mutex);
+                    
+                    if (!currentFrameInfo.is_decoding) {
+                        // Сохраняем текущий тип кадра для отслеживания изменений
+                        static FrameInfo::FrameType lastType = FrameInfo::EMPTY;
+                        FrameInfo::FrameType currentType = currentFrameInfo.type;
+                        
+                        // Приоритет выбора кадра зависит от скорости
+                        if (currentPlaybackRate <= 2.0) {
+                            // При низких скоростях предпочитаем full-res, затем low-res, затем cached
+                            if (currentFrameInfo.type == FrameInfo::FULL_RES && currentFrameInfo.frame) {
+                                frameBuffer.updateFrame(currentFrameInfo.frame, currentFrameValue, FrameInfo::FULL_RES, currentFrameInfo.time_base);
+                                lastType = FrameInfo::FULL_RES;
+                            } else if (currentFrameInfo.type == FrameInfo::LOW_RES && currentFrameInfo.low_res_frame) {
+                                frameBuffer.updateFrame(currentFrameInfo.low_res_frame, currentFrameValue, FrameInfo::LOW_RES, currentFrameInfo.time_base);
+                                lastType = FrameInfo::LOW_RES;
+                            }
+                        } else if (currentPlaybackRate <= 8.0) {
+                            // При средних скоростях предпочитаем low-res, затем cached, затем full-res
+                            if (currentFrameInfo.type == FrameInfo::LOW_RES && currentFrameInfo.low_res_frame) {
+                                frameBuffer.updateFrame(currentFrameInfo.low_res_frame, currentFrameValue, FrameInfo::LOW_RES, currentFrameInfo.time_base);
+                                lastType = FrameInfo::LOW_RES;
+                            }
+                        } else {
+                            // При высоких скоростях (8x-10x) предпочитаем cached, затем low-res
+                            if (currentFrameInfo.type == FrameInfo::CACHED && currentFrameInfo.cached_frame) {
+                                frameBuffer.updateFrame(currentFrameInfo.cached_frame, currentFrameValue, FrameInfo::CACHED, currentFrameInfo.time_base);
+                                lastType = FrameInfo::CACHED;
+                            }
+                        }
+                        
+                        // Если произошло изменение типа кадра, выводим информацию в консоль для отладки
+                        if (lastType != currentType && currentType != FrameInfo::EMPTY) {
+                            std::string typeStr;
+                            switch (currentType) {
+                                case FrameInfo::FULL_RES: typeStr = "FULL_RES"; break;
+                                case FrameInfo::LOW_RES: typeStr = "LOW_RES"; break;
+                                case FrameInfo::CACHED: typeStr = "CACHED"; break;
+                                default: typeStr = "UNKNOWN"; break;
+                            }
+                            std::cout << "Frame type changed to: " << typeStr << " at frame " << currentFrameValue << std::endl;
+                        }
+                    }
+                }
+            } else {
+                // Улучшенная логика выбора кадра для средних скоростей (1x-10x)
+                const FrameInfo& currentFrameInfo = frameIndex[currentFrameValue];
+                std::lock_guard<std::mutex> lock(currentFrameInfo.mutex);
+                
+                if (!currentFrameInfo.is_decoding) {
+                    // Сохраняем текущий тип кадра для отслеживания изменений
+                    static FrameInfo::FrameType lastType = FrameInfo::EMPTY;
+                    FrameInfo::FrameType currentType = currentFrameInfo.type;
+                    
+                    // Приоритет выбора кадра зависит от скорости
+                    if (currentPlaybackRate <= 2.0) {
+                        // При низких скоростях предпочитаем full-res, затем low-res, затем cached
+                        if (currentFrameInfo.type == FrameInfo::FULL_RES && currentFrameInfo.frame) {
+                            frameBuffer.updateFrame(currentFrameInfo.frame, currentFrameValue, FrameInfo::FULL_RES, currentFrameInfo.time_base);
+                            lastType = FrameInfo::FULL_RES;
+                        } else if (currentFrameInfo.type == FrameInfo::LOW_RES && currentFrameInfo.low_res_frame) {
+                            frameBuffer.updateFrame(currentFrameInfo.low_res_frame, currentFrameValue, FrameInfo::LOW_RES, currentFrameInfo.time_base);
+                            lastType = FrameInfo::LOW_RES;
+                        }
+                    } else if (currentPlaybackRate <= 8.0) {
+                        // При средних скоростях предпочитаем low-res, затем cached, затем full-res
+                        if (currentFrameInfo.type == FrameInfo::LOW_RES && currentFrameInfo.low_res_frame) {
+                            frameBuffer.updateFrame(currentFrameInfo.low_res_frame, currentFrameValue, FrameInfo::LOW_RES, currentFrameInfo.time_base);
+                            lastType = FrameInfo::LOW_RES;
+                        }
+                    } else {
+                        // При высоких скоростях (8x-10x) предпочитаем cached, затем low-res
+                        if (currentFrameInfo.type == FrameInfo::CACHED && currentFrameInfo.cached_frame) {
+                            frameBuffer.updateFrame(currentFrameInfo.cached_frame, currentFrameValue, FrameInfo::CACHED, currentFrameInfo.time_base);
+                            lastType = FrameInfo::CACHED;
+                        }
+                    }
+                    
+                    // Если произошло изменение типа кадра, выводим информацию в консоль для отладки
+                    if (lastType != currentType && currentType != FrameInfo::EMPTY) {
+                        std::string typeStr;
+                        switch (currentType) {
+                            case FrameInfo::FULL_RES: typeStr = "FULL_RES"; break;
+                            case FrameInfo::LOW_RES: typeStr = "LOW_RES"; break;
+                            case FrameInfo::CACHED: typeStr = "CACHED"; break;
+                            default: typeStr = "UNKNOWN"; break;
+                        }
+                        std::cout << "Frame type changed to: " << typeStr << " at frame " << currentFrameValue << std::endl;
+                    }
                 }
             }
         }
@@ -770,4 +1314,145 @@ void manageVideoDecoding(const std::string& filename, const std::string& lowResF
     // Wait for any ongoing decoding to finish before exiting
     if (lowResFuture.valid()) lowResFuture.wait();
     if (highResFuture.valid()) highResFuture.wait();
+    if (cachedFramesFuture.valid()) cachedFramesFuture.wait();
+    
+    // Очищаем ресурсы отображения
+    cleanupDisplayResources();
+}
+
+// Функция для проверки, является ли строка URL
+bool isURL(const std::string& str) {
+    std::regex url_regex(
+        R"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))",
+        std::regex::icase
+    );
+    return std::regex_match(str, url_regex);
+}
+
+// Добавляем функцию для генерации ID для URL
+std::string generateURLId(const std::string& url) {
+    EVP_MD_CTX *mdctx;
+    const EVP_MD *md;
+    unsigned char md_value[EVP_MAX_MD_SIZE];
+    unsigned int md_len;
+    
+    md = EVP_md5();
+    mdctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(mdctx, md, NULL);
+    
+    // Используем саму строку URL как входные данные для хеша
+    EVP_DigestUpdate(mdctx, url.c_str(), url.length());
+    
+    EVP_DigestFinal_ex(mdctx, md_value, &md_len);
+    EVP_MD_CTX_free(mdctx);
+    
+    char md5string[33];
+    for(unsigned int i = 0; i < md_len; i++)
+        snprintf(&md5string[i*2], 3, "%02x", (unsigned int)md_value[i]);
+    
+    return std::string(md5string);
+}
+
+// Модифицируем функцию загрузки видео
+bool downloadVideoFromURL(const std::string& url, std::string& outputFilename) {
+    std::string tempDir = getCachePath() + "/temp_downloads";
+    fs::create_directories(tempDir);
+    
+    // Используем новую функцию для URL
+    std::string fileId = generateURLId(url);
+    
+    std::string outputPath = tempDir + "/" + fileId + ".mp4";
+    
+    // Проверяем, существует ли уже загруженный файл
+    if (fs::exists(outputPath)) {
+        std::cout << "Found previously downloaded file: " << outputPath << std::endl;
+        outputFilename = outputPath;
+        return true;
+    }
+    
+    // Формируем команду для yt-dlp
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "yt-dlp -f \"bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best\" "
+             "--merge-output-format mp4 "
+             "--no-playlist "
+             "--no-mtime "
+             "-o \"%s\" "
+             "\"%s\"",
+             outputPath.c_str(), url.c_str());
+    
+    std::cout << "Starting video download from URL: " << url << std::endl;
+    int result = system(cmd);
+    if (result != 0) {
+        std::cerr << "Error downloading video from URL" << std::endl;
+        return false;
+    }
+    
+    std::cout << "Video download completed successfully" << std::endl;
+    outputFilename = outputPath;
+    
+    // Регистрируем файл для удаления при завершении программы
+    registerTempFileForCleanup(outputPath);
+    
+    return true;
+}
+
+// Функция для регистрации временных файлов для удаления
+std::vector<std::string> tempFilesToCleanup;
+
+void registerTempFileForCleanup(const std::string& filePath) {
+    tempFilesToCleanup.push_back(filePath);
+}
+
+// Функция для очистки временных файлов
+void cleanupTempFiles() {
+    for (const auto& filePath : tempFilesToCleanup) {
+        if (fs::exists(filePath)) {
+            try {
+                fs::remove(filePath);
+                std::cout << "Removed temporary file: " << filePath << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Error removing temporary file: " << filePath << " - " << e.what() << std::endl;
+            }
+        }
+    }
+    tempFilesToCleanup.clear();
+}
+
+// Модифицированная функция для обработки как файлов, так и URL с поддержкой отслеживания прогресса
+bool processMediaSource(const std::string& source, std::string& processedFilePath, ProgressCallback progressCallback) {
+    // Проверяем, является ли источник URL
+    if (isURL(source)) {
+        // Если это URL, загружаем видео с отслеживанием прогресса
+        if (!downloadVideoFromURL(source, processedFilePath)) {
+            return false;
+        }
+        
+        // Если загрузка успешна и есть callback, сообщаем о завершении
+        if (progressCallback) {
+            progressCallback(100);
+        }
+    } else {
+        // Если это локальный файл, просто используем его путь
+        processedFilePath = source;
+        
+        // Для локальных файлов прогресс мгновенный
+        if (progressCallback) {
+            progressCallback(100);
+        }
+    }
+    
+    return true;
+}
+
+// Original version without progress callback for backward compatibility
+bool convertToLowRes(const char* filename, std::string& outputFilename) {
+    // Call the version with progress callback but pass nullptr
+    return convertToLowRes(filename, outputFilename, nullptr);
+}
+
+// Original version without progress callback for backward compatibility
+bool processMediaSource(const std::string& source, std::string& processedFilePath) {
+    // Call the version with progress callback but pass nullptr
+    return processMediaSource(source, processedFilePath, nullptr);
 }

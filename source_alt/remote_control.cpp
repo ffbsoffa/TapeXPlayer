@@ -1,4 +1,5 @@
 #include "remote_control.h"
+#include "common.h"  // Добавляем явное включение common.h
 #include <iostream>
 #include <cstring>
 #include <algorithm>
@@ -11,7 +12,7 @@ extern std::atomic<bool> is_reverse;  // Add reference to is_reverse
 
 // Speed control constants
 const double MIN_SPEED = 0.01;   // Minimum speed (1%)
-const double MAX_SPEED = 18.0;   // Maximum speed (1800%)
+const double MAX_SPEED = 24.0;   // Maximum speed (1800%)
 const double SPEED_EPSILON = 0.0001; // Epsilon for speed comparison
 const double DEFAULT_SPEED = 4.0;   // 400% default speed
 const double SPEED_STEP = 0.75;   // 50% speed change per step
@@ -221,7 +222,12 @@ void RemoteControl::handle_hui_message(double deltatime, std::vector<unsigned ch
             if (velocity == 0x7F && !button_pressed) {  // Button pressed
                 button_pressed = true;
                 
-                if (!is_playing) {
+                // Check speed before playback
+                double current_speed = get_playback_rate().load();
+                if (std::abs(current_speed) > 1.1) {
+                    // At high speed, first reset speed
+                    reset_to_normal_speed();
+                } else if (!is_playing) {
                     // Start playback if stopped
                     is_playing = true;
                     handle_play();
@@ -350,12 +356,14 @@ void RemoteControl::stop_processing_thread() {
 }
 
 void RemoteControl::command_processing_thread() {
-    while (thread_running && !quit) {
+    while (thread_running) {
         process_commands();
+        
+        // Update timecode even without commands to keep FSFrameDebugger current
         update_timecode();
         
-        // Add a small delay
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // Optimize update interval to reduce CPU load
+        std::this_thread::sleep_for(std::chrono::milliseconds(30)); // ~30 fps
     }
 }
 
@@ -365,18 +373,30 @@ void RemoteControl::update_timecode() {
     try {
         std::string current_tc = get_current_timecode();
         
-        if (current_tc.length() > 0 && strncmp(shared_cmd->timecode, current_tc.c_str(), 11) != 0) {
+        // Get current playback state
+        bool is_playing_state = true;  // Should be logical value from player state
+        bool is_reverse_state = is_reverse.load();
+        float current_rate_value = static_cast<float>(get_playback_rate().load());
+        
+        // Update all fields in shared memory
+        shared_cmd->flags.is_playing = is_playing_state ? 1 : 0;
+        shared_cmd->flags.is_reverse = is_reverse_state ? 1 : 0;
+        shared_cmd->current_rate = current_rate_value;
+        
+        // Update timecode only if changed
+        if (strncmp(shared_cmd->timecode, current_tc.c_str(), 11) != 0) {
             strncpy(shared_cmd->timecode, current_tc.c_str(), 11);
             shared_cmd->timecode[11] = '\0';
             
-            // Update HUI display
+#ifndef _WIN32
+            // Sync entire structure
+            msync(shared_cmd, sizeof(RemoteCommand), MS_ASYNC);
+#endif
+            
+            // Also update timecode on external display
             if (hui_initialized) {
                 update_hui_timecode(current_tc);
             }
-            
-#ifndef _WIN32
-            msync(shared_cmd, sizeof(RemoteCommand), MS_SYNC);
-#endif
         }
     }
     catch (const std::exception& e) {
@@ -544,6 +564,11 @@ bool RemoteControl::create_shared_memory() {
     strncpy(shared_cmd->timecode, "00:00:00:00", 11);
     shared_cmd->timecode[11] = '\0';
     
+    // Initialize new fields
+    shared_cmd->flags.is_playing = 0;
+    shared_cmd->flags.is_reverse = 0;
+    shared_cmd->current_rate = 1.0f;
+    
     // Force synchronization
     msync(shared_cmd, sizeof(RemoteCommand), MS_SYNC);
     
@@ -608,7 +633,16 @@ void RemoteControl::handle_seek(double time) {
 }
 
 void RemoteControl::handle_play() {
-    toggle_pause();
+    // Check current speed
+    double current_speed = get_playback_rate().load();
+    
+    if (std::abs(current_speed) > 1.1) {
+        // If speed is high, reset it
+        reset_to_normal_speed();
+    } else {
+        // Otherwise normal pause toggle
+        toggle_pause();
+    }
 }
 
 void RemoteControl::handle_stop() {
@@ -713,4 +747,70 @@ void RemoteControl::cleanup_display() {
         };
         midi_out->sendMessage(&clear_msg);
     }
+}
+
+std::vector<std::string> RemoteControl::get_input_devices() const {
+    std::vector<std::string> devices;
+    if (!midi_in) return devices;
+    
+    for (unsigned int i = 0; i < midi_in->getPortCount(); i++) {
+        devices.push_back(midi_in->getPortName(i));
+    }
+    return devices;
+}
+
+std::vector<std::string> RemoteControl::get_output_devices() const {
+    std::vector<std::string> devices;
+    if (!midi_out) return devices;
+    
+    for (unsigned int i = 0; i < midi_out->getPortCount(); i++) {
+        devices.push_back(midi_out->getPortName(i));
+    }
+    return devices;
+}
+
+bool RemoteControl::select_device(const std::string& device_name, bool is_input) {
+    try {
+        if (is_input && midi_in) {
+            // Close current port if open
+            midi_in->closePort();
+            
+            // Find and open new port
+            for (unsigned int i = 0; i < midi_in->getPortCount(); i++) {
+                if (midi_in->getPortName(i) == device_name) {
+                    midi_in->openPort(i);
+                    midi_in->setCallback(&RemoteControl::hui_callback, this);
+                    midi_in->ignoreTypes(false, false, false);
+                    current_input_device = device_name;
+                    return true;
+                }
+            }
+        }
+        else if (!is_input && midi_out) {
+            // Close current port if open
+            midi_out->closePort();
+            
+            // Find and open new port
+            for (unsigned int i = 0; i < midi_out->getPortCount(); i++) {
+                if (midi_out->getPortName(i) == device_name) {
+                    midi_out->openPort(i);
+                    current_output_device = device_name;
+                    initialize_display();
+                    return true;
+                }
+            }
+        }
+    }
+    catch (RtMidiError &error) {
+        std::cerr << "Error selecting MIDI device: " << error.getMessage() << std::endl;
+    }
+    return false;
+}
+
+std::string RemoteControl::get_current_input_device() const {
+    return current_input_device;
+}
+
+std::string RemoteControl::get_current_output_device() const {
+    return current_output_device;
 } 

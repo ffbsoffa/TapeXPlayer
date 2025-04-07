@@ -18,6 +18,7 @@ extern "C" {
 #include "common.h"
 #include <random>
 #include <nfd.hpp>
+#include <map>
 
 std::vector<float> audio_buffer;
 size_t audio_buffer_index = 0;
@@ -37,7 +38,17 @@ const double JOG_SPEED = 0.25;
 
 std::atomic<int> sample_rate{44100};
 
+// Global variables for audio device management
+std::atomic<int> current_audio_device_index(0);
+std::atomic<int> selected_audio_device_index(-1); // Index of user-selected audio card
+std::mutex audio_device_mutex;
 PaStream* stream = nullptr;
+
+// Map to store the actual device indices for each menu item index
+std::map<int, int> menu_to_device_index;
+
+// Function declarations
+std::vector<std::string> get_audio_output_devices();
 
 void smooth_speed_change() {
     const double normal_step = 0.3;
@@ -163,6 +174,15 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
     float *out = (float*)outputBuffer;
     (void) inputBuffer; 
 
+    // Check if audio buffer is empty or not initialized
+    if (audio_buffer.empty()) {
+        // Fill output buffer with silence
+        for (unsigned int i = 0; i < framesPerBuffer * 2; i++) {
+            *out++ = 0.0f;
+        }
+        return paContinue;
+    }
+
     double rate = playback_rate.load();
     if (rate == 0.0) {
         for (unsigned int i = 0; i < framesPerBuffer * 2; i++) {
@@ -182,7 +202,7 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
             position = std::min(static_cast<double>(audio_buffer.size() - window_size), position + rate);
         }
 
-        if (position < 0 || position >= audio_buffer.size() - window_size) {
+        if (position < 0 || position >= audio_buffer.size() - window_size || audio_buffer.size() < window_size * 2) {
             *out++ = 0.0f;
             *out++ = 0.0f;
         } else {
@@ -190,6 +210,10 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
             float sum_right = 0.0f;
             for (int j = 0; j < window_size; ++j) {
                 size_t index = static_cast<size_t>(position) + j;
+                if (index * 2 + 1 >= audio_buffer.size()) {
+                    // Prevent out-of-bounds access
+                    continue;
+                }
                 float weight = 1.0f - std::abs(j - (window_size / 2.0f - 0.5f)) / (window_size / 2.0f);
                 sum_left += audio_buffer[index * 2] * weight;
                 sum_right += audio_buffer[index * 2 + 1] * weight;
@@ -201,15 +225,18 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
 
     audio_buffer_index = static_cast<size_t>(position);
 
+    // Prevent division by zero if sample_rate is 0
+    double time_per_sample = sample_rate.load() > 0 ? 1.0 / sample_rate.load() : 0.0;
+    
+    // Check if audio_buffer is valid before calculating times
+    if (!audio_buffer.empty()) {
+        double elapsed_time = audio_buffer_index * time_per_sample;
+        double total_time = (audio_buffer.size() / 2) * time_per_sample; 
+        double adjusted_total_time = total_time - 0.1; 
 
-    double time_per_sample = 1.0 / sample_rate.load();
-    double elapsed_time = audio_buffer_index * time_per_sample;
-    double total_time = (audio_buffer.size() / 2) * time_per_sample; 
-    double adjusted_total_time = total_time - 0.1; 
-
-    elapsed_time = std::max(0.0, std::min(elapsed_time, adjusted_total_time));
-
-    current_audio_time.store(elapsed_time, std::memory_order_release);
+        elapsed_time = std::max(0.0, std::min(elapsed_time, adjusted_total_time));
+        current_audio_time.store(elapsed_time, std::memory_order_release);
+    }
 
     return paContinue;
 }
@@ -353,31 +380,71 @@ void start_audio(const char* filename) {
     try {
         std::cout << "Starting audio initialization..." << std::endl;
 
+        // Clear any existing audio buffer
+        audio_buffer.clear();
+        audio_buffer_index = 0;
+        decoding_finished.store(false);
+        decoding_completed.store(false);
+
         PaError err;
         err = Pa_Initialize();
         if (err != paNoError) {
             throw std::runtime_error("PortAudio error: " + std::string(Pa_GetErrorText(err)));
         }
 
-        PaStream *stream;
         PaStreamParameters outputParameters;
 
-        outputParameters.device = Pa_GetDefaultOutputDevice();
-        if (outputParameters.device == paNoDevice) {
+        // Use selected device if set, otherwise use default
+        int deviceIndex;
+        if (selected_audio_device_index.load() >= 0) {
+            deviceIndex = selected_audio_device_index.load();
+            std::cout << "Using previously selected audio device (index " << deviceIndex << ")" << std::endl;
+        } else {
+            deviceIndex = Pa_GetDefaultOutputDevice();
+            std::cout << "Using default audio device (index " << deviceIndex << ")" << std::endl;
+        }
+        
+        if (deviceIndex == paNoDevice) {
             throw std::runtime_error("No default output device.");
         }
+        
+        // Check if device supports output
+        const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(deviceIndex);
+        if (!deviceInfo || deviceInfo->maxOutputChannels <= 0) {
+            std::cerr << "Selected device does not support output, falling back to default" << std::endl;
+            deviceIndex = Pa_GetDefaultOutputDevice();
+            if (deviceIndex == paNoDevice) {
+                throw std::runtime_error("No default output device.");
+            }
+        }
+        
+        // Store the current device index
+        current_audio_device_index.store(deviceIndex);
+        
+        // Make sure the menu_to_device_index map is initialized
+        get_audio_output_devices();
+        
+        outputParameters.device = deviceIndex;
         outputParameters.channelCount = 2;
         outputParameters.sampleFormat = paFloat32;
         outputParameters.suggestedLatency = Pa_GetDeviceInfo(outputParameters.device)->defaultLowOutputLatency;
         outputParameters.hostApiSpecificStreamInfo = NULL;
 
-        // Начинаем декодирование аудио в отдельном потоке
+        // Start decoding audio in a separate thread
         std::thread decoding_thread([filename]() {
             decode_audio(filename);
         });
         decoding_thread.detach(); 
 
+        // Give the decoding thread a moment to start
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // Close any existing stream
+        if (stream) {
+            Pa_StopStream(stream);
+            Pa_CloseStream(stream);
+            stream = nullptr;
+        }
 
         err = Pa_OpenStream(
             &stream,
@@ -408,7 +475,8 @@ void start_audio(const char* filename) {
         std::cout << "Audio playback started. Decoding continues in background." << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "Audio Error: " << e.what() << std::endl;
-        quit.store(true);
+        // Don't quit the application on audio error, just report it
+        // quit.store(true);
     }
 }
 
@@ -443,13 +511,13 @@ std::string generateTXTimecode(double time) {
     double fps = original_fps.load();
     double total_dur = total_duration.load();
 
-    // Жестко ограничиваем время длительностью файла
+    // Hard limit time to file duration
     time = std::min(std::max(time, 0.0), total_dur);
 
     int64_t total_frames = static_cast<int64_t>(std::round(time * fps));
     int64_t max_frames = static_cast<int64_t>(std::floor(total_dur * fps));
 
-    // Жеско ограничиваем количество кадров
+    // Hard limit frame count
     total_frames = std::min(total_frames, max_frames);
 
     int hours = static_cast<int>(total_frames / (3600 * fps));
@@ -575,11 +643,188 @@ double parse_timecode(const std::string& timecode) {
     return hours * 3600.0 + minutes * 60.0 + seconds + frames / fps;
 }
 
-void cleanup_audio() {
+// Function to get the number of available audio devices
+int get_audio_device_count() {
+    return Pa_GetDeviceCount();
+}
+
+// Function to get the name of an audio device by index
+std::string get_audio_device_name(int index) {
+    const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(index);
+    if (deviceInfo) {
+        return deviceInfo->name;
+    }
+    return "Unknown Device";
+}
+
+// Function to get the current audio device index as a menu index
+int get_current_audio_device_index() {
+    int currentDeviceIndex = current_audio_device_index.load();
+    
+    // Find the menu index that corresponds to this device index
+    for (const auto& pair : menu_to_device_index) {
+        if (pair.second == currentDeviceIndex) {
+            return pair.first;
+        }
+    }
+    
+    // If not found, return -1
+    return -1;
+}
+
+// Function to get a list of all available audio output devices with their actual indices
+std::vector<std::string> get_audio_output_devices() {
+    std::vector<std::string> devices;
+    menu_to_device_index.clear();
+    
+    // Initialize PortAudio if needed
+    static bool pa_initialized = false;
+    if (!pa_initialized) {
+        PaError err = Pa_Initialize();
+        if (err != paNoError) {
+            return devices; // Return empty list on error
+        }
+        pa_initialized = true;
+    }
+    
+    int numDevices = Pa_GetDeviceCount();
+    if (numDevices < 0) {
+        return devices; // Return empty list on error
+    }
+    
+    // Add all output devices to the list
+    int menuIndex = 0;
+    for (int i = 0; i < numDevices; i++) {
+        const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(i);
+        if (deviceInfo && deviceInfo->maxOutputChannels > 0) {
+            devices.push_back(deviceInfo->name);
+            menu_to_device_index[menuIndex] = i;  // Map menu index to actual device index
+            menuIndex++;
+        }
+    }
+    
+    return devices;
+}
+
+// Function to switch to a different audio device
+bool switch_audio_device(int menuIndex) {
+    std::lock_guard<std::mutex> lock(audio_device_mutex);
+    
+    // Get the actual device index from the menu index
+    if (menu_to_device_index.find(menuIndex) == menu_to_device_index.end()) {
+        std::cerr << "Invalid menu index: " << menuIndex << std::endl;
+        return false;
+    }
+    
+    int deviceIndex = menu_to_device_index[menuIndex];
+    
+    // Check if the device index is valid
+    if (deviceIndex < 0 || deviceIndex >= Pa_GetDeviceCount()) {
+        std::cerr << "Invalid device index: " << deviceIndex << std::endl;
+        return false;
+    }
+    
+    // Check if the device supports output
+    const PaDeviceInfo* deviceInfo = Pa_GetDeviceInfo(deviceIndex);
+    if (!deviceInfo || deviceInfo->maxOutputChannels <= 0) {
+        std::cerr << "Device does not support output" << std::endl;
+        return false;
+    }
+    
+    // Сохраняем выбранный индекс устройства
+    selected_audio_device_index.store(deviceIndex);
+    
+    // If we're already using this device, do nothing
+    if (deviceIndex == current_audio_device_index.load() && stream) {
+        return true;
+    }
+    
+    // Remember the current playback state
+    double current_time = current_audio_time.load();
+    double current_rate = playback_rate.load();
+    double current_target_rate = target_playback_rate.load();
+    bool current_reverse = is_reverse.load();
+    
+    // Stop and close the current stream
     if (stream) {
         Pa_StopStream(stream);
         Pa_CloseStream(stream);
         stream = nullptr;
     }
-    Pa_Terminate();
+    
+    // Set up new stream parameters
+    PaStreamParameters outputParameters;
+    outputParameters.device = deviceIndex;
+    outputParameters.channelCount = 2;
+    outputParameters.sampleFormat = paFloat32;
+    outputParameters.suggestedLatency = Pa_GetDeviceInfo(deviceIndex)->defaultLowOutputLatency;
+    outputParameters.hostApiSpecificStreamInfo = NULL;
+    
+    // Open and start the new stream
+    PaError err = Pa_OpenStream(
+        &stream,
+        NULL, 
+        &outputParameters,
+        sample_rate.load(), 
+        256,   
+        paClipOff,
+        patestCallback,
+        NULL);
+    
+    if (err != paNoError) {
+        std::cerr << "Failed to open new audio device: " << Pa_GetErrorText(err) << std::endl;
+        return false;
+    }
+    
+    err = Pa_StartStream(stream);
+    if (err != paNoError) {
+        std::cerr << "Failed to start new audio device: " << Pa_GetErrorText(err) << std::endl;
+        Pa_CloseStream(stream);
+        stream = nullptr;
+        return false;
+    }
+    
+    // Update the current device index
+    current_audio_device_index.store(deviceIndex);
+    
+    // Restore playback state
+    current_audio_time.store(current_time);
+    playback_rate.store(current_rate);
+    target_playback_rate.store(current_target_rate);
+    is_reverse.store(current_reverse);
+    
+    std::cout << "Switched to audio device: " << deviceInfo->name << std::endl;
+    return true;
+}
+
+void cleanup_audio() {
+    std::lock_guard<std::mutex> lock(audio_device_mutex);
+    
+    try {
+        if (stream) {
+            PaError err = Pa_StopStream(stream);
+            if (err != paNoError) {
+                std::cerr << "Error stopping stream: " << Pa_GetErrorText(err) << std::endl;
+            }
+            
+            err = Pa_CloseStream(stream);
+            if (err != paNoError) {
+                std::cerr << "Error closing stream: " << Pa_GetErrorText(err) << std::endl;
+            }
+            stream = nullptr;
+        }
+        
+        PaError err = Pa_Terminate();
+        if (err != paNoError) {
+            std::cerr << "Error terminating PortAudio: " << Pa_GetErrorText(err) << std::endl;
+        }
+        
+        // Clear audio buffer to free memory
+        std::vector<float>().swap(audio_buffer);
+        audio_buffer_index = 0;
+        
+        std::cout << "Audio system cleaned up successfully" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error during audio cleanup: " << e.what() << std::endl;
+    }
 }

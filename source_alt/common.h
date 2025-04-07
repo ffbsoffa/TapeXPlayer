@@ -52,4 +52,28 @@ struct SeekInfo {
 
 extern SeekInfo seekInfo;
 
+// Добавьте сигнальную переменную
+extern std::atomic<bool> speed_reset_requested;
+
+// Добавляем объявление функции для сброса скорости
+void reset_to_normal_speed();
+
+// Переменные и функции для управления зумом
+extern std::atomic<bool> zoom_enabled;
+extern std::atomic<float> zoom_factor;
+extern std::atomic<float> zoom_center_x;
+extern std::atomic<float> zoom_center_y;
+extern std::atomic<bool> show_zoom_thumbnail;
+
+// Максимальный и минимальный коэффициент зума
+extern const float MAX_ZOOM_FACTOR;
+extern const float MIN_ZOOM_FACTOR;
+
+// Функции для управления зумом
+void increase_zoom();
+void decrease_zoom();
+void reset_zoom();
+void set_zoom_center(float x, float y);
+void toggle_zoom_thumbnail();
+
 #endif // COMMON_H
