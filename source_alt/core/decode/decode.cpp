@@ -84,7 +84,7 @@ void FrameCleaner::cleanFrames(int startFrame, int endFrame) {
             if (frameIndex[i].low_res_frame) {
                 frameIndex[i].low_res_frame.reset();
             }
-            // Не удаляем cached_frame
+           
             if (frameIndex[i].cached_frame) {
                 frameIndex[i].type = FrameInfo::CACHED;
             } else {
@@ -144,7 +144,7 @@ void printMemoryUsage() {
     // Implementation... (Keep this if still needed)
 }
 
-// Функция для проверки, является ли строка URL
+
 bool isURL(const std::string& str) {
     std::regex url_regex(
         R"(https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))",
@@ -153,7 +153,7 @@ bool isURL(const std::string& str) {
     return std::regex_match(str, url_regex);
 }
 
-// Добавляем функцию для генерации ID для URL
+
 std::string generateURLId(const std::string& url) {
     EVP_MD_CTX *mdctx;
     const EVP_MD *md;
@@ -177,7 +177,6 @@ std::string generateURLId(const std::string& url) {
     return std::string(md5string);
 }
 
-// Модифицируем функцию загрузки видео
 bool downloadVideoFromURL(const std::string& url, std::string& outputFilename) {
     std::string tempDir = LowResDecoder::getCachePath() + "/temp_downloads";
     fs::create_directories(tempDir);
@@ -187,14 +186,14 @@ bool downloadVideoFromURL(const std::string& url, std::string& outputFilename) {
     
     std::string outputPath = tempDir + "/" + fileId + ".mp4";
     
-    // Проверяем, существует ли уже загруженный файл
+
     if (fs::exists(outputPath)) {
         std::cout << "Found previously downloaded file: " << outputPath << std::endl;
         outputFilename = outputPath;
         return true;
     }
     
-    // Формируем команду для yt-dlp
+
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
              "yt-dlp -f \"bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best\" "
@@ -215,20 +214,19 @@ bool downloadVideoFromURL(const std::string& url, std::string& outputFilename) {
     std::cout << "Video download completed successfully" << std::endl;
     outputFilename = outputPath;
     
-    // Регистрируем файл для удаления при завершении программы
+
     registerTempFileForCleanup(outputPath);
     
     return true;
 }
 
-// Функция для регистрации временных файлов для удаления
+
 std::vector<std::string> tempFilesToCleanup;
 
 void registerTempFileForCleanup(const std::string& filePath) {
     tempFilesToCleanup.push_back(filePath);
 }
 
-// Функция для очистки временных файлов
 void cleanupTempFiles() {
     for (const auto& filePath : tempFilesToCleanup) {
         if (fs::exists(filePath)) {
@@ -243,24 +241,24 @@ void cleanupTempFiles() {
     tempFilesToCleanup.clear();
 }
 
-// Модифицированная функция для обработки как файлов, так и URL с поддержкой отслеживания прогресса
+
 bool processMediaSource(const std::string& source, std::string& processedFilePath, ProgressCallback progressCallback) {
     // Проверяем, является ли источник URL
     if (isURL(source)) {
-        // Если это URL, загружаем видео с отслеживанием прогресса
+
         if (!downloadVideoFromURL(source, processedFilePath)) {
             return false;
         }
         
-        // Если загрузка успешна и есть callback, сообщаем о завершении
+
         if (progressCallback) {
             progressCallback(100);
         }
     } else {
-        // Если это локальный файл, просто используем его путь
+
         processedFilePath = source;
         
-        // Для локальных файлов прогресс мгновенный
+ 
         if (progressCallback) {
             progressCallback(100);
         }
@@ -269,22 +267,22 @@ bool processMediaSource(const std::string& source, std::string& processedFilePat
     return true;
 }
 
-// Original version without progress callback for backward compatibility
+
 bool convertToLowRes(const char* filename, std::string& outputFilename) {
-    // Call the version with progress callback but pass nullptr
+
     return LowResDecoder::convertToLowRes(filename, outputFilename, nullptr);
 }
 
-// Версия processMediaSource без колбэка прогресса
+
 bool processMediaSource(const std::string& source, std::string& processedFilePath) {
     bool result = false;
     
-    // Проверяем, является ли источник URL
+
     if (isURL(source)) {
-        // Если это URL, загружаем видео
+
         result = downloadVideoFromURL(source, processedFilePath);
     } else {
-        // Если это локальный файл, просто используем его путь
+
         processedFilePath = source;
         result = true;
     }
