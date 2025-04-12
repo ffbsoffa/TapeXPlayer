@@ -25,7 +25,6 @@
 
 namespace fs = std::filesystem;
 
-// Глобальный промежуточный буфер
 FrameBuffer frameBuffer;
 
 extern std::atomic<bool> speed_reset_requested;
