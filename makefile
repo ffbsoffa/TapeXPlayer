@@ -9,38 +9,12 @@ USE_DEBUG_SOURCE = 0
 FRAMEWORKS = -framework VideoToolbox -framework AudioToolbox -framework CoreFoundation \
             -framework CoreVideo -framework CoreMedia -framework AppKit -framework CoreMIDI \
             -framework CoreAudio -framework UniformTypeIdentifiers -framework OpenGL \
-            -framework Cocoa
+            -framework Cocoa -framework Metal 
 
 # Common libraries
 LIBS = -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 -lSDL2 -lSDL2_ttf -lrtmidi \
        -lportaudio -lavcodec -lavformat -lavutil -lswscale -lswresample \
        -lssl -lcrypto -lGLEW
-
-# ARM64 settings
-ARM_PREFIX = /opt/homebrew
-ARM_CFLAGS = -I$(ARM_PREFIX)/include \
-             -I$(ARM_PREFIX)/include/gstreamer-1.0 \
-             -I$(ARM_PREFIX)/include/glib-2.0 \
-             -I$(ARM_PREFIX)/lib/glib-2.0/include \
-             -I$(ARM_PREFIX)/include/SDL2 \
-             -I$(ARM_PREFIX)/Cellar/rtmidi/6.0.0/include/rtmidi \
-             -I$(ARM_PREFIX)/opt/openssl/include \
-             -I$(SRC_DIR)/nfd/include
-
-ARM_LDFLAGS = -L$(ARM_PREFIX)/lib \
-              -L$(ARM_PREFIX)/opt/openssl/lib \
-              -L$(ARM_PREFIX)/Cellar/rtmidi/6.0.0/lib \
-              -L$(ARM_PREFIX)/Cellar/ffmpeg/7.1_4/lib \
-              -L$(ARM_PREFIX)/Cellar/sdl2/2.30.11/lib \
-              -L$(ARM_PREFIX)/Cellar/sdl2_ttf/2.24.0/lib \
-              -L$(ARM_PREFIX)/Cellar/portaudio/19.7.0/lib \
-              -Wl,-rpath,$(ARM_PREFIX)/lib \
-              -Wl,-rpath,$(ARM_PREFIX)/opt/openssl/lib \
-              -Wl,-rpath,$(ARM_PREFIX)/Cellar/rtmidi/6.0.0/lib \
-              -Wl,-rpath,$(ARM_PREFIX)/Cellar/ffmpeg/7.1_4/lib \
-              -Wl,-rpath,$(ARM_PREFIX)/Cellar/sdl2/2.30.11/lib \
-              -Wl,-rpath,$(ARM_PREFIX)/Cellar/sdl2_ttf/2.24.0/lib \
-              -Wl,-rpath,$(ARM_PREFIX)/Cellar/portaudio/19.7.0/lib
 
 # x86_64 settings
 X86_PREFIX = /usr/local
@@ -51,7 +25,8 @@ X86_CFLAGS = -I$(X86_PREFIX)/include \
              -I$(X86_PREFIX)/include/SDL2 \
              -I$(X86_PREFIX)/Cellar/rtmidi/6.0.0/include/rtmidi \
              -I$(X86_PREFIX)/opt/openssl/include \
-             -I$(SRC_DIR)/nfd/include
+             -I$(SRC_DIR)/nfd/include \
+             -I$(X86_PREFIX)/Cellar/ffmpeg/7.1_4/include
 
 X86_LDFLAGS = -L$(X86_PREFIX)/lib \
               -L$(X86_PREFIX)/opt/openssl/lib \
@@ -68,6 +43,33 @@ X86_LDFLAGS = -L$(X86_PREFIX)/lib \
               -Wl,-rpath,$(X86_PREFIX)/Cellar/sdl2_ttf/2.24.0/lib \
               -Wl,-rpath,$(X86_PREFIX)/Cellar/portaudio/19.7.0/lib
 
+# ARM64 settings
+ARM_PREFIX = /opt/homebrew
+ARM_CFLAGS = -I$(ARM_PREFIX)/include \
+             -I$(ARM_PREFIX)/include/gstreamer-1.0 \
+             -I$(ARM_PREFIX)/include/glib-2.0 \
+             -I$(ARM_PREFIX)/lib/glib-2.0/include \
+             -I$(ARM_PREFIX)/include/SDL2 \
+             -I$(ARM_PREFIX)/Cellar/rtmidi/6.0.0/include/rtmidi \
+             -I$(ARM_PREFIX)/opt/openssl/include \
+             -I$(SRC_DIR)/nfd/include \
+             -I$(ARM_PREFIX)/Cellar/ffmpeg/7.1_4/include
+
+ARM_LDFLAGS = -L$(ARM_PREFIX)/lib \
+              -L$(ARM_PREFIX)/opt/openssl/lib \
+              -L$(ARM_PREFIX)/Cellar/rtmidi/6.0.0/lib \
+              -L$(ARM_PREFIX)/Cellar/ffmpeg/7.1_4/lib \
+              -L$(ARM_PREFIX)/Cellar/sdl2/2.30.11/lib \
+              -L$(ARM_PREFIX)/Cellar/sdl2_ttf/2.24.0/lib \
+              -L$(ARM_PREFIX)/Cellar/portaudio/19.7.0/lib \
+              -Wl,-rpath,$(ARM_PREFIX)/lib \
+              -Wl,-rpath,$(ARM_PREFIX)/opt/openssl/lib \
+              -Wl,-rpath,$(ARM_PREFIX)/Cellar/rtmidi/6.0.0/lib \
+              -Wl,-rpath,$(ARM_PREFIX)/Cellar/ffmpeg/7.1_4/lib \
+              -Wl,-rpath,$(ARM_PREFIX)/Cellar/sdl2/2.30.11/lib \
+              -Wl,-rpath,$(ARM_PREFIX)/Cellar/sdl2_ttf/2.24.0/lib \
+              -Wl,-rpath,$(ARM_PREFIX)/Cellar/portaudio/19.7.0/lib
+
 ifeq ($(USE_DEBUG_SOURCE),1)
     ARM_NFD_LIB_PATH=source_debug/libnfd.a
     X86_NFD_LIB_PATH=source_debug/libnfd_x86_64.a
@@ -82,10 +84,20 @@ else
     SRC_DIR=source
 endif
 
-SRCS = $(wildcard $(SRC_DIR)/*.cpp)
-OBJC_SRCS = $(wildcard $(SRC_DIR)/*.mm)
-ARM_OBJS = $(SRCS:$(SRC_DIR)/%.cpp=obj/arm64/%.o) $(OBJC_SRCS:$(SRC_DIR)/%.mm=obj/arm64/%.o)
-X86_OBJS = $(SRCS:$(SRC_DIR)/%.cpp=obj/x86_64/%.o) $(OBJC_SRCS:$(SRC_DIR)/%.mm=obj/x86_64/%.o)
+SRCS = $(wildcard $(SRC_DIR)/*.cpp) \
+       $(wildcard $(SRC_DIR)/common/*.cpp) \
+       $(wildcard $(SRC_DIR)/main/*.cpp) \
+       $(wildcard $(SRC_DIR)/core/*/*.cpp)
+
+OBJC_SRCS = $(wildcard $(SRC_DIR)/*.mm) \
+            $(wildcard $(SRC_DIR)/common/*.mm) \
+            $(wildcard $(SRC_DIR)/main/*.mm) \
+            $(wildcard $(SRC_DIR)/core/*/*.mm)
+
+ARM_OBJS = $(patsubst $(SRC_DIR)/%.cpp,obj/arm64/%.o,$(SRCS)) \
+           $(patsubst $(SRC_DIR)/%.mm,obj/arm64/%.o,$(OBJC_SRCS))
+X86_OBJS = $(patsubst $(SRC_DIR)/%.cpp,obj/x86_64/%.o,$(SRCS)) \
+           $(patsubst $(SRC_DIR)/%.mm,obj/x86_64/%.o,$(OBJC_SRCS))
 
 TARGET = TapeXPlayer
 ifeq ($(USE_DEBUG_SOURCE),1)
@@ -96,12 +108,12 @@ X86_TARGET = $(TARGET)_x86_64
 
 .PHONY: all clean arm64 x86_64 debug
 
-all: universal
+all: x86_64 arm64 universal
 
 debug:
 	$(MAKE) USE_DEBUG_SOURCE=1
 
-universal: arm64 x86_64
+universal: $(ARM_TARGET) $(X86_TARGET)
 	lipo -create -output $(TARGET) $(ARM_TARGET) $(X86_TARGET)
 
 arm64: $(ARM_TARGET)
@@ -115,20 +127,20 @@ $(X86_TARGET): $(X86_OBJS)
 	$(CXX) -arch x86_64 $(X86_OBJS) $(X86_NFD_LIB_PATH) $(X86_LDFLAGS) $(LIBS) $(FRAMEWORKS) -o $@
 
 obj/arm64/%.o: $(SRC_DIR)/%.cpp
-	@mkdir -p obj/arm64
-	$(CXX) $(CXXFLAGS) -arch arm64 $(ARM_CFLAGS) -I"$(SRC_DIR)" -c $< -o $@
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -arch arm64 $(ARM_CFLAGS) -I"$(SRC_DIR)" -I"$(SRC_DIR)/common" -I"$(SRC_DIR)/main" -I"$(SRC_DIR)/core" -c $< -o $@
 
 obj/x86_64/%.o: $(SRC_DIR)/%.cpp
-	@mkdir -p obj/x86_64
-	$(CXX) $(CXXFLAGS) -arch x86_64 $(X86_CFLAGS) -I"$(SRC_DIR)" -c $< -o $@
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -arch x86_64 $(X86_CFLAGS) -I"$(SRC_DIR)" -I"$(SRC_DIR)/common" -I"$(SRC_DIR)/main" -I"$(SRC_DIR)/core" -c $< -o $@
 
 obj/arm64/%.o: $(SRC_DIR)/%.mm
-	@mkdir -p obj/arm64
-	$(CXX) $(CXXFLAGS) -arch arm64 $(ARM_CFLAGS) -I"$(SRC_DIR)" -c $< -o $@
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -arch arm64 $(ARM_CFLAGS) -I"$(SRC_DIR)" -I"$(SRC_DIR)/common" -I"$(SRC_DIR)/main" -I"$(SRC_DIR)/core" -c $< -o $@
 
 obj/x86_64/%.o: $(SRC_DIR)/%.mm
-	@mkdir -p obj/x86_64
-	$(CXX) $(CXXFLAGS) -arch x86_64 $(X86_CFLAGS) -I"$(SRC_DIR)" -c $< -o $@
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -arch x86_64 $(X86_CFLAGS) -I"$(SRC_DIR)" -I"$(SRC_DIR)/common" -I"$(SRC_DIR)/main" -I"$(SRC_DIR)/core" -c $< -o $@
 
 clean:
 	rm -rf obj $(TARGET) $(ARM_TARGET) $(X86_TARGET)
