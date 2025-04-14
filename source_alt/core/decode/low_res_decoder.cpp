@@ -9,6 +9,11 @@
 #include <unistd.h>
 #include <cmath> // For std::abs in timestamp comparison
 #include <atomic> // Include atomic header
+#include <cstdio> // For popen, pclose, fgets
+#include <string>
+#include <algorithm> // For std::min
+#include <vector> // For storing ffprobe output lines
+#include <cstdlib> // For atof
 
 namespace fs = std::filesystem;
 
@@ -202,9 +207,47 @@ std::string LowResDecoder::generateFileId(const std::string& filename) {
     return std::string(md5string);
 }
 
+// Function to get video duration using ffprobe
+double getVideoDuration(const std::string& filename) {
+    std::string command = "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \\\"" + filename + "\\\"";
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        std::cerr << "Error executing ffprobe command to get duration." << std::endl;
+        return -1.0;
+    }
+
+    char buffer[128];
+    std::string result = "";
+    while (!feof(pipe)) {
+        if (fgets(buffer, 128, pipe) != NULL) {
+            result += buffer;
+        }
+    }
+
+    int status = pclose(pipe);
+    if (status != 0 || result.empty()) {
+        std::cerr << "ffprobe command failed or returned empty result for duration. Status: " << status << std::endl;
+         std::cerr << "ffprobe output: " << result << std::endl; // Log ffprobe output on error
+        return -1.0;
+    }
+
+    try {
+        // Remove trailing newline if present
+        if (!result.empty() && result.back() == '\n') {
+            result.pop_back();
+        }
+        return std::stod(result); // Use stod for better precision and error handling
+    } catch (const std::invalid_argument& ia) {
+        std::cerr << "Invalid argument: Could not convert ffprobe duration output '" << result << "' to double." << std::endl;
+        return -1.0;
+    } catch (const std::out_of_range& oor) {
+        std::cerr << "Out of range: Could not convert ffprobe duration output '" << result << "' to double." << std::endl;
+        return -1.0;
+    }
+}
+
 bool LowResDecoder::convertToLowRes(const std::string& filename, std::string& outputFilename, ProgressCallback progressCallback) {
     std::string cacheDir = getCachePath();
-    
     fs::create_directories(cacheDir);
 
     std::string fileId = generateFileId(filename);
@@ -219,69 +262,118 @@ bool LowResDecoder::convertToLowRes(const std::string& filename, std::string& ou
         std::cout << "Found cached low-resolution file: " << cachePath << std::endl;
         outputFilename = cachePath;
         if (progressCallback) {
-            progressCallback(100); // Indicate completion
+            progressCallback(100);
         }
         return true;
     }
 
-    // Create FFmpeg command for low-res conversion
-    std::string command = "ffmpeg -y -i \"" + filename + "\" -vf \"scale=640:-1\" -c:v libx264 -crf 23 -preset veryfast -c:a aac -b:a 128k \"" + cachePath + "\" 2>&1";
-    
+    // --- Get Video Duration ---
+    double totalDuration = getVideoDuration(filename);
+    if (totalDuration <= 0) {
+        std::cerr << "Could not determine video duration. Progress reporting will be inaccurate." << std::endl;
+        // Proceed without accurate progress, or return false? For now, proceed.
+    } else {
+         std::cout << "Total video duration: " << totalDuration << " seconds." << std::endl;
+    }
+    // --- End Get Video Duration ---
+
+
+    // Create FFmpeg command for low-res conversion without audio (-an)
+    std::string command = "ffmpeg -y -i \"" + filename + "\" -vf \"scale=640:-2\" -c:v libx264 -crf 23 -preset veryfast -an \"" + cachePath + "\" 2>&1";
+
     FILE* pipe = popen(command.c_str(), "r");
     if (!pipe) {
         std::cerr << "Error executing FFmpeg command" << std::endl;
         return false;
     }
 
-    char buffer[128];
+    char buffer[256]; // Increased buffer size slightly
     std::string result = "";
-    
+    std::string line_buffer = ""; // Buffer to accumulate lines
+
     // Read FFmpeg output to track progress
-    while (!feof(pipe)) {
-        if (fgets(buffer, 128, pipe) != NULL) {
-            result += buffer;
-            
+    while (true) {
+        if (fgets(buffer, sizeof(buffer), pipe) == NULL) {
+             if (feof(pipe)) {
+                 // End of file reached
+                 break;
+             } else {
+                 // Error reading from pipe
+                 std::cerr << "Error reading FFmpeg output pipe." << std::endl;
+                 pclose(pipe); // Close the pipe before returning
+                 return false; // Indicate failure
+             }
+         }
+        
+        result += buffer; // Append to the complete result string
+        line_buffer += buffer; // Append to the current line buffer
+
+        // Process line by line (check for newline)
+        size_t newline_pos;
+        while ((newline_pos = line_buffer.find('\n')) != std::string::npos || (newline_pos = line_buffer.find('\r')) != std::string::npos) {
+             std::string current_line = line_buffer.substr(0, newline_pos);
+             line_buffer.erase(0, newline_pos + 1); // Remove processed line (and newline)
+
             // Parse FFmpeg output to estimate progress
             if (progressCallback) {
-                // Look for time= in the output
-                std::string output(buffer);
-                size_t timePos = output.find("time=");
-                if (timePos != std::string::npos) {
-                    // Extract time information
-                    std::string timeStr = output.substr(timePos + 5, 11); // "00:00:00.00"
-                    
+                size_t timePos = current_line.find("time=");
+                 if (timePos != std::string::npos) {
+                    // Look for the end of the time string (space or end of string)
+                     size_t timeEndPos = current_line.find_first_of(" \t", timePos + 5);
+                     std::string timeStr;
+                     if (timeEndPos != std::string::npos) {
+                         timeStr = current_line.substr(timePos + 5, timeEndPos - (timePos + 5));
+                     } else {
+                         timeStr = current_line.substr(timePos + 5); // Take rest of string
+                     }
+
+
                     // Convert time to seconds
-                    int hours = 0, minutes = 0, seconds = 0;
-                    float milliseconds = 0;
-                    sscanf(timeStr.c_str(), "%d:%d:%d.%f", &hours, &minutes, &seconds, &milliseconds);
-                    float currentTime = hours * 3600 + minutes * 60 + seconds + milliseconds / 100;
-                    
-                    // Estimate progress (assuming we know total duration)
-                    // Since we don't know the total duration here, we'll use a heuristic
-                    // This is a simplified approach - in a real implementation, you might want to 
-                    // first determine the total duration of the video
-                    int progress = std::min(int(currentTime / 3 * 100), 99); // Cap at 99% until complete
-                    progressCallback(progress);
+                    int hours = 0, minutes = 0;
+                    double seconds = 0.0; // Use double for seconds
+                    // Use sscanf which is readily available
+                    int scanned_items = sscanf(timeStr.c_str(), "%d:%d:%lf", &hours, &minutes, &seconds);
+
+                    if (scanned_items == 3) { // Ensure all parts were scanned
+                         double currentTime = hours * 3600.0 + minutes * 60.0 + seconds;
+
+                        // Calculate progress if duration is known
+                        if (totalDuration > 0) {
+                            int progress = std::min(static_cast<int>((currentTime / totalDuration) * 100.0), 99); // Cap at 99% until complete
+                            if (progressCallback) { // Call callback if provided
+                                progressCallback(progress);
+                            }
+                            // Also print progress to stdout
+                            std::cout << "Conversion Progress: " << progress << "%\r" << std::flush; 
+                         } else {
+                             // Optional: Provide some basic indication even without duration?
+                             // e.g., progressCallback(-1); // Indicate unknown progress
+                         }
+                    } else {
+                        // std::cerr << "Warning: Could not parse time string: " << timeStr << std::endl;
+                    }
                 }
             }
-        }
-    }
-    
+        } // end while processing lines
+    } // end while reading pipe
+
     int status = pclose(pipe);
+    std::cout << std::endl; // Move to next line after progress updates
     if (status != 0) {
         std::cerr << "FFmpeg command failed with status " << status << std::endl;
+        std::cerr << "FFmpeg output:\n" << result << std::endl;
+        // Consider removing the partially created cache file on failure
+        fs::remove(cachePath); 
         return false;
     }
 
     outputFilename = cachePath;
-    
-    // Register the file for cleanup
-    // registerTempFileForCleanup(cachePath); // This function seems missing/external - commented out
-    
+
     if (progressCallback) {
-        progressCallback(100); // Indicate completion
+        progressCallback(100); // Indicate completion via callback
     }
-    
+    std::cout << "Conversion Progress: 100%" << std::endl; // Final progress output to stdout
+
     return true;
 }
 

@@ -19,9 +19,32 @@ extern "C" {
 #include <random>
 #include <nfd.hpp>
 #include <map>
+#include <limits> // Needed for std::numeric_limits
+#include <cstring> // For strerror
 
-std::vector<float> audio_buffer;
-size_t audio_buffer_index = 0;
+// Headers for mmap and file operations
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <cstdio> // For mkstemp, unlink
+
+// Use int16_t for audio buffer to save memory
+// std::vector<int16_t> audio_buffer;
+
+// Add mmap state variables
+std::string audio_temp_filename; // Path to the mmap temp file
+int audio_write_fd = -1;         // FD for decoder writing
+int audio_read_fd = -1;          // FD for player reading
+int16_t* audio_write_ptr = nullptr; // Mmap pointer for writing
+const int16_t* audio_read_ptr = nullptr; // Mmap pointer for reading
+size_t audio_total_bytes = 0;      // Total size of the mapped file in bytes
+size_t audio_total_samples = 0;    // Total number of int16_t samples expected
+std::atomic<size_t> audio_decoded_samples_count(0); // Atomic counter for available samples
+std::mutex mmap_init_mutex; // Mutex to protect access during setup/cleanup
+
+// Playback position (remains similar)
+double audio_buffer_index = 0.0; // Fractional sample index (stereo pairs)
+
 std::atomic<bool> decoding_finished{false};
 std::atomic<bool> decoding_completed{false};
 
@@ -51,7 +74,7 @@ std::map<int, int> menu_to_device_index;
 std::vector<std::string> get_audio_output_devices();
 
 void smooth_speed_change() {
-    const double normal_step = 0.25;
+    const double normal_step = 0.4;
     const double pause_step = 1.0; // Still needed for pausing interpolation
     const int normal_interval = 7; // Re-add missing constant
     const int pause_interval = 4;  // Still needed for pausing interpolation
@@ -83,12 +106,12 @@ void smooth_speed_change() {
     auto calculate_and_set_volume = [&](double current_rate) {
         float new_volume = 1.0f; // Default to full volume
         if (current_rate <= 0.3) { // Start fading below 0.3x
-            new_volume = current_rate / 0.3f; // Linear fade from 0.3x down to 0
+            new_volume = static_cast<float>(current_rate / 0.3); // Linear fade from 0.3x down to 0 (cast needed)
         } else if (current_rate >= 7.0) {
             if (current_rate >= 18.0) {
                 new_volume = 0.15f;
             } else {
-                float t = (current_rate - 7.0f) / (18.0f - 7.0f);
+                float t = static_cast<float>((current_rate - 7.0) / (18.0 - 7.0)); // Cast needed
                 new_volume = 1.0f - (t * 0.85f);
             }
         }
@@ -243,28 +266,44 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
                           void *userData) {
     float *out = (float*)outputBuffer;
     (void) inputBuffer; 
+    (void) timeInfo;
+    (void) statusFlags;
+    (void) userData;
 
-    // Check if audio buffer is empty or not initialized
-    if (audio_buffer.empty()) {
-        // Fill output buffer with silence
-        for (unsigned int i = 0; i < framesPerBuffer * 2; i++) {
+    // Get mmap pointer and decoded count (check if ready)
+    const int16_t* current_read_ptr = audio_read_ptr; // Get current pointer atomically? No, ptr setup is mutexed.
+    size_t current_total_samples = audio_total_samples; // Get total expected size
+    size_t available_samples = audio_decoded_samples_count.load(std::memory_order_acquire);
+
+    // If mmap not ready or no samples available/decoded yet, output silence
+    if (current_read_ptr == nullptr || current_total_samples == 0) {
+        for (unsigned int i = 0; i < framesPerBuffer * 2; ++i) { // Assuming stereo
             *out++ = 0.0f;
         }
         return paContinue;
     }
 
+    // Get playback state
     double rate = playback_rate.load();
-    if (std::abs(rate) < 0.001) {
-        for (unsigned int i = 0; i < framesPerBuffer * 2; i++) {
+    if (std::abs(rate) < 0.001) { // Paused state
+        for (unsigned int i = 0; i < framesPerBuffer * 2; ++i) { // Assuming stereo
             *out++ = 0.0f;
         }
         return paContinue;
     }
 
-    float current_volume = volume.load(); // Громкость считывается ПОСЛЕ проверки rate == 0.0
-    double position = audio_buffer_index;
+    float current_volume = volume.load();
+    double current_position = audio_buffer_index; // Local copy for this callback run
+    bool reverse = is_reverse.load();
+    int current_channels = 2; // Assuming stereo - TODO: get from variable?
+    size_t buffer_num_sample_pairs = current_total_samples / current_channels; // Total number of sample pairs expected
 
-    // Helper function for Catmull-Rom interpolation
+    // Helper function for converting int16_t sample to float
+    auto int16_to_float = [](int16_t sample) -> float {
+        return static_cast<float>(sample) / 32768.0f;
+    };
+
+    // Helper function for Catmull-Rom interpolation (operates on floats)
     auto interpolate_catmull_rom = [](float p0, float p1, float p2, float p3, float t) -> float {
         // Formula from https://en.wikipedia.org/wiki/Cubic_Hermite_spline#Catmull%E2%80%93Rom_spline
         // (Slightly rearranged for efficiency)
@@ -278,93 +317,110 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
         );
     };
 
-    size_t buffer_half_size = audio_buffer.size() / 2;
-
     for (unsigned int i = 0; i < framesPerBuffer; i++) {
-        if (is_reverse.load()) {
-            position = std::max(0.0, position - rate);
+        // --- Calculate next position --- 
+        if (reverse) {
+             current_position -= rate;
+             // Wrap around or clamp at beginning
+             while (current_position < 0.0 && buffer_num_sample_pairs > 0) current_position += buffer_num_sample_pairs; 
+             current_position = std::max(0.0, current_position); // Clamp lower bound
         } else {
-            position = std::min(static_cast<double>(buffer_half_size - 2), position + rate);
+             current_position += rate;
+             // Check against *available* samples for forward playback limit before wrapping
+             size_t available_pairs = available_samples / current_channels;
+             if (available_pairs > 0 && current_position >= static_cast<double>(available_pairs)) {
+                 // Reached end of currently decoded data, clamp or wrap?
+                 // Clamping might be safer to avoid reading potentially unwritten data if wrap calculation is imperfect
+                 current_position = std::max(0.0, static_cast<double>(available_pairs - 1)); // Clamp to last available pair
+                 // Or wrap: 
+                 // while (current_position >= static_cast<double>(available_pairs) && available_pairs > 0) current_position -= available_pairs;
+             }
+             // Prevent going beyond the *total* expected pairs, even if wrapped/clamped
+             if (buffer_num_sample_pairs > 0) {
+                  current_position = std::min(current_position, static_cast<double>(buffer_num_sample_pairs - 1));
+             }
         }
+        
+        // --- Check Data Availability and Interpolate --- 
+        size_t index1 = static_cast<size_t>(current_position); // Integer part of position (sample pair index)
+        float frac = static_cast<float>(current_position - index1); // Fractional part
 
-        // --- Cubic Interpolation Logic ---
-        // Check bounds (need index - 1 to index + 2)
-        if (position >= 1.0 && position < static_cast<double>(buffer_half_size - 2) && audio_buffer.size() >= 8) 
-        { // Can perform Cubic interpolation
+        // Determine sample pair indices needed for interpolation
+        // Ensure indices stay within the bounds of a valid size_t
+        size_t idx_pair0_rel = (index1 >= 1) ? index1 - 1 : 0;
+        size_t idx_pair1_rel = index1;
+        size_t idx_pair2_rel = index1 + 1;
+        size_t idx_pair3_rel = index1 + 2;
 
-            size_t index1 = static_cast<size_t>(position); // Index before the fractional part
-            float frac = static_cast<float>(position - index1); // Fractional part
+        // Convert to absolute *sample* indices for the int16_t buffer
+        size_t max_needed_abs_sample_index = idx_pair3_rel * current_channels + (current_channels - 1);
 
-            // Get the 4 points for interpolation (indices: index1-1, index1, index1+1, index1+2)
-            size_t idx0 = (index1 - 1) * 2;
-            size_t idx1 = index1 * 2;
-            size_t idx2 = (index1 + 1) * 2;
-            size_t idx3 = (index1 + 2) * 2;
+        // *** CRUCIAL CHECK: Are all needed samples already decoded? ***
+        // Also check if indices are within the *total* expected bounds
+        if (idx_pair3_rel < buffer_num_sample_pairs && // Ensure highest pair index is within total bounds
+            max_needed_abs_sample_index < available_samples) // Ensure highest sample index is within *decoded* bounds
+        { 
+            // Indices are valid and data is available - proceed with interpolation
 
-            // Left channel interpolation
-            float yL0 = audio_buffer[idx0];
-            float yL1 = audio_buffer[idx1];
-            float yL2 = audio_buffer[idx2];
-            float yL3 = audio_buffer[idx3];
+            // Calculate absolute sample indices
+            size_t abs_idx0 = idx_pair0_rel * current_channels;
+            size_t abs_idx1 = idx_pair1_rel * current_channels;
+            size_t abs_idx2 = idx_pair2_rel * current_channels;
+            size_t abs_idx3 = idx_pair3_rel * current_channels;
+
+            // Get the 4 points (int16_t) for interpolation from mmap
+            // Left channel
+            int16_t sL0 = current_read_ptr[abs_idx0];
+            int16_t sL1 = current_read_ptr[abs_idx1];
+            int16_t sL2 = current_read_ptr[abs_idx2];
+            int16_t sL3 = current_read_ptr[abs_idx3];
+            // Right channel (index + 1)
+            int16_t sR0 = current_read_ptr[abs_idx0 + 1];
+            int16_t sR1 = current_read_ptr[abs_idx1 + 1];
+            int16_t sR2 = current_read_ptr[abs_idx2 + 1];
+            int16_t sR3 = current_read_ptr[abs_idx3 + 1];
+
+            // Convert points to float (using existing helper)
+            float yL0 = int16_to_float(sL0); float yL1 = int16_to_float(sL1);
+            float yL2 = int16_to_float(sL2); float yL3 = int16_to_float(sL3);
+            float yR0 = int16_to_float(sR0); float yR1 = int16_to_float(sR1);
+            float yR2 = int16_to_float(sR2); float yR3 = int16_to_float(sR3);
+
+            // Interpolate (using existing helper)
             float interpolated_left = interpolate_catmull_rom(yL0, yL1, yL2, yL3, frac);
-
-            // Right channel interpolation
-            float yR0 = audio_buffer[idx0 + 1];
-            float yR1 = audio_buffer[idx1 + 1];
-            float yR2 = audio_buffer[idx2 + 1];
-            float yR3 = audio_buffer[idx3 + 1];
             float interpolated_right = interpolate_catmull_rom(yR0, yR1, yR2, yR3, frac);
-
-            // Apply volume and output
-            *out++ = interpolated_left * current_volume;
-            *out++ = interpolated_right * current_volume;
-
-        } else if (position >= 0.0 && position < static_cast<double>(buffer_half_size - 1) && audio_buffer.size() >= 4) 
-        { // Can perform Linear interpolation (near edges)
-
-            size_t index1 = static_cast<size_t>(position); // Index before the fractional part
-            float frac = static_cast<float>(position - index1); // Fractional part
-
-            // Get the 2 points for interpolation (indices: index1, index1+1)
-            size_t idx1 = index1 * 2;
-            size_t idx2 = (index1 + 1) * 2;
-
-            // Left channel interpolation
-            float yL1 = audio_buffer[idx1];
-            float yL2 = audio_buffer[idx2];
-            float interpolated_left = yL1 + frac * (yL2 - yL1);
-
-            // Right channel interpolation
-            float yR1 = audio_buffer[idx1 + 1];
-            float yR2 = audio_buffer[idx2 + 1];
-            float interpolated_right = yR1 + frac * (yR2 - yR1);
 
              // Apply volume and output
             *out++ = interpolated_left * current_volume;
             *out++ = interpolated_right * current_volume;
 
-        } else { // Cannot interpolate (too close to edge or buffer too small)
-            // Cannot interpolate near edges or if buffer is too small
+        } else {
+            // Data not yet available or too close to edge (within total bounds), output silence
             *out++ = 0.0f;
             *out++ = 0.0f;
         }
-        // --- End Interpolation Logic ---
+        // --- End Check and Interpolate ---
     }
 
-    audio_buffer_index = static_cast<size_t>(position);
+    // Store the final position back to the global variable
+    audio_buffer_index = current_position;
 
-    // Prevent division by zero if sample_rate is 0
-    double time_per_sample = sample_rate.load() > 0 ? 1.0 / sample_rate.load() : 0.0;
-    
-    // Check if audio_buffer is valid before calculating times
-    if (!audio_buffer.empty()) {
-        double elapsed_time = audio_buffer_index * time_per_sample;
-        double total_time = (audio_buffer.size() / 2) * time_per_sample; 
-        double adjusted_total_time = total_time - 0.1; 
-
-        elapsed_time = std::max(0.0, std::min(elapsed_time, adjusted_total_time));
+    // --- Update current_audio_time based on mmap position --- 
+    int current_sample_rate = sample_rate.load();
+    if (current_sample_rate > 0) {
+        double time_per_sample_pair = 1.0 / current_sample_rate;
+        double elapsed_time = audio_buffer_index * time_per_sample_pair; 
+        
+        // Clamp time to total duration if known (using total_duration global)
+        double total_dur = total_duration.load(); // Get the total duration set elsewhere
+        if (total_dur > 0) {
+             elapsed_time = std::min(elapsed_time, total_dur - 0.01); // Prevent exceeding total duration slightly
+        }
+        elapsed_time = std::max(0.0, elapsed_time); // Ensure non-negative
+        
         current_audio_time.store(elapsed_time, std::memory_order_release);
     }
+    // --- End Time Update --- 
 
     return paContinue;
 }
@@ -377,8 +433,24 @@ void decode_audio(const char* filename) {
     AVPacket* packet = av_packet_alloc();
     int audio_stream_index = -1;
 
+    // --- Reset mmap state before decoding --- 
+    std::lock_guard<std::mutex> lock(mmap_init_mutex); // Protect cleanup/setup
+    // Cleanup previous mmap if any (e.g., if a previous decode failed midway)
+    if (audio_read_ptr) { munmap((void*)audio_read_ptr, audio_total_bytes); audio_read_ptr = nullptr; }
+    if (audio_write_ptr) { munmap(audio_write_ptr, audio_total_bytes); audio_write_ptr = nullptr; }
+    if (audio_read_fd != -1) { close(audio_read_fd); audio_read_fd = -1; }
+    if (audio_write_fd != -1) { close(audio_write_fd); audio_write_fd = -1; }
+    if (!audio_temp_filename.empty()) { unlink(audio_temp_filename.c_str()); audio_temp_filename.clear(); }
+    audio_total_bytes = 0;
+    audio_total_samples = 0;
+    audio_decoded_samples_count.store(0); 
+    decoding_finished.store(false); 
+    decoding_completed.store(false);
+    // --- End Reset --- 
+    // Mutex lock released here
+
     try {
-        std::cout << "Starting audio decoding..." << std::endl;
+        std::cout << "Starting audio decoding for mmap..." << std::endl;
         std::cout << "FFmpeg version: " << av_version_info() << std::endl;
 
         if (avformat_open_input(&format_ctx, filename, nullptr, nullptr) != 0) {
@@ -422,95 +494,247 @@ void decode_audio(const char* filename) {
             throw std::runtime_error("Could not allocate frame");
         }
 
-        std::cout << "Audio decoding setup complete, starting to read frames..." << std::endl;
+        std::cout << "Audio decoding setup complete." << std::endl;
 
-        sample_rate.store(audio_codec_ctx->sample_rate);
-        std::cout << "Audio sample rate: " << sample_rate.load() << " Hz" << std::endl;
+        // --- Determine Size and Create/Truncate Temp File --- 
+        int current_sample_rate = audio_codec_ctx->sample_rate;
+        int current_channels = audio_codec_ctx->ch_layout.nb_channels;
+        double duration_sec = 0.0;
+        if (format_ctx->duration != AV_NOPTS_VALUE) {
+             duration_sec = static_cast<double>(format_ctx->duration) / AV_TIME_BASE;
+        }
+        else if (format_ctx->streams[audio_stream_index]->duration != AV_NOPTS_VALUE) {
+            AVRational time_base = format_ctx->streams[audio_stream_index]->time_base;
+             duration_sec = static_cast<double>(format_ctx->streams[audio_stream_index]->duration) * time_base.num / time_base.den;
+        }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (duration_sec <= 0 || current_sample_rate <= 0 || current_channels <= 0) {
+             throw std::runtime_error("Could not determine audio duration/parameters for mmap.");
+        }
+
+        audio_total_samples = static_cast<size_t>(duration_sec * current_sample_rate * current_channels + 0.5); // +0.5 for rounding
+        audio_total_bytes = audio_total_samples * sizeof(int16_t);
+        sample_rate.store(current_sample_rate);
+
+        std::cout << "Estimated duration: " << duration_sec << "s, Sample Rate: " << current_sample_rate << " Hz, Channels: " << current_channels << std::endl;
+        std::cout << "Calculated total size: " << audio_total_samples << " samples, " << audio_total_bytes / (1024.0*1024.0) << " MB." << std::endl;
+
+        char temp_filename_template[] = "/tmp/tapexplayer_audio_XXXXXX";
+        audio_write_fd = mkstemp(temp_filename_template);
+        if (audio_write_fd == -1) {
+             throw std::runtime_error("Failed to create temporary file: " + std::string(strerror(errno)));
+        }
+        audio_temp_filename = temp_filename_template;
+        std::cout << "Created temporary file: " << audio_temp_filename << " (fd: " << audio_write_fd << ")" << std::endl;
+
+        // Ensure file is closed if we exit prematurely (needed for unlink)
+        struct FdCloser { int fd; ~FdCloser() { if(fd != -1) close(fd); } } writeFdCloser{audio_write_fd};
+
+        if (ftruncate(audio_write_fd, audio_total_bytes) == -1) {
+            unlink(audio_temp_filename.c_str()); // Cleanup before throwing
+            audio_temp_filename.clear();
+            throw std::runtime_error("Failed to truncate temporary file: " + std::string(strerror(errno)));
+        }
+        std::cout << "Truncated temporary file successfully." << std::endl;
+        // --- End File Creation/Truncation ---
+
+        // --- Map File for Writing --- 
+        audio_write_ptr = static_cast<int16_t*>(mmap(
+            nullptr, audio_total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, audio_write_fd, 0
+        ));
+        if (audio_write_ptr == MAP_FAILED) {
+             audio_write_ptr = nullptr; // Ensure it's null on failure
+             unlink(audio_temp_filename.c_str());
+             audio_temp_filename.clear();
+             throw std::runtime_error("Failed to map temporary file for writing: " + std::string(strerror(errno)));
+        }
+        std::cout << "Memory mapping for writing successful." << std::endl;
+        // --- End Map File --- 
+
+        std::cout << "Starting frame reading and writing to mmap..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Keep this pause?
 
         int frame_count = 0;
         int packet_count = 0;
         int ret;
+        size_t current_write_offset = 0; // Offset in int16_t samples
+
         while ((ret = av_read_frame(format_ctx, packet)) >= 0 && !quit.load()) {
             if (packet->stream_index == audio_stream_index) {
                 packet_count++;
                 ret = avcodec_send_packet(audio_codec_ctx, packet);
-                if (ret < 0) {
-                    std::cerr << "Error sending packet for decoding: " << av_err2str(ret) << std::endl;
-                    continue;
-                }
+                if (ret < 0) { std::cerr << "Error sending packet: " << av_err2str(ret) << std::endl; continue; }
 
                 while (ret >= 0) {
                     ret = avcodec_receive_frame(audio_codec_ctx, frame);
-                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                        break;
-                    } else if (ret < 0) {
-                        std::cerr << "Error during decoding: " << av_err2str(ret) << std::endl;
+                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { break; }
+                    else if (ret < 0) { std::cerr << "Error receiving frame: " << av_err2str(ret) << std::endl; break; }
+
+                    // --- Convert samples to int16_t and WRITE TO MMAP --- 
+                    const int16_t int16_max = std::numeric_limits<int16_t>::max();
+                    const int16_t int16_min = std::numeric_limits<int16_t>::min();
+                    size_t samples_in_frame = 0;
+
+                    // Check if write would exceed total allocated size
+                    if (current_write_offset + frame->nb_samples * current_channels > audio_total_samples) {
+                        std::cerr << "Warning: Decoded samples exceed estimated file size. Stopping decode prematurely." << std::endl;
+                        ret = AVERROR_EOF; // Force loop exit
                         break;
                     }
 
+                    int16_t* current_write_pos = audio_write_ptr + current_write_offset;
+
                     if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLTP) {
-                        for (int i = 0; i < frame->nb_samples; ++i) {
-                            for (int ch = 0; ch < frame->ch_layout.nb_channels; ++ch) {
-                                float sample = reinterpret_cast<float*>(frame->data[ch])[i];
-                                audio_buffer.push_back(sample);
+                        int samples_per_channel = frame->nb_samples;
+                        int num_channels = frame->ch_layout.nb_channels;
+                        float** float_data = reinterpret_cast<float**>(frame->data);
+                        samples_in_frame = samples_per_channel * num_channels;
+
+                        for (int i = 0; i < samples_per_channel; ++i) {
+                            for (int ch = 0; ch < num_channels; ++ch) {
+                                float sample_float = float_data[ch][i];
+                                float scaled_sample = sample_float * 32767.0f;
+                                int16_t sample_int16 = static_cast<int16_t>(std::round(std::max(static_cast<float>(int16_min), std::min(static_cast<float>(int16_max), scaled_sample))));
+                                *current_write_pos++ = sample_int16;
                             }
                         }
                     } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16P) {
-                        for (int i = 0; i < frame->nb_samples; ++i) {
-                            for (int ch = 0; ch < frame->ch_layout.nb_channels; ++ch) {
-                                int16_t sample = reinterpret_cast<int16_t*>(frame->data[ch])[i];
-                                audio_buffer.push_back(sample / 32768.0f);
+                        int samples_per_channel = frame->nb_samples;
+                        int num_channels = frame->ch_layout.nb_channels;
+                        int16_t** s16p_data = reinterpret_cast<int16_t**>(frame->data);
+                        samples_in_frame = samples_per_channel * num_channels;
+
+                        for (int i = 0; i < samples_per_channel; ++i) {
+                            for (int ch = 0; ch < num_channels; ++ch) {
+                                *current_write_pos++ = s16p_data[ch][i];
                             }
                         }
                     } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16) {
                         int16_t* samples = reinterpret_cast<int16_t*>(frame->data[0]);
-                        for (int i = 0; i < frame->nb_samples * frame->ch_layout.nb_channels; ++i) {
-                            audio_buffer.push_back(samples[i] / 32768.0f);
-                        }
+                        samples_in_frame = frame->nb_samples * frame->ch_layout.nb_channels;
+                        memcpy(current_write_pos, samples, samples_in_frame * sizeof(int16_t));
                     } else {
-                        std::cerr << "Unsupported audio format: " << av_get_sample_fmt_name(audio_codec_ctx->sample_fmt) << std::endl;
+                        std::cerr << "Unsupported audio format for mmap: " << av_get_sample_fmt_name(audio_codec_ctx->sample_fmt) << std::endl;
+                        // Skip frame, don't advance offset or count
+                        samples_in_frame = 0; 
                     }
+                    
+                    if (samples_in_frame > 0) {
+                        current_write_offset += samples_in_frame;
+                        // Atomically update the count of available samples
+                        audio_decoded_samples_count.store(current_write_offset, std::memory_order_release);
+                    }
+                    // --- End sample conversion and write ---
 
                     frame_count++;
-                    if (frame_count % 1000 == 0) {
-                    }
-                }
-            }
+                } // End while receive_frame
+            } // End if audio stream
             av_packet_unref(packet);
-            if (packet_count % 1000 == 0) {
-            }
-        }
+            if(ret == AVERROR_EOF) break; // Exit outer loop if needed
+        } // End while read_frame
+
+         // --- Flush decoder --- 
+         // Send NULL packet to flush remaining frames
+         avcodec_send_packet(audio_codec_ctx, NULL);
+         while (true) {
+             ret = avcodec_receive_frame(audio_codec_ctx, frame);
+             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                 break;
+             }
+              if (ret < 0) {
+                  std::cerr << "Error flushing decoder: " << av_err2str(ret) << std::endl;
+                  break;
+              }
+              // Process flushed frames (same logic as above)
+              // --- Convert samples to int16_t and WRITE TO MMAP --- 
+              const int16_t int16_max = std::numeric_limits<int16_t>::max();
+              const int16_t int16_min = std::numeric_limits<int16_t>::min();
+              size_t samples_in_frame = 0;
+              if (current_write_offset + frame->nb_samples * current_channels > audio_total_samples) {
+                  std::cerr << "Warning: Flushed samples exceed estimated file size." << std::endl;
+                  break; 
+              }
+              int16_t* current_write_pos = audio_write_ptr + current_write_offset;
+              if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLTP) {
+                  int samples_per_channel = frame->nb_samples; int num_channels = frame->ch_layout.nb_channels; float** float_data = reinterpret_cast<float**>(frame->data); 
+                  for (int i = 0; i < samples_per_channel; ++i) for (int ch = 0; ch < num_channels; ++ch) { float s_f = float_data[ch][i]; float sc_s = s_f * 32767.0f; int16_t s_i = static_cast<int16_t>(std::round(std::max(static_cast<float>(int16_min), std::min(static_cast<float>(int16_max), sc_s)))); *current_write_pos++ = s_i; } 
+              } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16P) {
+                  int samples_per_channel = frame->nb_samples; int num_channels = frame->ch_layout.nb_channels; int16_t** s16p_data = reinterpret_cast<int16_t**>(frame->data); 
+                  for (int i = 0; i < samples_per_channel; ++i) for (int ch = 0; ch < num_channels; ++ch) *current_write_pos++ = s16p_data[ch][i]; 
+              } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16) {
+                  int16_t* samples = reinterpret_cast<int16_t*>(frame->data[0]); memcpy(current_write_pos, samples, samples_in_frame * sizeof(int16_t)); 
+              } else { samples_in_frame = 0; } 
+              
+              if (samples_in_frame > 0) {
+                  current_write_offset += samples_in_frame;
+                  audio_decoded_samples_count.store(current_write_offset, std::memory_order_release);
+              }
+              // --- End sample conversion and write ---
+         } // End while flushing
+         // --- End Flush --- 
 
         if (ret < 0 && ret != AVERROR_EOF) {
             std::cerr << "Error reading frame: " << av_err2str(ret) << std::endl;
         }
 
-        std::cout << "Audio decoding finished. Total frames: " << frame_count << ", Total packets: " << packet_count << std::endl;
+        std::cout << "Audio decoding finished. Total samples written: " << audio_decoded_samples_count.load() << std::endl;
         decoding_finished.store(true);
+
+        // --- Finalize mmap write --- 
+        if (audio_write_ptr) {
+             if (msync(audio_write_ptr, audio_total_bytes, MS_SYNC) == -1) {
+                 std::cerr << "Warning: msync failed: " << strerror(errno) << std::endl;
+             }
+             if (munmap(audio_write_ptr, audio_total_bytes) == -1) {
+                 std::cerr << "Error unmapping write region: " << strerror(errno) << std::endl;
+             }
+             audio_write_ptr = nullptr; // Mark as unmapped
+        }
+        writeFdCloser.fd = -1; // Prevent RAII closer from closing again
+        if (audio_write_fd != -1) {
+             if (close(audio_write_fd) == -1) {
+                 std::cerr << "Error closing write fd: " << strerror(errno) << std::endl;
+             }
+             audio_write_fd = -1;
+        }
+        // --- End Finalize --- 
+
         decoding_completed.store(true);  
     }
     catch (const std::exception& e) {
         std::cerr << "Decoding error: " << e.what() << std::endl;
-        decoding_finished.store(true);
+        decoding_finished.store(true); // Indicate finished even on error
+        decoding_completed.store(true); 
+
+        // --- Cleanup on error --- 
+        std::lock_guard<std::mutex> lock(mmap_init_mutex); // Protect cleanup
+        if (audio_write_ptr) { munmap(audio_write_ptr, audio_total_bytes); audio_write_ptr = nullptr; }
+        if (audio_write_fd != -1) { close(audio_write_fd); audio_write_fd = -1; }
+        if (!audio_temp_filename.empty()) { unlink(audio_temp_filename.c_str()); audio_temp_filename.clear(); }
+        audio_total_bytes = 0;
+        audio_total_samples = 0;
+        audio_decoded_samples_count.store(0);
+         // --- End Cleanup on error --- 
     }
 
+    // --- Final FFmpeg cleanup --- 
     if (frame) av_frame_free(&frame);
     if (audio_codec_ctx) avcodec_free_context(&audio_codec_ctx);
     if (format_ctx) avformat_close_input(&format_ctx);
     av_packet_free(&packet);
+    std::cout << "decode_audio finished execution." << std::endl;
 }
 
 void start_audio(const char* filename) {
+    // --- No need to clear vector --- 
+    // audio_buffer.clear();
+    // audio_buffer_index = 0;
+    // --- Reset state handled in decode_audio --- 
+    // decoding_finished.store(false);
+    // decoding_completed.store(false);
+
     try {
         std::cout << "Starting audio initialization..." << std::endl;
-
-        // Clear any existing audio buffer
-        audio_buffer.clear();
-        audio_buffer_index = 0;
-        decoding_finished.store(false);
-        decoding_completed.store(false);
 
         PaError err;
         err = Pa_Initialize();
@@ -556,14 +780,59 @@ void start_audio(const char* filename) {
         outputParameters.suggestedLatency = Pa_GetDeviceInfo(outputParameters.device)->defaultLowOutputLatency;
         outputParameters.hostApiSpecificStreamInfo = NULL;
 
-        // Start decoding audio in a separate thread
+        // --- Start decoding audio in a separate thread --- 
+        // Decoder thread now CREATES the mmap file
         std::thread decoding_thread([filename]() {
             decode_audio(filename);
         });
         decoding_thread.detach(); 
 
-        // Give the decoding thread a moment to start
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // --- Wait briefly for decoder to create and setup mmap file --- 
+        // This is a potential race condition point. A more robust solution might 
+        // involve a condition variable signaled by decode_audio after mmap setup.
+        std::cout << "Waiting for decoder to setup mmap file..." << std::endl;
+        for(int i=0; i < 100; ++i) { // Wait up to ~2 seconds
+             std::this_thread::sleep_for(std::chrono::milliseconds(20));
+             std::lock_guard<std::mutex> lock(mmap_init_mutex);
+             if (!audio_temp_filename.empty() && audio_total_bytes > 0) break; 
+        }
+        
+        std::string temp_file_to_open;
+        size_t expected_bytes;
+        {
+             std::lock_guard<std::mutex> lock(mmap_init_mutex);
+             if (audio_temp_filename.empty() || audio_total_bytes == 0) {
+                  throw std::runtime_error("Decoder did not create/setup mmap file in time.");
+             }
+             temp_file_to_open = audio_temp_filename;
+             expected_bytes = audio_total_bytes;
+             std::cout << "Decoder setup complete. Opening mmap file: " << temp_file_to_open << " for reading (" << expected_bytes << " bytes)." << std::endl;
+        }
+        // --- End Wait --- 
+
+        // --- Open and Map the Temporary File for Reading --- 
+        audio_read_fd = open(temp_file_to_open.c_str(), O_RDONLY);
+        if (audio_read_fd == -1) {
+            throw std::runtime_error("Failed to open temporary audio file for reading: " + std::string(strerror(errno)));
+        }
+        std::cout << "Opened temp file for reading (fd: " << audio_read_fd << ")" << std::endl;
+
+        // Map the *entire* pre-allocated file
+        audio_read_ptr = static_cast<const int16_t*>(mmap(
+            nullptr, expected_bytes, PROT_READ, MAP_SHARED, audio_read_fd, 0
+        ));
+
+        if (audio_read_ptr == MAP_FAILED) {
+            audio_read_ptr = nullptr; // Ensure null on failure
+            close(audio_read_fd);
+            audio_read_fd = -1;
+            throw std::runtime_error("Failed to map temporary file for reading: " + std::string(strerror(errno)));
+        }
+        std::cout << "Memory mapping for reading successful." << std::endl;
+        // --- End Open/Map --- 
+
+        // Give the decoding thread a moment to start writing data
+        // std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Maybe not needed?
 
         // Close any existing stream
         if (stream) {
@@ -572,37 +841,55 @@ void start_audio(const char* filename) {
             stream = nullptr;
         }
 
+        // Get the sample rate determined during decoding
+        int pa_sample_rate = sample_rate.load(); 
+        if(pa_sample_rate <= 0) {
+             std::cerr << "Warning: Invalid sample rate detected (" << pa_sample_rate << "). Defaulting to 44100 Hz for PortAudio." << std::endl;
+             pa_sample_rate = 44100;
+        }
+
         err = Pa_OpenStream(
             &stream,
             NULL, 
             &outputParameters,
-            sample_rate.load(), 
-            256,   
+            pa_sample_rate, 
+            256, // framesPerBuffer - keep relatively small for low latency
             paClipOff,
             patestCallback,
             NULL); 
 
         if (err != paNoError) {
-            throw std::runtime_error("PortAudio error: " + std::string(Pa_GetErrorText(err)));
+            // Cleanup mmap before throwing
+            if (audio_read_ptr) { munmap((void*)audio_read_ptr, expected_bytes); audio_read_ptr = nullptr; }
+            if (audio_read_fd != -1) { close(audio_read_fd); audio_read_fd = -1; }
+            throw std::runtime_error("PortAudio error opening stream: " + std::string(Pa_GetErrorText(err)));
         }
 
         err = Pa_StartStream(stream);
         if (err != paNoError) {
-            throw std::runtime_error("PortAudio error: " + std::string(Pa_GetErrorText(err)));
+             // Cleanup mmap before throwing
+            Pa_CloseStream(stream); stream = nullptr;
+            if (audio_read_ptr) { munmap((void*)audio_read_ptr, expected_bytes); audio_read_ptr = nullptr; }
+            if (audio_read_fd != -1) { close(audio_read_fd); audio_read_fd = -1; }
+            throw std::runtime_error("PortAudio error starting stream: " + std::string(Pa_GetErrorText(err)));
         }
 
-        std::cout << "Audio device opened successfully" << std::endl;
+        std::cout << "Audio device opened successfully, PortAudio stream started." << std::endl;
 
-        audio_buffer_index = 0;
+        audio_buffer_index = 0.0; // Reset playback position
         current_audio_time.store(0.0);
         playback_rate.store(0.0);
         target_playback_rate.store(0.0);
 
-        std::cout << "Audio playback started. Decoding continues in background." << std::endl;
+        std::cout << "Audio playback ready. Decoding runs in background." << std::endl;
     } catch (const std::exception& e) {
-        std::cerr << "Audio Error: " << e.what() << std::endl;
-        // Don't quit the application on audio error, just report it
-        // quit.store(true);
+        std::cerr << "Audio Error in start_audio: " << e.what() << std::endl;
+        // Ensure partial cleanup if error occurred during setup
+        std::lock_guard<std::mutex> lock(mmap_init_mutex);
+        if (stream) { Pa_CloseStream(stream); stream = nullptr; }
+        if (audio_read_ptr) { munmap((void*)audio_read_ptr, audio_total_bytes); audio_read_ptr = nullptr; }
+        if (audio_read_fd != -1) { close(audio_read_fd); audio_read_fd = -1; }
+        // Don't unlink here, let decode_audio or cleanup_audio handle it
     }
 }
 
@@ -739,16 +1026,50 @@ void stop_jog() {
 }
 
 void seek_to_time(double target_time) {
-    if (target_time < 0) {
-        target_time = 0;
-    } else if (target_time > total_duration.load()) {
-        target_time = total_duration.load();
+    // Ensure mmap is ready before seeking
+    if (audio_read_ptr == nullptr || audio_total_samples == 0) {
+        std::cerr << "Warning: Attempted to seek before audio mmap is ready." << std::endl;
+        return;
     }
 
-    size_t target_index = static_cast<size_t>(target_time * sample_rate.load());
-    audio_buffer_index = target_index;
+    double total_dur = total_duration.load(); // Get total duration
+    if (total_dur <= 0) { // Use calculated duration if global not set
+        int current_sample_rate = sample_rate.load();
+        if (current_sample_rate > 0) {
+            total_dur = static_cast<double>(audio_total_samples) / (current_sample_rate * 2.0); // Assuming stereo
+        }
+    }
+
+    // Clamp target time to valid range [0, total_duration]
+    target_time = std::max(0.0, target_time);
+    if (total_dur > 0) {
+        target_time = std::min(target_time, total_dur);
+    }
+
+    // Calculate target sample pair index
+    int current_sample_rate = sample_rate.load();
+    if (current_sample_rate <= 0) {
+         std::cerr << "Warning: Cannot calculate seek index due to invalid sample rate." << std::endl;
+         return;
+    }
+    // Calculate index based on sample pairs (stereo)
+    double target_index_double = target_time * current_sample_rate; 
+    
+    // Clamp index to valid range [0, total_pairs - 1]
+    size_t buffer_num_sample_pairs = audio_total_samples / 2; // Assuming stereo
+    if (buffer_num_sample_pairs > 0) {
+         target_index_double = std::min(target_index_double, static_cast<double>(buffer_num_sample_pairs - 1));
+    }
+    target_index_double = std::max(0.0, target_index_double);
+    
+    // Update the playback index (used by patestCallback)
+    audio_buffer_index = target_index_double; 
+
+    // Update the current time displayed/reported
     current_audio_time.store(target_time);
-    seek_performed.store(true);
+    
+    seek_performed.store(true); // Keep this flag if used elsewhere
+    std::cout << "Seeked to time: " << target_time << "s (index: " << audio_buffer_index << ")" << std::endl;
 }
 
 double parse_timecode(const std::string& timecode) {
@@ -867,18 +1188,64 @@ bool switch_audio_device(int menuIndex) {
         return true;
     }
     
-    // Remember the current playback state
+    // --- Remember playback state AND mmap info --- 
     double current_time = current_audio_time.load();
     double current_rate = playback_rate.load();
     double current_target_rate = target_playback_rate.load();
     bool current_reverse = is_reverse.load();
+    double current_index = audio_buffer_index; // Remember fractional index
+    std::string current_temp_file = audio_temp_filename; // Copy needed info before closing
+    size_t current_total_bytes = audio_total_bytes;
     
-    // Stop and close the current stream
+    // --- Stop stream and release current mmap read resources --- 
     if (stream) {
         Pa_StopStream(stream);
         Pa_CloseStream(stream);
         stream = nullptr;
+        std::cout << "Closed existing PortAudio stream." << std::endl;
     }
+    if (audio_read_ptr) {
+         if (munmap((void*)audio_read_ptr, current_total_bytes) == -1) {
+              std::cerr << "Warning: Failed to unmap read region during device switch: " << strerror(errno) << std::endl;
+         }
+         audio_read_ptr = nullptr;
+         std::cout << "Unmapped existing audio read region." << std::endl;
+    }
+    if (audio_read_fd != -1) {
+         if (close(audio_read_fd) == -1) {
+              std::cerr << "Warning: Failed to close read fd during device switch: " << strerror(errno) << std::endl;
+         }
+         audio_read_fd = -1;
+         std::cout << "Closed existing audio read fd." << std::endl;
+    }
+    // --- End Stop/Release --- 
+
+    // Check if temp file still exists (might have been cleaned up if decode thread finished/failed)
+    if (current_temp_file.empty()) {
+         std::cerr << "Error switching device: Temporary audio file info lost." << std::endl;
+         return false;
+    }
+    // Re-open the *same* temp file for reading
+    audio_read_fd = open(current_temp_file.c_str(), O_RDONLY);
+    if (audio_read_fd == -1) {
+         std::cerr << "Error switching device: Failed to re-open temp file: " << strerror(errno) << std::endl;
+         return false; // Cannot continue without the file
+    }
+    std::cout << "Re-opened temp file for reading (fd: " << audio_read_fd << ")" << std::endl;
+
+    // Re-map the file for reading
+    audio_read_ptr = static_cast<const int16_t*>(mmap(
+            nullptr, current_total_bytes, PROT_READ, MAP_SHARED, audio_read_fd, 0
+    ));
+
+    if (audio_read_ptr == MAP_FAILED) {
+         std::cerr << "Error switching device: Failed to re-map file: " << strerror(errno) << std::endl;
+         close(audio_read_fd);
+         audio_read_fd = -1;
+         audio_read_ptr = nullptr;
+         return false;
+    }
+     std::cout << "Re-mapped file for reading successfully." << std::endl;
     
     // Set up new stream parameters
     PaStreamParameters outputParameters;
@@ -917,6 +1284,7 @@ bool switch_audio_device(int menuIndex) {
     
     // Restore playback state
     current_audio_time.store(current_time);
+    audio_buffer_index = current_index; // Restore fractional index
     playback_rate.store(current_rate);
     target_playback_rate.store(current_target_rate);
     is_reverse.store(current_reverse);
@@ -947,14 +1315,57 @@ void cleanup_audio() {
             stream = nullptr;
         }
         
+        // --- Cleanup mmap resources --- 
+        std::lock_guard<std::mutex> lock(mmap_init_mutex); // Protect concurrent access
+
+        // Unmap read region if mapped
+        if (audio_read_ptr) {
+            if (munmap((void*)audio_read_ptr, audio_total_bytes) == -1) {
+                 std::cerr << "Error unmapping read region: " << strerror(errno) << std::endl;
+            }
+            audio_read_ptr = nullptr;
+        }
+        // Unmap write region if mapped (should normally be done by decoder thread, but cleanup just in case)
+        if (audio_write_ptr) {
+            // Note: might already be unmapped by decoder thread
+            munmap(audio_write_ptr, audio_total_bytes); // Ignore error here, might already be gone
+            audio_write_ptr = nullptr;
+        }
+
+        // Close file descriptors
+        if (audio_read_fd != -1) {
+            if (close(audio_read_fd) == -1) {
+                 std::cerr << "Error closing read fd: " << strerror(errno) << std::endl;
+            }
+            audio_read_fd = -1;
+        }
+        if (audio_write_fd != -1) {
+            if (close(audio_write_fd) == -1) {
+                // Might already be closed by decoder thread
+            }
+            audio_write_fd = -1;
+        }
+
+        // Delete the temporary file
+        if (!audio_temp_filename.empty()) {
+            if (unlink(audio_temp_filename.c_str()) == -1) {
+                 std::cerr << "Error deleting temporary audio file: " << strerror(errno) << std::endl;
+            }
+             std::cout << "Deleted temporary audio file: " << audio_temp_filename << std::endl;
+            audio_temp_filename.clear();
+        }
+
+        // Reset size/count variables
+        audio_total_bytes = 0;
+        audio_total_samples = 0;
+        audio_decoded_samples_count.store(0);
+        audio_buffer_index = 0.0; // Reset playback position
+        // --- End mmap cleanup --- 
+        
         PaError err = Pa_Terminate();
         if (err != paNoError) {
             std::cerr << "Error terminating PortAudio: " << Pa_GetErrorText(err) << std::endl;
         }
-        
-        // Clear audio buffer to free memory
-        std::vector<float>().swap(audio_buffer);
-        audio_buffer_index = 0;
         
         std::cout << "Audio system cleaned up successfully" << std::endl;
     } catch (const std::exception& e) {

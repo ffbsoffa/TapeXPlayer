@@ -91,8 +91,8 @@ const float MIN_ZOOM_FACTOR = 1.0f;
 const float ZOOM_STEP = 1.2f;
 
 // External variables from mainau.cpp
-extern std::vector<float> audio_buffer;
-extern size_t audio_buffer_index;
+// extern std::vector<int16_t> audio_buffer; // REMOVED: No longer using vector buffer
+extern double audio_buffer_index; // Keep this, it's now the fractional mmap index
 extern std::atomic<bool> decoding_finished;
 extern std::atomic<bool> decoding_completed;
 
@@ -281,11 +281,11 @@ void resetPlayerState() {
     seekInfo.completed.store(false);
     seek_performed.store(false);
     
-    // Clear audio buffer
-    if (!audio_buffer.empty()) {
-        audio_buffer.clear();
-    }
-    audio_buffer_index = 0;
+    // Clear audio buffer - REMOVED Block
+    // if (!audio_buffer.empty()) { 
+    //     audio_buffer.clear();
+    // }
+    audio_buffer_index = 0.0; // Reset the double index
     
     // Reset decoding flags
     decoding_finished.store(false);
@@ -822,8 +822,7 @@ int main(int argc, char* argv[]) {
                 // Make sure audio variables are reset
                 decoding_finished.store(false);
                 decoding_completed.store(false);
-                audio_buffer.clear();
-                audio_buffer_index = 0;
+                audio_buffer_index = 0.0;
                 
                 audio_thread = std::thread([&currentFilename, &audio_started]() {
                     start_audio(currentFilename.c_str());

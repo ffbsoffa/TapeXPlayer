@@ -233,7 +233,7 @@ void FullResDecoderManager::decodingLoop() {
                 // std::cout << "[FRDM Log] Next decode scheduled for: " << nextScheduledHighResTime_.time_since_epoch().count() << std::endl;
             }
 
-            // --- Cleanup (Restored from 10/04 version) --- 
+// --- Cleanup (Restored from 10/04 version) --- 
             // Clean up frames outside the *new* high-res window. 
             // This uses the static method. Needs careful synchronization if frameIndex is heavily shared.
             
