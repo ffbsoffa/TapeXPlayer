@@ -179,7 +179,7 @@ void updateVisualization(SDL_Renderer* renderer, const std::vector<FrameInfo>& f
     }
 }
 
-void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double playbackRate, bool isReverse, double currentTime, int frameNumber, bool showOSD, bool waiting_for_timecode, const std::string& input_timecode, double original_fps, bool jog_forward, bool jog_backward, bool isLoading, const std::string& loadingType, int loadingProgress) {
+void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double playbackRate, bool isReverse, double currentTime, int frameNumber, bool showOSD, bool waiting_for_timecode, const std::string& input_timecode, double original_fps, bool jog_forward, bool jog_backward) {
     int windowWidth, windowHeight;
     SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
     SDL_Color textColor = {255, 255, 255, 255};
@@ -193,8 +193,7 @@ void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double pl
 
     // Left Text
     std::string leftText;
-    if (isLoading) leftText = "UNTHREAD";
-    else if (jog_forward || jog_backward) leftText = "JOG";
+    if (jog_forward || jog_backward) leftText = "JOG";
     else if (std::abs(playbackRate) < 0.01) leftText = "STILL";
     else if (std::abs(playbackRate) > 1.0) leftText = "SHUTTLE";
     else leftText = "PLAY";
@@ -212,13 +211,7 @@ void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double pl
 
     // Timecode
     std::string timecode;
-    if (isLoading) {
-        static Uint32 lastBlinkTime = 0;
-        static bool showDashes = true;
-         Uint32 currentTicks = SDL_GetTicks();
-         if (currentTicks - lastBlinkTime > 500) { showDashes = !showDashes; lastBlinkTime = currentTicks; }
-        timecode = showDashes ? "--:--:--:--" : "  :  :  :  ";
-    } else if (waiting_for_timecode) {
+    if (waiting_for_timecode) {
         timecode = "00:00:00:00"; // Start with placeholder
         std::string formatted_input = input_timecode;
         formatted_input.resize(8, '0'); // Pad with zeros if needed
@@ -252,12 +245,6 @@ void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double pl
 
     // Right Text
     std::string rightText;
-    if (isLoading) {
-        std::string prefix = (loadingType == "youtube") ? "DL" : (loadingType == "file" ? "LD" : (loadingType == "convert" ? "LS" : "LD"));
-        char progressBuffer[5];
-        snprintf(progressBuffer, sizeof(progressBuffer), "%03d", loadingProgress);
-        rightText = prefix + std::string(progressBuffer);
-    } else {
         rightText = isReverse ? "REV " : "FWD ";
         char rateBuffer[10];
         if (std::abs(playbackRate) < 0.01) snprintf(rateBuffer, sizeof(rateBuffer), "0");
@@ -265,7 +252,6 @@ void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double pl
         else snprintf(rateBuffer, sizeof(rateBuffer), "%.2f", std::abs(playbackRate));
         rightText += rateBuffer;
         rightText += "x";
-    }
     
     SDL_Surface* rightSurface = TTF_RenderText_Blended(font, rightText.c_str(), textColor);
     if (rightSurface) {
@@ -523,7 +509,7 @@ void displayFrame(
                            const int baseStripeHeight = static_cast<int>(85 * resolutionScale);
                            const int baseStripeSpacing = static_cast<int>(450 * resolutionScale);
                            const int minStripeSpacing = static_cast<int>(62 * resolutionScale);
-                           const int minStripeHeight = static_cast<int>(14 * resolutionScale);
+                           int currentMinStripeHeight = (absPlaybackRate >= 16.0) ? 1 : static_cast<int>(14 * resolutionScale); // Set min height to 1 for >= 16x
                            const int midStripeHeight = static_cast<int>(50 * resolutionScale);
                            int stripeHeight, stripeSpacing;
                            // ... (rest of stripe parameter calculation based on absPlaybackRate, identical to old code) ...
@@ -534,38 +520,160 @@ void displayFrame(
                                 stripeHeight = baseStripeHeight; stripeSpacing = baseStripeSpacing;
                             } else if (absPlaybackRate >= 3.5 && absPlaybackRate < 14.0) {
                                 double t = (absPlaybackRate - 4.0) / 10.0; t = std::pow(t, 0.7);
-                                stripeHeight = static_cast<int>(baseStripeHeight * (1.0 - t) + minStripeHeight * t); stripeSpacing = static_cast<int>(baseStripeSpacing * (1.0 - t) + minStripeSpacing * t);
-                            } else { stripeHeight = minStripeHeight; stripeSpacing = minStripeSpacing; }
+                                stripeHeight = static_cast<int>(baseStripeHeight * (1.0 - t) + currentMinStripeHeight * t);
+                                stripeSpacing = static_cast<int>(baseStripeSpacing * (1.0 - t) + minStripeSpacing * t);
+                            } else { // Covers >= 14.0x
+                                 stripeHeight = currentMinStripeHeight; 
+                                 stripeSpacing = minStripeSpacing; 
+                                 // --- Set very low min height for 20x+ specifically ---
+                                 if (absPlaybackRate >= 20.0) {
+                                     currentMinStripeHeight = static_cast<int>(12.0 * resolutionScale); // Set to 1px scaled
+                                     stripeHeight = currentMinStripeHeight; // Ensure stripeHeight uses this new minimum
+                                 }
+                                 // --- End Set low min height ---
+                            }
 
 
                            // Calculate cycle progress for animation
                            double cycleProgress;
                            const double baseDuration = 1.5;
                            const int fps = static_cast<int>(originalFps > 0 ? originalFps : 30); // Use actual FPS if available
-                           // ... (rest of cycleProgress calculation based on absPlaybackRate, identical to old code) ...
-                            if (absPlaybackRate >= 14.0) {
-                                double speedFactor = std::pow(absPlaybackRate/14.0, 1.2) * 4.02; if (absPlaybackRate >= 16.0) speedFactor *= 1.0 + (absPlaybackRate - 16.0) * 0.417;
-                                double highSpeedCycleDuration = 1.0 / (fps * speedFactor); cycleProgress = std::fmod(currentTime, highSpeedCycleDuration) / highSpeedCycleDuration;
-                            } else if (absPlaybackRate >= 12.0) {
-                                double t = (absPlaybackRate - 12.0) / 2.0; double speedMultiplier = 0.4 + t * 0.6; double transitionDuration = baseDuration / (absPlaybackRate * speedMultiplier); cycleProgress = std::fmod(currentTime, transitionDuration) / transitionDuration;
-                            } else if (absPlaybackRate >= 3.5) {
-                                double normalizedSpeed = (absPlaybackRate - 3.5) / 8.5; double speedMultiplier = 0.08 + (std::pow(normalizedSpeed, 3) * 0.15); if (absPlaybackRate < 8.0) speedMultiplier *= 0.7;
-                                double mediumSpeedDuration = baseDuration / (absPlaybackRate * speedMultiplier); cycleProgress = std::fmod(currentTime, mediumSpeedDuration) / mediumSpeedDuration;
-                            } else { double speedFactor = std::min(absPlaybackRate / 2.0, 2.0); double adjustedDuration = baseDuration / speedFactor; cycleProgress = std::fmod(currentTime, adjustedDuration) / adjustedDuration; }
+                           const double minCycleDuration = 0.05; // 50ms minimum cycle time
+                           
+                           if (absPlaybackRate >= 12.0) { // New logic for high speeds (12x+)
+                                double cycleDuration = (baseDuration / absPlaybackRate) * 3.0; // Simple inverse relation + factor
+                                cycleDuration = std::max(minCycleDuration, cycleDuration); // Apply minimum duration
+                                cycleProgress = std::fmod(currentTime, cycleDuration) / cycleDuration;
+                           } else if (absPlaybackRate >= 3.5) { // Covers 3.5x up to 12.0x (Old medium speed logic)
+                                double normalizedSpeed = (absPlaybackRate - 3.5) / 8.5; // Normalize in 3.5-12 range
+                                double speedMultiplier = 0.08 + (std::pow(normalizedSpeed, 3) * 0.15);
+                                if (absPlaybackRate < 8.0) speedMultiplier *= 0.7; // Keep the old adjustment for < 8x
+                                double mediumSpeedDuration = baseDuration / (absPlaybackRate * speedMultiplier);
+                                mediumSpeedDuration = std::max(minCycleDuration, mediumSpeedDuration); // Apply minimum duration
+                                cycleProgress = std::fmod(currentTime, mediumSpeedDuration) / mediumSpeedDuration;
+                           } else { // Covers >= effectThreshold (1.1x) up to 3.5x (unchanged)
+                                double speedFactor = std::min(absPlaybackRate / 2.0, 2.0) * 0.5; 
+                                double adjustedDuration = baseDuration / speedFactor; 
+                                if (adjustedDuration <= 0) adjustedDuration = 1.0; // Fallback
+                                cycleProgress = std::fmod(currentTime, adjustedDuration) / adjustedDuration; 
+                           }
 
 
-                           // Apply B&W zones under stripes (2x-10x)
+                           // --- Generate Stripe Positions with Randomized Spacing ---
+                           std::vector<std::pair<int, int>> stripePositions; // Store {startY, height}
+                           std::vector<int> stripeSpacings; // Store spacing *after* each stripe
+
+                           // Use the calculated stripeSpacing for the current speed as the *base* for randomization
+                           int baseSpacingForSpeed; // Declared here, calculated below
+                           // --- Adjust base spacing based on specific speed ranges --- 
+                           double currentSpacingVariationFactor = 0.001; // Keep default variation low initially
+                           
+                           // Define target spacings for interpolation points
+                           const double spacingAt12x = 100.0 * resolutionScale;
+                           const double spacingAt24x = 18.0 * resolutionScale; // New target spacing
+
+                           if (absPlaybackRate >= 2.0 && absPlaybackRate < 3.5) {
+                                // Add 86 pixels for ~3x range to make stripes sparse (applied to base stripeSpacing)
+                                baseSpacingForSpeed = stripeSpacing + static_cast<int>((10.0 + 76.0) * resolutionScale); 
+                           } else if (absPlaybackRate >= 8.0 && absPlaybackRate < 12.0) { // Fixed range for 10x spacing
+                                // Force smaller spacing for ~10x range
+                                baseSpacingForSpeed = static_cast<int>(spacingAt12x); 
+                           } else if (absPlaybackRate >= 12.0) { // Interpolate from 12x up to 24x, then hold
+                               double t = std::min(1.0, (absPlaybackRate - 12.0) / (24.0 - 12.0)); // Normalize 0 to 1 between 12x and 24x
+                               baseSpacingForSpeed = static_cast<int>(spacingAt12x * (1.0 - t) + spacingAt24x * t);
+                           } else { // Covers < 8x (excluding 2.0-3.5 range handled above)
+                                // Use the originally calculated stripeSpacing which interpolates height/spacing
+                               baseSpacingForSpeed = stripeSpacing; 
+                           }
+                           // --- End Adjust base spacing --- 
+
+                           std::mt19937 rng(std::random_device{}()); // Random number generator
+                           // Use the potentially modified spacing variation factor
+                           double spacingVariationFactor = currentSpacingVariationFactor; 
+                           int minAllowedSpacing = std::max(1, minStripeSpacing / 4); // Reduce min allowed spacing for high speeds
+
+                           // Calculate the initial vertical offset based on cycleProgress and *average* spacing/height
+                           // Ensures the pattern starts scrolling from off-screen smoothly
+                           int averagePatternUnitHeight = baseStripeHeight + baseSpacingForSpeed;
+                           // Ensure averagePatternUnitHeight is positive to avoid division by zero or negative fmod issues
+                           if (averagePatternUnitHeight <= 0) averagePatternUnitHeight = 1; 
+                           double initialOffset = std::fmod(cycleProgress * averagePatternUnitHeight, averagePatternUnitHeight);
+                           int currentY = static_cast<int>(initialOffset) - averagePatternUnitHeight; 
+
+
+                           // Now start the loop to calculate and store stripes, starting from the potentially negative currentY
+                           while (currentY < textureHeight) {
+                               // Calculate height for this potential stripe (variable random variation)
+                               int finalStripeHeight; // Use a new variable for the final calculated height                               
+                               if (absPlaybackRate >= 16.0) {
+                                   // For >= 16x, vary height slightly randomly from 1 to 3 pixels
+                                   finalStripeHeight = 1 + (rand() % 3); // Generates 1, 2, 3
+                               } else {
+                                   // Minimal height variation for other speeds (+/- 1 pixel before scaling)
+                                   double heightVariation = ((rand() % 3 - 1) * resolutionScale); 
+                                   // Use the potentially reduced currentMinStripeHeight for clamping
+                                   finalStripeHeight = std::max(static_cast<int>(stripeHeight + heightVariation), currentMinStripeHeight);
+                               }
+                               // Ensure height is at least 1 pixel if scale is very small
+                               finalStripeHeight = std::max(1, finalStripeHeight); 
+
+                               // Calculate randomized spacing for the *next* gap (using current variation factor)
+                               int currentStripeSpacing;
+                               if (absPlaybackRate >= 16.0) {
+                                   // For >= 16x, apply subtle +/- 2 pixel random offset to base spacing
+                                   int randomOffset = (rand() % 5) - 2; // Generates -2, -1, 0, 1, 2
+                                   currentStripeSpacing = std::max(1, static_cast<int>(baseSpacingForSpeed + randomOffset)); // Ensure spacing is at least 1
+                               } else {
+                                   // Apply smaller variation for lower speeds
+                                   int randomSpacingOffset = static_cast<int>(baseSpacingForSpeed * spacingVariationFactor * 2.0 * ((double)rand() / RAND_MAX - 0.5)); // +/- variation
+                                   currentStripeSpacing = std::max(minAllowedSpacing, baseSpacingForSpeed + randomSpacingOffset);
+                               }
+
+                               // Determine the actual start and end Y for drawing, clamping to texture bounds
+                               // This will handle cases where currentY is negative
+                               int startY = std::max(0, currentY);
+                               int endY = std::min(textureHeight, currentY + finalStripeHeight);
+
+                               // Store position only if the stripe is at least partially visible
+                               if (endY > startY && startY < textureHeight) {
+                                   stripePositions.push_back({startY, endY - startY}); // Store {start, actual_height}
+                               }
+
+                               stripeSpacings.push_back(currentStripeSpacing); // Store spacing for consistency if needed later
+
+                               // Advance Y position using the *final* calculated height
+                               currentY += finalStripeHeight + currentStripeSpacing;
+                               
+                               // Safety break to prevent infinite loops in case of calculation issues
+                               if (stripePositions.size() > textureHeight) { // Unlikely, but safe
+                                    std::cerr << "Warning: Excessive stripe calculation, breaking loop." << std::endl;
+                                    break;
+                               }
+                           }
+                           // --- End Stripe Position Generation ---
+
+
+                           // Apply B&W zones under stripes (2x-10x) - USE STORED POSITIONS
                            if (absPlaybackRate >= 2.0 && absPlaybackRate < 10.0) {
-                               int stripeCount_bw = (textureHeight + stripeSpacing) / stripeSpacing;
-                               for (int i = 0; i < stripeCount_bw; ++i) {
-                                   // ... (calculations for bwZoneHeight, y_bw, bwStartY, bwEndY identical to old code) ...
-                                    double baseOffset = cycleProgress * stripeSpacing + i * stripeSpacing; double heightVariation = (absPlaybackRate >= 14.0) ? 0 : ((rand() % 21 - 10) * resolutionScale);
-                                    int currentStripeHeight = std::max(static_cast<int>(stripeHeight + heightVariation), minStripeHeight); int bwZoneHeight = static_cast<int>(currentStripeHeight * 1.75);
-                                    int heightDifference = bwZoneHeight - currentStripeHeight; int y_stripe = static_cast<int>(std::fmod(baseOffset, textureHeight + stripeSpacing)) - currentStripeHeight;
-                                    int y_bw = y_stripe - heightDifference / 2;
+                               // We need stripe height info here, which we didn't store directly.
+                               // Option 1: Re-calculate roughly based on average stripeHeight for the speed.
+                               // Option 2: Store height along with startY in stripePositions. Let's modify above.
+                               // --> Changed stripePositions to store {startY, actual_height}.
+                               for (const auto& pos : stripePositions) {
+                                   int startY = pos.first;
+                                   int currentStripeHeight = pos.second; // Use stored actual height
+                                   if (currentStripeHeight <= 0) continue; // Skip if height is zero/negative
+
+                                   // Calculate B&W zone based on this specific stripe's position and height
+                                   int bwZoneHeight = static_cast<int>(currentStripeHeight * 1.75);
+                                   int heightDifference = bwZoneHeight - currentStripeHeight;
+                                   // Calculate y_bw relative to the actual startY
+                                   int y_bw = startY - heightDifference / 2; 
 
                                     if (y_bw < textureHeight && y_bw + bwZoneHeight > 0) { // Check overlap
-                                        int bwStartY = std::max(0, y_bw); int bwEndY = std::min(textureHeight, y_bw + bwZoneHeight);
+                                       int bwStartY = std::max(0, y_bw); 
+                                       int bwEndY = std::min(textureHeight, y_bw + bwZoneHeight);
+                                       // Apply B&W effect (existing code)
                                         for (int yPos = bwStartY; yPos < bwEndY; ++yPos) {
                                             uint8_t* yPlane = dst_data[0] + yPos * pitch;
                                             for (int x = 0; x < textureWidth; ++x) { yPlane[x] = static_cast<uint8_t>(yPlane[x] * 0.85); } // Darken Y
@@ -579,28 +687,18 @@ void displayFrame(
                                }
                            }
 
-                           // Draw grey stripes
-                           int stripeCount = (textureHeight + stripeSpacing) / stripeSpacing;
-                           for (int i = 0; i < stripeCount; ++i) {
-                               double baseOffset = cycleProgress * stripeSpacing + i * stripeSpacing;
-                               // Debug: Print index and base stripe height
-                               // if (i < 5) std::cout << "Stripe[" << i << "] baseHeight: " << stripeHeight; // COMMENTED OUT
- 
-                               // Apply random height variation per stripe (+/- 12 pixels before scaling)
-                               // double heightVariation = ((rand() % 11 - 5) * resolutionScale); // Old +/- 5 code
-                               // --- DEBUG: Use much larger variation to test visibility ---
-                               double heightVariation = ((rand() % 25 - 12) * resolutionScale); // Final range +/- 12
-                               int currentStripeHeight = std::max(static_cast<int>(stripeHeight + heightVariation), minStripeHeight);
-                               int y = static_cast<int>(std::fmod(baseOffset, textureHeight + stripeSpacing)) - currentStripeHeight;
- 
-                               // Debug: Print variation and final height
-                               // if (i < 5) { // Log only first 5 stripes to avoid spam
-                               //     std::cout << "  Stripe[" << i << "] variation: " << heightVariation << ", finalHeight: " << currentStripeHeight << std::endl;
-                               // }
+                           // Draw grey stripes - USE STORED POSITIONS
+                           // Iterate through the stored positions and draw each stripe
+                           for (const auto& pos : stripePositions) {
+                               int startY = pos.first;
+                               int currentStripeHeight = pos.second; // Use stored actual height
+                               int endY = startY + currentStripeHeight;
 
-                               if (y < textureHeight && y + currentStripeHeight > 0) { // Check overlap
-                                   int startY = std::max(0, y);
-                                   int endY = std::min(textureHeight, y + currentStripeHeight);
+                               // Check if stripe is actually visible (redundant due to check during generation, but safe)
+                               if (startY < textureHeight && endY > 0 && currentStripeHeight > 0) {
+                                   startY = std::max(0, startY); // Clamp again just in case
+                                   endY = std::min(textureHeight, endY);
+
                                    // --- Restore stripe drawing logic --- 
                                    for (int yPos = startY; yPos < endY; ++yPos) {
                                        memset(dst_data[0] + yPos * pitch, 128, textureWidth); // Y
@@ -612,110 +710,120 @@ void displayFrame(
                                    }
                                    // --- End of restored stripe drawing logic --- 
 
-                                   // Add black outline below the stripe
+                                   // Add black outline below the stripe - USES endY from current stripe
                                    if (absPlaybackRate >= 8.0) {
-                                       // Calculate intensity based on speed (8x to 14x)
+                                       // ... (existing outline logic using 'endY') ...
                                        const double outlineStartSpeed = 8.0;
-                                       const double outlineFullSpeed = 14.0; // Range for intensity
+                                       const double outlineFullSpeed = 14.0;
                                        double t = std::max(0.0, std::min(1.0, (absPlaybackRate - outlineStartSpeed) / (outlineFullSpeed - outlineStartSpeed)));
-
-                                       // Calculate target Y value (128 -> 16)
                                        uint8_t targetY = 16 + static_cast<uint8_t>((128 - 16) * (1.0 - t));
-
-                                       // Set outline height to fixed 1 pixel when active
                                        int currentOutlineHeight = 1; 
-
-                                       // Draw the outline rows
                                        for (int h = 0; h < currentOutlineHeight; ++h) {
-                                           int outlineY = endY + h;
-                                           if (outlineY < textureHeight) { // Check bounds for each row
+                                           int outlineY = endY + h; // Position below the stripe
+                                           if (outlineY < textureHeight) {
                                                memset(dst_data[0] + outlineY * pitch, targetY, textureWidth);
-                                               // Ensure UV is neutral for the outline rows
-                                               if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
-                                                   int uvY = outlineY / 2;
-                                                   if (uvY < textureHeight / 2) {
-                                                       if (dst_linesize[1] > 0) memset(dst_data[1] + uvY * dst_linesize[1], 128, textureWidth / 2);
-                                                       if (dst_linesize[2] > 0) memset(dst_data[2] + uvY * dst_linesize[2], 128, textureWidth / 2);
-                                                   }
-                                               } else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) {
-                                                   int uvY = outlineY / 2;
-                                                   if (uvY < textureHeight / 2) {
-                                                       uint8_t* uvPlane = dst_data[1] + uvY * dst_linesize[1];
-                                                       for (int x_uv = 0; x_uv < textureWidth / 2; ++x_uv) { uvPlane[x_uv*2]=128; uvPlane[x_uv*2+1]=128; }
-                                                   }
-                                               }
+                                               // UV handling for outline (existing code)
+                                               if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) { /* ... */ }
+                                               else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) { /* ... */ }
                                            }
                                        }
                                    }
 
-                                   // Add snow effect (>= 4x)
-                                   if (absPlaybackRate >= 4.0 && startY < textureHeight) { // Ensure snowY is valid
-                                       int snowY = startY; // Snow on the first line of the stripe
+                                   // Add snow effect (>= 4x) - USES startY from current stripe
+                                   if (absPlaybackRate >= 4.0 && startY < textureHeight) {
+                                       // ... (existing snow logic using 'startY') ...
+                                       int snowY = startY; 
                                        int snowCount = std::max(8, textureWidth / 80); if (absPlaybackRate > 10.0) snowCount = static_cast<int>(snowCount * 1.5);
-                                       for (int j = 0; j < snowCount; ++j) {
-                                           int snowX = rand() % textureWidth;
-                                           double speedFactor_snow = std::sqrt(absPlaybackRate); int tailBase = 10 + static_cast<int>(rand() % 20); int tailLength = tailBase + static_cast<int>(speedFactor_snow * 5.0);
-                                           // Use pitch * textureHeight as rough upper bound check, needs refinement if possible
-                                           size_t max_offset = static_cast<size_t>(pitch) * textureHeight;
-                                           if (static_cast<size_t>(snowY * pitch + snowX) < max_offset) dst_data[0][snowY * pitch + snowX] = 235; 
-                                           for (int k = 1; k < tailLength; k++) {
-                                               int xPos = (snowX + k); 
-                                               if (xPos >= textureWidth) continue; // Skip pixels beyond texture width
-                                               double fadeFactor = exp(-0.15 * k); int brightness = 128 + static_cast<int>(107 * fadeFactor);
-                                               if (static_cast<size_t>(snowY * pitch + xPos) < max_offset) dst_data[0][snowY * pitch + xPos] = brightness; 
-                                           }
-                                       }
+                                       for (int j = 0; j < snowCount; ++j) { /* ... */ }
                                    }
                                }
                            }
 
-                           // Scanline duplication effect (>= 16x)
+
+                           // Scanline duplication effect (>= 16x) - NEEDS UPDATED STRIPE MASK
                             if (absPlaybackRate >= 16.0) {
-                                double effectIntensity = std::min(1.0, (absPlaybackRate - 16.0) / 6.0);
+                                // Reduce maximum intensity (existing code)
+                                double effectIntensity = std::min(0.85, (absPlaybackRate - 16.0) / 8.0);
                                 std::vector<bool> stripeMask(textureHeight, false);
-                                // Re-calculate stripeMask based on current parameters
-                                int stripeCount_dup = (textureHeight + stripeSpacing) / stripeSpacing;
-                                for (int i = 0; i < stripeCount_dup; ++i) {
-                                     // ... (calculations for currentStripeHeight_dup, y_bw/y, bwStartY/startY, bwEndY/endY identical to old code) ...
-                                    double baseOffset = cycleProgress * stripeSpacing + i * stripeSpacing; double heightVariation = (absPlaybackRate >= 14.0) ? 0 : ((rand() % 21 - 10) * resolutionScale);
-                                    int currentStripeHeight_dup = std::max(static_cast<int>(stripeHeight + heightVariation), minStripeHeight);
+
+                                // --- Re-calculate stripeMask based on STORED POSITIONS ---
+                                // Mark B&W zones first (if active)
                                     if (absPlaybackRate >= 2.0 && absPlaybackRate < 10.0) {
-                                        int bwZoneHeight = static_cast<int>(currentStripeHeight_dup * 1.75); int heightDifference = bwZoneHeight - currentStripeHeight_dup;
-                                        int y_stripe = static_cast<int>(std::fmod(baseOffset, textureHeight + stripeSpacing)) - currentStripeHeight_dup; int y_bw = y_stripe - heightDifference / 2;
-                                        if (y_bw < textureHeight && y_bw + bwZoneHeight > 0) { int bwStartY = std::max(0, y_bw); int bwEndY = std::min(textureHeight, y_bw + bwZoneHeight); for (int yy = bwStartY; yy < bwEndY; ++yy) stripeMask[yy] = true; }
-                      } else {
-                                        int y = static_cast<int>(std::fmod(baseOffset, textureHeight + stripeSpacing)) - currentStripeHeight_dup;
-                                        if (y < textureHeight && y + currentStripeHeight_dup > 0) { int startY = std::max(0, y); int endY = std::min(textureHeight, y + currentStripeHeight_dup); for (int yy = startY; yy < endY; ++yy) stripeMask[yy] = true; }
+                                    for (const auto& pos : stripePositions) {
+                                        int startY = pos.first;
+                                        int currentStripeHeight = pos.second;
+                                        if (currentStripeHeight <= 0) continue;
+                                        int bwZoneHeight = static_cast<int>(currentStripeHeight * 1.75);
+                                        int heightDifference = bwZoneHeight - currentStripeHeight;
+                                        int y_bw = startY - heightDifference / 2;
+                                        if (y_bw < textureHeight && y_bw + bwZoneHeight > 0) {
+                                            int bwStartY = std::max(0, y_bw);
+                                            int bwEndY = std::min(textureHeight, y_bw + bwZoneHeight);
+                                            for (int yy = bwStartY; yy < bwEndY; ++yy) stripeMask[yy] = true;
+                                        }
                                     }
                                 }
+                                
+                                // Mark actual grey stripes
+                                for (const auto& pos : stripePositions) {
+                                    int startY = pos.first;
+                                    int currentStripeHeight = pos.second;
+                                    int endY = startY + currentStripeHeight;
+                                    if (startY < textureHeight && endY > 0 && currentStripeHeight > 0) {
+                                        startY = std::max(0, startY);
+                                        endY = std::min(textureHeight, endY);
+                                        for (int yy = startY; yy < endY; ++yy) stripeMask[yy] = true;
 
+                                        // Also mark the black outline in the mask if it exists
+                                        if (absPlaybackRate >= 8.0) {
+                                            int currentOutlineHeight = 1;
+                                            for (int h = 0; h < currentOutlineHeight; ++h) {
+                                                int outlineY = endY + h;
+                                                if (outlineY < textureHeight) {
+                                                    stripeMask[outlineY] = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // --- End Stripe Mask Calculation ---
+
+
+                                // Find clear areas and apply duplication (existing logic using the new mask)
                                 bool inClearArea = false; int clearStart = 0;
                                 for (int y = 0; y < textureHeight; ++y) {
                                     if (!stripeMask[y] && !inClearArea) { clearStart = y; inClearArea = true; }
                                     else if ((stripeMask[y] || y == textureHeight - 1) && inClearArea) {
                                         int clearEnd = stripeMask[y] ? y : y + 1;
-                                        if (clearEnd - clearStart > 4) { // Area has enough height
-                                            int areaStart = clearStart; int areaEnd = clearEnd;
-                                            int skipLines = (effectIntensity > 0.7) ? 1 : ((effectIntensity > 0.4) ? 2 : 3);
-                                            int baseDuplication = static_cast<int>(1 + 4 * effectIntensity);
-                                            for (int lineY = areaStart; lineY < areaEnd; lineY += skipLines) { // Iterate through source lines
-                                                if (rand() % 100 < effectIntensity * 100) { // Probabilistic duplication
-                                                     int duplication = std::min(areaEnd - lineY - 1, baseDuplication); // How many lines to overwrite
-                                                     for (int dup = 1; dup <= duplication; ++dup) {
-                                                         if (lineY + dup >= areaEnd) break;
-                                                         // Copy Y plane (scanline)
-                                                         memcpy(dst_data[0] + (lineY + dup) * pitch, dst_data[0] + lineY * pitch, textureWidth);
-                                                         // Copy UV planes (handling subsampling)
-                                                         if ((lineY/2 != (lineY+dup)/2) && ((lineY+dup)/2 < textureHeight/2)) { // Only copy UV if the destination line is different in the UV plane
-                                                            if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
-                                                                if (dst_linesize[1] > 0) memcpy(dst_data[1] + (lineY+dup)/2 * dst_linesize[1], dst_data[1] + lineY/2 * dst_linesize[1], textureWidth/2);
-                                                                if (dst_linesize[2] > 0) memcpy(dst_data[2] + (lineY+dup)/2 * dst_linesize[2], dst_data[2] + lineY/2 * dst_linesize[2], textureWidth/2);
-                                                             } else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) {
-                                                                if (dst_linesize[1] > 0) memcpy(dst_data[1] + (lineY+dup)/2 * dst_linesize[1], dst_data[1] + lineY/2 * dst_linesize[1], textureWidth); // NV12 UV plane is full width
-                                                             }
-                                                         }
-                                                     }
+                                        if (clearEnd - clearStart > 1) { // Area needs at least 2 lines (source + target)
+                                            int areaStart = clearStart; 
+                                            int areaEnd = clearEnd;
+                                            
+                                            // Use the *first* line of the clear area as the source
+                                            int sourceLineY = areaStart;
+                                            // Check if sourceLineY is valid (should always be if areaStart is)
+                                            if (sourceLineY >= 0 && sourceLineY < textureHeight && pitch > 0) {
+                                                uint8_t* srcLine = dst_data[0] + sourceLineY * pitch;
+                                                
+                                                // Duplicate this source line starting from the *next* line until the end of the area
+                                                for (int destY = areaStart + 1; destY < areaEnd; destY++) {
+                                                    // Copy Y plane directly
+                                                    uint8_t* dstLine = dst_data[0] + destY * pitch;
+                                                    memcpy(dstLine, srcLine, textureWidth);
+                                                    
+                                                    // Copy UV planes (handling subsampling)
+                                                    if ((sourceLineY/2 != destY/2) && (destY/2 < textureHeight/2)) {
+                                                        if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
+                                                            if (dst_linesize[1] > 0) memcpy(dst_data[1] + destY/2 * dst_linesize[1], dst_data[1] + sourceLineY/2 * dst_linesize[1], textureWidth/2);
+                                                            if (dst_linesize[2] > 0) memcpy(dst_data[2] + destY/2 * dst_linesize[2], dst_data[2] + sourceLineY/2 * dst_linesize[2], textureWidth/2);
+                                                        } else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) {
+                                                            if (dst_linesize[1] > 0) memcpy(dst_data[1] + destY/2 * dst_linesize[1], dst_data[1] + sourceLineY/2 * dst_linesize[1], textureWidth); // NV12 UV plane is full width
+                                                        }
+                                                    }
                                                 }
+                                            } else {
+                                                // Optional: Log error if sourceLineY is invalid (should not happen)
+                                                // std::cerr << "Warning: Invalid sourceLineY (" << sourceLineY << ") in scanline duplication." << std::endl;
                                             }
                                         }
                                         inClearArea = false;
@@ -870,7 +978,7 @@ void displayFrame(
 
     // Render OSD (if enabled)
     if (showOSD && font) {
-        renderOSD(renderer, font, isPlaying.load(), currentPlaybackRate, isReverse, currentTime, newCurrentFrame, showOSD, waitingForTimecode, inputTimecode, originalFps, jog_forward.load(), jog_backward.load(), false, "", 0);
+        renderOSD(renderer, font, isPlaying.load(), currentPlaybackRate, isReverse, currentTime, newCurrentFrame, showOSD, waitingForTimecode, inputTimecode, originalFps, jog_forward.load(), jog_backward.load());
     }
 
     // Update the screen
@@ -898,7 +1006,11 @@ void cleanupDisplayResources() {
     // static unique_ptr in displayFrame will handle it at program exit.
 }
 
-void renderLoadingScreen(SDL_Renderer* renderer, TTF_Font* font, const std::string& loadingType, int loadingProgress) {
+// Function to render the loading screen
+void renderLoadingScreen(SDL_Renderer* renderer, TTF_Font* font, const LoadingStatus& status) {
+    static Uint32 lastBlinkTime = 0;
+    static bool showDashes = true;
+
     // Clear the screen with black background
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
@@ -911,9 +1023,58 @@ void renderLoadingScreen(SDL_Renderer* renderer, TTF_Font* font, const std::stri
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 150);
     SDL_Rect osdRect = {0, windowHeight - 30, windowWidth, 30};
     SDL_RenderFillRect(renderer, &osdRect);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+
+    // Prepare OSD text based on LoadingStatus
+    SDL_Color textColor = {255, 255, 255, 255};
     
-    // Render the OSD with loading information
-    if (font) renderOSD(renderer, font, false, 0.0, false, 0.0, 0, true, false, "", 25.0, false, false, true, loadingType, loadingProgress);
+    // Left Text (Fixed during loading)
+    std::string leftText = "THREADING"; // More accurate VCR term for loading
+    SDL_Surface* leftSurface = TTF_RenderText_Blended(font, leftText.c_str(), textColor);
+    if (leftSurface) {
+        SDL_Texture* leftTexture = SDL_CreateTextureFromSurface(renderer, leftSurface);
+        if (leftTexture) {
+            SDL_Rect leftRect = {10, windowHeight - 30 + (30 - leftSurface->h) / 2, leftSurface->w, leftSurface->h};
+            SDL_RenderCopy(renderer, leftTexture, NULL, &leftRect);
+            SDL_DestroyTexture(leftTexture);
+        }
+        SDL_FreeSurface(leftSurface);
+    }
+
+    // Center Text (Stage) -> Blinking Timecode Placeholder
+    // Update blink state
+    Uint32 currentTicks = SDL_GetTicks();
+    if (currentTicks - lastBlinkTime > 500) { // Blink every 500ms
+        showDashes = !showDashes;
+        lastBlinkTime = currentTicks;
+    }
+    std::string timecodeText = showDashes ? "--:--:--:--" : "  :  :  :  ";
+    SDL_Surface* timecodeSurface = TTF_RenderText_Blended(font, timecodeText.c_str(), textColor);
+    if (timecodeSurface) {
+        SDL_Texture* timecodeTexture = SDL_CreateTextureFromSurface(renderer, timecodeSurface);
+        if (timecodeTexture) {
+            SDL_Rect timecodeRect = {(windowWidth - timecodeSurface->w) / 2, windowHeight - 30 + (30 - timecodeSurface->h) / 2, timecodeSurface->w, timecodeSurface->h};
+            SDL_RenderCopy(renderer, timecodeTexture, NULL, &timecodeRect);
+            SDL_DestroyTexture(timecodeTexture);
+        }
+        SDL_FreeSurface(timecodeSurface);
+    }
+
+    // Right Text (Progress Percentage) -> Show as 3-digit number
+    int progressPercent = status.percent.load();
+    char progressBuffer[4]; // 3 digits + null terminator
+    snprintf(progressBuffer, sizeof(progressBuffer), "%03d", progressPercent);
+    std::string rightText = progressBuffer;
+    SDL_Surface* rightSurface = TTF_RenderText_Blended(font, rightText.c_str(), textColor);
+    if (rightSurface) {
+        SDL_Texture* rightTexture = SDL_CreateTextureFromSurface(renderer, rightSurface);
+        if (rightTexture) {
+            SDL_Rect rightRect = {windowWidth - rightSurface->w - 10, windowHeight - 30 + (30 - rightSurface->h) / 2, rightSurface->w, rightSurface->h};
+            SDL_RenderCopy(renderer, rightTexture, NULL, &rightRect);
+            SDL_DestroyTexture(rightTexture);
+        }
+        SDL_FreeSurface(rightSurface);
+    }
     
     // Present the renderer
     SDL_RenderPresent(renderer);

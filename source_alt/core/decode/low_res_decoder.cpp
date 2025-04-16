@@ -14,6 +14,7 @@
 #include <algorithm> // For std::min
 #include <vector> // For storing ffprobe output lines
 #include <cstdlib> // For atof
+#include <functional> // For std::function
 
 namespace fs = std::filesystem;
 
@@ -209,7 +210,8 @@ std::string LowResDecoder::generateFileId(const std::string& filename) {
 
 // Function to get video duration using ffprobe
 double getVideoDuration(const std::string& filename) {
-    std::string command = "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \\\"" + filename + "\\\"";
+    // Use standard double quotes for the filename, which is generally safer on Unix-like systems
+    std::string command = "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"" + filename + "\"";
     FILE* pipe = popen(command.c_str(), "r");
     if (!pipe) {
         std::cerr << "Error executing ffprobe command to get duration." << std::endl;
@@ -246,7 +248,7 @@ double getVideoDuration(const std::string& filename) {
     }
 }
 
-bool LowResDecoder::convertToLowRes(const std::string& filename, std::string& outputFilename, ProgressCallback progressCallback) {
+bool LowResDecoder::convertToLowRes(const std::string& filename, std::string& outputFilename, const std::function<void(int)>& progressCallback) {
     std::string cacheDir = getCachePath();
     fs::create_directories(cacheDir);
 
@@ -340,7 +342,7 @@ bool LowResDecoder::convertToLowRes(const std::string& filename, std::string& ou
                         // Calculate progress if duration is known
                         if (totalDuration > 0) {
                             int progress = std::min(static_cast<int>((currentTime / totalDuration) * 100.0), 99); // Cap at 99% until complete
-                            if (progressCallback) { // Call callback if provided
+                            if (progressCallback) { // Call callback if it's valid (not null)
                                 progressCallback(progress);
                             }
                             // Also print progress to stdout

@@ -6,6 +6,9 @@
 #include <cmath>     // For std::abs
 #include <iomanip> // For std::setw, std::setfill
 
+// Initialize static member
+std::atomic<double> LowCachedDecoderManager::speed_threshold(16.0);
+
 // Forward declare AVFrame if needed, or include relevant header if getFrame returns it
 struct AVFrame;
 
@@ -26,7 +29,7 @@ LowCachedDecoderManager::LowCachedDecoderManager(
     isReverse_(isReverseRef),
     ringBufferCapacity_(ringBufferCapacity),
     highResWindowSize_(highResWindowSize),
-    segmentSize_(1250), // User requested segment size
+    segmentSize_(2750), // User requested segment size
     stopRequested_(false),
     isRunning_(false),
     lastNotifiedFrame_(-1),
@@ -136,8 +139,8 @@ void LowCachedDecoderManager::decodingLoop() {
             }
         } // Lock released here
 
-        // --- Speed Check: Disable and Clear if Speed >= 12.0x ---
-        if (currentPlaybackRateAbs >= 16.0) {
+        // --- Speed Check: Disable and Clear if Speed >= threshold ---
+        if (currentPlaybackRateAbs >= speed_threshold.load()) {
             std::set<int> segmentsToClear; // Temporary set to hold segments for clearing
             bool hadSegmentsToClear = false;
 
@@ -146,7 +149,7 @@ void LowCachedDecoderManager::decodingLoop() {
                 std::lock_guard<std::mutex> lock(mtx_);
                 if (!loadedSegments_.empty()) {
                     hadSegmentsToClear = true;
-                    // std::cout << "LowCachedDecoderManager: Speed >= 12.0x. Clearing "
+                    // std::cout << "LowCachedDecoderManager: Speed >= threshold. Clearing "
                               // << loadedSegments_.size() << " loaded low-res segments." << std::endl;
                     segmentsToClear = loadedSegments_;
                     loadedSegments_.clear();          // Clear the original set immediately
@@ -174,7 +177,7 @@ void LowCachedDecoderManager::decodingLoop() {
             continue; 
 
         } else {
-            // --- Normal Segment-based Decoding Logic (Speed < 12.0x) ---
+            // --- Normal Segment-based Decoding Logic (Speed < threshold) ---
             if (decoder_ && !frameIndex_.empty() && segmentSize_ > 0) {
                 int currentSegment = currentFrame / segmentSize_;
                 int numSegmentsTotal = (frameIndex_.size() + segmentSize_ - 1) / segmentSize_;
@@ -246,11 +249,11 @@ void LowCachedDecoderManager::decodingLoop() {
                         if (rate < 0.9) return std::numeric_limits<int>::max();
                         // Speed check >= 10.0 is handled above, no need to return max here
                         // if (rate >= 10.0) return std::numeric_limits<int>::max(); 
-                        if (rate <= 1.0) return 8000;
+                        if (rate <= 1.0) return 10000;
                         if (rate <= 1.8) return 5000;
                         if (rate <= 3.8) return 2500;
-                        if (rate <= 7.8) return 900;
-                        return 900; // Default for rates between 7.8 and 10.0
+                        if (rate <= 7.8) return 1250;
+                        return 1250; // Default for rates between 7.8 and 10.0
                     };
                     std::chrono::milliseconds lowResUpdateInterval(getUpdateInterval(currentPlaybackRateAbs));
                     bool forceUpdateDueToRateChange = (rateDifference > significantRateChangeThreshold);
@@ -298,7 +301,7 @@ void LowCachedDecoderManager::decodingLoop() {
                     previousSegment_ = currentSegment; 
                 }
             } // end if(decoder_ && !frameIndex_.empty() ...)
-        } // end else (speed < 12.0x)
+        } // end else (speed < threshold)
 
         // --- Idle Sleep (if paused and no frame change) ---
         // Placed outside the main speed check to allow sleeping even at high speeds if paused.

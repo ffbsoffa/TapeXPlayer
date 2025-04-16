@@ -18,7 +18,7 @@ CachedDecoderManager::CachedDecoderManager(
     frameIndex_(frameIndex),
     currentFrame_(currentFrame),
     isReverse_(isReverseRef),
-    segmentSize_(segmentSize > 0 ? segmentSize : 2500),
+    segmentSize_(segmentSize > 0 ? segmentSize : 10000),
     stopRequested_(false),
     isRunning_(false),
     previousSegment_(-1),
@@ -94,7 +94,7 @@ void CachedDecoderManager::decodingLoop() {
 
         { // Scope for lock
             std::unique_lock<std::mutex> lock(mtx_);
-            if (!cv_.wait_for(lock, std::chrono::milliseconds(200), [&] {
+            if (!cv_.wait_for(lock, std::chrono::milliseconds(3600), [&] {
                 return stopRequested_.load() || currentFrame_.load() != lastNotifiedFrame_;
             })) {
                 if (stopRequested_ || currentFrame_.load() == lastNotifiedFrame_) {

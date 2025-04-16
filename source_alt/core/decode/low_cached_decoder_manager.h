@@ -16,6 +16,8 @@
 
 class LowCachedDecoderManager {
 public:
+    static std::atomic<double> speed_threshold; // New static variable for speed threshold
+    
     LowCachedDecoderManager(
         const std::string& lowResFilename,
         std::vector<FrameInfo>& frameIndex, 
@@ -28,6 +30,10 @@ public:
     );
 
     ~LowCachedDecoderManager();
+
+    // Delete copy constructor and assignment operators (due to atomic members and thread management)
+    LowCachedDecoderManager(const LowCachedDecoderManager&) = delete;
+    LowCachedDecoderManager& operator=(const LowCachedDecoderManager&) = delete;
 
     // Start the manager's background thread
     void run();

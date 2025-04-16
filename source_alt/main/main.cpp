@@ -32,6 +32,8 @@
 #include "core/menu/menu_system.h"
 #include "core/decode/cached_decoder.h"
 #include "../core/decode/cached_decoder_manager.h"
+#include "main.h"
+#include "initmanager.h"
 
 // Forward declaration for zoom event handler from display.mm
 void handleZoomMouseEvent(SDL_Event& event, int windowWidth, int windowHeight, int frameWidth, int frameHeight);
@@ -71,6 +73,7 @@ std::mutex frameIndexMutex;
 void start_audio(const char* filename);
 std::string generateTXTimecode(double time);
 void smooth_speed_change();
+void check_and_reset_threshold();
 SeekInfo seekInfo;
 std::atomic<bool> audio_initialized(false);
 std::thread audio_thread;
@@ -100,104 +103,12 @@ extern std::atomic<bool> decoding_completed;
 const int TARGET_FPS = 60;
 const int FRAME_DELAY = 1000 / TARGET_FPS;
 
-// Structure for storing window settings
-struct WindowSettings {
-    int x = SDL_WINDOWPOS_CENTERED;
-    int y = SDL_WINDOWPOS_CENTERED;
-    int width = 1280;
-    int height = 720;
-    bool isFullscreen = false;
-    bool isValid = false;
-};
-
 // Add this at the beginning of the file with other global variables
 static std::string argv0;
 static std::vector<std::string> restartArgs;
-static bool restart_requested = false;
-static std::string restart_filename;
-static bool reload_file_requested = false; // New flag for reloading file without restarting program
-
-// Function to get config file path depending on OS
-std::string getConfigFilePath() {
-    std::string configPath;
-    
-#if defined(_WIN32) || defined(_WIN64)
-    // Windows: use AppData
-    char* appDataPath = nullptr;
-    size_t pathLen;
-    _dupenv_s(&appDataPath, &pathLen, "APPDATA");
-    if (appDataPath) {
-        configPath = std::string(appDataPath) + "\\TapeXPlayer\\";
-        free(appDataPath);
-    } else {
-        configPath = ".\\";
-    }
-#elif defined(__APPLE__)
-    // macOS: use ~/Library/Application Support/
-    const char* homeDir = getenv("HOME");
-    if (homeDir) {
-        configPath = std::string(homeDir) + "/Library/Application Support/TapeXPlayer/";
-    } else {
-        configPath = "./";
-    }
-#else
-    // Linux and other UNIX-like systems: use ~/.config/
-    const char* homeDir = getenv("HOME");
-    if (homeDir) {
-        configPath = std::string(homeDir) + "/.config/TapeXPlayer/";
-    } else {
-        configPath = "./";
-    }
-#endif
-
-    // Create directory if it doesn't exist
-    std::filesystem::create_directories(configPath);
-    
-    return configPath + "window_settings.conf";
-}
-
-// Function to load window settings
-WindowSettings loadWindowSettings() {
-    WindowSettings settings;
-    std::string configFile = getConfigFilePath();
-    std::ifstream file(configFile);
-    
-    if (file.is_open()) {
-        file >> settings.x >> settings.y >> settings.width >> settings.height >> settings.isFullscreen;
-        settings.isValid = true;
-        file.close();
-    }
-    
-    return settings;
-}
-
-// Function to save window settings - updated
-void saveWindowSettings(SDL_Window* window) {
-    int x, y, width, height;
-    SDL_GetWindowPosition(window, &x, &y);
-    SDL_GetWindowSize(window, &width, &height);
-    Uint32 flags = SDL_GetWindowFlags(window);
-    bool isFullscreen = (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
-    
-    std::string configFile = getConfigFilePath();
-    std::ofstream file(configFile);
-    
-    if (file.is_open()) {
-        file << x << " " << y << " " << width << " " << height << " " << (isFullscreen ? 1 : 0);
-        file.close();
-    }
-}
-
-// Replace old function with this one
-void saveWindowSettings(int x, int y, int width, int height, bool isFullscreen) {
-    std::string configFile = getConfigFilePath();
-    std::ofstream file(configFile);
-    
-    if (file.is_open()) {
-        file << x << " " << y << " " << width << " " << height << " " << (isFullscreen ? 1 : 0);
-        file.close();
-    }
-}
+bool restart_requested = false;
+std::string restart_filename;
+std::atomic<bool> reload_file_requested = false; // Use atomic consistent with extern declaration
 
 // Functions to access playback rate variables
 std::atomic<double>& get_playback_rate() {
@@ -247,90 +158,33 @@ void reset_to_normal_speed() {
     // First set flag for decoder
     speed_reset_requested.store(true);
     
+    // Temporarily increase speed threshold to 24x during reset
+    LowCachedDecoderManager::speed_threshold.store(24.0);
+    
     // Then reset speed to 1x and direction forward
     target_playback_rate.store(1.0);
     is_reverse.store(false);
     
     // Set pause depending on requirements
     // is_paused.store(false); // uncomment if auto-play needed
-}
-
-// Function declaration at start of file
-bool processMediaSource(const std::string& source, std::string& processedFilePath, ProgressCallback progressCallback = nullptr);
-void cleanupTempFiles();
-
-// Function to reset player state before loading new file
-void resetPlayerState() {
-    // Reset flags and states
-    quit = false;
-    shouldExit = false;
-    current_audio_time.store(0.0);
-    playback_rate.store(0.0); // Start with playback rate at 0 to prevent audio playing immediately
-    target_playback_rate.store(0.0); // Also set target to 0
-    is_reverse.store(false);
-    is_seeking.store(false);
-    total_duration.store(0.0);
-    original_fps.store(0.0);
     
-    // Reset timecode input state
-    waiting_for_timecode = false;
-    input_timecode.clear();
+    // Start a timer or trigger to restore the threshold back to 16x
+    // This could be done via a separate thread, timer, or check in the main loop
     
-    // Reset seek state
-    seekInfo.requested.store(false);
-    seekInfo.completed.store(false);
-    seek_performed.store(false);
-    
-    // Clear audio buffer - REMOVED Block
-    // if (!audio_buffer.empty()) { 
-    //     audio_buffer.clear();
-    // }
-    audio_buffer_index = 0.0; // Reset the double index
-    
-    // Reset decoding flags
-    decoding_finished.store(false);
-    decoding_completed.store(false);
-}
-
-// Function to restart player with new file
-void restartPlayerWithFile(const std::string& filename) {
-    std::cout << "Loading new file: " << filename << std::endl;
-    log("Loading new file: " + filename);
-    
-    // Save filename for loading
-    restart_filename = filename;
-    
-    // Set file reload flag
-    reload_file_requested = true;
-    
-    // Signal to exit main loop
-    shouldExit = true;
+    // Example of a check that could be placed in the main loop:
+    // if speed_reset_requested is true and current_playback_rate is close to 1.0,
+    // then reset speed_threshold back to 16.0 and set speed_reset_requested to false
 }
 
 void handleMenuCommand(int command) {
     switch (command) {
         case MENU_FILE_OPEN: {
             NFD::UniquePath outPath;
-            nfdfilteritem_t filterItem[1] = { { "Video files", "mp4,mov,avi,mkv" } };
+            nfdfilteritem_t filterItem[1] = { { "Video files", "mp4,mov,avi,mkv,wmv,flv,webm" } };
             nfdresult_t result = NFD::OpenDialog(outPath, filterItem, 1);
             if (result == NFD_OKAY) {
                 std::string filename = outPath.get();
                 std::cout << "Selected file: " << filename << std::endl;
-                
-                // Show loading screen before restarting player
-                SDL_Window* window = SDL_GetWindowFromID(1); // Assuming window ID 1
-                if (window) {
-                    SDL_Renderer* renderer = SDL_GetRenderer(window);
-                    if (renderer) {
-                        // Get font
-                        SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
-                        TTF_Font* font = TTF_OpenFontRW(rw, 1, 24);
-                        if (font) {
-                            renderLoadingScreen(renderer, font, "file", 0);
-                            TTF_CloseFont(font);
-                        }
-                    }
-                }
                 
                 // Restart player with new file
                 restartPlayerWithFile(filename);
@@ -341,76 +195,6 @@ void handleMenuCommand(int command) {
             // TODO: Implement interface selection logic
             break;
         }
-    }
-}
-
-// Progress callback functions
-void convertProgressCallback(int progress) {
-    static SDL_Renderer* rendererPtr = nullptr;
-    static TTF_Font* fontPtr = nullptr;
-    
-    // Store renderer and font pointers on first call
-    if (rendererPtr == nullptr) {
-        SDL_Window* window = SDL_GetWindowFromID(1); // Assuming window ID 1
-        if (window) {
-            rendererPtr = SDL_GetRenderer(window);
-        }
-    }
-    
-    if (fontPtr == nullptr) {
-        // We need to recreate the font for this thread
-        SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
-        fontPtr = TTF_OpenFontRW(rw, 1, 24);
-    }
-    
-    if (rendererPtr && fontPtr) {
-        renderLoadingScreen(rendererPtr, fontPtr, "convert", progress);
-    }
-}
-
-void bufferProgressCallback(int progress) {
-    static SDL_Renderer* rendererPtr = nullptr;
-    static TTF_Font* fontPtr = nullptr;
-    
-    // Store renderer and font pointers on first call
-    if (rendererPtr == nullptr) {
-        SDL_Window* window = SDL_GetWindowFromID(1); // Assuming window ID 1
-        if (window) {
-            rendererPtr = SDL_GetRenderer(window);
-        }
-    }
-    
-    if (fontPtr == nullptr) {
-        // We need to recreate the font for this thread
-        SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
-        fontPtr = TTF_OpenFontRW(rw, 1, 24);
-    }
-    
-    if (rendererPtr && fontPtr) {
-        renderLoadingScreen(rendererPtr, fontPtr, "file", 50 + progress / 2); // Scale from 50-100%
-    }
-}
-
-void youtubeProgressCallback(int progress) {
-    static SDL_Renderer* rendererPtr = nullptr;
-    static TTF_Font* fontPtr = nullptr;
-    
-    // Store renderer and font pointers on first call
-    if (rendererPtr == nullptr) {
-        SDL_Window* window = SDL_GetWindowFromID(1); // Assuming window ID 1
-        if (window) {
-            rendererPtr = SDL_GetRenderer(window);
-        }
-    }
-    
-    if (fontPtr == nullptr) {
-        // We need to recreate the font for this thread
-        SDL_RWops* rw = SDL_RWFromConstMem(font_otf, sizeof(font_otf));
-        fontPtr = TTF_OpenFontRW(rw, 1, 24);
-    }
-    
-    if (rendererPtr && fontPtr) {
-        renderLoadingScreen(rendererPtr, fontPtr, "youtube", progress);
     }
 }
 
@@ -551,6 +335,10 @@ int main(int argc, char* argv[]) {
     bool firstRun = true;
     bool fileProvided = (argc > 1); // Check if a file was provided as a command line argument
 
+    // --- Define fixed speed steps ---
+    const std::vector<double> speed_steps = {0.5, 1.0, 3.0, 10.0, 24.0};
+    static int current_speed_index = 1; // Start at 1.0x (index 1)
+
     while (true) {
         // Determine which file to load
         std::string fileToLoad;
@@ -561,14 +349,14 @@ int main(int argc, char* argv[]) {
             fileToLoad = argv[1];
             shouldLoadFile = true;
             firstRun = false;
-        } else if (reload_file_requested) {
+        } else if (reload_file_requested.load()) {
             // --- Show Loading Screen BEFORE processing --- 
-            renderLoadingScreen(renderer, font, "file", 0);
+            // renderLoadingScreen(renderer, font, "file", 0); // Removed
             // --- End Show Loading Screen ---
             // On reload, use filename from reload request
             fileToLoad = restart_filename;
             shouldLoadFile = true;
-            reload_file_requested = false;
+            reload_file_requested.store(false);
         } else if (firstRun) {
             // First run but no file provided - just show the empty player
             firstRun = false;
@@ -617,14 +405,11 @@ int main(int argc, char* argv[]) {
                                 // Ctrl+O to open file
                                 if (e.key.keysym.mod & KMOD_CTRL) {
                                     NFD::UniquePath outPath;
-                                    nfdfilteritem_t filterItem[1] = { { "Video files", "mp4,mov,avi,mkv" } };
+                                    nfdfilteritem_t filterItem[1] = { { "Video files", "mp4,mov,avi,mkv,wmv,flv,webm" } };
                                     nfdresult_t result = NFD::OpenDialog(outPath, filterItem, 1);
                                     if (result == NFD_OKAY) {
                                         std::string filename = outPath.get();
                                         std::cout << "Selected file: " << filename << std::endl;
-                                        
-                                        // Show loading screen before restarting player
-                                        renderLoadingScreen(renderer, font, "file", 0);
                                         
                                         // Restart player with new file
                                         restartPlayerWithFile(filename);
@@ -648,8 +433,8 @@ int main(int argc, char* argv[]) {
                 // Use renderOSD to display placeholder values for timecode and playback direction
                 // Parameters: renderer, font, isPlaying, playbackRate, isReverse, currentTime, frameNumber, 
                 // showOSD, waiting_for_timecode, input_timecode, original_fps, jog_forward, jog_backward, 
-                // isLoading, loadingType, loadingProgress
-                renderOSD(renderer, font, false, 0.0, false, 0.0, 0, true, false, "", 25.0, false, false, true, "", 0);
+                // Removed isLoading, loadingType, loadingProgress
+                renderOSD(renderer, font, false, 0.0, false, 0.0, 0, true, false, "", 25.0, false, false);
                 
                 // Render a small hint at the center of the screen
                 SDL_Color textColor = {200, 200, 200, 200};
@@ -657,9 +442,6 @@ int main(int argc, char* argv[]) {
                 if (messageSurface) {
                     SDL_Texture* messageTexture = SDL_CreateTextureFromSurface(renderer, messageSurface);
                     if (messageTexture) {
-                        int windowWidth, windowHeight;
-                        SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
-                        
                         SDL_Rect messageRect = {
                             windowWidth / 2 - messageSurface->w / 2,
                             windowHeight / 2 - messageSurface->h / 2,
@@ -681,269 +463,116 @@ int main(int argc, char* argv[]) {
                     SDL_Delay(FRAME_DELAY - frameTime);
                 }
             }
+
+            // If the user requested to exit from the 'no file loaded' state,
+            // AND it wasn't a request to reload a file, break the main loop
+            if (shouldExit && !reload_file_requested.load()) { 
+                break;
+            }
         }
         
         if (shouldLoadFile) {
-            // Reset flags and states
             resetPlayerState();
             
-            // --- Ensure window is visible and show loading screen if loading from command line --- 
             if (firstRun && fileProvided) { 
-                 SDL_SetWindowTitle(window, "TapeXPlayer - Loading...");
-                 renderLoadingScreen(renderer, font, "file", 0);
+                 SDL_SetWindowTitle(window, "TapeXPlayer"); // Set title directly
                  SDL_RenderPresent(renderer); // Force immediate display
                  firstRun = false; // Mark first run as handled
             }
-            // --- End Loading Screen for Cmd Line --- 
+            // Initialize variables for the playback loop that need to be passed to/from loading sequence
+            std::vector<FrameInfo> frameIndex; // Needs to be populated by loading sequence
+            std::unique_ptr<FullResDecoderManager> fullResManagerPtr;
+            std::unique_ptr<LowCachedDecoderManager> lowCachedManagerPtr;
+            std::unique_ptr<CachedDecoderManager> cachedManagerPtr;
+            std::atomic<int> currentFrame(0); // Will be reset inside loading sequence
+            std::atomic<bool> isPlaying(false); // Will be set inside loading sequence
 
-            // Ensure audio is completely stopped
-            cleanup_audio();
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            
-            // Process media source (file or URL)
-            std::string processedFilePath;
-            if (!processMediaSource(fileToLoad, processedFilePath, youtubeProgressCallback)) {
-                std::cerr << "Failed to process media source: " << fileToLoad << std::endl;
-                break;
-            }
-            
-            // Use processed file path for further processing
-            currentFilename = processedFilePath;
+            // Create LoadingStatus object for this loading operation
+            LoadingStatus loadingStatus;
 
-            if (currentFilename.empty()) {
-                std::cerr << "No file selected. Exiting." << std::endl;
-                log("No file selected. Exiting.");
-                break;
-            }
+            // Call the loading sequence function asynchronously
+            std::future<bool> loading_future = mainLoadingSequence(
+                renderer, window,
+                loadingStatus, // 3rd argument is LoadingStatus&
+                fileToLoad,    // 4th argument is const std::string&
+                    currentFilename, 
+                frameIndex, fullResManagerPtr, lowCachedManagerPtr, cachedManagerPtr,
+                currentFrame, isPlaying // Atomics are passed by reference implicitly
+            );
 
-            // Handle file path for macOS
-            if (currentFilename.find("/Volumes/") == 0) {
-                // Path is already absolute, leave as is
-            } else if (currentFilename[0] != '/') {
-                // Relative path, add current directory
-                char cwd[PATH_MAX];
-                if (getcwd(cwd, sizeof(cwd)) != NULL) {
-                    currentFilename = std::string(cwd) + "/" + currentFilename;
-                } else {
-                    std::cerr << "Error getting current directory" << std::endl;
-                    break;
+            // --- Show Loading Screen while waiting for the future --- 
+            SDL_SetWindowTitle(window, "TapeXPlayer - Loading..."); // Set loading title
+            while (loading_future.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
+                // Render loading screen
+                renderLoadingScreen(renderer, font, loadingStatus);
+
+                // Handle essential events (like SDL_QUIT) during loading
+                SDL_Event e;
+                while (SDL_PollEvent(&e)) {
+                    if (e.type == SDL_QUIT) {
+                        // Need to signal the loading thread to stop if possible
+                        // This requires adding stop logic to mainLoadingSequence/its sub-tasks
+                        // For now, just set quit flags and break loops
+                        quit = true;
+                        shouldExit = true; 
+                        // Optionally try to cancel the future if the task supports cancellation
+                        goto loading_exit; // Exit loading loop immediately
+                    } 
+                    // Handle other minimal events if necessary
                 }
+                if (quit.load()) goto loading_exit; // Exit if quit was set
+
+                // Small delay to prevent busy-waiting
+                 // SDL_Delay(10); // wait_for already provides a delay
+            }
+            loading_exit:; // Label for exiting the loading loop
+
+            // Check if we exited due to quit signal
+            if (quit.load()) {
+                // Cleanup resources acquired before loading started if necessary
+                continue; // Go to the start of the outer loop, which will handle exit
             }
 
-            std::cout << "Loading file: " << currentFilename << std::endl;
-            log("Loading file: " + currentFilename);
+            // Loading finished, get the result
+            bool loading_success = loading_future.get();
 
-            if (!std::filesystem::exists(currentFilename)) {
-                std::cerr << "File not found: " << currentFilename << std::endl;
-                log("Error: file not found: " + currentFilename);
-                break;
-            }
+             if (!loading_success) {
+                  // Loading failed, let the outer loop handle showing the "Press Ctrl+O" screen
+                   continue; // Go to the start of the outer while(true) loop
+              }
 
-            // Update window title with filename
+            // --- Loading successful, update window title --- 
             std::string filename_only = std::filesystem::path(currentFilename).filename().string();
             std::string windowTitle = "TapeXPlayer - " + filename_only;
             SDL_SetWindowTitle(window, windowTitle.c_str());
 
-            // Show loading indicator
-            renderLoadingScreen(renderer, font, "file", 0);
-
-            std::string lowResFilename = "low_res_output.mp4";
-
-            std::vector<FrameInfo> frameIndex = createFrameIndex(currentFilename.c_str());
-            std::cout << "Frame index created. Total frames: " << frameIndex.size() << std::endl;
-
-            // --- Show Loading Screen: Indexing --- 
-            renderLoadingScreen(renderer, font, "index", 0); // Using "index" type
-
-            // --- Show Loading Screen: Converting --- 
-            renderLoadingScreen(renderer, font, "convert", 0); // Show before starting conversion
-
-            if (!LowResDecoder::convertToLowRes(currentFilename.c_str(), lowResFilename, convertProgressCallback)) {
-                std::cerr << "Error converting video to low resolution" << std::endl;
-                break;
-            }
-            
-            // Update loading indicator for buffer initialization
-            renderLoadingScreen(renderer, font, "buffer", 0); // Show before manager creation
-
-            // Get video dimensions
-            int videoWidth, videoHeight;
-            get_video_dimensions(currentFilename.c_str(), &videoWidth, &videoHeight);
-
-            // We no longer resize the window to match video dimensions
-            // This ensures the window maintains its current size when loading a new file
-
-            std::future<double> fps_future = std::async(std::launch::async, get_video_fps, currentFilename.c_str());
-            std::future<double> duration_future = std::async(std::launch::async, get_file_duration, currentFilename.c_str());
-
-            // --- Get FPS and Set Adaptive Window Size BEFORE manager creation ---
-            original_fps.store(fps_future.get()); // Block until FPS is available
-            double fps = original_fps.load();
-
-            // int highResWindowSize = 600; // Default value (fallback) - Declare without default now
-            int highResWindowSize;
-            if (fps > 55.0) { // 60 FPS range (e.g., 59.94)
-                // highResWindowSize = 2400; // Old value
-                highResWindowSize = 1400; // New value
-            } else if (fps > 45.0) { // 50 FPS range
-                // highResWindowSize = 2000; // Old value
-                highResWindowSize = 1200; // New value
-            } else if (fps > 28.0) { // 30 FPS range (e.g., 29.97)
-                // highResWindowSize = 1200; // Old value
-                highResWindowSize = 700;  // New value
-            } else { // <= 28 FPS (includes 24, 25)
-                // highResWindowSize = 1000; // Old value
-                highResWindowSize = 600;  // New value
-            }
-            std::cout << "[DEBUG] Set highResWindowSize to: " << highResWindowSize << std::endl; 
-
-            // --- Calculate Adaptive Cached Segment Size based on FPS ---
-            int adaptiveCachedSegmentSize;
-            if (fps > 55.0) { // ~60 FPS
-                adaptiveCachedSegmentSize = 3000;
-            } else if (fps > 45.0) { // ~50 FPS
-                adaptiveCachedSegmentSize = 2500;
-            } else if (fps > 28.0) { // ~30 FPS
-                adaptiveCachedSegmentSize = 1500;
-            } else if (fps > 0) { // ~24/25 FPS or other
-                adaptiveCachedSegmentSize = 1250; 
-            } else { // Fallback if FPS is unknown
-                adaptiveCachedSegmentSize = 2000; // Default fallback size
-            }
-            std::cout << "[DEBUG] Set adaptiveCachedSegmentSize to: " << adaptiveCachedSegmentSize << std::endl;
-
-            bool enableHighResDecode = true;
-
-            // Initialize audio
-            bool audio_started = false;
-            for (int attempt = 0; attempt < 3 && !audio_started; ++attempt) {
-                std::cout << "Attempting to start audio (attempt " << attempt + 1 << " of 3)" << std::endl;
-                
-                // Make sure audio variables are reset
-                decoding_finished.store(false);
-                decoding_completed.store(false);
-                audio_buffer_index = 0.0;
-                
-                audio_thread = std::thread([&currentFilename, &audio_started]() {
-                    start_audio(currentFilename.c_str());
-                });
-                audio_thread.join();  // Wait for thread completion
-                
-                audio_started = !quit.load();  // If quit is not set, consider audio started successfully
-                
-                if (!audio_started) {
-                    std::cout << "Audio failed to start, retrying..." << std::endl;
-                    std::this_thread::sleep_for(std::chrono::seconds(1));  // Small pause before next attempt
-                }
-            }
-
-            if (!audio_started) {
-                std::cerr << "Failed to start audio after 3 attempts. Exiting." << std::endl;
-                break;
-            }
-
-            speed_change_thread = std::thread(smooth_speed_change);
-
-            bool fps_received = false;
-            bool duration_received = false;
-
-            previous_playback_rate.store(playback_rate.load());
-            
-            // Initialize atomics needed by managers
-            std::atomic<int> currentFrame(0);
-            std::atomic<bool> isPlaying(false); // Initialize as not playing
-
-            // Define ring buffer capacity before creating managers
-            const size_t ringBufferCapacity = 2000;
-
-            // Pointers for managers, to handle potential exceptions during creation
-            std::unique_ptr<FullResDecoderManager> fullResManagerPtr;
-            std::unique_ptr<LowCachedDecoderManager> lowCachedManagerPtr;
-            std::unique_ptr<CachedDecoderManager> cachedManagerPtr;
-
-            try {
-                // Create manager instances using unique_ptr
-                
-                fullResManagerPtr = std::make_unique<FullResDecoderManager>(
-                    currentFilename, 
-                    frameIndex, 
-                    currentFrame, 
-                    playback_rate, 
-                    highResWindowSize, 
-                    isPlaying,
-                    is_reverse
-                );
-            
-                lowCachedManagerPtr = std::make_unique<LowCachedDecoderManager>(
-                    lowResFilename, 
-                    frameIndex, 
-                    currentFrame, 
-                    ringBufferCapacity, 
-                    highResWindowSize, 
-                    isPlaying,
-                    playback_rate,
-                    is_reverse
-                );
-                
-                // Create the CachedDecoderManager instance with adaptive size
-                cachedManagerPtr = std::make_unique<CachedDecoderManager>(
-                    lowResFilename, 
-                    frameIndex,     
-                    currentFrame,   
-                    is_reverse,     
-                    adaptiveCachedSegmentSize // Pass the calculated adaptive size
-                );
-
-                // Start the managers' internal threads
+             // --- Start Decoder Manager Threads (after successful load and no quit signal) ---
                 if (fullResManagerPtr) fullResManagerPtr->run(); 
                 if (lowCachedManagerPtr) lowCachedManagerPtr->run(); 
-                if (cachedManagerPtr) cachedManagerPtr->run(); // Start the new manager
+             if (cachedManagerPtr) cachedManagerPtr->run();
+             // -------------------------------------------------------------------------
 
-            } catch (const std::exception& e) {
-                std::cerr << "Error creating decoder managers: " << e.what() << std::endl;
-                log("Error creating decoder managers: " + std::string(e.what()));
-                shouldExit = true; // Signal exit if managers fail
-            } catch (...) {
-                 std::cerr << "Unknown error creating decoder managers." << std::endl;
-                 log("Unknown error creating decoder managers.");
-                 shouldExit = true;
-            }
+             // --- Duration handling moved outside loading sequence for simplicity ---
+             // Let's get duration after successful load if needed immediately
+             double duration = get_file_duration(currentFilename.c_str());
+             total_duration.store(duration);
+             std::cout << "Total duration: " << total_duration.load() << " seconds" << std::endl;
 
             // Start playback after a short delay and manager setup
             std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Shorter delay maybe?
-            // Ensure playback starts paused
+             // Ensure playback starts paused (already handled by isPlaying init and loading func)
             target_playback_rate.store(0.0); 
             playback_rate.store(0.0); // Ensure current rate is also 0
-            isPlaying.store(false); // Ensure isPlaying is false
 
-            // Variables for periodic timecode logging
-            // auto lastTimecodeLogTime = std::chrono::steady_clock::now(); // Commented out
-            // const std::chrono::seconds timecodeLogInterval(1); // Commented out
-
+             // --- Start of the inner playback loop ---
             while (!shouldExit) {
-                // --- Periodic Timecode Logging --- 
-                // auto currentTimePoint = std::chrono::steady_clock::now(); // Commented out
-                // if (currentTimePoint - lastTimecodeLogTime >= timecodeLogInterval) { // Commented out
-                //     std::cout << "[Main Loop] Current Timecode: " << get_current_timecode() // Commented out
-                //               << ", Playback Rate: " << playback_rate.load() // Commented out
-                //               << ", Is Reverse: " << is_reverse.load() << std::endl; // Commented out
-                //     lastTimecodeLogTime = currentTimePoint; // Commented out
-                // } // Commented out
-                
                 // Process remote commands at the start of each frame
                 if (g_remote_control->is_initialized()) {
                     g_remote_control->process_commands();
                 }
-
-                // Check if duration is ready - Moved earlier
-                if (!duration_received && duration_future.valid()) {
-                    std::future_status status = duration_future.wait_for(std::chrono::seconds(0));
-                    if (status == std::future_status::ready) {
-                        total_duration.store(duration_future.get());
-                        std::cout << "Total duration: " << total_duration.load() << " seconds" << std::endl;
-                        duration_received = true;
-                    }
-                }
+                
+                // Check if we need to reset the speed threshold
+                check_and_reset_threshold();
 
                 // Handle fullscreen toggle request from menu
                 if (toggle_fullscreen_requested.load()) {
@@ -1003,6 +632,9 @@ int main(int argc, char* argv[]) {
                                     if (std::abs(playback_rate.load()) > 1.1) {
                                         // If speed is above 1.1x, first reset speed
                                         reset_to_normal_speed();
+                                        // --- Reset speed index to 1.0x --- 
+                                        current_speed_index = 1; // Index for 1.0x in speed_steps
+                                        // --- End Reset speed index --- 
                                     } else {
                                         toggle_pause();
                                     }
@@ -1029,10 +661,16 @@ int main(int argc, char* argv[]) {
                                     }
                                     break;
                                 case SDLK_UP:
-                                    target_playback_rate.store(std::min(target_playback_rate.load() * 2.0, 18.0));
+                                    if (current_speed_index < speed_steps.size() - 1) {
+                                        current_speed_index++;
+                                    }
+                                    target_playback_rate.store(speed_steps[current_speed_index]);
                                     break;
                                 case SDLK_DOWN:
-                                    target_playback_rate.store(std::max(target_playback_rate.load() / 2.0, 0.125));
+                                    if (current_speed_index > 0) {
+                                        current_speed_index--;
+                                    }
+                                    target_playback_rate.store(speed_steps[current_speed_index]);
                                     break;
                                 case SDLK_r:
                                     is_reverse.store(!is_reverse.load());
@@ -1053,14 +691,11 @@ int main(int argc, char* argv[]) {
                                     // Ctrl+O to open file
                                     if (e.key.keysym.mod & KMOD_CTRL) {
                                         NFD::UniquePath outPath;
-                                        nfdfilteritem_t filterItem[1] = { { "Video files", "mp4,mov,avi,mkv" } };
+                                        nfdfilteritem_t filterItem[1] = { { "Video files", "mp4,mov,avi,mkv,wmv,flv,webm" } };
                                         nfdresult_t result = NFD::OpenDialog(outPath, filterItem, 1);
                                         if (result == NFD_OKAY) {
                                             std::string filename = outPath.get();
                                             std::cout << "Selected file: " << filename << std::endl;
-                                            
-                                            // Show loading screen before restarting player
-                                            renderLoadingScreen(renderer, font, "file", 0);
                                             
                                             // Restart player with new file
                                             restartPlayerWithFile(filename);
@@ -1113,12 +748,15 @@ int main(int argc, char* argv[]) {
                                     break;
                                 case SDLK_z:
                                     // Toggle zoom mode
-                                    if (zoom_enabled.load()) {
-                                        reset_zoom();
+                                    if (!zoom_enabled.load()) {
+                                        int mouseX, mouseY;
+                                        SDL_GetMouseState(&mouseX, &mouseY);
+                                        // Pass texture dimensions to the function
+                                        handleZoomMouseEvent(e, windowWidth, windowHeight, get_last_texture_width(), get_last_texture_height()); 
                                     } else {
-                                        zoom_enabled.store(true);
-                                        zoom_factor.store(2.0f); // Initial zoom factor
+                                        reset_zoom(); // Disable zoom if it was enabled
                                     }
+                                    zoom_enabled.store(!zoom_enabled.load());
                                     break;
                                 case SDLK_t:
                                     // Toggle thumbnail display
@@ -1155,10 +793,7 @@ int main(int argc, char* argv[]) {
                             std::string extension = filename.substr(filename.find_last_of(".") + 1);
                             std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
                             
-                            if (extension == "mp4" || extension == "mov" || extension == "avi" || extension == "mkv") {
-                                // Show loading screen before restarting player
-                                renderLoadingScreen(renderer, font, "file", 0);
-                                
+                            if (extension == "mp4" || extension == "mov" || extension == "avi" || extension == "mkv" || extension == "wmv" || extension == "flv" || extension == "webm") {
                                 // Restart player with new file
                                 restartPlayerWithFile(filename);
                             } else {
@@ -1186,28 +821,9 @@ int main(int argc, char* argv[]) {
 
                 // Update currentFrame based on current audio time
                 double currentTime = current_audio_time.load();
-                // int newCurrentFrame = 0; // Default to 0 - OLD CALCULATION
-                // if (original_fps.load() > 0 && !frameIndex.empty()) { 
-                //     newCurrentFrame = static_cast<int>(currentTime * original_fps.load());
-                //     // Ensure frame index stays within bounds
-                //     if (newCurrentFrame >= frameIndex.size()) {
-                //         newCurrentFrame = frameIndex.size() - 1;
-                //     }
-                //     if (newCurrentFrame < 0) {
-                //         newCurrentFrame = 0;
-                //     }
-                // }
-                
-                // --- NEW CALCULATION using time_ms --- 
                 int64_t target_time_ms = static_cast<int64_t>(currentTime * 1000.0);
                 int newCurrentFrame = findClosestFrameIndexByTime(frameIndex, target_time_ms);
-                // Ensure frame index stays within bounds (redundant if findClosestFrameIndexByTime handles empty index)
-                if (!frameIndex.empty()) {
-                    newCurrentFrame = std::max(0, std::min(newCurrentFrame, static_cast<int>(frameIndex.size()) - 1));
-                } else {
-                    newCurrentFrame = 0;
-                }
-                // --- END NEW CALCULATION ---
+                 if (!frameIndex.empty()) { newCurrentFrame = std::max(0, std::min(newCurrentFrame, static_cast<int>(frameIndex.size()) - 1)); } else { newCurrentFrame = 0; }
                  
                  // Notify managers ONLY if the frame has actually changed
                  if (newCurrentFrame != currentFrame.load()) {
@@ -1217,81 +833,31 @@ int main(int argc, char* argv[]) {
                      if (cachedManagerPtr) cachedManagerPtr->notifyFrameChange();
                  }
 
-                // --- Frame Selection Logic --- (Moved from decoding threads)
+                // --- Frame Selection Logic ---
                 std::shared_ptr<AVFrame> frameToDisplay = nullptr;
                 FrameInfo::FrameType frameTypeToDisplay = FrameInfo::EMPTY;
-                double currentPlaybackRate = std::abs(playback_rate.load()); // Get current speed
-
-                if (newCurrentFrame >= 0 && newCurrentFrame < frameIndex.size()) {
-                    const FrameInfo& currentFrameInfo = frameIndex[newCurrentFrame];
-                    // Use std::unique_lock for more control over locking
-                    std::unique_lock<std::mutex> lock(currentFrameInfo.mutex);
-
-                    if (!currentFrameInfo.is_decoding) { 
-                        if (currentPlaybackRate <= 1.1) { // Speed <= 1.1x: Prefer Full_Res
-                            if (currentFrameInfo.frame) { frameToDisplay = currentFrameInfo.frame; frameTypeToDisplay = FrameInfo::FULL_RES; }
-                            else if (currentFrameInfo.low_res_frame) { frameToDisplay = currentFrameInfo.low_res_frame; frameTypeToDisplay = FrameInfo::LOW_RES; }
-                            else if (currentFrameInfo.cached_frame) { frameToDisplay = currentFrameInfo.cached_frame; frameTypeToDisplay = FrameInfo::CACHED; }
-                            lock.unlock(); // Unlock after accessing
-                        } else { // Speed > 1.1x: NEVER use Full_Res. Prefer Low > Cached
-                            if (currentFrameInfo.low_res_frame) { frameToDisplay = currentFrameInfo.low_res_frame; frameTypeToDisplay = FrameInfo::LOW_RES; }
-                            else if (currentFrameInfo.cached_frame) { frameToDisplay = currentFrameInfo.cached_frame; frameTypeToDisplay = FrameInfo::CACHED; }
-                            else { // Fallback: Search neighbors if Low/Cached not available
-                                lock.unlock(); // Release lock *before* searching neighbors
-                                bool isForward = playback_rate.load() >= 0;
-                                int step = isForward ? 1 : -1;
-                                int searchRange = 15; // Search range
-
-                                for (int i = 1; i <= searchRange; ++i) { // Start from neighbor
-                                    int checkFrameIdx = newCurrentFrame + (i * step);
-                                    if (checkFrameIdx >= 0 && checkFrameIdx < frameIndex.size()) {
-                                        // Lock neighbor briefly just to check
-                                        std::lock_guard<std::mutex> search_lock(frameIndex[checkFrameIdx].mutex);
-                                        if (!frameIndex[checkFrameIdx].is_decoding) { // Check if neighbor is not being decoded
-                                            // Check low_res_frame first (preferred)
-                                            if (frameIndex[checkFrameIdx].low_res_frame) {
-                                                frameToDisplay = frameIndex[checkFrameIdx].low_res_frame;
-                                                frameTypeToDisplay = FrameInfo::LOW_RES;
-                                                break; // Found one
-                                            } 
-                                            // Then check cached_frame (fallback)
-                                            else if (frameIndex[checkFrameIdx].cached_frame) {
-                                                frameToDisplay = frameIndex[checkFrameIdx].cached_frame;
-                                                frameTypeToDisplay = FrameInfo::CACHED;
-                                                break; // Found one
-                                            }
-                                        }
-                                    } else {
-                                        break; // Out of bounds
-                                    }
-                                }
-                                // frameToDisplay might still be nullptr if no suitable neighbor found
-                            }
-                            // If Low/Cached found initially, the lock was released implicitly. 
-                            // Ensure lock is released if we fell through the neighbor search without finding anything.
-                            if (lock.owns_lock()) { 
-                                lock.unlock();
-                            }
-                        }
-                    } else { // Frame is currently being decoded
-                        lock.unlock(); // Unlock if frame is decoding
-                        // frameToDisplay remains nullptr
-                    }
-                } else { // frameToDisplay remains nullptr if index is out of bounds
-                    // --- End Frame Selection Logic ---
-                    // frameToDisplay remains nullptr
-                }
+                double currentPlaybackRate = std::abs(playback_rate.load()); if (newCurrentFrame >= 0 && newCurrentFrame < frameIndex.size()) { const FrameInfo& currentFrameInfo = frameIndex[newCurrentFrame]; std::unique_lock<std::mutex> lock(currentFrameInfo.mutex); if (!currentFrameInfo.is_decoding) { if (currentPlaybackRate <= 1.1) { if (currentFrameInfo.frame) { frameToDisplay = currentFrameInfo.frame; frameTypeToDisplay = FrameInfo::FULL_RES; } else if (currentFrameInfo.low_res_frame) { frameToDisplay = currentFrameInfo.low_res_frame; frameTypeToDisplay = FrameInfo::LOW_RES; } else if (currentFrameInfo.cached_frame) { frameToDisplay = currentFrameInfo.cached_frame; frameTypeToDisplay = FrameInfo::CACHED; } lock.unlock(); } else { if (currentFrameInfo.low_res_frame) { frameToDisplay = currentFrameInfo.low_res_frame; frameTypeToDisplay = FrameInfo::LOW_RES; } else if (currentFrameInfo.cached_frame) { frameToDisplay = currentFrameInfo.cached_frame; frameTypeToDisplay = FrameInfo::CACHED; } else { lock.unlock(); bool isForward = playback_rate.load() >= 0; int step = isForward ? 1 : -1; int searchRange = 15; for (int i = 1; i <= searchRange; ++i) { int checkFrameIdx = newCurrentFrame + (i * step); if (checkFrameIdx >= 0 && checkFrameIdx < frameIndex.size()) { std::lock_guard<std::mutex> search_lock(frameIndex[checkFrameIdx].mutex); if (!frameIndex[checkFrameIdx].is_decoding) { if (frameIndex[checkFrameIdx].low_res_frame) { frameToDisplay = frameIndex[checkFrameIdx].low_res_frame; frameTypeToDisplay = FrameInfo::LOW_RES; break; } else if (frameIndex[checkFrameIdx].cached_frame) { frameToDisplay = frameIndex[checkFrameIdx].cached_frame; frameTypeToDisplay = FrameInfo::CACHED; break; } } } else { break; } } } if (lock.owns_lock()) { lock.unlock(); } } } else { lock.unlock(); } }
 
                 // Check if seek is complete
                 if (seekInfo.completed.load()) {
                     seekInfo.completed.store(false);
                     seek_performed.store(false);
                 }
-                displayFrame(renderer, frameIndex, newCurrentFrame, frameToDisplay, frameTypeToDisplay, // Pass selected frame and type
-                            enableHighResDecode, playback_rate.load(), current_audio_time, total_duration,
+
+                // --- Determine highResWindowSize and ringBufferCapacity ---
+                 // Note: These might be better calculated once during loading or dynamically based on needs
+                 int highResWindowSize = 700; // Default or recalculate based on fps if needed here
+                 double fps_local = original_fps.load();
+                 if (fps_local > 55.0) { highResWindowSize = 1400; } else if (fps_local > 45.0) { highResWindowSize = 1200; } else if (fps_local > 28.0) { highResWindowSize = 700; } else { highResWindowSize = 600; }
+                 const size_t ringBufferCapacity = 2000; // Could also be adaptive
+
+
+                displayFrame(renderer, frameIndex, newCurrentFrame, frameToDisplay, frameTypeToDisplay,
+                            true, // enableHighResDecode - Assuming true for now
+                             playback_rate.load(), current_audio_time.load(), total_duration.load(),
                             showIndex, showOSD, font, isPlaying, is_reverse.load(), waiting_for_timecode,
-                            input_timecode, original_fps, jog_forward, jog_backward,
-                            ringBufferCapacity, highResWindowSize, 950);
+                            input_timecode, original_fps.load(), jog_forward, jog_backward,
+                            ringBufferCapacity, highResWindowSize, 950); // Pass calculated sizes
 
                 // Limit frame rate
                 Uint32 frameTime = SDL_GetTicks() - frameStart;
@@ -1304,54 +870,60 @@ int main(int argc, char* argv[]) {
                     seekInfo.time.store(current_audio_time.load());
                     seekInfo.requested.store(true);
                     seekInfo.completed.store(false);
-                    // seek_performed.store(false); // Moved completion check earlier
                     // Notify managers immediately on seek request
                      if (fullResManagerPtr) fullResManagerPtr->notifyFrameChange();
                      if (lowCachedManagerPtr) lowCachedManagerPtr->notifyFrameChange();
                      if (cachedManagerPtr) cachedManagerPtr->notifyFrameChange();
                 }
 
-                // Make sure to stop and join the threads before exiting
-                if (shouldExit) {
-                    // Stop managers first (this will join their threads)
-                    if (fullResManagerPtr) fullResManagerPtr->stop();
-                    if (lowCachedManagerPtr) lowCachedManagerPtr->stop();
-                    if (cachedManagerPtr) cachedManagerPtr->stop();
-                    
-                    // Also join other threads like speed_change_thread if they exist
-                    if (speed_change_thread.joinable()) {
-                        speed_change_thread.join();
-                    }
-                    break; // Exit the main loop
-                }
-            }
+                // Exit condition check for the inner loop
+                if (shouldExit.load()) {
+                    break; 
+                } 
 
-            // Ensure threads are joined on normal exit as well
-            shouldExit = true; // Signal threads to stop (redundant, but safe)
-             // Stop managers (this will join their threads)
+            } // --- End of the inner playback loop ---
+
+
+            // --- Cleanup after inner loop exits (either by shouldExit or reaching end of file naturally?) ---
+            std::cout << "[Cleanup] Stopping managers..." << std::endl; // Debug log
             if (fullResManagerPtr) fullResManagerPtr->stop();
             if (lowCachedManagerPtr) lowCachedManagerPtr->stop();
             if (cachedManagerPtr) cachedManagerPtr->stop();
+            std::cout << "[Cleanup] Managers stopped." << std::endl; // Debug log
             
+            std::cout << "[Cleanup] Joining speed change thread..." << std::endl; // Debug log
             if (speed_change_thread.joinable()) {
+                 // Ensure smooth_speed_change loop checks shouldExit/quit
+                try {
                 speed_change_thread.join();
+                    std::cout << "[Cleanup] Speed change thread joined." << std::endl; // Debug log
+                } catch (const std::system_error& e) {
+                     std::cerr << "[Cleanup] Error joining speed_change_thread: " << e.what() << " (" << e.code() << ")" << std::endl;
+                     // Consider if detaching is an option here as a last resort
+                 }
             }
+            
 
             // Cleanup audio resources
+            std::cout << "[Cleanup] Cleaning audio..." << std::endl; // Debug log
             cleanup_audio();
             
-            // Ensure audio is completely stopped and resources are released
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-            // Clean up temporary files before loading new file
+            // Clean up temporary files before potentially loading new file
+            std::cout << "[Cleanup] Cleaning temp files..." << std::endl; // Debug log
             cleanupTempFiles();
             
-            // If there was a request to exit the program (not reload file), break the loop
-            if (!reload_file_requested && !restart_requested) {
-                break;
+            // If there was a request to exit the program (not reload file), break the outer loop
+            if (!reload_file_requested.load() && !restart_requested) {
+                 // Ensure shouldExit is true so the outer loop terminates correctly
+                 shouldExit = true; // Set explicitly for clarity
+                 break; // Break the outer while(true) loop
             }
-        }
-    }
+            // If reload or restart was requested, the outer loop will continue,
+            // and reload_file_requested will be handled at the beginning.
+        } // End if (shouldLoadFile)
+    } // End outer while(true) loop
 
     // Save final window settings before closing
     saveWindowSettings(window);
@@ -1408,4 +980,13 @@ int main(int argc, char* argv[]) {
     }
 
     return 0;
+}
+
+// Add this check in the appropriate update loop
+void check_and_reset_threshold() {
+    if (speed_reset_requested.load() && fabs(playback_rate.load() - 1.0) < 0.1) {
+        // Speed is close to 1.0x now, reset the threshold back to default
+        LowCachedDecoderManager::speed_threshold.store(16.0);
+        speed_reset_requested.store(false);
+    }
 }

@@ -271,6 +271,18 @@ void FullResDecoderManager::decodingLoop() {
         // Optional minimal sleep to prevent tight loop if conditions change rapidly
         // std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
+        // --- Check speed and clear high-res frames if > 1.1x --- 
+        double current_speed = std::abs(playbackRateAbs); // Get current speed
+        if (current_speed > 1.1) { // Check if speed is greater than 1.1x
+            // std::cout << "[FullResManager] Speed > 1.1x, clearing high-res frames." << std::endl;
+            decoder_->clearHighResFrames(frameIndex_); // Call the clear function
+
+            // Sleep briefly to avoid busy-waiting when speed is high
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue; // Skip decoding new frames on this iteration
+        }
+        // --- End speed check ---
+
     } // end while loop
 
     // std::cout << "FullResDecoderManager: Decoding loop finished." << std::endl;

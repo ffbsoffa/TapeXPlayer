@@ -6,6 +6,7 @@
 #include <atomic>
 #include <future>
 #include <string>
+#include <functional>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -31,7 +32,7 @@ public:
     // --- Static Utility Methods ---
     // Convert original video to low-res version
     static bool convertToLowRes(const std::string& filename, std::string& outputFilename, 
-                              ProgressCallback progressCallback = nullptr);
+                              const std::function<void(int)>& progressCallback = nullptr);
     
     // String utilities for file handling
     static std::string getCachePath();

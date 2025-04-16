@@ -21,7 +21,7 @@ public:
         std::vector<FrameInfo>& frameIndex,
         std::atomic<int>& currentFrame,
         std::atomic<bool>& isReverseRef, // Needed for direction
-        int segmentSize = 5000 // Default segment size (adjust as needed)
+        int segmentSize = 10500 // Default segment size (adjust as needed)
     );
 
     ~CachedDecoderManager();

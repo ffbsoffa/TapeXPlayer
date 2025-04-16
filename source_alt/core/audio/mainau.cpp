@@ -74,9 +74,9 @@ std::map<int, int> menu_to_device_index;
 std::vector<std::string> get_audio_output_devices();
 
 void smooth_speed_change() {
-    const double normal_step = 0.4;
+    const double normal_step = 0.2;
     const double pause_step = 1.0; // Still needed for pausing interpolation
-    const int normal_interval = 7; // Re-add missing constant
+    const int normal_interval = 18; // Re-add missing constant
     const int pause_interval = 4;  // Still needed for pausing interpolation
 
     // --- Base Overshoot Curve Parameters (for scaling) ---
@@ -119,7 +119,7 @@ void smooth_speed_change() {
     };
     // --- End Lambda ---
 
-    while (!quit.load()) {
+    while (!quit.load() && !shouldExit.load()) {
         double current = playback_rate.load();
         double target = target_playback_rate.load();
 
@@ -163,6 +163,7 @@ void smooth_speed_change() {
 
                  while (true) {
                      // ... (Overshoot curve calculation logic) ...
+                     if (quit.load() || shouldExit.load()) break; // Check for exit signal
                      auto now = std::chrono::steady_clock::now();
                      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - overshoot_start_time);
                      int elapsedMs = elapsed.count();
@@ -187,6 +188,7 @@ void smooth_speed_change() {
 
                  while (true) {
                      // ... (Simple ramp-up logic) ...
+                     if (quit.load() || shouldExit.load()) break; // Check for exit signal
                      auto now = std::chrono::steady_clock::now();
                      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ramp_start_time);
                      int elapsedMs = elapsed.count();
