@@ -488,7 +488,7 @@ void displayFrame(
 
                        // --- Apply Betacam Effects ---
                        double absPlaybackRate = std::abs(currentPlaybackRate);
-                       const double effectThreshold = 1.1; // Slightly above 1x to trigger effects
+                       const double effectThreshold = 1.2; // Slightly above 1x to trigger effects
                        if (absPlaybackRate >= effectThreshold && currentTime > 0.1 && (totalDuration - currentTime) > 0.1) {
                            // Apply B&W effect for high speeds (>= 10.0x)
                            if (absPlaybackRate >= 10.0) {
@@ -513,7 +513,7 @@ void displayFrame(
                            const int midStripeHeight = static_cast<int>(50 * resolutionScale);
                            int stripeHeight, stripeSpacing;
                            // ... (rest of stripe parameter calculation based on absPlaybackRate, identical to old code) ...
-                            if ((absPlaybackRate >= 0.2 && absPlaybackRate < 0.9) || (absPlaybackRate >= 1.2 && absPlaybackRate < 2.0)) {
+                            if ((absPlaybackRate >= 0.2 && absPlaybackRate < 0.9) || (absPlaybackRate >= 1.1 && absPlaybackRate < 2.0)) {
                                 double t = (absPlaybackRate < 0.9) ? (absPlaybackRate - 0.2) / 0.7 : (absPlaybackRate - 1.2) / 0.8;
                                 t = t * t * (3 - 2 * t); stripeHeight = static_cast<int>(maxStripeHeight * (1 - t) + midStripeHeight * t); stripeSpacing = baseStripeSpacing;
                             } else if (absPlaybackRate >= 2.0 && absPlaybackRate < 4.0) {

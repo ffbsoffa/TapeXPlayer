@@ -219,10 +219,8 @@ void FullResDecoderManager::decodingLoop() {
                                        (now >= nextScheduledHighResTime_ || justReturnedToHighRes);
 
             if (shouldTriggerDecode && highResStart <= highResEnd) {
-                // Decode the required high-resolution range
-                // std::cout << "[FRDM Log] Triggering decode range [" 
-                          // << highResStart << "-" << highResEnd 
-                          // << "] (Reason: " << (justReturnedToHighRes ? "Returned to 1x" : "Scheduled time") << ")" << std::endl;
+                std::cout << "[Manager Log] Calling decodeFrameRange with window: ["
+                          << highResStart << " - " << highResEnd << "]" << std::endl;
                 bool success = decoder_->decodeFrameRange(frameIndex_, highResStart, highResEnd);
                 if (!success) {
                     std::cerr << "FullResDecoderManager Warning: decodeFrameRange failed for [" 

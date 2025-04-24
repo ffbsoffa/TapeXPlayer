@@ -76,7 +76,7 @@ std::vector<std::string> get_audio_output_devices();
 void smooth_speed_change() {
     const double normal_step = 0.2;
     const double pause_step = 1.0; // Still needed for pausing interpolation
-    const int normal_interval = 18; // Re-add missing constant
+    const int normal_interval = 14; // Re-add missing constant
     const int pause_interval = 4;  // Still needed for pausing interpolation
 
     // --- Base Overshoot Curve Parameters (for scaling) ---

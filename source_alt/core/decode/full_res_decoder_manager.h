@@ -40,7 +40,7 @@ private:
     std::atomic<bool>& isPlaying_;             // Reference to shared data
     std::atomic<bool>& isReverse_;             // Added: Reference to shared data
     
-    const int& highResWindowSize_;             // Store as const reference
+    const int highResWindowSize_;             // Store as const reference
 
     std::unique_ptr<FullResDecoder> decoder_;  // Owns the specific decoder instance
 

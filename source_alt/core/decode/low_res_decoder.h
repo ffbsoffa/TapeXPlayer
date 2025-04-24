@@ -73,6 +73,8 @@ private:
     int height_ = 0;
     AVPixelFormat pixFmt_ = AV_PIX_FMT_NONE;
     std::atomic<bool> stop_requested_{false};
+    AVBufferRef *global_hw_device_ctx_ = nullptr;
+    bool hw_accel_available_ = false;
 };
 
 #endif // LOW_RES_DECODER_H 

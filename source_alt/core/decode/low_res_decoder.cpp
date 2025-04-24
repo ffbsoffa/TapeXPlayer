@@ -486,8 +486,8 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex, int st
         }
 
         // Optional: Set threading options for the codec context itself (if supported)
-        // codecContext->thread_count = 1; // Or std::thread::hardware_concurrency(); ? Let FFmpeg decide default for now.
-        // codecContext->thread_type = FF_THREAD_SLICE; // Or FF_THREAD_FRAME;
+        codecContext->thread_count = std::max(1, (int)std::thread::hardware_concurrency() / numThreads); // Пример: распределить ядра
+        codecContext->thread_type = FF_THREAD_FRAME; // Или FF_THREAD_SLICE, нужно тестировать
 
         if (avcodec_parameters_to_context(codecContext, formatContext->streams[videoStream]->codecpar) < 0) {
             std::cerr << "[Thread " << threadId << "] Error copying codec parameters." << std::endl;
