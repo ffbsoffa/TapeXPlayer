@@ -78,6 +78,9 @@ private:
     int previousSegment_ = -1; // Added - tracks last processed segment index
     bool previousIsReverse_ = false; // Added - tracks last direction state
 
+    // Private methods
+    void loadSegment(int segmentIndex);   // Declaration added
+    void unloadSegment(int segmentIndex); // Declaration added
 };
 
 #endif // LOW_CACHED_DECODER_MANAGER_H 

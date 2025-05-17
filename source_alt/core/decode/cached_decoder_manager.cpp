@@ -281,6 +281,19 @@ void CachedDecoderManager::loadSegment(int segmentIndex) {
         loadedSegments_.insert(segmentIndex);
         // --- DEBUG ---
         // std::cout << "CachedDecoderManager: Successfully loaded segment " << segmentIndex << ". Total loaded: " << loadedSegments_.size() << std::endl;
+
+        // --- Ensure FrameType is set for newly cached frames in the segment ---
+        for (int i = startFrame; i <= endFrame; ++i) {
+            // Bounds check for safety, though startFrame/endFrame should be valid
+            if (i >= 0 && i < frameIndex_.size()) { 
+                std::lock_guard<std::mutex> frameLock(frameIndex_[i].mutex); // Lock individual frame
+                if (frameIndex_[i].cached_frame && frameIndex_[i].type == FrameInfo::EMPTY) {
+                    frameIndex_[i].type = FrameInfo::CACHED;
+                }
+            }
+        }
+        // --- End Ensure FrameType ---
+
     } else {
         std::cerr << "CachedDecoderManager Warning: Failed to load segment " << segmentIndex << std::endl;
     }

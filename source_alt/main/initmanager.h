@@ -42,7 +42,7 @@ std::string getConfigFilePath();
 WindowSettings loadWindowSettings();
 void saveWindowSettings(SDL_Window* window);
 void resetPlayerState();
-void restartPlayerWithFile(const std::string& filename);
+void restartPlayerWithFile(const std::string& filename, double seek_after_load_time = -1.0);
 
 // Main file loading sequence function
 std::future<bool> mainLoadingSequence(

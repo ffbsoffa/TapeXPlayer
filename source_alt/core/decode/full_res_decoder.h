@@ -3,6 +3,7 @@
 #include <atomic>
 #include <future>
 #include <string>
+#include <CoreVideo/CoreVideo.h> // Ensure this is included for CVPixelBufferRef
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -34,6 +35,7 @@ public:
     int getWidth() const;
     int getHeight() const;
     AVPixelFormat getPixelFormat() const; // Returns context pix fmt
+    float getDisplayAspectRatio() const; // <-- ADDED Getter
 
     // --- Static Utility Methods ---
     static void removeHighResFrames(std::vector<FrameInfo>& frameIndex,
@@ -43,6 +45,9 @@ public:
     static bool shouldProcessFrame(const FrameInfo& frame);
 
     void requestStop();
+
+    // --- ADDED: Method to check for irrecoverable HW failure ---
+    bool hasHardwareFailedIrrecoverably() const;
 
 private:
     // Initialization and cleanup
@@ -56,6 +61,8 @@ private:
     int width_ = 0;
     int height_ = 0;
     AVPixelFormat pixFmt_ = AV_PIX_FMT_NONE; // Actual pixel format of the opened context
+    AVRational sampleAspectRatio_ = {0, 1}; // <-- ADDED SAR field
+    float displayAspectRatio_ = 16.0f/9.0f; // <-- ADDED DAR field
 
     // FFmpeg context members
     AVFormatContext* formatCtx_ = nullptr;
@@ -71,5 +78,11 @@ private:
     AVPixelFormat hw_pix_fmt_ = AV_PIX_FMT_NONE; // Will be AV_PIX_FMT_VIDEOTOOLBOX if enabled
 
     std::atomic<bool> stop_requested_{false};
+
+    // --- ADDED: Flag for irrecoverable HW failure ---
+    std::atomic<bool> hw_irrecoverably_failed_;
+
+    // --- ADDED: Static counter for instances ---
+    static std::atomic<int> instance_counter_;
 
 };

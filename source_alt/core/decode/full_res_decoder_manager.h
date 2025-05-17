@@ -15,13 +15,13 @@
 class FullResDecoderManager {
 public:
     FullResDecoderManager(
-        const std::string& filename,            // Source filename
-        std::vector<FrameInfo>& frameIndex,     // Shared frame index
-        std::atomic<int>& currentFrame,         // Shared current frame
-        std::atomic<double>& playbackRate,      // Shared playback rate
-        const int& highResWindowSizeRef,         // Use const reference
-        std::atomic<bool>& isPlaying,           // Shared playing status
-        std::atomic<bool>& isReverseRef         // Added: Shared reverse status
+        const std::string& filename,            
+        std::vector<FrameInfo>& frameIndex,     
+        std::atomic<int>& currentFrame,         
+        std::atomic<double>& playbackRate,      
+        const int& highResWindowSizeRef,         
+        std::atomic<bool>& isPlaying,           
+        std::atomic<bool>& isReverseRef         
     );
 
     ~FullResDecoderManager();
@@ -29,6 +29,13 @@ public:
     void run(); // Start the manager thread
     void stop(); // Stop the manager thread
     void notifyFrameChange(); // Notify about frame changes
+
+    // Add getter for the decoder instance
+    FullResDecoder* getDecoder() const;
+
+    // New methods for window size activity control
+    void checkWindowSizeAndToggleActivity(int windowWidth, int windowHeight);
+    bool isCurrentlyActive() const;
 
 private:
     void decodingLoop(); // The actual loop logic
@@ -41,6 +48,9 @@ private:
     std::atomic<bool>& isReverse_;             // Added: Reference to shared data
     
     const int highResWindowSize_;             // Store as const reference
+
+    // --- ADDED: Flag for permanent HW failure of the current decoder instance ---
+    bool current_decoder_hw_failed_permanently_ = false;
 
     std::unique_ptr<FullResDecoder> decoder_;  // Owns the specific decoder instance
 
@@ -57,6 +67,10 @@ private:
     // State for improved interval timing
     std::chrono::steady_clock::time_point nextScheduledHighResTime_;
     bool highResConditionsMetPreviously_ = false;
+
+    // New members for activity control
+    std::atomic<bool> isHighResActive_{true}; // Default to active
+    std::mutex activityCheckMutex_; // For protecting decoder access during activity check
 
     // REMOVED: size_t ringBufferCapacity; (Less relevant here)
     // REMOVED: std::future<void> highResFuture;

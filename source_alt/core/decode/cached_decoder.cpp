@@ -3,6 +3,7 @@
 #include <iostream>
 #include <thread>
 #include <algorithm> // For std::max, std::min
+#include <functional> // Ensure std::function is included (needed for callbacks later implicitly)
 
 // --- Constructor and Destructor --- 
 CachedDecoder::CachedDecoder(const std::string& filename, std::vector<FrameInfo>& frameIndex) :
@@ -86,11 +87,10 @@ bool CachedDecoder::initialize() {
         return false;
     }
     
-    // Enable multi-threading hint (optional)
+    // Enable multi-threading hint for software decoding
     codecCtx_->thread_count = std::thread::hardware_concurrency();
     codecCtx_->thread_type = FF_THREAD_FRAME;
 
-    // Open codec
     if (avcodec_open2(codecCtx_, codec, nullptr) < 0) {
         std::cerr << "CachedDecoder Error: Failed to open codec" << std::endl;
         cleanup();
@@ -191,11 +191,31 @@ bool CachedDecoder::decodeRange(int startFrame, int endFrame) {
     int seek_ret = av_seek_frame(formatCtx_, videoStreamIndex_, seekTargetPts, AVSEEK_FLAG_BACKWARD);
     if (seek_ret < 0) {
         std::cerr << "CachedDecoder Warning: Seek to pts " << seekTargetPts << " (ms ~" << seekTargetTimeMs << ") failed: " << av_err2str(seek_ret) << std::endl;
-        // Consider trying to seek to beginning if initial seek fails?
-        // av_seek_frame(formatCtx_, videoStreamIndex_, 0, AVSEEK_FLAG_BYTE); 
     } else {
         avcodec_flush_buffers(codecCtx_); // Flush decoder after successful seek
         // std::cout << "CachedDecoder Seek successful to ~" << seekTargetTimeMs << " ms" << std::endl;
+
+        // --- "Warm-up" decoder: Decode and discard a couple of frames after seek --- 
+        int warmup_frames_to_discard = 4; // Increased from 2 to potentially avoid initial green frames
+        AVFrame* warmup_frame = av_frame_alloc();
+        AVPacket* warmup_packet = av_packet_alloc(); // Need a packet for warm-up too
+        if (warmup_frame && warmup_packet) {
+            for (int i = 0; i < warmup_frames_to_discard; ++i) {
+                if (av_read_frame(formatCtx_, warmup_packet) < 0) break; // EOF or error
+                if (warmup_packet->stream_index == videoStreamIndex_) {
+                    if (avcodec_send_packet(codecCtx_, warmup_packet) >= 0) {
+                        if (avcodec_receive_frame(codecCtx_, warmup_frame) >= 0) {
+                            // Successfully received a warmup frame, do nothing with it
+                            av_frame_unref(warmup_frame);
+                        } // else: EAGAIN or error, will be handled by main loop or next warmup iter
+                    }
+                }
+                av_packet_unref(warmup_packet); // Unref packet in warmup loop
+            }
+        }
+        if(warmup_frame) av_frame_free(&warmup_frame);
+        if(warmup_packet) av_packet_free(&warmup_packet);
+        // --- End Warm-up ---
     }
 
     // --- Decoding Loop --- 
@@ -208,9 +228,9 @@ bool CachedDecoder::decodeRange(int startFrame, int endFrame) {
         return false;
     }
 
-    int decodedFrameCountInLoop = 0; // Counter for frames decoded in this loop iteration
-    bool firstFrameDecoded = false;
-    int currentFrameIndex = -1; // Track the estimated index based on PTS
+    int decodedFramesSinceFirstStore = 0; // Счетчик для шага
+    bool firstFrameStoredInRange = false;  // Флаг для первого кадра
+    int firstStoredFrameIndex = -1;       // Индекс первого сохраненного кадра в этом вызове
 
     while (av_read_frame(formatCtx_, packet) >= 0) {
         if (packet->stream_index == videoStreamIndex_) {
@@ -234,66 +254,146 @@ bool CachedDecoder::decodeRange(int startFrame, int endFrame) {
                     break; // Error receiving frame
                 }
 
+                // --- Check for decode errors in the frame itself ---
+                if (frame->decode_error_flags) {
+                    std::cerr << "CachedDecoder Warning: Frame (PTS: " << frame->pts << ") has decode_error_flags: " << frame->decode_error_flags << ". Skipping." << std::endl;
+                    av_frame_unref(frame); // Unref problematic frame
+                    continue; // Skip this frame
+                }
+                // --- End Check for decode errors ---
+
                 // --- Frame Identification and Storage --- 
                 int64_t framePts = frame->best_effort_timestamp;
+                int currentFrameIndex = -1; 
+                int64_t frameTimeMs = -1; // Declare frameTimeMs here, default to -1
+
                 if (framePts == AV_NOPTS_VALUE) framePts = frame->pts;
 
                 // Estimate current frame index based on PTS
                 // This requires frameIndex_ to have valid time_ms
                 if (framePts != AV_NOPTS_VALUE) {
-                    int64_t frameTimeMs = av_rescale_q(framePts - videoStream_->start_time, timeBase_, {1, 1000});
+                    // Calculate actual frameTimeMs if PTS is valid
+                    frameTimeMs = av_rescale_q(framePts - videoStream_->start_time, timeBase_, {1, 1000});
                     
-                    // Find the closest frame index (simple linear search for now)
-                    // TODO: Optimize this search if needed (e.g., binary search if frameIndex is sorted by time_ms)
-                    int bestMatchIndex = -1;
-                    int64_t minDiff = INT64_MAX;
-                    int searchStart = std::max(0, startFrame - adaptedStep_ * 2); // Start search a bit before target
-                    int searchEnd = std::min(static_cast<int>(frameIndex_.size()) - 1, endFrame + adaptedStep_);
+                    // Binary search for the closest frame index
+                    if (!frameIndex_.empty()) {
+                        int64_t targetTimeMs = frameTimeMs;
+                        
+                        auto it = std::lower_bound(frameIndex_.begin(), frameIndex_.end(), targetTimeMs,
+                            [](const FrameInfo& info, int64_t val) {
+                                // Ensure comparison is safe even if some time_ms might be uninitialized (-1)
+                                // However, createFrameIndex should initialize all time_ms.
+                                // For lower_bound, elements considered "less" if their time_ms is less.
+                                if (info.time_ms < 0 && val >= 0) return true; // Uninitialized considered less than initialized
+                                if (info.time_ms >= 0 && val < 0) return false; // Initialized considered not less than uninitialized
+                                return info.time_ms < val; 
+                            });
 
-                    for (int idx = searchStart; idx <= searchEnd; ++idx) {
-                         if (frameIndex_[idx].time_ms >= 0) { // Check for valid time_ms
-                              int64_t diff = std::abs(frameIndex_[idx].time_ms - frameTimeMs);
-                              if (diff < minDiff) {
-                                   minDiff = diff;
-                                   bestMatchIndex = idx;
-                              } 
-                              // Optimization: If we passed the target time, maybe stop early?
-                              // if (frameIndex_[idx].time_ms > frameTimeMs + 50) break; 
-                         }
-                    }
-                    currentFrameIndex = bestMatchIndex;
-                }
+                        int64_t minAbsoluteDifference = INT64_MAX;
 
-                // Check if the identified frame index is within the target range and is a cache point
-                if (currentFrameIndex != -1 &&
-                    currentFrameIndex >= startFrame &&
-                    currentFrameIndex <= endFrame &&
-                    currentFrameIndex % adaptedStep_ == 0)
-                {
-                    // Lock the specific frame info
-                    std::lock_guard<std::mutex> lock(frameIndex_[currentFrameIndex].mutex);
-
-                    // Store if not already cached
-                    // --- ВОССТАНАВЛИВАЕМ ХРАНЕНИЕ КАДРА ---
-                    if (!frameIndex_[currentFrameIndex].cached_frame) { // Проверяем, что его еще нет
-                        frameIndex_[currentFrameIndex].cached_frame = std::shared_ptr<AVFrame>(av_frame_clone(frame), [](AVFrame* f){ av_frame_free(&f); });
-                        if (!frameIndex_[currentFrameIndex].cached_frame) {
-                             std::cerr << "CachedDecoder Error: Failed to clone frame for index " << currentFrameIndex << std::endl;
-                        } else {
-                            // Update frame info (optional)
-                            frameIndex_[currentFrameIndex].pts = framePts;
-                            frameIndex_[currentFrameIndex].relative_pts = framePts - videoStream_->start_time;
-                            frameIndex_[currentFrameIndex].time_ms = av_rescale_q(frameIndex_[currentFrameIndex].relative_pts, timeBase_, {1, 1000});
-                            frameIndex_[currentFrameIndex].time_base = timeBase_;
-
-                            // Set type if empty
-                            if (frameIndex_[currentFrameIndex].type == FrameInfo::EMPTY) {
-                                frameIndex_[currentFrameIndex].type = FrameInfo::CACHED;
+                        // Candidate 1: Element at or after targetTimeMs (from std::lower_bound)
+                        if (it != frameIndex_.end()) {
+                            if (it->time_ms >= 0) { // Consider only if time_ms is valid
+                                int64_t diff = std::abs(it->time_ms - targetTimeMs);
+                                if (diff < minAbsoluteDifference) {
+                                    minAbsoluteDifference = diff;
+                                    currentFrameIndex = std::distance(frameIndex_.begin(), it);
+                                }
                             }
-                             // std::cout << "Cached frame at index " << currentFrameIndex << std::endl; // Отладочный вывод
+                        }
+
+                        // Candidate 2: Element before targetTimeMs (if 'it' is not the beginning)
+                        if (it != frameIndex_.begin()) {
+                            auto prev_it = std::prev(it);
+                            if (prev_it->time_ms >= 0) { // Consider only if time_ms is valid
+                                int64_t diff = std::abs(prev_it->time_ms - targetTimeMs);
+                                if (diff < minAbsoluteDifference) {
+                                    minAbsoluteDifference = diff;
+                                    currentFrameIndex = std::distance(frameIndex_.begin(), prev_it);
+                                } else if (diff == minAbsoluteDifference) {
+                                    // If differences are equal, std::lower_bound gives the element >= target.
+                                    // If 'it' was valid, currentFrameIndex is already set to it.
+                                    // If 'it' was not valid (e.g. end() or invalid time_ms) and currentFrameIndex is still -1,
+                                    // then prev_it (if equally close) becomes the candidate.
+                                    if (currentFrameIndex == -1) {
+                                         currentFrameIndex = std::distance(frameIndex_.begin(), prev_it);
+                }
+                                }
+                            }
                         }
                     }
-                    // --- КОНЕЦ ВОССТАНОВЛЕНИЯ ---
+                }
+                // End of new binary search logic
+
+                // --- Logic for deciding whether to store the frame (Counter Based Step) ---
+                if (currentFrameIndex != -1 && currentFrameIndex >= startFrame && currentFrameIndex <= endFrame) {
+                    bool shouldStoreThisFrame = false;
+
+                    // Ищем и сохраняем первый подходящий кадр в диапазоне
+                    if (!firstFrameStoredInRange) {
+                        // Ensure frameTimeMs is valid for this check
+                        // Store the first frame ONLY if it\'s a key frame AND its timestamp is valid and near the target
+                        if (frame->key_frame == 1 && frameTimeMs != -1 && frameTimeMs >= seekTargetTimeMs - 50) { // Re-added key_frame check
+                            shouldStoreThisFrame = true;
+                            firstFrameStoredInRange = true;
+                            firstStoredFrameIndex = currentFrameIndex; // Запоминаем, где сохранили первый
+                            decodedFramesSinceFirstStore = 0; // Сбрасываем счетчик для первого кадра
+                        }
+                        // If the first frame isn\'t a key frame meeting the time condition,
+                        // we keep looking (firstFrameStoredInRange remains false).
+                    }
+                    // Для последующих кадров используем счетчик
+                    else {
+                        decodedFramesSinceFirstStore++; // Увеличиваем счетчик для КАЖДОГО кадра после первого
+                        if (decodedFramesSinceFirstStore >= adaptedStep_) { // Сравниваем с шагом
+                           shouldStoreThisFrame = true;
+                           decodedFramesSinceFirstStore = 0; // Сбрасываем счетчик после решения о сохранении
+                        }
+                    }
+
+                    if (shouldStoreThisFrame) {
+                         // Дополнительная проверка: не пытаемся сохранить по индексу меньшему, чем первый сохраненный
+                         if (firstStoredFrameIndex == -1 || currentFrameIndex >= firstStoredFrameIndex) {
+                             std::lock_guard<std::mutex> lock(frameIndex_[currentFrameIndex].mutex);
+                             // Сохраняем, только если слот пуст
+                             if (!frameIndex_[currentFrameIndex].cached_frame) {
+                                AVFrame* temp_clone = av_frame_clone(frame);
+                                if (temp_clone) { // If clone succeeded structually
+                                    // Restore check for software formats (assuming YUV planar)
+                                    bool is_frame_valid = temp_clone->width > 0 && temp_clone->height > 0 &&
+                                                          temp_clone->data[0] != nullptr && temp_clone->linesize[0] > 0 &&
+                                                          temp_clone->data[1] != nullptr && temp_clone->linesize[1] > 0 &&
+                                                          temp_clone->data[2] != nullptr && temp_clone->linesize[2] > 0;
+
+                                    if (!is_frame_valid) {
+                                        std::cerr << "CachedDecoder Warning: Cloned frame for index " << currentFrameIndex
+                                                   << " appears invalid or incomplete (w:" << temp_clone->width << " h:" << temp_clone->height
+                                                   << " data[0]:" << (void*)temp_clone->data[0] << " ls[0]:" << temp_clone->linesize[0]
+                                                   << " data[1]:" << (void*)temp_clone->data[1] << " ls[1]:" << temp_clone->linesize[1]
+                                                   << " data[2]:" << (void*)temp_clone->data[2] << " ls[2]:" << temp_clone->linesize[2]
+                                                   << "). Discarding clone." << std::endl;
+                                        av_frame_free(&temp_clone); // Free the problematic clone, do not store it
+                                    } else {
+                                        // Clone is sane, store it
+                                        frameIndex_[currentFrameIndex].cached_frame = std::shared_ptr<AVFrame>(temp_clone, [](AVFrame* f){ av_frame_free(&f); });
+                                        
+                                        // Update info
+                                        frameIndex_[currentFrameIndex].pts = framePts;
+                                        frameIndex_[currentFrameIndex].relative_pts = framePts - videoStream_->start_time;
+                                        // frameIndex_[currentFrameIndex].time_ms = av_rescale_q(frameIndex_[currentFrameIndex].relative_pts, timeBase_, {1, 1000});
+                                        frameIndex_[currentFrameIndex].time_base = timeBase_;
+
+                                        // Set type
+                                        if (frameIndex_[currentFrameIndex].type == FrameInfo::EMPTY || frameIndex_[currentFrameIndex].type == FrameInfo::CACHED) {
+                                            frameIndex_[currentFrameIndex].type = FrameInfo::CACHED;
+                                        }
+                                    }
+                                } else {
+                                     std::cerr << "CachedDecoder Error: av_frame_clone returned nullptr for index " << currentFrameIndex << std::endl;
+                                }
+                            } // End if !cached_frame
+                         } // else: Индекс "прыгнул" назад? Пропускаем сохранение.
+                    }
                 }
 
                 av_frame_unref(frame); // Unref frame inside receive loop

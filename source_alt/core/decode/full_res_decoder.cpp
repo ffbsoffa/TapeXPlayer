@@ -11,17 +11,22 @@
 #include <CoreVideo/CoreVideo.h> // Include necessary for CVPixelBufferRef type if used directly
 #include <libavutil/pixdesc.h> // For av_get_pix_fmt_name if needed later
 
+// --- ADDED: Initialization for static instance counter ---
+std::atomic<int> FullResDecoder::instance_counter_(0);
+
 // --- Implementation of get_hw_format (copied from test) ---
 enum AVPixelFormat FullResDecoder::get_hw_format(AVCodecContext *ctx,
                                                  const enum AVPixelFormat *pix_fmts) {
     const enum AVPixelFormat *p;
     for (p = pix_fmts; *p != -1; p++) {
         if (*p == AV_PIX_FMT_VIDEOTOOLBOX) {
-            std::cout << "FullResDecoder: Found supported hardware pixel format: AV_PIX_FMT_VIDEOTOOLBOX" << std::endl;
+            // Log removed for cleaner output during problematic decodes
+            // std::cout << "FullResDecoder: Found supported hardware pixel format: AV_PIX_FMT_VIDEOTOOLBOX" << std::endl;
             return *p;
         }
     }
-    std::cerr << "FullResDecoder: Failed to get HW surface format." << std::endl;
+    // Log removed for cleaner output
+    // std::cerr << "FullResDecoder: Failed to get HW surface format." << std::endl;
     return AV_PIX_FMT_NONE;
 }
 
@@ -40,40 +45,52 @@ FullResDecoder::FullResDecoder(const std::string& sourceFilename)
       hw_accel_enabled_(false), // Initialize new members
       hw_device_ctx_(nullptr),
       hw_pix_fmt_(AV_PIX_FMT_NONE),
-      stop_requested_(false) // Initialize stop flag
+      stop_requested_(false), // Initialize stop flag
+      hw_irrecoverably_failed_(false) // Initialize new flag
 {
+    // --- ADDED: Instance counter log ---
+    int current_instance_num = ++instance_counter_;
+    std::cout << "[FullResDecoder CONSTRUCTOR TID:" << std::this_thread::get_id() << "] Instance # " << current_instance_num << " created for: " << sourceFilename_ << std::endl;
+    std::cerr << "[FullResDecoder CONSTRUCTOR TID:" << std::this_thread::get_id() << "] Instance # " << current_instance_num << " created for: " << sourceFilename_ << std::endl;
+
     std::cout << "FullResDecoder: Initializing for " << sourceFilename_ << "..." << std::endl;
     initialized_ = initialize();
 }
 
 FullResDecoder::~FullResDecoder() {
-    std::cout << "FullResDecoder: Destroying for " << sourceFilename_ << "..." << std::endl;
+    // --- ADDED: Instance counter log for destructor ---
+    // int current_instance_num = instance_counter_.load(); // or just use a member if you store it
+    std::cout << "[FullResDecoder DESTRUCTOR TID:" << std::this_thread::get_id() << "] Destroying decoder for: " << sourceFilename_ << " (Instance count might be misleading if not decremented)" << std::endl;
+    std::cerr << "[FullResDecoder DESTRUCTOR TID:" << std::this_thread::get_id() << "] Destroying decoder for: " << sourceFilename_ << " (Instance count might be misleading if not decremented)" << std::endl;
     cleanup();
-    std::cout << "FullResDecoder: Destroyed." << std::endl;
+    // std::cout << "FullResDecoder: Destroyed." << std::endl; // Original log
 }
 
 bool FullResDecoder::initialize() {
-    if (initialized_) return true; // Already initialized
+    if (initialized_) return true;
 
     const AVCodec* codec = nullptr;
     int ret = 0;
-    bool hw_init_success = false;
+    bool hw_init_success = false; // <--- ОБЪЯВЛЕНИЕ ПЕРЕМЕННОЙ
 
-    // Open input
+    // Сбрасываем флаг успеха HW инициализации в начале - теперь это делается выше
+    // hw_init_success = false; 
+
+    // Лог входа в функцию initialize
+    std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] initialize ENTERED for " << sourceFilename_ << std::endl;
+
     if (avformat_open_input(&formatCtx_, sourceFilename_.c_str(), nullptr, nullptr) != 0) {
         std::cerr << "FullResDecoder Error: Could not open input file: " << sourceFilename_ << std::endl;
-        return false; // No need for cleanup() here, nothing allocated yet
-    }
-
-    // Find stream info
-    if (avformat_find_stream_info(formatCtx_, nullptr) < 0) {
-        std::cerr << "FullResDecoder Error: Could not find stream info for: " << sourceFilename_ << std::endl;
-        cleanup(); // formatCtx_ is open, need cleanup
         return false;
     }
 
-    // Find best video stream
-    videoStreamIndex_ = av_find_best_stream(formatCtx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0); // Find stream first
+    if (avformat_find_stream_info(formatCtx_, nullptr) < 0) {
+        std::cerr << "FullResDecoder Error: Could not find stream info for: " << sourceFilename_ << std::endl;
+        cleanup();
+        return false;
+    }
+
+    videoStreamIndex_ = av_find_best_stream(formatCtx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (videoStreamIndex_ < 0) {
          std::cerr << "FullResDecoder Error: Could not find video stream in: " << sourceFilename_ << std::endl;
          cleanup();
@@ -82,137 +99,213 @@ bool FullResDecoder::initialize() {
     videoStream_ = formatCtx_->streams[videoStreamIndex_];
     codecParams_ = videoStream_->codecpar;
 
-    // Find the decoder for the stream
     codec = avcodec_find_decoder(codecParams_->codec_id);
     if (!codec) {
         std::cerr << "FullResDecoder Error: Could not find decoder for codec id " << codecParams_->codec_id << std::endl;
         cleanup();
         return false;
     }
-    std::cout << "FullResDecoder: Found decoder: " << codec->name << std::endl;
+    std::cout << "FullResDecoder: Found decoder: " << codec->name << " for " << sourceFilename_ << std::endl;
 
-    // --- Try to initialize Hardware Acceleration (VideoToolbox) ---
 #ifdef __APPLE__
     enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+    AVCodecContext* tempHwCodecCtx = nullptr;
+    AVBufferRef* tempHwDeviceCtxRef = nullptr; // Для av_hwdevice_ctx_create
+
+    std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] initialize: Starting HW config loop for " << sourceFilename_ << std::endl;
     for (int i = 0; ; i++) {
-        const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
-        if (!config) {
-             std::cout << "FullResDecoder: Decoder " << codec->name << " does not support VideoToolbox (no more HW configs)." << std::endl;
+        const AVCodecHWConfig *hw_config = avcodec_get_hw_config(codec, i);
+        if (!hw_config) {
+            std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] initialize: No more HW configs for " << codec->name << " for " << sourceFilename_ << std::endl;
             break;
         }
-        if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
-            config->device_type == hw_type) {
-            std::cout << "FullResDecoder: Decoder supports VideoToolbox HW acceleration method." << std::endl;
-            hw_pix_fmt_ = AV_PIX_FMT_VIDEOTOOLBOX; // We expect this format
 
-            // Allocate codec context specifically for HW attempt
-            AVCodecContext* hwCodecCtx = avcodec_alloc_context3(codec);
-            if (!hwCodecCtx) {
-                 std::cerr << "FullResDecoder Warning: Failed to allocate HW codec context attempt." << std::endl;
-                 break; // Stop trying HW if allocation fails
-            }
+        if (hw_config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && hw_config->device_type == hw_type) {
+            std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] initialize: Found VideoToolbox HW config method for " << sourceFilename_ << std::endl;
 
-            // Create HW device context and store it in hw_device_ctx_
-            ret = av_hwdevice_ctx_create(&hw_device_ctx_, hw_type, nullptr, nullptr, 0);
+            // 1. Создаем HW девайс контекст
+            ret = av_hwdevice_ctx_create(&tempHwDeviceCtxRef, hw_type, nullptr, nullptr, 0);
             if (ret < 0) {
-                std::cerr << "FullResDecoder Warning: Failed to create HW device context: " << av_err2str(ret) << std::endl;
-                avcodec_free_context(&hwCodecCtx); // Clean up attempted context
-                hw_device_ctx_ = nullptr; // Ensure it's null
-                break; // Stop trying HW acceleration
+                std::cerr << "FullResDecoder Warning: Failed to create HW device context: " << av_err2str(ret) << " for " << sourceFilename_ << std::endl;
+                tempHwDeviceCtxRef = nullptr; // Убедимся, что NULL
+                continue; // Следующая HW конфигурация
             }
 
-            // Assign the created HW device context to the codec context
-            hwCodecCtx->hw_device_ctx = av_buffer_ref(hw_device_ctx_); // Assign created context
-            if (!hwCodecCtx->hw_device_ctx) {
-                std::cerr << "FullResDecoder Warning: Failed to ref HW device context." << std::endl;
-                avcodec_free_context(&hwCodecCtx);
-                // hw_device_ctx_ needs unref since ref failed
-                av_buffer_unref(&hw_device_ctx_);
-                hw_device_ctx_ = nullptr;
+            // 2. Создаем и настраиваем кодек контекст
+            tempHwCodecCtx = avcodec_alloc_context3(codec);
+            if (!tempHwCodecCtx) {
+                std::cerr << "FullResDecoder Warning: Failed to allocate HW codec context attempt for " << sourceFilename_ << std::endl;
+                av_buffer_unref(&tempHwDeviceCtxRef); // Очищаем созданный девайс контекст
+                continue;
+            }
+
+            tempHwCodecCtx->hw_device_ctx = av_buffer_ref(tempHwDeviceCtxRef); // Передаем владение ссылкой
+            if (!tempHwCodecCtx->hw_device_ctx) {
+                std::cerr << "FullResDecoder Warning: Failed to ref HW device context for " << sourceFilename_ << std::endl;
+                av_buffer_unref(&tempHwDeviceCtxRef); // Наша ссылка
+                avcodec_free_context(&tempHwCodecCtx); // Контекст кодека (он бы свою ссылку очистил, если бы получил)
+                continue;
+            }
+            // Важно: После успешного av_buffer_ref(tempHwDeviceCtxRef) в tempHwCodecCtx->hw_device_ctx,
+            // сам tempHwDeviceCtxRef (наша исходная ссылка) все еще действителен и должен быть unref'нут позже,
+            // если этот tempHwCodecCtx станет основным codecCtx_, или если мы от него отказываемся.
+
+            tempHwCodecCtx->get_format = get_hw_format;
+            if (avcodec_parameters_to_context(tempHwCodecCtx, codecParams_) < 0) {
+                std::cerr << "FullResDecoder Warning: Failed to copy params to HW context attempt for " << sourceFilename_ << std::endl;
+                avcodec_free_context(&tempHwCodecCtx); // Очистит свою ссылку на tempHwDeviceCtxRef
+                av_buffer_unref(&tempHwDeviceCtxRef);    // Очищаем нашу исходную ссылку
+                continue;
+            }
+
+            if (avcodec_open2(tempHwCodecCtx, codec, nullptr) < 0) {
+                std::cerr << "FullResDecoder Warning: Failed to open codec with HW acceleration for " << sourceFilename_ << std::endl;
+                avcodec_free_context(&tempHwCodecCtx);
+                av_buffer_unref(&tempHwDeviceCtxRef);
+                continue;
+            }
+            std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] initialize: HW codec opened, attempting test decode for " << sourceFilename_ << std::endl;
+
+            // 3. ТЕСТОВОЕ ДЕКОДИРОВАНИЕ
+            bool test_decode_successful = false;
+            AVPacket* test_packet = av_packet_alloc();
+            AVFrame* test_frame = av_frame_alloc();
+            int frames_decoded_count = 0;
+            const int REQUIRED_TEST_FRAMES = 1;
+
+            if (test_packet && test_frame) {
+                // Перемотка на начало видеопотока для теста
+                av_seek_frame(formatCtx_, videoStreamIndex_, videoStream_->start_time != AV_NOPTS_VALUE ? videoStream_->start_time : 0, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY);
+                avcodec_flush_buffers(tempHwCodecCtx); // Сброс буферов перед тестом
+
+                int packets_read_for_test = 0;
+                while (frames_decoded_count < REQUIRED_TEST_FRAMES && packets_read_for_test < 20) { // Ограничение на кол-во пакетов для теста
+                    if (av_read_frame(formatCtx_, test_packet) < 0) {
+                        std::cerr << "FullResDecoder HW Test: Failed to read packet for test decode for " << sourceFilename_ << std::endl;
+                        break; 
+                    }
+                    packets_read_for_test++;
+                    if (test_packet->stream_index == videoStreamIndex_) {
+                        ret = avcodec_send_packet(tempHwCodecCtx, test_packet);
+                        if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                            std::cerr << "FullResDecoder HW Test: Failed to send packet: " << av_err2str(ret) << " for " << sourceFilename_ << std::endl;
+                            av_packet_unref(test_packet);
+                            break; 
+                        }
+                        if (ret == 0) { // Пакет успешно отправлен (или EAGAIN)
+                           int receive_ret = avcodec_receive_frame(tempHwCodecCtx, test_frame);
+                           if (receive_ret == 0) {
+                               std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] initialize: HW Test Decode successful for 1 frame for " << sourceFilename_ << std::endl;
+                               frames_decoded_count++;
+                               av_frame_unref(test_frame);
+                           } else if (receive_ret != AVERROR(EAGAIN) && receive_ret != AVERROR_EOF) {
+                               std::cerr << "FullResDecoder HW Test: Failed to receive frame: " << av_err2str(receive_ret) << " for " << sourceFilename_ << std::endl;
+                               av_packet_unref(test_packet);
                 break;
             }
-
-            // Set the get_format callback
-            hwCodecCtx->get_format = get_hw_format;
-
-             // Copy parameters and try to open codec with HW acceleration
-            if (avcodec_parameters_to_context(hwCodecCtx, codecParams_) < 0) {
-                 std::cerr << "FullResDecoder Warning: Failed to copy params to HW context attempt." << std::endl;
-                 avcodec_free_context(&hwCodecCtx); // Cleanup attempt (will unref hw_device_ctx_)
-                 // hw_device_ctx_ was already unreffed after creation, no extra unref needed here
-                 break;
+                        }
+                    }
+                    av_packet_unref(test_packet);
+                }
+                test_decode_successful = (frames_decoded_count >= REQUIRED_TEST_FRAMES);
             }
+            av_packet_free(&test_packet);
+            av_frame_free(&test_frame);
 
-            if (avcodec_open2(hwCodecCtx, codec, nullptr) < 0) {
-                std::cerr << "FullResDecoder Warning: Failed to open codec with HW acceleration." << std::endl;
-                avcodec_free_context(&hwCodecCtx); // Cleanup attempt (will unref hw_device_ctx_)
-                 // hw_device_ctx_ was already unreffed after creation, no extra unref needed here
-                break;
-            }
-
-            // Success! Use this context.
-            std::cout << "FullResDecoder: Successfully initialized with VideoToolbox HW Acceleration." << std::endl;
-            codecCtx_ = hwCodecCtx; // Assign the successfully opened HW context
+            if (test_decode_successful) {
+                std::cout << "FullResDecoder: Successfully initialized with VideoToolbox HW Acceleration (passed test decode) for " << sourceFilename_ << std::endl;
+                codecCtx_ = tempHwCodecCtx; // Присваиваем успешно протестированный контекст
             hw_accel_enabled_ = true;
             hw_init_success = true;
-            // Unref the initially created hw_device_ctx_ as codecCtx_ now holds a reference
-            av_buffer_unref(&hw_device_ctx_);
-            hw_device_ctx_ = nullptr; // Mark our direct pointer as null
-            break; // Found working HW config, stop searching
-        }
-    }
-#endif
+                hw_pix_fmt_ = hw_config->pix_fmt; // Используем формат из hw_config
 
-    // --- Fallback to Software Decoder if HW failed (or not Apple) ---
+                // tempHwDeviceCtxRef теперь принадлежит codecCtx_, так что нашу ссылку на него можно освободить.
+                av_buffer_unref(&tempHwDeviceCtxRef);
+                tempHwDeviceCtxRef = nullptr;
+
+                // **Критически важно**: Перемотать и сбросить для основного декодирования
+                av_seek_frame(formatCtx_, videoStreamIndex_, videoStream_->start_time != AV_NOPTS_VALUE ? videoStream_->start_time : 0, AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY);
+                avcodec_flush_buffers(codecCtx_);
+                                
+                codecCtx_->thread_count = 0; // Let FFmpeg/VideoToolbox decide thread count (was 1)
+                // codecCtx_->thread_type = FF_THREAD_FRAME; // Example, if frame-level threading is desired
+
+                break; // Выходим из цикла поиска HW конфигураций
+            } else {
+                std::cerr << "FullResDecoder: HW Test Decode FAILED. Cleaning up this HW attempt for " << sourceFilename_ << std::endl;
+                avcodec_free_context(&tempHwCodecCtx); // Очищаем неудачный кодек-контекст
+                av_buffer_unref(&tempHwDeviceCtxRef);    // Очищаем наш изначальный ref на девайс-контекст
+                tempHwDeviceCtxRef = nullptr;
+            }
+        } // if (config matches)
+    } // for (HW configs)
+
+    // Если tempHwDeviceCtxRef все еще существует (например, последняя итерация не вошла в if или вышла раньше), очистим
+    if (tempHwDeviceCtxRef) {
+        av_buffer_unref(&tempHwDeviceCtxRef);
+    }
+#endif // __APPLE__
+
+    // --- Fallback to Software Decoder if HW failed (hw_init_success все еще false) ---
     if (!hw_init_success) {
-        std::cout << "FullResDecoder: Initializing Software Decoder." << std::endl;
-         // Ensure hw_device_ctx_ is cleaned up if created but not assigned/opened
-         if (hw_device_ctx_) {
+        std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] initialize: Initializing Software Decoder for " << sourceFilename_ << std::endl;
+        // hw_device_ctx_ должен быть nullptr здесь, если логика выше верна
+        if (hw_device_ctx_) { // Дополнительная проверка
             av_buffer_unref(&hw_device_ctx_);
             hw_device_ctx_ = nullptr;
          }
          hw_accel_enabled_ = false;
          hw_pix_fmt_ = AV_PIX_FMT_NONE;
+        hw_irrecoverably_failed_ = false; // Явный сброс для SW пути
 
         codecCtx_ = avcodec_alloc_context3(codec);
         if (!codecCtx_) {
-            std::cerr << "FullResDecoder Error: Could not alloc SW codec context." << std::endl;
-            cleanup();
-            return false;
+            std::cerr << "FullResDecoder Error: Could not alloc SW codec context for " << sourceFilename_ << std::endl;
+            cleanup(); return false;
         }
         if (avcodec_parameters_to_context(codecCtx_, codecParams_) < 0) {
-            std::cerr << "FullResDecoder Error: Could not copy codec params to SW context." << std::endl;
-            cleanup();
-            return false;
+            std::cerr << "FullResDecoder Error: Could not copy codec params to SW context for " << sourceFilename_ << std::endl;
+            cleanup(); return false;
         }
-        // Optional: Enable multi-threading hint for SW decoder
-        // codecCtx_->thread_count = std::thread::hardware_concurrency();
-        // codecCtx_->thread_type = FF_THREAD_FRAME; // or FF_THREAD_SLICE
         if (avcodec_open2(codecCtx_, codec, nullptr) < 0) {
-            std::cerr << "FullResDecoder Error: Could not open SW codec." << std::endl;
-            cleanup();
-            return false;
+            std::cerr << "FullResDecoder Error: Could not open SW codec for " << sourceFilename_ << std::endl;
+            cleanup(); return false;
         }
-         std::cout << "FullResDecoder: Initialized with Software Decoder." << std::endl;
+        std::cout << "FullResDecoder: Initialized with Software Decoder for " << sourceFilename_ << std::endl;
     }
 
-    // Store common properties
+    if (!codecCtx_) { // Если ни HW, ни SW не инициализировались
+        std::cerr << "FullResDecoder Error: Codec context is null after all initialization attempts for " << sourceFilename_ << std::endl;
+        cleanup(); return false;
+    }
+
     width_ = codecCtx_->width;
     height_ = codecCtx_->height;
-    // Use the actual pixel format reported by the opened context
     pixFmt_ = codecCtx_->pix_fmt;
+    sampleAspectRatio_ = videoStream_->sample_aspect_ratio;
+    if (height_ > 0 && sampleAspectRatio_.den != 0 && sampleAspectRatio_.num != 0) {
+         displayAspectRatio_ = (static_cast<float>(width_) / height_) * (static_cast<float>(sampleAspectRatio_.num) / sampleAspectRatio_.den);
+    } else if (height_ > 0) {
+         displayAspectRatio_ = static_cast<float>(width_) / height_;
+    } else {
+         displayAspectRatio_ = 16.0f / 9.0f; // Fallback
+    }
 
     initialized_ = true;
-    std::cout << "FullResDecoder: Initialization successful." << std::endl;
+    hw_irrecoverably_failed_ = false; // Убедимся, что сброшен при успешной инициализации (HW или SW)
+
+    std::cout << "FullResDecoder: Final Initialization successful for " << sourceFilename_ << "." << std::endl;
     std::cout << "  Mode: " << (hw_accel_enabled_ ? "Hardware (VideoToolbox)" : "Software") << std::endl;
     std::cout << "  Resolution: " << width_ << "x" << height_ << std::endl;
-    // Safely get pixel format name
     const char* fmt_name = av_get_pix_fmt_name(pixFmt_);
     std::cout << "  Context Pixel Format: " << (fmt_name ? fmt_name : "N/A") << std::endl;
+    std::cout << "  SAR: " << sampleAspectRatio_.num << "/" << sampleAspectRatio_.den << std::endl;
+    std::cout << "  Calculated Display Aspect Ratio: " << displayAspectRatio_ << std::endl;
     std::cout << "  Time Base: " << videoStream_->time_base.num << "/" << videoStream_->time_base.den << std::endl;
 
     return true;
 }
+
 
 void FullResDecoder::cleanup() {
     if (swsCtx_) {
@@ -237,10 +330,8 @@ void FullResDecoder::cleanup() {
     initialized_ = false;
     hw_accel_enabled_ = false;
     hw_pix_fmt_ = AV_PIX_FMT_NONE;
-    width_ = 0;
-    height_ = 0;
-    pixFmt_ = AV_PIX_FMT_NONE;
     stop_requested_ = false; // Reset stop flag on cleanup
+    hw_irrecoverably_failed_ = false; // Reset on cleanup
     // std::cout << "FullResDecoder cleaned up." << std::endl; // Optional log
 }
 
@@ -251,6 +342,14 @@ bool FullResDecoder::isHardwareAccelerated() const {
 
 
 bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame) {
+    std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange ENTERED. File: " << sourceFilename_ << " Range: [" << startFrame << "-" << endFrame <<"] hw_failed_flag is: " << hw_irrecoverably_failed_.load() << std::endl;
+    stop_requested_ = false;
+
+    if (hw_irrecoverably_failed_.load()) {
+        std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange Error: HW irrecoverably failed previously. FLAG IS TRUE. ABORTING for " << sourceFilename_ << std::endl;
+        return false;
+    }
+
     auto function_start_time = std::chrono::high_resolution_clock::now();
     if (!initialized_ || !formatCtx_ || !codecCtx_ || videoStreamIndex_ < 0) {
         std::cerr << "FullResDecoder::decodeFrameRange Error: Decoder not initialized." << std::endl;
@@ -271,7 +370,8 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
          return false;
     }
 
-    std::cout << "[Timing] FullResDecoder::decodeFrameRange: Decoding range [" << startFrame << " - " << endFrame << "] (HW: " << hw_accel_enabled_ << ")" << std::endl;
+    // Comment out debug log for range
+    // std::cout << "[Timing] FullResDecoder::decodeFrameRange: Decoding range [" << startFrame << " - " << endFrame << "] (HW: " << hw_accel_enabled_ << ")" << std::endl;
 
     // --- Seeking (using member contexts) ---
     AVRational timeBase = videoStream_->time_base;
@@ -297,6 +397,7 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
             startTimeMs = -1; // Reset startTimeMs if seek failed, rely only on counter
         } else {
             avcodec_flush_buffers(codecCtx_);
+            // Comment out timing log
             // std::cout << "[Timing] FullResDecoder::decodeFrameRange: Seek successful in " << seek_duration.count() << " ms. Buffers flushed." << std::endl;
         }
     } else {
@@ -318,30 +419,59 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
     int decoded_frame_count = 0; // Counter for timing log
     bool success = true; // Flag to track overall success
 
-    auto loop_start_time = std::chrono::high_resolution_clock::now(); // Timing: Loop start
+    // Comment out timing log
+    // auto loop_start_time = std::chrono::high_resolution_clock::now(); // Timing: Loop start
     while (!stop_requested_.load() && av_read_frame(formatCtx_, packet) >= 0) {
         if (packet->stream_index == videoStreamIndex_) {
             int ret = avcodec_send_packet(codecCtx_, packet);
                 if (ret < 0) {
-                if (ret != AVERROR(EAGAIN)) {
-                    std::cerr << "FullResDecoder::decodeFrameRange Warning: Error sending packet: " << av_err2str(ret) << std::endl;
+                // if (ret != AVERROR(EAGAIN)) { // OLD CHECK
+                //     std::cerr << "FullResDecoder::decodeFrameRange Warning: Error sending packet: " << av_err2str(ret) << std::endl;
+                //     if (hw_accel_enabled_ && (ret == AVERROR_INVALIDDATA || ret == AVERROR_EXTERNAL)) { 
+                //         std::cerr << "FullResDecoder::decodeFrameRange: Marking HW as irrecoverably failed due to send_packet error." << std::endl;
+                //         hw_irrecoverably_failed_ = true;
+                //     }
+                // }
+                // --- NEW AGGRESSIVE CHECK ---
+                if (ret != AVERROR(EAGAIN)) { // Still ignore EAGAIN
+                    std::cerr << "FullResDecoder::decodeFrameRange Warning: Error sending packet: " << av_err2str(ret) << " (code: " << ret << ") for " << sourceFilename_ << std::endl;
+                    if (hw_accel_enabled_) {
+                        std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange: AGGRESSIVE CHECK - Marking HW as irrecoverably failed due to ANY critical send_packet error." << std::endl;
+                        hw_irrecoverably_failed_ = true;
+                        std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange hw_failed_flag SET TO TRUE after send_packet error." << std::endl;
+                    }
                 }
+                // --- END NEW AGGRESSIVE CHECK ---
                     av_packet_unref(packet);
+                    if (hw_irrecoverably_failed_.load()) { success = false; goto decode_loop_end; } // Exit if HW failed
                     continue;
                 }
 
                 while (!stop_requested_.load() && ret >= 0) {
-                ret = avcodec_receive_frame(codecCtx_, frame); // Receive into 'frame'
+                ret = avcodec_receive_frame(codecCtx_, frame); 
                 if (ret == AVERROR(EAGAIN)) {
                         break;
                 } else if (ret == AVERROR_EOF) {
-                    // std::cout << "FullResDecoder::decodeFrameRange: End of stream reached while decoding." << std::endl;
                     av_packet_unref(packet);
                     goto decode_loop_end;
                     } else if (ret < 0) {
-                    std::cerr << "FullResDecoder::decodeFrameRange Error: Error receiving frame: " << av_err2str(ret) << std::endl;
-                        success = false; // Mark failure
+                    // std::cerr << "FullResDecoder::decodeFrameRange Error: Error receiving frame: " << av_err2str(ret) << std::endl; // OLD LOG
+                    //     if (hw_accel_enabled_ && (ret == AVERROR_INVALIDDATA || ret == AVERROR_EXTERNAL)) { 
+                    //         std::cerr << "FullResDecoder::decodeFrameRange: Marking HW as irrecoverably failed due to receive_frame error." << std::endl;
+                    //         hw_irrecoverably_failed_ = true;
+                    //     }
+                    // success = false; 
+                    // goto decode_loop_end;
+                    // --- NEW AGGRESSIVE CHECK ---
+                    std::cerr << "FullResDecoder::decodeFrameRange Error: Error receiving frame: " << av_err2str(ret) << " (code: " << ret << ") for " << sourceFilename_ << std::endl;
+                    if (hw_accel_enabled_) {
+                         std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange: AGGRESSIVE CHECK - Marking HW as irrecoverably failed due to ANY critical receive_frame error." << std::endl;
+                         hw_irrecoverably_failed_ = true;
+                         std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange hw_failed_flag SET TO TRUE after receive_frame error." << std::endl;
+                    }
+                    success = false; 
                         goto decode_loop_end;
+                    // --- END NEW AGGRESSIVE CHECK ---
                 }
 
                 // --- Frame Identification & Storage ---
@@ -403,17 +533,21 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
                 }
 
                 av_frame_unref(frame); // Unref frame inside receive loop
+                 if (hw_irrecoverably_failed_.load()) { success = false; goto decode_loop_end; } // Check after processing frame too
             } // end while(receive_frame)
         } // end if(packet->stream_index == videoStreamIndex_)
             av_packet_unref(packet);
+        if (hw_irrecoverably_failed_.load()) { success = false; goto decode_loop_end; } // Check in outer loop
     } // end while(av_read_frame)
 
 decode_loop_end:
-    auto loop_end_time = std::chrono::high_resolution_clock::now(); // Timing: Loop end
-    std::chrono::duration<double, std::milli> loop_duration = loop_end_time - loop_start_time;
-    std::cout << "[Timing] FullResDecoder::decodeFrameRange: Decode loop finished in " << loop_duration.count() << " ms. Decoded frames: " << decoded_frame_count << std::endl;
+    // Comment out timing log
+    // auto loop_end_time = std::chrono::high_resolution_clock::now(); // Timing: Loop end
+    // std::chrono::duration<double, std::milli> loop_duration = loop_end_time - loop_start_time;
+    // std::cout << "[Timing] FullResDecoder::decodeFrameRange: Decode loop finished in " << loop_duration.count() << " ms. Decoded frames: " << decoded_frame_count << std::endl;
 
     if (stop_requested_.load()) { // Optional: Log if stopped due to request
+        // Keep this log? It might be useful.
         std::cout << "[FullResDecoder] Exiting decode loop due to stop request." << std::endl;
     }
     av_frame_free(&frame);
@@ -423,6 +557,9 @@ decode_loop_end:
     std::chrono::duration<double, std::milli> function_duration = function_end_time - function_start_time;
     // std::cout << "[Timing] FullResDecoder::decodeFrameRange: Finished processing range [" << startFrame << " - " << endFrame << "] in " << function_duration.count() << " ms." << std::endl;
 
+    if (hw_irrecoverably_failed_.load()) {
+         std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange EXITING due to hw_failed_flag=true for " << sourceFilename_ << std::endl;
+    }
     return success; // Indicate operation completed (or if errors occurred)
 }
 
@@ -498,7 +635,19 @@ int FullResDecoder::getWidth() const { return width_; }
 int FullResDecoder::getHeight() const { return height_; }
 AVPixelFormat FullResDecoder::getPixelFormat() const { return pixFmt_; }
 
+// --- ADDED --- Implement the getter for Display Aspect Ratio
+float FullResDecoder::getDisplayAspectRatio() const {
+    return displayAspectRatio_;
+}
+
 // --- Public method to request stop --- 
 void FullResDecoder::requestStop() {
     stop_requested_ = true;
+}
+
+// --- ADDED: Implementation for checking irrecoverable HW failure ---
+bool FullResDecoder::hasHardwareFailedIrrecoverably() const {
+    // Added log to see when this is called
+    std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] hasHardwareFailedIrrecoverably() CALLED. Returning: " << hw_irrecoverably_failed_.load() << " for " << sourceFilename_ << std::endl;
+    return hw_irrecoverably_failed_.load();
 } 

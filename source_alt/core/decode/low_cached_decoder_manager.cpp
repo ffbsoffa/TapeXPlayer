@@ -218,23 +218,15 @@ void LowCachedDecoderManager::decodingLoop() {
                           loadedSegments_.erase(segIdx);
                       }
 
-                      // Load immediately
+                      // Load immediately, prioritizing current segment
+                      if (segmentsToLoad.count(currentSegment)) {
+                          // std::cout << "  Prioritizing load of current segment: " << currentSegment << std::endl;
+                          loadSegment(currentSegment);
+                          segmentsToLoad.erase(currentSegment); // Remove from set after loading
+                      }
+                      // Load remaining needed segments
                       for (int segIdx : segmentsToLoad) {
-                          int startFrame = segIdx * segmentSize_;
-                          int endFrame = std::min(startFrame + segmentSize_ - 1, static_cast<int>(frameIndex_.size()) - 1);
-                          int highResHalfSize = highResWindowSize_ / 2;
-                          int highResStart = std::max(0, currentFrame - highResHalfSize);
-                          int highResEnd = std::min(static_cast<int>(frameIndex_.size()) - 1, currentFrame + highResHalfSize);
-                          auto start_time = std::chrono::high_resolution_clock::now();
-                          auto ms_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(start_time.time_since_epoch()).count();
-                          // std::cout << "[TimingDebug:" << ms_since_epoch << "] START decode segment (forced): " << segIdx << " [" << startFrame << "-" << endFrame << "] for currentFrame: " << currentFrame << std::endl;
-                          bool success = decoder_->decodeLowResRange(frameIndex_, startFrame, endFrame, highResStart, highResEnd, false);
-                          auto end_time = std::chrono::high_resolution_clock::now();
-                          auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-                          ms_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(end_time.time_since_epoch()).count();
-                          // std::cout << "[TimingDebug:" << ms_since_epoch << "] END decode segment (forced):   " << segIdx << " Success: " << (success ? "Yes" : "No") << ". Duration: " << duration << "ms." << std::endl;
-                          if (success) { loadedSegments_.insert(segIdx); }
-                          else { std::cerr << "LowCachedDecoderManager Warning: Failed to load segment (forced) " << segIdx << std::endl; }
+                         loadSegment(segIdx);
                       }
                       lastLowResUpdateTime_ = now; // Update time after forced load/unload
                       previousSegment_ = currentSegment; // Update segment tracker
@@ -278,22 +270,15 @@ void LowCachedDecoderManager::decodingLoop() {
                     }
 
                     if (!segmentsToLoad.empty() && (timeSinceLastUpdate >= lowResUpdateInterval || forceUpdateDueToRateChange)) {
+                         // Prioritize loading current segment if needed within interval/rate check
+                         if (segmentsToLoad.count(currentSegment)) {
+                             // std::cout << "  Prioritizing load of current segment (interval/rate): " << currentSegment << std::endl;
+                             loadSegment(currentSegment);
+                             segmentsToLoad.erase(currentSegment);
+                         }
+                         // Load remaining needed segments
                         for (int segIdx : segmentsToLoad) {
-                            int startFrame = segIdx * segmentSize_;
-                            int endFrame = std::min(startFrame + segmentSize_ - 1, static_cast<int>(frameIndex_.size()) - 1);
-                            int highResHalfSize = highResWindowSize_ / 2;
-                            int highResStart = std::max(0, currentFrame - highResHalfSize);
-                            int highResEnd = std::min(static_cast<int>(frameIndex_.size()) - 1, currentFrame + highResHalfSize);
-                            auto start_time = std::chrono::high_resolution_clock::now();
-                            auto ms_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(start_time.time_since_epoch()).count();
-                            // std::cout << "[TimingDebug:" << ms_since_epoch << "] START decode segment (interval/rate): " << segIdx << " [" << startFrame << "-" << endFrame << "] for currentFrame: " << currentFrame << std::endl;
-                            bool success = decoder_->decodeLowResRange(frameIndex_, startFrame, endFrame, highResStart, highResEnd, false);
-                            auto end_time = std::chrono::high_resolution_clock::now();
-                            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-                            ms_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(end_time.time_since_epoch()).count();
-                            // std::cout << "[TimingDebug:" << ms_since_epoch << "] END decode segment (interval/rate):   " << segIdx << " Success: " << (success ? "Yes" : "No") << ". Duration: " << duration << "ms." << std::endl;
-                            if (success) { loadedSegments_.insert(segIdx); }
-                            else { std::cerr << "LowCachedDecoderManager Warning: Failed to load segment (interval/rate) " << segIdx << std::endl; }
+                            loadSegment(segIdx);
                         }
                         lastLowResUpdateTime_ = now; // Update time after load attempt
                     }
@@ -317,4 +302,68 @@ void LowCachedDecoderManager::decodingLoop() {
 
     // std::cout << "LowCachedDecoderManager: Decoding loop finished." << std::endl;
     isRunning_ = false; // Ensure isRunning is false when loop exits
+}
+
+// --- Helper function to load a segment --- 
+void LowCachedDecoderManager::loadSegment(int segmentIndex) {
+    if (!decoder_ || !decoder_->isInitialized()) { 
+         std::cerr << "LowCachedDecoderManager Error: Decoder not initialized in loadSegment." << std::endl;
+         return;
+    }
+    if (frameIndex_.empty() || segmentSize_ <= 0) return;
+
+    // Check if already loaded (needs lock)
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (loadedSegments_.count(segmentIndex)) {
+            // std::cout << "LowCachedDecoderManager: Segment " << segmentIndex << " already loaded or loading." << std::endl;
+            return; // Already loaded or being loaded by another thread check
+        }
+        // Mark as loading (optional, depends on if multiple threads could call this)
+        // loadedSegments_.insert(segmentIndex); // Or use a separate loading set
+    }
+
+    int startFrame = segmentIndex * segmentSize_;
+    int endFrame = std::min(startFrame + segmentSize_ - 1, static_cast<int>(frameIndex_.size()) - 1);
+
+    if (startFrame > endFrame) return;
+
+    // std::cout << "LowCachedDecoderManager: Loading segment " << segmentIndex << " [" << startFrame << "-" << endFrame << "]" << std::endl;
+
+    int currentFrame = currentFrame_.load(); // Get current frame for context
+    int highResHalfSize = highResWindowSize_ / 2;
+    int highResStart = std::max(0, currentFrame - highResHalfSize);
+    int highResEnd = std::min(static_cast<int>(frameIndex_.size()) - 1, currentFrame + highResHalfSize);
+
+    bool success = decoder_->decodeLowResRange(frameIndex_, startFrame, endFrame, highResStart, highResEnd, false);
+
+    if (success) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        loadedSegments_.insert(segmentIndex); // Add to set *after* successful load
+        // std::cout << "LowCachedDecoderManager: Successfully loaded segment " << segmentIndex << ". Total loaded: " << loadedSegments_.size() << std::endl;
+    } else {
+        std::cerr << "LowCachedDecoderManager Warning: Failed to load segment " << segmentIndex << std::endl;
+        // Optional: remove from loading set if used
+    }
+}
+
+// --- Helper function to unload a segment --- 
+void LowCachedDecoderManager::unloadSegment(int segmentIndex) {
+    bool shouldRemove = false;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (loadedSegments_.count(segmentIndex)) {
+            loadedSegments_.erase(segmentIndex);
+            shouldRemove = true;
+        }
+    }
+
+    if (shouldRemove) {
+        int startFrame = segmentIndex * segmentSize_;
+        int endFrame = std::min(startFrame + segmentSize_ - 1, static_cast<int>(frameIndex_.size()) - 1);
+        if (startFrame <= endFrame) {
+            // std::cout << "LowCachedDecoderManager: Unloading segment " << segmentIndex << " [" << startFrame << "-" << endFrame << "]" << std::endl;
+            LowResDecoder::removeLowResFrames(frameIndex_, startFrame, endFrame);
+        }
+    }
 }

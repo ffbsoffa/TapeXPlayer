@@ -23,7 +23,7 @@ void updateVisualization(SDL_Renderer* renderer, const std::vector<FrameInfo>& f
 
 void displayCurrentFrame(SDL_Renderer* renderer, const FrameInfo& frameInfo, bool enableHighResDecode, double playbackRate, double currentTime, double totalDuration);
 
-void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double playbackRate, bool isReverse, double currentTime, int frameNumber, bool showOSD = true, bool waiting_for_timecode = false, const std::string& input_timecode = "", double original_fps = 25.0, bool jog_forward = false, bool jog_backward = false);
+void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double playbackRate, bool isReverse, double currentTime, int frameNumber, bool showOSD = true, bool waiting_for_timecode = false, const std::string& input_timecode = "", double original_fps = 25.0, bool jog_forward = false, bool jog_backward = false, bool isDeepPauseActive = false);
 
 void displayFrame(
     SDL_Renderer* renderer,
@@ -47,7 +47,9 @@ void displayFrame(
     std::atomic<bool>& jog_backward,
     size_t ringBufferCapacity,
     int highResWindowSize,
-    int segmentSize
+    int segmentSize,
+    float targetDisplayAspectRatio,
+    bool isDeepPauseActive
 );
 
 void renderLoadingScreen(SDL_Renderer* renderer, TTF_Font* font, const LoadingStatus& status);

@@ -10,6 +10,8 @@
 #include <SDL2/SDL_ttf.h>
 #include <cstring> // For memset and memcpy
 #include <memory> // For std::unique_ptr
+#include <cmath>   // For sin, M_PI (อาจจะต้องมี _USE_MATH_DEFINES ใน Windows)
+#include <random>  // For random number generation
 
 #ifdef __APPLE__ // Include macOS specific headers only on Apple platforms
 #include <CoreVideo/CoreVideo.h>
@@ -61,22 +63,71 @@ bool screenTextureInitialized = false;
 int screenWidth = 0;
 int screenHeight = 0;
 
+// --- HSync Loss Effect State Variables ---
+static bool hsyncLossActive = false;
+static float hsyncEffectProgress = 0.0f; // Not used directly for skew, but for overall conceptual progress
+static float hsyncCurrentSkew = 0.0f;
+static float hsyncMaxSkewAmount = 0.0f;
+static int hsyncEffectDurationFrames = 0;
+static int hsyncEffectCurrentFrame = 0;
+static auto hsyncLastTriggerTime = std::chrono::steady_clock::now();
+// Make HSYNC_MIN_INTERVAL shorter for debugging
+static const std::chrono::milliseconds HSYNC_MIN_INTERVAL(1000); // Min 1 second between triggers (was 8000)
+static float tearLineNormalized = 0.5f; // Vertical position of the "tear" (0.0 to 1.0)
+// --- End HSync State ---
+
 // Forward declarations for zoom functions
 void renderZoomedFrame(SDL_Renderer* renderer, SDL_Texture* texture, int frameWidth, int frameHeight, float zoomFactor, float centerX, float centerY);
 void renderZoomThumbnail(SDL_Renderer* renderer, SDL_Texture* texture, int frameWidth, int frameHeight, float zoomFactor, float centerX, float centerY);
 void handleZoomMouseEvent(SDL_Event& event, int windowWidth, int windowHeight, int frameWidth, int frameHeight);
 
 // Helper function to render the cached software texture
-static void renderSoftwareTexture(SDL_Renderer* renderer, SDL_Texture* texture, int texWidth, int texHeight, const SDL_Rect& destRect) { // Pass destRect
+// UPDATED SIGNATURE to accept srcClip, dstClip, and horizontalShift
+static void renderSoftwareTexture(SDL_Renderer* renderer, SDL_Texture* texture, int texWidth, int texHeight, const SDL_Rect& fullDestRect, const SDL_Rect* srcClip, const SDL_Rect* dstClip, int horizontalShift) {
     if (!texture || texWidth <= 0 || texHeight <= 0) return; // Safety check
 
-    if (zoom_enabled.load()) {
-        renderZoomedFrame(renderer, texture, texWidth, texHeight, zoom_factor.load(), zoom_center_x.load(), zoom_center_y.load());
-    } else {
-        // Use the pre-calculated destRect which includes jitter offset
-        SDL_RenderCopy(renderer, texture, nullptr, &destRect);
+    SDL_Rect finalDst = dstClip ? *dstClip : fullDestRect;
+    // Apply horizontalShift if provided (primarily for the non-split hsync render path)
+    if (!dstClip && horizontalShift != 0) { // Only apply to fullDestRect if not rendering parts
+        finalDst.x += horizontalShift;
+        // Basic clipping for the shifted fullDestRect
+        // This is a simplified clip; more robust clipping might be needed if shift is large.
+        int windowWidth, windowHeight;
+        SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
+        if (finalDst.x + finalDst.w < 0) return; // Fully off-screen left
+        if (finalDst.x > windowWidth) return;    // Fully off-screen right
+        // Further refinement for partial visibility could be added if necessary.
     }
-    if (zoom_enabled.load() && show_zoom_thumbnail.load()) {
+
+
+    if (zoom_enabled.load()) {
+        // Zoom rendering needs to consider the srcClip and dstClip if they are provided,
+        // or apply zoom to the fullDestRect if they are null.
+        // A quick fix: If srcClip is provided, it means we're doing a special render (like hsync parts), so skip zoom for these parts.
+        if (srcClip) {
+             SDL_RenderCopy(renderer, texture, srcClip, &finalDst);
+        } else {
+            // If not rendering parts and zoom is on, render zoomed to the (potentially shifted) finalDst
+            // renderZoomedFrame needs to be aware of the finalDst for correct positioning.
+            // For now, renderZoomedFrame uses global window dimensions. This needs adjustment if zoomed hsync is desired.
+            // Let's render unzoomed if horizontalShift is active for simplicity to avoid complex zoom + shift interaction for now.
+            if (horizontalShift != 0 && !dstClip) { // if it's a full frame render that was shifted
+                SDL_RenderCopy(renderer, texture, srcClip, &finalDst); // srcClip is likely nullptr here
+            } else {
+        renderZoomedFrame(renderer, texture, texWidth, texHeight, zoom_factor.load(), zoom_center_x.load(), zoom_center_y.load());
+            }
+        }
+    } else {
+        // Use the pre-calculated destRect which includes jitter offset (fullDestRect here)
+        // or the specifically provided dstClip (for hsync parts)
+        SDL_RenderCopy(renderer, texture, srcClip, &finalDst);
+    }
+
+    // Thumbnail should ideally use the un-distorted full frame.
+    // If called for hsync parts, this will draw thumbnail multiple times or with clipped content.
+    // This needs to be drawn only once per frame, with the full un-skewed texture.
+    // For now, it will be drawn if zoom is enabled, potentially multiple times during hsync.
+    if (zoom_enabled.load() && show_zoom_thumbnail.load() && !srcClip) { // Only draw for full frame render (not parts)
         renderZoomThumbnail(renderer, texture, texWidth, texHeight, zoom_factor.load(), zoom_center_x.load(), zoom_center_y.load());
     }
 }
@@ -179,7 +230,7 @@ void updateVisualization(SDL_Renderer* renderer, const std::vector<FrameInfo>& f
     }
 }
 
-void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double playbackRate, bool isReverse, double currentTime, int frameNumber, bool showOSD, bool waiting_for_timecode, const std::string& input_timecode, double original_fps, bool jog_forward, bool jog_backward) {
+void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double playbackRate, bool isReverse, double currentTime, int frameNumber, bool showOSD, bool waiting_for_timecode, const std::string& input_timecode, double original_fps, bool jog_forward, bool jog_backward, bool isDeepPauseActive) {
     int windowWidth, windowHeight;
     SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
     SDL_Color textColor = {255, 255, 255, 255};
@@ -193,10 +244,17 @@ void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double pl
 
     // Left Text
     std::string leftText;
-    if (jog_forward || jog_backward) leftText = "JOG";
-    else if (std::abs(playbackRate) < 0.01) leftText = "STILL";
-    else if (std::abs(playbackRate) > 1.0) leftText = "SHUTTLE";
-    else leftText = "PLAY";
+    if (isDeepPauseActive) {
+        leftText = "PAUSE";
+    } else if (jog_forward || jog_backward) {
+        leftText = "JOG";
+    } else if (std::abs(playbackRate) < 0.01) {
+        leftText = "STILL";
+    } else if (std::abs(playbackRate) > 1.0) {
+        leftText = "SHUTTLE";
+    } else {
+        leftText = "PLAY";
+    }
 
     SDL_Surface* leftSurface = TTF_RenderText_Blended(font, leftText.c_str(), textColor);
         if (leftSurface) {
@@ -288,7 +346,10 @@ void displayFrame(
     std::atomic<bool>& jog_backward,
     size_t ringBufferCapacity,
     int highResWindowSize,
-    int segmentSize
+    int segmentSize,
+    // Add the new parameter to the definition
+    float targetDisplayAspectRatio,
+    bool isDeepPauseActive // Added for deep pause
 ) {
     auto request_time = std::chrono::high_resolution_clock::now();
     auto ms_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(request_time.time_since_epoch()).count();
@@ -326,7 +387,101 @@ void displayFrame(
     AVFrame* frame = frameToDisplay ? frameToDisplay.get() : nullptr; // Get raw pointer or nullptr
     SDL_Rect destRect = {0,0,0,0}; // Destination rect for rendering
 
-    if (frame) { // --- Start Processing if a valid frame is provided ---
+    // --- Handle Deep Pause State ---
+    if (isDeepPauseActive) {
+        // In deep pause, we don't process new frames.
+        // We'll fall through to the final rendering stage which should use lastTexture if available,
+        // or just render OSD/Index over black if no texture has been rendered yet.
+        // The main frame processing block below will be skipped.
+        frame = nullptr; // Ensure no new frame is processed
+        renderedWithMetal = false; // Ensure SW path is taken for potentially showing lastTexture
+    }
+
+
+    if (!isDeepPauseActive && frame) { // --- Start Processing if a valid frame is provided AND NOT in deep pause ---
+        // --- Дополнительная проверка валидности полученного кадра ---
+        if (frame) { // This inner check might seem redundant now but keeping for safety
+            bool isPotentiallyValidHardwareFrame = (static_cast<AVPixelFormat>(frame->format) == AV_PIX_FMT_VIDEOTOOLBOX);
+            // Для VideoToolbox кадров, data[0..2] могут быть NULL, data[3] содержит CVPixelBufferRef.
+            // Проверка frame->width > 0 и frame->height > 0 остается важной для всех типов.
+            if (!isPotentiallyValidHardwareFrame && (!frame->data[0] || frame->linesize[0] <= 0)) {
+                std::cerr << "[Display] Warning: SW Frame " << newCurrentFrame
+                          << " (type: " << frameTypeToDisplay << ") data or linesize is invalid "
+                          << "(data[0]=" << (void*)frame->data[0]
+                          << ", linesize[0]=" << frame->linesize[0]
+                          << "). Marking as invalid." << std::endl;
+                frame = nullptr;
+            }
+            if (frame && (frame->width <= 0 || frame->height <= 0)) { // Check width/height for all frames
+                 std::cerr << "[Display] Warning: Frame " << newCurrentFrame
+                          << " (type: " << frameTypeToDisplay << ") width/height is invalid "
+                          << "(w=" << frame->width << ", h=" << frame->height
+                          << "). Marking as invalid." << std::endl;
+                frame = nullptr;
+            }
+        }
+    // --- Конец дополнительной проверки ---
+
+    // --- HSync Loss Effect Logic ---
+    // This effect should likely be skipped in deep pause too, or its state frozen.
+    // For now, it will be skipped because `frame` is nullified in deep pause, preventing SW path.
+    // If we wanted to show effects on a frozen frame, this needs adjustment.
+    double absPlaybackRateForEffect = std::abs(currentPlaybackRate); // Use a local copy for this block
+    bool hsyncConditionMet = (absPlaybackRateForEffect >= 1.5 && absPlaybackRateForEffect <= 2.2);
+
+    if (hsyncConditionMet && !hsyncLossActive) {
+        auto now = std::chrono::steady_clock::now();
+        if (now - hsyncLastTriggerTime > HSYNC_MIN_INTERVAL) {
+            // Use a thread-local random engine for better randomness if called from multiple threads,
+            // but displayFrame is likely called from a single render thread.
+            static std::mt19937 gen(std::random_device{}());
+            // Increase probability for debugging
+            std::uniform_int_distribution<> distrib(1, 30); // Chance: 1 in 30 calls (was 250)
+
+            if (distrib(gen) == 1) {
+                hsyncLossActive = true;
+                hsyncEffectCurrentFrame = 0;
+                // Duration 0.4 to 0.8 seconds based on typical FPS (e.g., 25-60)
+                float effectDurationSec = 0.4f + (static_cast<float>(gen() % 201) / 1000.0f); // Changed to 0.4 to 0.6 sec
+                hsyncEffectDurationFrames = static_cast<int>( (originalFps > 0 ? originalFps : 30.0) * effectDurationSec );
+                if (hsyncEffectDurationFrames < 5) hsyncEffectDurationFrames = 5; // Minimum duration
+
+                // Max skew amount will be calculated based on destRect.w later, if effect triggers
+                // For now, set a placeholder or calculate if destRect.w is known (it's not yet)
+                // hsyncMaxSkewAmount = (destRect.w * 0.03f) + (static_cast<float>(gen() % (int)(destRect.w * 0.05f)));
+                hsyncLastTriggerTime = now;
+            }
+        }
+    }
+
+    if (hsyncLossActive) {
+        hsyncEffectCurrentFrame++;
+        float overallProgress = static_cast<float>(hsyncEffectCurrentFrame) / hsyncEffectDurationFrames;
+        overallProgress = std::min(1.0f, std::max(0.0f, overallProgress));
+
+        // Skew amount (0 -> max -> 0) using sine wave
+        hsyncCurrentSkew = hsyncMaxSkewAmount * sin(overallProgress * M_PI);
+
+        // Tear line animates (e.g., moves from 0.2 to 0.8 of screen height and back, over 2 cycles)
+        tearLineNormalized = 0.5f + 0.3f * sin(overallProgress * M_PI * 4.0f); // Oscillates between 0.2 and 0.8
+
+        if (hsyncEffectCurrentFrame >= hsyncEffectDurationFrames) {
+            hsyncLossActive = false;
+            hsyncCurrentSkew = 0.0f;
+        }
+    } else {
+        hsyncCurrentSkew = 0.0f; // Ensure skew is zero if not active
+    }
+    // --- End HSync Effect Logic ---
+
+    // --- Max Skew Amount Calculation (deferred until destRect.w is known) ---
+    // Moved the actual calculation of hsyncMaxSkewAmount after destRect is defined.
+    // --- End Max Skew Amount Calculation ---
+
+
+    // This entire block processes the *new* frame if available
+    // if (frame) { // This 'frame' is the one potentially nullified by deep pause check
+
         AVPixelFormat currentSrcFormat = static_cast<AVPixelFormat>(frame->format);
 
         // --- Попытка рендеринга через Metal ---
@@ -474,19 +629,49 @@ void displayFrame(
                                sws_scale(swsContextPtr.get(), (const uint8_t* const*)frame->data, frame->linesize, 0, frame->height, dst_data, dst_linesize);
                       } else { std::cerr << "Error: SwsContext is null for needed SW conversion!" << std::endl; }
                   } else {
-                           // Direct copy if formats match (e.g., YUV420P -> IYUV)
-                           // This assumes sws_scale is bypassed only if src AVFmt == target AVFmt
-                           // We still need to copy data to the texture planes
+                           // Direct copy if formats match
+                           // Safer row-by-row copy, respecting linesizes
                            if (currentSdlFormat == SDL_PIXELFORMAT_IYUV && currentSrcFormat == AV_PIX_FMT_YUV420P) {
-                               memcpy(dst_data[0], frame->data[0], frame->linesize[0] * frame->height); // Y
-                               memcpy(dst_data[1], frame->data[1], frame->linesize[1] * frame->height / 2); // U
-                               memcpy(dst_data[2], frame->data[2], frame->linesize[2] * frame->height / 2); // V
+                               // Copy Y plane row by row
+                               for (int y = 0; y < frame->height; ++y) {
+                                   if (dst_data[0] && frame->data[0]) { // Safety check pointers
+                                       memcpy(dst_data[0] + y * dst_linesize[0], // Dest: Start of row y in texture Y plane
+                                              frame->data[0] + y * frame->linesize[0], // Src: Start of row y in frame Y plane
+                                              frame->width); // Copy width bytes (actual data width)
+                                   }
+                               }
+                               // Copy U plane row by row (height/2 rows, width/2 bytes per row)
+                               for (int y = 0; y < frame->height / 2; ++y) {
+                                   if (dst_data[1] && frame->data[1]) { // Safety check pointers
+                                       memcpy(dst_data[1] + y * dst_linesize[1], // Dest: Start of row y in texture U plane
+                                              frame->data[1] + y * frame->linesize[1], // Src: Start of row y in frame U plane
+                                              frame->width / 2); // Copy width/2 bytes
+                                   }
+                               }
+                               // Copy V plane row by row (height/2 rows, width/2 bytes per row)
+                               for (int y = 0; y < frame->height / 2; ++y) {
+                                   if (dst_data[2] && frame->data[2]) { // Safety check pointers
+                                        memcpy(dst_data[2] + y * dst_linesize[2], // Dest: Start of row y in texture V plane
+                                               frame->data[2] + y * frame->linesize[2], // Src: Start of row y in frame V plane
+                                               frame->width / 2); // Copy width/2 bytes
+                                   }
+                               }
                            } else if (currentSdlFormat == SDL_PIXELFORMAT_UYVY && currentSrcFormat == AV_PIX_FMT_UYVY422) {
-                                memcpy(dst_data[0], frame->data[0], frame->linesize[0] * frame->height); // UYVY
-                           } // Add other direct copy cases if needed
+                               // Example for packed format (can still use row-by-row for safety)
+                               for (int y = 0; y < frame->height; ++y) {
+                                    if (dst_data[0] && frame->data[0]) { // Safety check pointers
+                                        memcpy(dst_data[0] + y * dst_linesize[0],
+                                               frame->data[0] + y * frame->linesize[0],
+                                               frame->width * 2); // UYVY is 2 bytes per pixel
+                                    }
+                               }
+                           } // Add other direct copy cases if needed (e.g., RGB24)
                        }
 
                        // --- Apply Betacam Effects ---
+                       // These effects are applied to the new frame data being put into lastTexture.
+                       // In deep pause, this block is skipped because `frame` was nullified.
+                       // If we wanted effects on the *frozen* deep pause frame, this logic would need to be callable separately.
                        double absPlaybackRate = std::abs(currentPlaybackRate);
                        const double effectThreshold = 1.2; // Slightly above 1x to trigger effects
                        if (absPlaybackRate >= effectThreshold && currentTime > 0.1 && (totalDuration - currentTime) > 0.1) {
@@ -655,32 +840,44 @@ void displayFrame(
 
                            // Apply B&W zones under stripes (2x-10x) - USE STORED POSITIONS
                            if (absPlaybackRate >= 2.0 && absPlaybackRate < 10.0) {
-                               // We need stripe height info here, which we didn't store directly.
-                               // Option 1: Re-calculate roughly based on average stripeHeight for the speed.
-                               // Option 2: Store height along with startY in stripePositions. Let's modify above.
-                               // --> Changed stripePositions to store {startY, actual_height}.
                                for (const auto& pos : stripePositions) {
                                    int startY = pos.first;
                                    int currentStripeHeight = pos.second; // Use stored actual height
-                                   if (currentStripeHeight <= 0) continue; // Skip if height is zero/negative
+                                   if (currentStripeHeight <= 0) continue;
 
-                                   // Calculate B&W zone based on this specific stripe's position and height
                                    int bwZoneHeight = static_cast<int>(currentStripeHeight * 1.75);
                                    int heightDifference = bwZoneHeight - currentStripeHeight;
-                                   // Calculate y_bw relative to the actual startY
-                                   int y_bw = startY - heightDifference / 2; 
+                                   int y_bw = startY - heightDifference / 2;
 
-                                    if (y_bw < textureHeight && y_bw + bwZoneHeight > 0) { // Check overlap
-                                       int bwStartY = std::max(0, y_bw); 
+                                    if (y_bw < textureHeight && y_bw + bwZoneHeight > 0) {
+                                       int bwStartY = std::max(0, y_bw);
                                        int bwEndY = std::min(textureHeight, y_bw + bwZoneHeight);
-                                       // Apply B&W effect (existing code)
                                         for (int yPos = bwStartY; yPos < bwEndY; ++yPos) {
-                                            uint8_t* yPlane = dst_data[0] + yPos * pitch;
-                                            for (int x = 0; x < textureWidth; ++x) { yPlane[x] = static_cast<uint8_t>(yPlane[x] * 0.85); } // Darken Y
-                                            if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
-                                                int uvY = yPos / 2; if (uvY < textureHeight / 2) { memset(dst_data[1] + uvY * dst_linesize[1], 128, textureWidth / 2); memset(dst_data[2] + uvY * dst_linesize[2], 128, textureWidth / 2); }
-                                            } else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) {
-                                                int uvY = yPos / 2; if (uvY < textureHeight / 2) { uint8_t* uvPlane = dst_data[1] + uvY * dst_linesize[1]; for (int x = 0; x < textureWidth / 2; ++x) { uvPlane[x*2]=128; uvPlane[x*2+1]=128; } }
+                                            uint8_t* rowStart = dst_data[0] + yPos * pitch;
+                                            if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
+                                                for (int x = 0; x < textureWidth; ++x) { // Iterate per pixel
+                                                    // Darken Y component
+                                                    rowStart[x * 2 + 1] = static_cast<uint8_t>(rowStart[x * 2 + 1] * 0.85f);
+                                                    // Set U and V to 128 for B&W
+                                                    if (x % 2 == 0) rowStart[x * 2] = 128; // U for even pixels
+                                                    else rowStart[x * 2] = 128;           // V for odd pixels (actually U for next pair, V for current if x*2-1)
+                                                                                         // Correct way for UYVY: U is at (pixel/2)*4, V is at (pixel/2)*4+2
+                                                }
+                                                // Simpler: Iterate by pairs for UYVY
+                                                for (int i = 0; i < textureWidth / 2; ++i) { // Iterate per UYVY group
+                                                    uint8_t* uyvy_group = rowStart + i * 4;
+                                                    uyvy_group[0] = 128; // U
+                                                    uyvy_group[1] = static_cast<uint8_t>(uyvy_group[1] * 0.85f); // Y0
+                                                    uyvy_group[2] = 128; // V
+                                                    uyvy_group[3] = static_cast<uint8_t>(uyvy_group[3] * 0.85f); // Y1
+                                                }
+                                            } else { // Existing logic for IYUV and NV12
+                                                for (int x = 0; x < textureWidth; ++x) { rowStart[x] = static_cast<uint8_t>(rowStart[x] * 0.85); } // Darken Y (for planar Y)
+                                                if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
+                                                    int uvY = yPos / 2; if (uvY < textureHeight / 2) { memset(dst_data[1] + uvY * dst_linesize[1], 128, textureWidth / 2); memset(dst_data[2] + uvY * dst_linesize[2], 128, textureWidth / 2); }
+                                                } else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) {
+                                                    int uvY = yPos / 2; if (uvY < textureHeight / 2) { uint8_t* uvPlane = dst_data[1] + uvY * dst_linesize[1]; for (int x = 0; x < textureWidth / 2; ++x) { uvPlane[x*2]=128; uvPlane[x*2+1]=128; } }
+                                                }
                                             }
                                         }
                                     }
@@ -688,17 +885,34 @@ void displayFrame(
                            }
 
                            // Draw grey stripes - USE STORED POSITIONS
-                           // Iterate through the stored positions and draw each stripe
                            for (const auto& pos : stripePositions) {
                                int startY = pos.first;
-                               int currentStripeHeight = pos.second; // Use stored actual height
+                               int currentStripeHeight = pos.second;
                                int endY = startY + currentStripeHeight;
 
-                               // Check if stripe is actually visible (redundant due to check during generation, but safe)
                                if (startY < textureHeight && endY > 0 && currentStripeHeight > 0) {
-                                   startY = std::max(0, startY); // Clamp again just in case
+                                   startY = std::max(0, startY);
                                    endY = std::min(textureHeight, endY);
 
+                                   for (int yPos = startY; yPos < endY; ++yPos) {
+                                       uint8_t* rowStart = dst_data[0] + yPos * pitch;
+                                       if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
+                                           for (int i = 0; i < textureWidth / 2; ++i) { // Iterate per UYVY group
+                                               uint8_t* uyvy_group = rowStart + i * 4;
+                                               uyvy_group[0] = 128; // U
+                                               uyvy_group[1] = 128; // Y0
+                                               uyvy_group[2] = 128; // V
+                                               uyvy_group[3] = 128; // Y1
+                                           }
+                                       } else {
+                                           memset(rowStart, 128, textureWidth); // Y plane for planar formats
+                                           if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
+                                               int uvY = yPos / 2; if (uvY < textureHeight / 2) { memset(dst_data[1] + uvY * dst_linesize[1], 128, textureWidth / 2); memset(dst_data[2] + uvY * dst_linesize[2], 128, textureWidth / 2); }
+                                           } else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) {
+                                               int uvY = yPos / 2; if (uvY < textureHeight / 2) { uint8_t* uvPlane = dst_data[1] + uvY * dst_linesize[1]; for (int x = 0; x < textureWidth / 2; ++x) { uvPlane[x*2]=128; uvPlane[x*2+1]=128; } }
+                                           }
+                                       }
+                                   }
                                    // --- Restore stripe drawing logic --- 
                                    for (int yPos = startY; yPos < endY; ++yPos) {
                                        memset(dst_data[0] + yPos * pitch, 128, textureWidth); // Y
@@ -712,33 +926,108 @@ void displayFrame(
 
                                    // Add black outline below the stripe - USES endY from current stripe
                                    if (absPlaybackRate >= 8.0) {
-                                       // ... (existing outline logic using 'endY') ...
                                        const double outlineStartSpeed = 8.0;
                                        const double outlineFullSpeed = 14.0;
                                        double t = std::max(0.0, std::min(1.0, (absPlaybackRate - outlineStartSpeed) / (outlineFullSpeed - outlineStartSpeed)));
-                                       uint8_t targetY = 16 + static_cast<uint8_t>((128 - 16) * (1.0 - t));
-                                       int currentOutlineHeight = 1; 
+                                       uint8_t targetYValue = 16 + static_cast<uint8_t>((128 - 16) * (1.0 - t));
+                                       int currentOutlineHeight = 1;
                                        for (int h = 0; h < currentOutlineHeight; ++h) {
-                                           int outlineY = endY + h; // Position below the stripe
+                                           int outlineY = endY + h;
                                            if (outlineY < textureHeight) {
-                                               memset(dst_data[0] + outlineY * pitch, targetY, textureWidth);
-                                               // UV handling for outline (existing code)
-                                               if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) { /* ... */ }
-                                               else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) { /* ... */ }
+                                               uint8_t* rowStart = dst_data[0] + outlineY * pitch;
+                                               if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
+                                                   for (int i = 0; i < textureWidth / 2; ++i) { // Iterate per UYVY group
+                                                       uint8_t* uyvy_group = rowStart + i * 4;
+                                                       // For outline, usually only Y is set, U/V remain (or set to neutral grey)
+                                                       uyvy_group[0] = 128; // U (neutral grey)
+                                                       uyvy_group[1] = targetYValue; // Y0
+                                                       uyvy_group[2] = 128; // V (neutral grey)
+                                                       uyvy_group[3] = targetYValue; // Y1
+                                                   }
+                                               } else {
+                                                   memset(rowStart, targetYValue, textureWidth); // Y plane for planar
+                                                   // UV handling for outline (existing code for IYUV/NV12)
+                                                   if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
+                                                        int uvY = outlineY / 2; if (uvY < textureHeight / 2) { memset(dst_data[1] + uvY * dst_linesize[1], 128, textureWidth / 2); memset(dst_data[2] + uvY * dst_linesize[2], 128, textureWidth / 2); }
+                                                   } else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) {
+                                                        int uvY = outlineY / 2; if (uvY < textureHeight / 2) { uint8_t* uvPlane = dst_data[1] + uvY * dst_linesize[1]; for (int x = 0; x < textureWidth / 2; ++x) { uvPlane[x*2]=128; uvPlane[x*2+1]=128; } }
+                                                   }
+                                               }
                                            }
                                        }
                                    }
 
                                    // Add snow effect (>= 4x) - USES startY from current stripe
                                    if (absPlaybackRate >= 4.0 && startY < textureHeight) {
-                                       // ... (existing snow logic using 'startY') ...
-                                       int snowY = startY; 
-                                       int snowCount = std::max(8, textureWidth / 80); if (absPlaybackRate > 10.0) snowCount = static_cast<int>(snowCount * 1.5);
-                                       for (int j = 0; j < snowCount; ++j) { /* ... */ }
+                                       int snowY = startY;
+                                       int snowCount = std::max(8, textureWidth / 80);
+                                       if (absPlaybackRate > 10.0) snowCount = static_cast<int>(snowCount * 1.5);
+
+                                       for (int j = 0; j < snowCount; ++j) {
+                                           int snowX = rand() % textureWidth; // snowX is pixel index
+                                           double speedFactor_snow = std::sqrt(absPlaybackRate);
+                                           int tailBase = 10 + static_cast<int>(rand() % 20);
+                                           int tailLength = tailBase + static_cast<int>(speedFactor_snow * 5.0);
+
+                                           if (snowY >= 0 && snowY < textureHeight && snowX >= 0 && snowX < textureWidth) {
+                                               uint8_t* rowStart = dst_data[0] + snowY * pitch;
+                                               if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
+                                                   // Snow is white, set Y to bright, U/V to neutral
+                                                   // snowX is the pixel index from 0 to textureWidth-1
+                                                   int baseByteOffset = snowX * 2;
+                                                   if (baseByteOffset + 1 < pitch) { // Check boundary for Y
+                                                      rowStart[baseByteOffset + 1] = 235; // Y
+                                                      if (snowX % 2 == 0) { // This Y is Y0, U is at baseByteOffset
+                                                          if (baseByteOffset < pitch) rowStart[baseByteOffset] = 128; // U
+                                                          if (baseByteOffset + 2 < pitch) rowStart[baseByteOffset+2] = 128; // V
+                                                      } else { // This Y is Y1, V is at baseByteOffset
+                                                          // U is at baseByteOffset - 1, V is at baseByteOffset
+                                                          if (baseByteOffset -1 >= 0) rowStart[baseByteOffset-1] = 128; // U
+                                                          if (baseByteOffset < pitch) rowStart[baseByteOffset] = 128; // V
+                                                      }
+                                                      // Correct UYVY snow (white):
+                                                      // For pixel snowX: U at (snowX/2)*4, Y0 at (snowX/2)*4+1, V at (snowX/2)*4+2, Y1 at (snowX/2)*4+3
+                                                      int group_idx = snowX / 2;
+                                                      int in_group_idx = snowX % 2; // 0 for Y0, 1 for Y1
+                                                      uint8_t* uyvy_pixel_group = rowStart + group_idx * 4;
+                                                      if (group_idx * 4 + (1 + in_group_idx*2) < pitch) { // Check Y component
+                                                          uyvy_pixel_group[0] = 128; // U
+                                                          uyvy_pixel_group[1 + in_group_idx*2] = 235; // Y (Y0 or Y1)
+                                                          uyvy_pixel_group[2] = 128; // V
+                                                      }
+                                                   }
+                                               } else {
+                                                   rowStart[snowX] = 235; // Y plane for planar
+                                               }
+                                           }
+
+                                           for (int k = 1; k < tailLength; k++) {
+                                               int xPos = (snowX + k);
+                                               if (xPos >= textureWidth) continue;
+
+                                               double fadeFactor = exp(-0.15 * k);
+                                               int brightness = 128 + static_cast<int>(107 * fadeFactor);
+
+                                               if (snowY >= 0 && snowY < textureHeight && xPos >= 0 && xPos < textureWidth) {
+                                                   uint8_t* rowStart = dst_data[0] + snowY * pitch;
+                                                    if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
+                                                       int group_idx = xPos / 2;
+                                                       int in_group_idx = xPos % 2;
+                                                       uint8_t* uyvy_pixel_group = rowStart + group_idx * 4;
+                                                       if (group_idx * 4 + (1 + in_group_idx*2) < pitch) { // Check Y component
+                                                            uyvy_pixel_group[0] = 128; // U
+                                                            uyvy_pixel_group[1 + in_group_idx*2] = brightness; // Y (Y0 or Y1)
+                                                            uyvy_pixel_group[2] = 128; // V
+                                                       }
+                                                    } else {
+                                                       rowStart[xPos] = brightness; // Y plane for planar
+                                                    }
+                                               }
+                                           }
+                                       }
                                    }
                                }
                            }
-
 
                            // Scanline duplication effect (>= 16x) - NEEDS UPDATED STRIPE MASK
                             if (absPlaybackRate >= 16.0) {
@@ -795,35 +1084,31 @@ void displayFrame(
                                     if (!stripeMask[y] && !inClearArea) { clearStart = y; inClearArea = true; }
                                     else if ((stripeMask[y] || y == textureHeight - 1) && inClearArea) {
                                         int clearEnd = stripeMask[y] ? y : y + 1;
-                                        if (clearEnd - clearStart > 1) { // Area needs at least 2 lines (source + target)
-                                            int areaStart = clearStart; 
+                                        if (clearEnd - clearStart > 1) {
+                                            int areaStart = clearStart;
                                             int areaEnd = clearEnd;
-                                            
-                                            // Use the *first* line of the clear area as the source
                                             int sourceLineY = areaStart;
-                                            // Check if sourceLineY is valid (should always be if areaStart is)
+
                                             if (sourceLineY >= 0 && sourceLineY < textureHeight && pitch > 0) {
                                                 uint8_t* srcLine = dst_data[0] + sourceLineY * pitch;
-                                                
-                                                // Duplicate this source line starting from the *next* line until the end of the area
                                                 for (int destY = areaStart + 1; destY < areaEnd; destY++) {
-                                                    // Copy Y plane directly
                                                     uint8_t* dstLine = dst_data[0] + destY * pitch;
-                                                    memcpy(dstLine, srcLine, textureWidth);
-                                                    
-                                                    // Copy UV planes (handling subsampling)
+                                                    if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
+                                                        memcpy(dstLine, srcLine, textureWidth * 2); // UYVY is 2 bytes per pixel
+                                                    } else {
+                                                        memcpy(dstLine, srcLine, textureWidth); // Y plane for planar
+                                                    }
+
                                                     if ((sourceLineY/2 != destY/2) && (destY/2 < textureHeight/2)) {
                                                         if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
                                                             if (dst_linesize[1] > 0) memcpy(dst_data[1] + destY/2 * dst_linesize[1], dst_data[1] + sourceLineY/2 * dst_linesize[1], textureWidth/2);
                                                             if (dst_linesize[2] > 0) memcpy(dst_data[2] + destY/2 * dst_linesize[2], dst_data[2] + sourceLineY/2 * dst_linesize[2], textureWidth/2);
                                                         } else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) {
-                                                            if (dst_linesize[1] > 0) memcpy(dst_data[1] + destY/2 * dst_linesize[1], dst_data[1] + sourceLineY/2 * dst_linesize[1], textureWidth); // NV12 UV plane is full width
+                                                            if (dst_linesize[1] > 0) memcpy(dst_data[1] + destY/2 * dst_linesize[1], dst_data[1] + sourceLineY/2 * dst_linesize[1], textureWidth);
                                                         }
+                                                        // No specific U/V copy for UYVY here as memcpy of dstLine should cover it.
                                                     }
                                                 }
-                                            } else {
-                                                // Optional: Log error if sourceLineY is invalid (should not happen)
-                                                // std::cerr << "Warning: Invalid sourceLineY (" << sourceLineY << ") in scanline duplication." << std::endl;
                                             }
                                         }
                                         inClearArea = false;
@@ -832,31 +1117,54 @@ void displayFrame(
                             }
                        } // End if absPlaybackRate >= effectThreshold
 
-                       // --- Apply Edge Fade --- 
+                       // --- Apply Edge Fade ---
                        const int leftEdgeFadeWidth = 3;
                        const int rightEdgeFadeWidth = 2;
-                       if ((leftEdgeFadeWidth > 0 || rightEdgeFadeWidth > 0) && textureWidth > (leftEdgeFadeWidth + rightEdgeFadeWidth) && pitch > 0) { // Check if fade is enabled and texture is wide enough
+                       if ((leftEdgeFadeWidth > 0 || rightEdgeFadeWidth > 0) && textureWidth > (leftEdgeFadeWidth + rightEdgeFadeWidth) && pitch > 0) {
                             for (int y = 0; y < textureHeight; ++y) {
-                                uint8_t* yPlane = dst_data[0] + y * pitch;
+                                uint8_t* rowStart = dst_data[0] + y * pitch;
                                 // Left edge fade
-                                if (leftEdgeFadeWidth > 0) { // Apply only if width > 0
-                                    for (int x = 0; x < leftEdgeFadeWidth; ++x) {
+                                if (leftEdgeFadeWidth > 0) {
+                                    for (int x = 0; x < leftEdgeFadeWidth; ++x) { // x is pixel index
                                         float fade = static_cast<float>(x) / (leftEdgeFadeWidth > 1 ? (leftEdgeFadeWidth - 1) : 1);
-                                        yPlane[x] = static_cast<uint8_t>(yPlane[x] * fade + 16.0f * (1.0f - fade));
+                                        if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
+                                            int group_idx = x / 2;
+                                            int in_group_idx = x % 2;
+                                            uint8_t* uyvy_pixel_group = rowStart + group_idx * 4;
+                                            // Fade only Y component, leave U/V or set to neutral for strong fade
+                                            if (group_idx * 4 + (1 + in_group_idx*2) < pitch) {
+                                                uint8_t currentY = uyvy_pixel_group[1 + in_group_idx*2];
+                                                uyvy_pixel_group[1 + in_group_idx*2] = static_cast<uint8_t>(currentY * fade + 16.0f * (1.0f - fade));
+                                                // Optionally fade U/V to grey:
+                                                // uyvy_pixel_group[0] = static_cast<uint8_t>(uyvy_pixel_group[0] * fade + 128.0f * (1.0f - fade));
+                                                // uyvy_pixel_group[2] = static_cast<uint8_t>(uyvy_pixel_group[2] * fade + 128.0f * (1.0f - fade));
+                                            }
+                                        } else {
+                                            rowStart[x] = static_cast<uint8_t>(rowStart[x] * fade + 16.0f * (1.0f - fade));
+                                        }
                                     }
                                 }
                                 // Right edge fade
-                                if (rightEdgeFadeWidth > 0) { // Apply only if width > 0
+                                if (rightEdgeFadeWidth > 0) {
                                     for (int x = 0; x < rightEdgeFadeWidth; ++x) {
-                                        int realX = textureWidth - 1 - x;
+                                        int realX = textureWidth - 1 - x; // pixel index
                                         float fade = static_cast<float>(x) / (rightEdgeFadeWidth > 1 ? (rightEdgeFadeWidth - 1) : 1);
-                                        // Boundary check for realX (already covered by loop limit and textureWidth check)
-                                        yPlane[realX] = static_cast<uint8_t>(yPlane[realX] * fade + 16.0f * (1.0f - fade));
+                                        if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
+                                            int group_idx = realX / 2;
+                                            int in_group_idx = realX % 2;
+                                            uint8_t* uyvy_pixel_group = rowStart + group_idx * 4;
+                                            if (group_idx * 4 + (1 + in_group_idx*2) < pitch) {
+                                                uint8_t currentY = uyvy_pixel_group[1 + in_group_idx*2];
+                                                uyvy_pixel_group[1 + in_group_idx*2] = static_cast<uint8_t>(currentY * fade + 16.0f * (1.0f - fade));
+                                            }
+                                        } else {
+                                            rowStart[realX] = static_cast<uint8_t>(rowStart[realX] * fade + 16.0f * (1.0f - fade));
+                                        }
                                     }
                                 }
                             }
                        }
-                       // --- End Edge Fade --- 
+                       // --- End Edge Fade ---
 
                        SDL_UnlockTexture(lastTexture);
                   } else {
@@ -878,17 +1186,22 @@ void displayFrame(
              } // end if(lastTexture exists after creation/check)
         } // End if (!renderedWithMetal)
 
-    } else { // --- No frameToDisplay provided ---
+    } else if (!isDeepPauseActive) { // No frameToDisplay provided AND not in deep pause
         // std::cout << "[TimingDebug:" << ms_since_epoch << "] >> No AVFrame provided for frame " << newCurrentFrame << "! Trying redraw." << std::endl; // Optional log
         // Attempt to redraw the last SW texture only if it exists and something was rendered before
         // Do nothing if Metal was used previously or no SW texture exists
     }
+    // If isDeepPauseActive is true, we skipped the block above and will proceed to render lastTexture.
 
      // --- Final Rendering Stage ---
      // Calculate destRect based on current texture dimensions (could be from Metal or SW path)
      // Ensure textureWidth and textureHeight are up-to-date
     if (firstFrameRendered && textureWidth > 0 && textureHeight > 0) {
-        float aspectRatio = static_cast<float>(textureWidth) / textureHeight;
+        // Use the targetDisplayAspectRatio passed from the caller
+        float aspectRatio = targetDisplayAspectRatio; 
+        // Ensure aspect ratio is positive to avoid division by zero or weird behavior
+        if (aspectRatio <= 0) { aspectRatio = 16.0f / 9.0f; } // Fallback
+
                       if (windowWidth / aspectRatio <= windowHeight) {
                           destRect.w = windowWidth;
                           destRect.h = static_cast<int>(windowWidth / aspectRatio);
@@ -898,46 +1211,135 @@ void displayFrame(
                       }
                       destRect.x = (windowWidth - destRect.w) / 2;
                       destRect.y = (windowHeight - destRect.h) / 2;
+        
+        // --- Calculate hsyncMaxSkewAmount now that destRect.w is known, if effect just started ---
+        // This might need adjustment if hsync is desired on a frozen deep pause frame.
+        if (!isDeepPauseActive && hsyncLossActive && hsyncEffectCurrentFrame == 1) { // First frame of an active effect
+             static std::mt19937 gen_skew(std::random_device{}()); // Separate generator for amount
+             // Max skew is a percentage of the *destination rect width*
+             float baseMaxSkew = destRect.w * (0.02f + (static_cast<float>(gen_skew() % 31) / 1000.0f)); // 2% to 5% of width
+             hsyncMaxSkewAmount = baseMaxSkew;
+             if (gen_skew() % 2 == 0) hsyncMaxSkewAmount *= -1; // Random direction
+        }
+
 
         // Apply Jitter Offset just before rendering (conceptually)
         // Jitter calculated earlier within the SW path is used here
-         double absPlaybackRate = std::abs(currentPlaybackRate); // Use current rate again
-         static std::random_device rd_jitter_render; // Separate RNG for render stage jitter
-         static std::mt19937 rng_jitter_render(rd_jitter_render());
+        if (!isDeepPauseActive) { // Jitter only if not in deep pause
+             double absPlaybackRate = std::abs(currentPlaybackRate); // Use current rate again
+             static std::random_device rd_jitter_render; // Separate RNG for render stage jitter
+             static std::mt19937 rng_jitter_render(rd_jitter_render());
 
-         double jitterAmplitude = 0;
-         // --- Jitter calculations for various speeds (0.2x to 1.0x excluded) ---
-         if (absPlaybackRate >= 1.3 && absPlaybackRate < 1.9) { double t = (absPlaybackRate - 1.3) / 0.6; jitterAmplitude = 10.0 + t * 9.0; }
-         else if (absPlaybackRate >= 1.9 && absPlaybackRate < 4.0) jitterAmplitude = 2.0;
-         else if (absPlaybackRate >= 4.0 && absPlaybackRate < 16.0) { double t = (absPlaybackRate - 4.0) / 12.0; jitterAmplitude = 1.4 + t * 2.2; }
-         else if (absPlaybackRate >= 20.0) jitterAmplitude = 2.0;
+             double jitterAmplitude = 0;
+             // --- Jitter calculations for various speeds (0.2x to 1.0x excluded) ---
+             if (absPlaybackRate >= 1.3 && absPlaybackRate < 1.9) { double t = (absPlaybackRate - 1.3) / 0.6; jitterAmplitude = 10.0 + t * 9.0; }
+             else if (absPlaybackRate >= 1.9 && absPlaybackRate < 4.0) jitterAmplitude = 2.0;
+             else if (absPlaybackRate >= 4.0 && absPlaybackRate < 16.0) { double t = (absPlaybackRate - 4.0) / 12.0; jitterAmplitude = 1.4 + t * 2.2; }
+             else if (absPlaybackRate >= 20.0) jitterAmplitude = 2.0;
 
-         if (jitterAmplitude > 0) {
-             if (newFrameProcessed) { // Apply jitter ONLY if a new frame was processed
-                 if (absPlaybackRate >= 0.20 && absPlaybackRate < 1.0) {
-                     int baseOffset = static_cast<int>(floor(jitterAmplitude));
-                     int offset = (newCurrentFrame % 2 == 0) ? baseOffset : -baseOffset;
-                     destRect.y += offset;
-                 }
-                 // --- Existing Random Jitter for other speeds ---
-                 else {
-                     // Sharp random jitter for specific higher speed range
-                     if (absPlaybackRate >= 1.3 && absPlaybackRate < 2.0) {
-                          std::uniform_real_distribution<> sharpJitterDist(-1.0, 1.0); destRect.y += static_cast<int>(sharpJitterDist(rng_jitter_render) * jitterAmplitude);
+             if (jitterAmplitude > 0) {
+                 if (newFrameProcessed) { // Apply jitter ONLY if a new frame was processed
+                     if (absPlaybackRate >= 0.20 && absPlaybackRate < 1.0) {
+                         int baseOffset = static_cast<int>(floor(jitterAmplitude));
+                         int offset = (newCurrentFrame % 2 == 0) ? baseOffset : -baseOffset;
+                         destRect.y += offset;
                      }
-                     // Normal random jitter for other speeds >= 1.0x (and specifically >= 4.0x based on amplitude calc)
-                     else { // This covers >=1.0x, excluding 1.3-2.0, but amplitude is only > 0 for >= 1.9, 4.0-16.0, >=20.0
-                          // Redundant check since we are inside if(jitterAmplitude > 0), but safe.
-                          std::normal_distribution<> normalJitterDist(0.0, 1.0); destRect.y += static_cast<int>(normalJitterDist(rng_jitter_render) * jitterAmplitude);
+                     // --- Existing Random Jitter for other speeds ---
+                     else {
+                         // Sharp random jitter for specific higher speed range
+                         if (absPlaybackRate >= 1.3 && absPlaybackRate < 2.0) {
+                              std::uniform_real_distribution<> sharpJitterDist(-1.0, 1.0); destRect.y += static_cast<int>(sharpJitterDist(rng_jitter_render) * jitterAmplitude);
+                         }
+                         // Normal random jitter for other speeds >= 1.0x (and specifically >= 4.0x based on amplitude calc)
+                         else { // This covers >=1.0x, excluding 1.3-2.0, but amplitude is only > 0 for >= 1.9, 4.0-16.0, >=20.0
+                              // Redundant check since we are inside if(jitterAmplitude > 0), but safe.
+                              std::normal_distribution<> normalJitterDist(0.0, 1.0); destRect.y += static_cast<int>(normalJitterDist(rng_jitter_render) * jitterAmplitude);
+                         }
                      }
                  }
              }
-         }
+        } // End if (!isDeepPauseActive) for jitter
 
 
         // Render the final texture (either Metal's output implicitly, or our SW texture)
+        // In deep pause, renderedWithMetal will be false, so it will try to render lastTexture.
         if (!renderedWithMetal && lastTexture) { // Render SW texture if it exists and wasn't Metal
-             renderSoftwareTexture(renderer, lastTexture, textureWidth, textureHeight, destRect); // Pass final destRect
+            // --- HSync Loss Effect Rendering ---
+            // Skip HSync effect rendering if in deep pause
+            if (!isDeepPauseActive && hsyncLossActive && hsyncMaxSkewAmount != 0.0f && destRect.h > 0 && textureHeight > 0) {
+                int actualTearLineScreenY = destRect.y + static_cast<int>(tearLineNormalized * destRect.h);
+                actualTearLineScreenY = std::max(destRect.y, std::min(actualTearLineScreenY, destRect.y + destRect.h -1)); // -1 to ensure min 1px for below part
+
+                // Part 1: Below the tear (renders normally, unchanged)
+                SDL_Rect srcBelow, dstBelow;
+                dstBelow.x = destRect.x;
+                dstBelow.y = actualTearLineScreenY;
+                dstBelow.w = destRect.w;
+                dstBelow.h = (destRect.y + destRect.h) - actualTearLineScreenY;
+
+                srcBelow.x = 0;
+                srcBelow.y = static_cast<int>((static_cast<float>(dstBelow.y - destRect.y) / destRect.h) * textureHeight);
+                srcBelow.w = textureWidth;
+                srcBelow.h = static_cast<int>((static_cast<float>(dstBelow.h) / destRect.h) * textureHeight);
+                
+                if (srcBelow.y + srcBelow.h > textureHeight) { // Adjust srcBelow.h if it exceeds texture bounds
+                    srcBelow.h = textureHeight - srcBelow.y;
+                }
+
+                if (srcBelow.h > 0 && dstBelow.h > 0) {
+                    renderSoftwareTexture(renderer, lastTexture, textureWidth, textureHeight, destRect, &srcBelow, &dstBelow, 0);
+                }
+
+                // Part 2: Above the tear (this part is skewed, rendered line by line)
+                int topPartScreenHeight = actualTearLineScreenY - destRect.y;
+                if (topPartScreenHeight > 0) {
+                    for (int y_screen = destRect.y; y_screen < actualTearLineScreenY; ++y_screen) {
+                        SDL_Rect srcLine, dstLine;
+                        
+                        // Normalize y_screen within the skewed region (0 at top of tear, 1 at top of screen)
+                        // Inverse: 0 at top of screen, 1 at tear line
+                        float normalizedYInSkewArea = static_cast<float>(actualTearLineScreenY - 1 - y_screen) / std::max(1, topPartScreenHeight -1) ;
+                        
+                        // Skew for this specific line (max skew at the very top, 0 at tear line)
+                        // hsyncMaxSkewAmount is already animated (0->peak->0)
+                        float currentLineSkew = hsyncMaxSkewAmount * normalizedYInSkewArea;
+
+                        dstLine.x = destRect.x + static_cast<int>(currentLineSkew);
+                        dstLine.y = y_screen;
+                        dstLine.w = destRect.w; // We'll clip this via srcLine.w adjustment if needed
+                        dstLine.h = 1;
+
+                        srcLine.x = 0; // Default source X
+                        // Calculate corresponding Y in source texture
+                        srcLine.y = static_cast<int>((static_cast<float>(y_screen - destRect.y) / destRect.h) * textureHeight);
+                        srcLine.w = textureWidth; // Default source width
+                        srcLine.h = 1;
+                        
+                        // Adjust srcLine.x and srcLine.w based on how much dstLine.x is shifted
+                        // and how much of dstLine.w would be outside destRect.x / destRect.x + destRect.w
+                        // This is a simplified clipping, more advanced would be needed for perfect results
+                        if (dstLine.x < destRect.x) {
+                            int offset = destRect.x - dstLine.x;
+                            srcLine.x += static_cast<int>((float)offset / dstLine.w * srcLine.w) ; 
+                            srcLine.w -= static_cast<int>((float)offset / dstLine.w * srcLine.w) ; 
+                            dstLine.w -= offset;
+                            dstLine.x = destRect.x;
+                        }
+                        if (dstLine.x + dstLine.w > destRect.x + destRect.w) {
+                            int overflow = (dstLine.x + dstLine.w) - (destRect.x + destRect.w);
+                            srcLine.w -= static_cast<int>((float)overflow / dstLine.w * srcLine.w) ; 
+                            dstLine.w -= overflow;
+                        }
+
+                        if (srcLine.y >= 0 && srcLine.y < textureHeight && srcLine.w > 0 && dstLine.w > 0) {
+                             SDL_RenderCopy(renderer, lastTexture, &srcLine, &dstLine);
+                        }
+                    }
+                }
+            } else {
+                 renderSoftwareTexture(renderer, lastTexture, textureWidth, textureHeight, destRect, nullptr, &destRect, 0); // Pass 0 for horizontalShift when no effect
+            }
+            // --- End HSync Loss Effect Rendering ---
         } else if (!renderedWithMetal && !lastTexture && firstFrameRendered) {
             // This case should ideally not happen if logic is correct,
             // but redraw the last known good texture if needed (maybe from a previous Metal frame?)
@@ -958,9 +1360,12 @@ void displayFrame(
                  SDL_RenderDrawRect(renderer, &thumbRect);
              }
         }
-    } else if (!firstFrameRendered) {
+    } else if (!firstFrameRendered && !isDeepPauseActive) { // Only show black if not first frame AND not deep pause
          // Nothing rendered yet, ensure screen is black
-         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderClear(renderer);
+         // SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderClear(renderer); // Already cleared at the beginning
+    } else if (isDeepPauseActive && !lastTexture && !firstFrameRendered) {
+        // In deep pause, but no texture was ever rendered (e.g., paused immediately)
+        // Screen is already cleared to black. OSD/Index will draw over it.
     }
 
 
@@ -978,7 +1383,7 @@ void displayFrame(
 
     // Render OSD (if enabled)
     if (showOSD && font) {
-        renderOSD(renderer, font, isPlaying.load(), currentPlaybackRate, isReverse, currentTime, newCurrentFrame, showOSD, waitingForTimecode, inputTimecode, originalFps, jog_forward.load(), jog_backward.load());
+        renderOSD(renderer, font, isPlaying.load(), currentPlaybackRate, isReverse, currentTime, newCurrentFrame, showOSD, waitingForTimecode, inputTimecode, originalFps, jog_forward.load(), jog_backward.load(), isDeepPauseActive); // Pass isDeepPauseActive
     }
 
     // Update the screen

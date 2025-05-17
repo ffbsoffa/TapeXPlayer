@@ -8,7 +8,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
-#include "RtMidi.h"
+#include "rtmidi/RtMidi.h"
 #include "../../common/common.h"
 
 #ifdef _WIN32

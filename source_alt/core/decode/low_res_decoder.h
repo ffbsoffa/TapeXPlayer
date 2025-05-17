@@ -46,7 +46,7 @@ public:
     bool decodeLowResRange(std::vector<FrameInfo>& frameIndex, 
                            int startFrame, int endFrame, 
                            int highResStart, int highResEnd, 
-                           bool skipHighResWindow = true);
+                           bool skipHighResWindow = false);
 
     bool isInitialized() const;
     int getWidth() const;

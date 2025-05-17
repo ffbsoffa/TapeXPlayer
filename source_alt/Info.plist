@@ -1,0 +1,54 @@
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>CFBundleExecutable</key>
+        <string>TapeXPlayer</string> <!-- Имя твоего исполняемого файла (TARGET) -->
+        <key>CFBundleIdentifier</key>
+        <string>com.ffbsoffa.fstapexplayer</string> <!-- ИЗМЕНИ ЭТО: Уникальный идентификатор -->
+        <key>CFBundleName</key>
+        <string>TapeXPlayer</string> <!-- Имя приложения -->
+        <key>CFBundleDisplayName</key>
+        <string>TapeXPlayer</string> <!-- Имя, отображаемое под иконкой -->
+        <key>CFBundleVersion</key>
+        <string>1.0.0</string> <!-- Версия -->
+        <key>CFBundleShortVersionString</key>
+        <string>1.0a</string>
+        <key>CFBundlePackageType</key>
+        <string>APPL</string>
+        <key>CFBundleSignature</key>
+        <string>FSTP</string> <!-- Пример 4-буквенного кода, можешь придумать свой -->
+        <key>LSMinimumSystemVersion</key>
+        <string>10.13</string> <!-- Минимальная версия macOS -->
+        <key>NSHumanReadableCopyright</key>
+        <string>Copyright © 2025 Maksim Maloletkin (FFB_soffa). All rights reserved.</string> <!-- ИЗМЕНИ ЭТО -->
+        
+        <!-- Раскомментируй и укажи имя файла иконки, если она есть в Resources -->
+        <key>CFBundleIconFile</key>
+        <string>TapeXPlayer.icns</string>
+
+        <!-- Для обработки URI txp:// -->
+        <key>CFBundleURLTypes</key>
+        <array>
+            <dict>
+                <key>CFBundleURLName</key>
+                <string>TapeXPlayer URL</string>
+                <key>CFBundleURLSchemes</key>
+                <array>
+                    <string>fstp</string>
+                </array>
+                <key>CFBundleTypeRole</key>
+                <string>Viewer</string>
+            </dict>
+        </array>
+
+        <!-- Для поддержки Metal и избежания некоторых предупреждений -->
+        <key>NSPrincipalClass</key>
+        <string>NSApplication</string>
+        <key>NSHighResolutionCapable</key>
+        <true/>
+        <key>NSSupportsAutomaticGraphicsSwitching</key>
+        <true/>
+
+    </dict>
+    </plist>

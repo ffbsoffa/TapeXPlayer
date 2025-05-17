@@ -74,13 +74,13 @@ std::map<int, int> menu_to_device_index;
 std::vector<std::string> get_audio_output_devices();
 
 void smooth_speed_change() {
-    const double normal_step = 0.2;
+    const double normal_step = 2.0;
     const double pause_step = 1.0; // Still needed for pausing interpolation
     const int normal_interval = 14; // Re-add missing constant
     const int pause_interval = 4;  // Still needed for pausing interpolation
 
     // --- Base Overshoot Curve Parameters (for scaling) ---
-    const double baseOvershootTotalDurationMs = 250.0;
+    const double baseOvershootTotalDurationMs = 350.0;
     const double baseOvershootDipSpeed = 0.7;
     const int baseOvershootPeakTimeMs = 50;
     const int baseOvershootDipTimeMs = 75;
@@ -108,11 +108,20 @@ void smooth_speed_change() {
         if (current_rate <= 0.3) { // Start fading below 0.3x
             new_volume = static_cast<float>(current_rate / 0.3); // Linear fade from 0.3x down to 0 (cast needed)
         } else if (current_rate >= 7.0) {
-            if (current_rate >= 18.0) {
-                new_volume = 0.15f;
-            } else {
-                float t = static_cast<float>((current_rate - 7.0) / (18.0 - 7.0)); // Cast needed
+            if (current_rate < 10.0) { // Fade from 7x to 10x
+                float t = static_cast<float>((current_rate - 7.0) / (10.0 - 7.0)); // Range is now 3.0
                 new_volume = 1.0f - (t * 0.85f);
+            } else { // Fade further from 10x to 24x
+                const float start_speed = 10.0f;
+                const float end_speed = 24.0f;
+                const float start_volume = 0.15f;
+                const float end_volume = 0.05f;
+                // Clamp speed to the fade range [10, 24]
+                float clamped_rate = std::min(static_cast<float>(current_rate), end_speed);
+                // Calculate progress within the 10-24 range
+                float t = (clamped_rate - start_speed) / (end_speed - start_speed);
+                // Linear interpolation between start_volume and end_volume
+                new_volume = start_volume + (end_volume - start_volume) * t;
             }
         }
         volume.store(new_volume);
@@ -129,11 +138,18 @@ void smooth_speed_change() {
 
         int interval = normal_interval; // Default interval
 
+        // --- Check for 3.0x speed exception ---
+        if (std::abs(target - 3.0) < 0.01) { // Check if target speed is 3.0x
+            interval = 4;
+        } else {
+            interval = normal_interval; // Default for other speeds
+        }
+        // --- End 3.0x speed exception ---
+
         // --- Prioritize JOGGING check --- 
         if (is_jogging) {
             playback_rate.store(JOG_SPEED); // Set speed directly to JOG_SPEED
             calculate_and_set_volume(JOG_SPEED);
-            interval = normal_interval; // Use normal interval during jog
         }
         // --- Handle RESUMING (includes overshoot logic) --- 
         else if (is_resuming) {
@@ -205,14 +221,13 @@ void smooth_speed_change() {
             // Update current/target to prevent immediate adjustment in next section
             current = 1.0; 
             target = 1.0;
-            interval = normal_interval; // Ensure normal interval after resume/overshoot
         }
         // --- Handle OTHER speed changes (including PAUSING) --- 
         else if (current != target) { 
             if (is_pausing) {
                  interval = pause_interval; // Use shorter interval for faster pausing
             } else {
-                 interval = normal_interval;
+                 // Interval is already set based on target (3.0x exception) or default normal_interval
             }
 
             double diff = target - current;
@@ -615,6 +630,36 @@ void decode_audio(const char* filename) {
                         int16_t* samples = reinterpret_cast<int16_t*>(frame->data[0]);
                         samples_in_frame = frame->nb_samples * frame->ch_layout.nb_channels;
                         memcpy(current_write_pos, samples, samples_in_frame * sizeof(int16_t));
+                    } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S32P) {
+                        // --- Restore S32P handling with float scaling --- 
+                        int samples_per_channel = frame->nb_samples;
+                        int num_channels = frame->ch_layout.nb_channels;
+                        int32_t** s32p_data = reinterpret_cast<int32_t**>(frame->data);
+                        samples_in_frame = samples_per_channel * num_channels;
+
+                        for (int i = 0; i < samples_per_channel; ++i) {
+                            for (int ch = 0; ch < num_channels; ++ch) {
+                                int32_t sample_s32 = s32p_data[ch][i];
+                                // Scale S32 to S16 range using float division
+                                float scaled_sample = static_cast<float>(sample_s32) / 65536.0f;
+                                int16_t sample_s16 = static_cast<int16_t>(std::round(std::max(-32768.0f, std::min(32767.0f, scaled_sample))));
+                                *current_write_pos++ = sample_s16;
+                            }
+                        }
+                    } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S32) {
+                        // --- Restore S32 handling with float scaling ---
+                        int samples_per_channel = frame->nb_samples;
+                        int num_channels = frame->ch_layout.nb_channels;
+                        int32_t* s32_samples = reinterpret_cast<int32_t*>(frame->data[0]);
+                        samples_in_frame = samples_per_channel * num_channels;
+
+                        for (size_t i = 0; i < samples_in_frame; ++i) {
+                            int32_t sample_s32 = s32_samples[i];
+                            // Scale S32 to S16 range using float division
+                            float scaled_sample = static_cast<float>(sample_s32) / 65536.0f;
+                            int16_t sample_s16 = static_cast<int16_t>(std::round(std::max(-32768.0f, std::min(32767.0f, scaled_sample))));
+                            *current_write_pos++ = sample_s16;
+                        }
                     } else {
                         std::cerr << "Unsupported audio format for mmap: " << av_get_sample_fmt_name(audio_codec_ctx->sample_fmt) << std::endl;
                         // Skip frame, don't advance offset or count
@@ -665,6 +710,31 @@ void decode_audio(const char* filename) {
                   for (int i = 0; i < samples_per_channel; ++i) for (int ch = 0; ch < num_channels; ++ch) *current_write_pos++ = s16p_data[ch][i]; 
               } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16) {
                   int16_t* samples = reinterpret_cast<int16_t*>(frame->data[0]); memcpy(current_write_pos, samples, samples_in_frame * sizeof(int16_t)); 
+              } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S32P) {
+                  // --- Restore S32P handling with float scaling in flush loop ---
+                   int samples_per_channel = frame->nb_samples; int num_channels = frame->ch_layout.nb_channels; int32_t** s32p_data = reinterpret_cast<int32_t**>(frame->data);
+                   samples_in_frame = samples_per_channel * num_channels;
+                   for (int i = 0; i < samples_per_channel; ++i) {
+                        for (int ch = 0; ch < num_channels; ++ch) {
+                            int32_t sample_s32 = s32p_data[ch][i];
+                            float scaled_sample = static_cast<float>(sample_s32) / 65536.0f;
+                            int16_t sample_s16 = static_cast<int16_t>(std::round(std::max(-32768.0f, std::min(32767.0f, scaled_sample))));
+                            *current_write_pos++ = sample_s16;
+                        }
+                    }
+              } else if (audio_codec_ctx->sample_fmt == AV_SAMPLE_FMT_S32) {
+                  // --- Restore S32 handling with float scaling in flush loop ---
+                   int samples_per_channel = frame->nb_samples;
+                   int num_channels = frame->ch_layout.nb_channels;
+                   int32_t* s32_samples = reinterpret_cast<int32_t*>(frame->data[0]);
+                   samples_in_frame = samples_per_channel * num_channels;
+ 
+                   for (size_t i = 0; i < samples_in_frame; ++i) {
+                       int32_t sample_s32 = s32_samples[i];
+                       float scaled_sample = static_cast<float>(sample_s32) / 65536.0f;
+                       int16_t sample_s16 = static_cast<int16_t>(std::round(std::max(-32768.0f, std::min(32767.0f, scaled_sample))));
+                       *current_write_pos++ = sample_s16;
+                   }
               } else { samples_in_frame = 0; } 
               
               if (samples_in_frame > 0) {

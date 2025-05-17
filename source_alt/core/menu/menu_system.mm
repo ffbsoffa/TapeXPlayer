@@ -1,8 +1,8 @@
-#import "menu_system_impl.h"
-#import "menu_system.h"
 #import <Cocoa/Cocoa.h>
 #import <AppKit/AppKit.h>
-#import <Foundation/Foundation.h>
+#import <AppKit/NSApplication.h>
+#import "menu_system_impl.h"
+#import "menu_system.h"
 #import "nfd.hpp"
 #include "../remote/remote_control.h"
 #include "../audio/mainau.h" // Include for audio device functions
@@ -40,7 +40,7 @@ extern bool switch_audio_device(int deviceIndex);
                keyEquivalent:@"q"];
     
     // File menu
-    NSMenuItem *fileMenuItem = [[NSMenuItem alloc] init];
+    NSMenuItem *fileMenuItem = [[NSMenuItem alloc] initWithTitle:@"File" action:nil keyEquivalent:@""];
     [mainMenu addItem:fileMenuItem];
     NSMenu *fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
     [fileMenuItem setSubmenu:fileMenu];
@@ -49,6 +49,14 @@ extern bool switch_audio_device(int deviceIndex);
                                                      action:@selector(openFile:)
                                               keyEquivalent:@"o"];
     [fileMenu addItem:openItem];
+    
+    NSMenuItem *copyLinkItem = [[NSMenuItem alloc] initWithTitle:@"Copy Link for Obsidian (fstp://)"
+                                                          action:@selector(handleMenuAction:)
+                                                   keyEquivalent:@"l"];
+    [copyLinkItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand]; // For Cmd+L
+    [copyLinkItem setTag:MENU_FILE_COPY_FSTP_URL_MARKDOWN];
+    [copyLinkItem setEnabled:NO]; // Initially disabled
+    [fileMenu addItem:copyLinkItem];
     
     // Interface menu
     NSMenuItem *interfaceMenuItem = [[NSMenuItem alloc] init];
@@ -71,10 +79,22 @@ extern bool switch_audio_device(int deviceIndex);
     // Finish launching
     [app finishLaunching];
     [app activateIgnoringOtherApps:YES];
+
+    // Register for GetURL Apple Events
+    [[NSAppleEventManager sharedAppleEventManager]
+        setEventHandler:self
+            andSelector:@selector(handleGetURLEvent:withReplyEvent:)
+          forEventClass:kInternetEventClass
+             andEventID:kAEGetURL];
+    NSLog(@"[MenuDelegate applicationDidFinishLaunching:] Registered kAEGetURL handler.");
 }
 
 - (void)openFile:(id)sender {
     handleMenuCommand(MENU_FILE_OPEN);
+}
+
+- (void)handleMenuAction:(NSMenuItem *)sender {
+    handleMenuCommand((int)[sender tag]);
 }
 
 - (void)updateInterfaceMenu:(NSMenu *)menu {
@@ -155,7 +175,7 @@ extern bool switch_audio_device(int deviceIndex);
 
 - (void)refreshAudioDevices:(id)sender {
     // Update the audio menu
-    [self updateAudioMenu:[(NSMenuItem *)sender menu]];
+    [self updateAudioMenu:[sender menu]];
 }
 
 - (void)selectAudioDevice:(NSMenuItem *)sender {
@@ -177,6 +197,69 @@ extern bool switch_audio_device(int deviceIndex);
     if (g_remote_control->select_device(std::string([deviceName UTF8String]), isInput)) {
         // Update menu to show new selection
         [self updateInterfaceMenu:[sender menu]];
+    }
+}
+
+- (void)updateCopyLinkMenuItemState:(BOOL)isFileLoaded {
+    NSLog(@"[menu_system.mm] updateCopyLinkMenuItemState called with isFileLoaded: %d", isFileLoaded);
+    NSMenu *mainMenu = [NSApp mainMenu];
+    NSMenuItem *fileMenuItem = [mainMenu itemWithTitle:@"File"];
+    if (fileMenuItem) {
+        NSMenu *fileMenu = [fileMenuItem submenu];
+        NSMenuItem *copyLinkItem = [fileMenu itemWithTag:MENU_FILE_COPY_FSTP_URL_MARKDOWN];
+        if (copyLinkItem) {
+            NSLog(@"[menu_system.mm] Found copyLinkItem. Current enabled state: %d. Setting to: %d", [copyLinkItem isEnabled], isFileLoaded);
+            [copyLinkItem setEnabled:isFileLoaded];
+            NSLog(@"[menu_system.mm] After setEnabled, new state: %d", [copyLinkItem isEnabled]);
+        } else {
+            NSLog(@"[menu_system.mm] copyLinkItem with tag %d NOT FOUND.", MENU_FILE_COPY_FSTP_URL_MARKDOWN);
+        }
+    } else {
+        NSLog(@"[menu_system.mm] File menu item NOT FOUND.");
+    }
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
+    if ([menuItem action] == @selector(handleMenuAction:)) {
+        if ([menuItem tag] == MENU_FILE_OPEN) {
+            return YES;
+        }
+        if ([menuItem tag] == MENU_FILE_COPY_FSTP_URL_MARKDOWN) {
+            return [menuItem isEnabled];
+        }
+    }
+    return YES;
+}
+
+// Handle URL opening when the app is already running (NEWER SIGNATURE)
+- (BOOL)application:(NSApplication *)application openURL:(NSURL *)url options:(NSDictionary<NSString*, id> *)options {
+    NSLog(@"[MenuDelegate application:openURL:options:] METHOD ENTRY - URL: %@", [url absoluteString]);
+    NSString *urlString = [url absoluteString];
+    NSLog(@"[MenuDelegate application:openURL:options:] received URL: %@", urlString);
+
+    if ([[url scheme] isEqualToString:@"fstp"]) {
+        NSLog(@"[MenuDelegate application:openURL:options:] Is an fstp URL. Calling processIncomingFstpUrl.");
+        processIncomingFstpUrl([urlString UTF8String]);
+        return YES;
+    } else {
+        NSLog(@"[MenuDelegate application:openURL:options:] Is NOT an fstp URL.");
+    }
+    return NO;
+}
+
+// Новый метод для обработки kAEGetURL Apple Event
+- (void)handleGetURLEvent:(NSAppleEventDescriptor *)event
+           withReplyEvent:(NSAppleEventDescriptor *)replyEvent {
+    NSString *urlString = [[event paramDescriptorForKeyword:keyDirectObject] stringValue];
+    NSLog(@"[MenuDelegate handleGetURLEvent:] Received URL via Apple Event: %@", urlString);
+
+    if (urlString) {
+        if ([[[NSURL URLWithString:urlString] scheme] isEqualToString:@"fstp"]) {
+            NSLog(@"[MenuDelegate handleGetURLEvent:] Is an fstp URL. Calling processIncomingFstpUrl.");
+            processIncomingFstpUrl([urlString UTF8String]);
+        } else {
+            NSLog(@"[MenuDelegate handleGetURLEvent:] Is NOT an fstp URL.");
+        }
     }
 }
 
@@ -206,6 +289,12 @@ void cleanupMenuSystem() {
     if (menuDelegate != nil) {
         [NSApp setDelegate:nil];
         menuDelegate = nil;
+    }
+}
+
+void updateCopyLinkMenuState(bool isFileLoaded) {
+    if (menuDelegate) {
+        [menuDelegate updateCopyLinkMenuItemState:isFileLoaded];
     }
 }
 

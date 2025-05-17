@@ -130,21 +130,6 @@ void resetPlayerState() {
     decoding_completed.store(false);
 }
 
-// Function to restart player with new file
-void restartPlayerWithFile(const std::string& filename) {
-    std::cout << "Loading new file: " << filename << std::endl;
-    log("Loading new file: " + filename);
-    
-    // Save filename for loading
-    restart_filename = filename;
-    
-    // Set file reload flag
-    reload_file_requested = true;
-    
-    // Signal to exit main loop
-    shouldExit = true;
-}
-
 // --- Main Loading Sequence Implementation (Asynchronous) ---
 std::future<bool> mainLoadingSequence(
     SDL_Renderer* renderer, // renderer и window теперь параметры
