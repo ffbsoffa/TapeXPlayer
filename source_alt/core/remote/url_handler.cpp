@@ -1,9 +1,9 @@
 #include "url_handler.h"
-#include <iostream> // Для std::cerr, std::cout
-#include <algorithm> // Для std::transform (если понадобится для нормализации пути)
-// Другие необходимые стандартные заголовки уже включены через url_handler.h
+#include <iostream> // For std::cerr, std::cout
+#include <algorithm> // For std::transform (if needed for path normalization)
+// Other necessary standard headers are already included via url_handler.h
 
-// Вспомогательная функция для URL-декодирования
+// Helper function for URL decoding
 std::string urlDecode(const std::string& encoded_string) {
     std::string result;
     result.reserve(encoded_string.length());
@@ -15,17 +15,17 @@ std::string urlDecode(const std::string& encoded_string) {
                     char decoded_char = static_cast<char>(std::stoi(hex, nullptr, 16));
                     result += decoded_char;
                 } catch (const std::invalid_argument& /*ia*/) {
-                    result += encoded_string[i]; // Ошибка, добавляем как есть
+                    result += encoded_string[i]; // Error, add as is
                     result += encoded_string[i+1];
                     result += encoded_string[i+2];
                 } catch (const std::out_of_range& /*oor*/) {
-                    result += encoded_string[i]; // Ошибка, добавляем как есть
+                    result += encoded_string[i]; // Error, add as is
                     result += encoded_string[i+1];
                     result += encoded_string[i+2];
                 }
                 i += 2;
             } else {
-                result += encoded_string[i]; // Неполный %-код
+                result += encoded_string[i]; // Incomplete %-code
             }
         } else if (encoded_string[i] == '+') {
             result += ' ';
@@ -36,23 +36,23 @@ std::string urlDecode(const std::string& encoded_string) {
     return result;
 }
 
-// Функция парсинга URL fstp://
+// Function for parsing fstp:// URL
 ParsedFstpUrl parseFstpUrl(const std::string& url_arg, double current_original_fps) {
     ParsedFstpUrl result;
     result.originalUrl = url_arg;
     const std::string prefix = "fstp://";
 
     if (url_arg.rfind(prefix, 0) != 0) {
-        return result; // Не наша схема
+        return result; // Not our scheme
     }
 
     std::string full_content = url_arg.substr(prefix.length());
 
-    // Обработка пути в URL
+    // Processing path in URL
     if (full_content.rfind("///", 0) == 0) {
-        full_content = full_content.substr(2); // Оставляем один / в начале: "/absolute/path"
+        full_content = full_content.substr(2); // Keep one / at the beginning: "/absolute/path"
     } 
-    // Иначе путь считается как есть (может быть относительным или абсолютным без тройного слеша)
+    // Otherwise path is considered as is (can be relative or absolute without triple slash)
 
     std::string encoded_path;
     std::string time_param_str;
@@ -60,17 +60,17 @@ ParsedFstpUrl parseFstpUrl(const std::string& url_arg, double current_original_f
     size_t time_marker_pos = full_content.find("&t=");
     if (time_marker_pos != std::string::npos) {
         encoded_path = full_content.substr(0, time_marker_pos);
-        time_param_str = full_content.substr(time_marker_pos + 3); // Длина "&t="
+        time_param_str = full_content.substr(time_marker_pos + 3); // Length of "&t="
     } else {
         encoded_path = full_content;
     }
 
     result.videoPath = urlDecode(encoded_path);
-    // Небольшая очистка для пути, если он начинается с "//" после декодирования
+    // Small cleanup for path if it starts with "//" after decoding
     if (result.videoPath.rfind("//", 0) == 0 && result.videoPath.length() > 2 && result.videoPath[2] != '/') {
         result.videoPath = result.videoPath.substr(1);
     }
-    // Удаление префикса "file://" если он есть
+    // Remove "file://" prefix if present
     const std::string file_scheme = "file://";
     if (result.videoPath.rfind(file_scheme, 0) == 0) {
         result.videoPath = result.videoPath.substr(file_scheme.length());
@@ -108,8 +108,8 @@ ParsedFstpUrl parseFstpUrl(const std::string& url_arg, double current_original_f
                      s = std::stoi(parts[0]);
                      time_parsed = true;
                 }
-            } catch (const std::exception& /*e*/) { /* Ошибка парсинга */ }
-        } else { // Формат без двоеточий: HHMMSSFF, HHMMSS, MMSS, SS
+            } catch (const std::exception& /*e*/) { /* Parsing error */ }
+        } else { // Format without colons: HHMMSSFF, HHMMSS, MMSS, SS
             try {
                 if (time_param_str.length() == 8) { // HHMMSSFF
                     h = std::stoi(time_param_str.substr(0, 2));
@@ -130,7 +130,7 @@ ParsedFstpUrl parseFstpUrl(const std::string& url_arg, double current_original_f
                     s = std::stoi(time_param_str.substr(0, 2));
                     time_parsed = true;
                 }
-            } catch (const std::exception& /*e*/) { /* Ошибка парсинга */ }
+            } catch (const std::exception& /*e*/) { /* Parsing error */ }
         }
 
         if (time_parsed) {
@@ -168,7 +168,7 @@ bool handleFstpUrlArgument(const std::string& url_arg,
     if (url_arg.rfind(prefix, 0) != 0) {
         shouldOpenFile = false;
         shouldSeek = false;
-        return false; // Не fstp URL
+        return false; // Not fstp URL
     }
 
     ParsedFstpUrl parsed = parseFstpUrl(url_arg, current_original_fps);
@@ -180,15 +180,15 @@ bool handleFstpUrlArgument(const std::string& url_arg,
         outVideoPath = parsed.videoPath;
         outTimeToSeek = parsed.timeInSeconds;
 
-        // Нормализуем пути для сравнения (например, для macOS это важно из-за case-insensitivity по умолчанию)
-        // Здесь можно добавить более сложную нормализацию, если потребуется.
-        // Для простоты пока прямое сравнение.
+        // Normalize paths for comparison (e.g., important for macOS due to case-insensitivity by default)
+        // More complex normalization could be added here if needed.
+        // For simplicity, direct comparison for now.
         bool pathsMatch = false;
         if (!currentOpenFilePath.empty() && !outVideoPath.empty()) {
-            // Простая проверка. Для production, возможно, потребуется канонизация путей
+            // Simple check. For production, path canonicalization might be needed
              pathsMatch = (currentOpenFilePath == outVideoPath);
-             // TODO: Рассмотреть std::filesystem::equivalent для более надежного сравнения путей, 
-             // если std::filesystem доступен и его использование оправдано.
+             // TODO: Consider std::filesystem::equivalent for more reliable path comparison,
+             // if std::filesystem is available and its use is justified.
             std::cout << "[url_handler.cpp DEBUG] Path comparison: currentOpenFilePath == outVideoPath -> " << (pathsMatch ? "true" : "false") << std::endl;
         }
 
@@ -211,7 +211,7 @@ bool handleFstpUrlArgument(const std::string& url_arg,
             shouldSeek = false;
              std::cout << "No seek time specified in URL." << std::endl;
         }
-        return true; // fstp URL был обработан
+        return true; // fstp URL was processed
     } else {
         std::cerr << "Error: Failed to parse valid data from fstp:// URL: " << url_arg << std::endl;
         shouldOpenFile = false;
@@ -221,6 +221,6 @@ bool handleFstpUrlArgument(const std::string& url_arg,
         std::cout << "[url_handler.cpp DEBUG]   shouldOpenFile set to false" << std::endl;
         std::cout << "[url_handler.cpp DEBUG]   shouldSeek set to false" << std::endl;
         // --- END DETAILED LOGGING ---
-        return true; // fstp URL был, но не распарсился - всё равно считаем обработанным, чтобы main не искал его как файл
+        return true; // fstp URL was present but failed to parse - still consider it processed so main doesn't look for it as a file
     }
 } 

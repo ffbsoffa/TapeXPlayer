@@ -17,6 +17,7 @@
 #include "core/decode/low_res_decoder.h"
 #include "common/common.h"
 #include "core/display/display.h"
+#include "core/display/screenshot.h"
 #include "common/fontdata.h"
 #include <filesystem>
 #include <fstream>
@@ -35,6 +36,9 @@
 #include "main.h"
 #include "initmanager.h"
 #include "core/remote/url_handler.h"
+
+// Add parse_timecode function declaration
+extern double parse_timecode(const std::string& timecode);
 
 // Pending FSTP URL processing globals
 static std::string g_pendingFstpUrlPath;
@@ -91,7 +95,8 @@ float currentDisplayAspectRatio = 16.0f / 9.0f;
 // Variables for deep pause
 std::atomic<bool> is_deep_pause_active(false);
 std::chrono::steady_clock::time_point deep_pause_timer_start;
-const std::chrono::seconds DEEP_PAUSE_THRESHOLD{15};
+const std::chrono::seconds DEEP_PAUSE_THRESHOLD{5}; // Reduced from 15 to 5 seconds
+std::atomic<bool> window_has_focus(true); // Track window focus state
 // --- End Deep Pause Variables ---
 
 // Variables for zoom control
@@ -106,6 +111,10 @@ const float MAX_ZOOM_FACTOR = 10.0f;
 const float MIN_ZOOM_FACTOR = 1.0f;
 const float ZOOM_STEP = 1.2f;
 
+// Variables for screenshot functionality
+std::atomic<bool> screenshot_requested(false);
+std::string screenshots_directory = "Screenshots";
+
 // External variables from mainau.cpp
 // extern std::vector<int16_t> audio_buffer; // REMOVED: No longer using vector buffer
 extern double audio_buffer_index; // Keep this, it's now the fractional mmap index
@@ -115,8 +124,8 @@ extern std::atomic<bool> decoding_completed;
 // Constants for frame rate limiting (Restored)
 const int TARGET_FPS = 60;
 const int FRAME_DELAY = 1000 / TARGET_FPS;
-const int DEEP_PAUSE_RENDER_FPS = 2; // FPS for deep pause
-const int DEEP_PAUSE_FRAME_DELAY = 1000 / DEEP_PAUSE_RENDER_FPS;
+const int DEEP_PAUSE_RENDER_FPS = 1; // FPS for deep pause - reduced to 1 FPS for maximum CPU savings
+const int DEEP_PAUSE_FRAME_DELAY = 1000 / DEEP_PAUSE_RENDER_FPS; // 1000ms delay
 
 // Add this at the beginning of the file with other global variables
 static std::string argv0;
@@ -125,8 +134,8 @@ bool restart_requested = false;
 std::string restart_filename;
 std::atomic<bool> reload_file_requested = false; // Use atomic consistent with extern declaration
 
-// Добавляем глобальную переменную для пути текущего открытого файла
-static std::string g_currentOpenFilePath = ""; // ОСТАВЛЕНО
+// Add global variable for currently open file path
+static std::string g_currentOpenFilePath = "";
 static double g_seek_after_next_load_time = -1.0; // For URL-triggered loads with seek time
 
 // Functions to access playback rate variables
@@ -153,21 +162,18 @@ std::string get_current_timecode() {
     // Get current playback time in seconds
     double current_time = current_audio_time.load();
     
-    // Convert to HH:MM:SS:FF format
-    int total_seconds = static_cast<int>(current_time);
-    int hours = total_seconds / 3600;
-    int minutes = (total_seconds % 3600) / 60;
-    int seconds = total_seconds % 60;
-    
-    // Calculate frames (FF) from fractional part of time
     // Use real video FPS
     double fps = original_fps.load();
     if (fps <= 0) fps = 30.0;  // Use 30 as default value if FPS is not yet defined
     
-    int frames = static_cast<int>((current_time - total_seconds) * fps);
+    // Calculate total frames (frame-precise method like generateTXTimecode)
+    int64_t total_frames = static_cast<int64_t>(std::round(current_time * fps));
     
-    // Make sure frame number doesn't exceed fps-1
-    frames = std::min(frames, static_cast<int>(fps) - 1);
+    // Calculate hours, minutes, seconds, and frames from total frame count
+    int hours = static_cast<int>(total_frames / (3600 * fps));
+    int minutes = static_cast<int>((total_frames / (60 * fps))) % 60;
+    int seconds = static_cast<int>((total_frames / fps)) % 60;
+    int frames = static_cast<int>(total_frames % static_cast<int64_t>(std::round(fps)));
     
     // Format string
     snprintf(timecode, sizeof(timecode), "%02d:%02d:%02d:%02d", 
@@ -199,38 +205,39 @@ void reset_to_normal_speed() {
     // then reset speed_threshold back to 16.0 and set speed_reset_requested to false
 }
 
-// --- Вспомогательные функции для генерации ссылки --- 
+// --- Helper functions for link generation --- 
 
-// Простая функция для URL-кодирования пути
-// Заменяет пробелы на %20 и некоторые другие базовые символы, если необходимо.
-// Для более полной реализации можно использовать библиотеку, но для путей обычно этого достаточно.
+// Simple function for URL-encoding a path
+// Replaces spaces with %20 and some other basic characters if necessary.
+// For a more complete implementation, a library could be used, but this is usually sufficient for paths.
 std::string urlEncodePath(const std::string& path) {
     std::ostringstream encoded;
-    // encoded << std::hex; // БЫЛО ЗАКОММЕНТИРОВАНО, НУЖНО РАСКОММЕНТИРОВАТЬ И ИСПОЛЬЗОВАТЬ ПРАВИЛЬНО
+    // encoded << std::hex; // WAS COMMENTED OUT, NEEDS TO BE UNCOMMENTED AND USED CORRECTLY
 
     for (char c : path) {
         if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
             encoded << c;
         } else {
-            // Используем std::hex для вывода в шестнадцатеричном формате
+            // Use std::hex for hexadecimal output
             encoded << '%' << std::setw(2) << std::setfill('0') << std::hex << std::uppercase << static_cast<int>(static_cast<unsigned char>(c));
         }
     }
     return encoded.str();
 }
 
-// Форматирует время в HHMMSSFF
+// Formats time as HHMMSSFF
 std::string formatTimeForFstpUrl(double time_in_seconds, double fps_val) {
     if (time_in_seconds < 0) time_in_seconds = 0;
-    if (fps_val <= 0) fps_val = 25.0; // Безопасное значение по умолчанию
+    if (fps_val <= 0) fps_val = 25.0; // Safe default value
 
-    int total_seconds_int = static_cast<int>(time_in_seconds);
-    int hours = total_seconds_int / 3600;
-    int minutes = (total_seconds_int % 3600) / 60;
-    int seconds = total_seconds_int % 60;
-    int frames = static_cast<int>((time_in_seconds - total_seconds_int) * fps_val);
-    frames = std::min(frames, static_cast<int>(fps_val) -1); // Убедимся, что не превышает FPS
-    if (frames < 0) frames = 0;
+    // Calculate total frames (frame-precise method like generateTXTimecode)
+    int64_t total_frames = static_cast<int64_t>(std::round(time_in_seconds * fps_val));
+    
+    // Calculate hours, minutes, seconds, and frames from total frame count
+    int hours = static_cast<int>(total_frames / (3600 * fps_val));
+    int minutes = static_cast<int>((total_frames / (60 * fps_val))) % 60;
+    int seconds = static_cast<int>((total_frames / fps_val)) % 60;
+    int frames = static_cast<int>(total_frames % static_cast<int64_t>(std::round(fps_val)));
 
     std::ostringstream time_stream;
     time_stream << std::setw(2) << std::setfill('0') << hours
@@ -240,11 +247,11 @@ std::string formatTimeForFstpUrl(double time_in_seconds, double fps_val) {
     return time_stream.str();
 }
 
-// Основная функция генерации и копирования
+// Main function for generation and copying
 void generateAndCopyFstpMarkdownLink() {
     if (g_currentOpenFilePath.empty()) {
         std::cout << "Cannot copy fstp link: No file is currently open." << std::endl;
-        // Можно добавить OSD сообщение об ошибке позже
+        // Could add OSD error message later
         return;
     }
 
@@ -252,19 +259,19 @@ void generateAndCopyFstpMarkdownLink() {
     double currentTime = current_audio_time.load();
     double fps = original_fps.load();
 
-    std::cout << "[DEBUG URL Encode] Path BEFORE encoding: " << filePath << std::endl; // <--- НОВЫЙ ЛОГ
+    std::cout << "[DEBUG URL Encode] Path BEFORE encoding: " << filePath << std::endl; // <--- NEW LOG
     std::string encodedPath = urlEncodePath(filePath);
-    std::cout << "[DEBUG URL Encode] Path AFTER encoding: " << encodedPath << std::endl; // <--- НОВЫЙ ЛОГ
+    std::cout << "[DEBUG URL Encode] Path AFTER encoding: " << encodedPath << std::endl; // <--- NEW LOG
 
     std::string timeParam = formatTimeForFstpUrl(currentTime, fps);
-    std::string displayTime = get_current_timecode(); // Используем существующую HH:MM:SS:FF
+    std::string displayTime = get_current_timecode(); // Use existing HH:MM:SS:FF
 
-    // Собираем URL. Убедимся, что абсолютные пути начинаются с ///, если они абсолютные.
+    // Build URL. Ensure absolute paths start with /// if they are absolute.
     std::string fstpUrl;
     if (!encodedPath.empty() && encodedPath[0] == '/') {
-        fstpUrl = "fstp:///" + encodedPath.substr(1); // Заменяем первый / на ///
+        fstpUrl = "fstp:///" + encodedPath.substr(1); // Replace first / with ///
     } else {
-        // Для относительных путей или если путь уже как-то отформатирован (маловероятно для g_currentOpenFilePath)
+        // For relative paths or if path is already formatted somehow (unlikely for g_currentOpenFilePath)
         fstpUrl = "fstp://" + encodedPath; 
     }
     fstpUrl += "&t=" + timeParam;
@@ -274,10 +281,10 @@ void generateAndCopyFstpMarkdownLink() {
 
     if (SDL_SetClipboardText(markdownLink.c_str()) == 0) {
         std::cout << "Copied to clipboard: " << markdownLink << std::endl;
-        // Можно добавить OSD сообщение об успехе
+        // Could add OSD success message
     } else {
         std::cerr << "Error copying to clipboard: " << SDL_GetError() << std::endl;
-        // Можно добавить OSD сообщение об ошибке
+        // Could add OSD error message
     }
 }
 
@@ -302,6 +309,15 @@ void handleMenuCommand(int command) {
         }
         case MENU_FILE_COPY_FSTP_URL_MARKDOWN: {
             generateAndCopyFstpMarkdownLink();
+            break;
+        }
+        case MENU_EDIT_COPY_SCREENSHOT: {
+            // Take screenshot using the same function as the S key
+            takeCurrentFrameScreenshot();
+            break;
+        }
+        case MENU_EDIT_GOTO_TIMECODE: {
+            waiting_for_timecode = true;
             break;
         }
     }
@@ -362,7 +378,8 @@ void restartPlayerWithFile(const std::string& filename, double seek_after_load_t
     
 #ifdef __APPLE__
     std::cout << "[main.cpp] Before updateCopyLinkMenuState(false) in restartPlayerWithFile" << std::endl;
-    updateCopyLinkMenuState(false); // Деактивируем перед перезагрузкой
+    updateCopyLinkMenuState(false); // Deactivate before reload
+    updateCopyScreenshotMenuState(false); // Deactivate screenshot before reload
     std::cout << "[main.cpp] After updateCopyLinkMenuState(false) in restartPlayerWithFile" << std::endl;
 #endif
     restart_filename = filename;
@@ -381,7 +398,7 @@ int main(int argc, char* argv[]) {
         restartArgs.push_back(argv[i]);
     }
 
-    // ParsedFstpUrl urlToOpen; // <--- ЗАМЕНЕНО на переменные ниже
+    // ParsedFstpUrl urlToOpen; // <--- REPLACED with variables below
     std::string pathFromUrl;
     double timeFromUrl = -1.0;
     bool openFileFromUrl = false;
@@ -393,8 +410,8 @@ int main(int argc, char* argv[]) {
     if (argc > 1) {
         for (int i = 1; i < argc; ++i) {
             std::string arg_str = argv[i];
-            // Используем g_currentOpenFilePath, но он еще пустой на старте.
-            // original_fps.load() также будет 0.0 на старте.
+            // Using g_currentOpenFilePath, but it's still empty at startup.
+            // original_fps.load() will also be 0.0 at startup.
             if (handleFstpUrlArgument(arg_str, g_currentOpenFilePath, original_fps.load(), pathFromUrl, timeFromUrl, openFileFromUrl, seekFromFileUrl)) {
                 fstpUrlProcessed = true;
                 // Log the direct outputs of handleFstpUrlArgument
@@ -403,11 +420,11 @@ int main(int argc, char* argv[]) {
                     ", openFileFromUrl=" + (openFileFromUrl ? "true" : "false") +
                     ", seekFromFileUrl=" + (seekFromFileUrl ? "true" : "false") +
                     ", for input arg_str='" + arg_str + "'");
-                // Если URL обработан (даже если невалидный), выходим из цикла, 
-                // т.к. мы не хотим, чтобы он интерпретировался как обычный путь к файлу.
+                // If URL is processed (even if invalid), exit the loop,
+                // as we don't want it to be interpreted as a regular file path.
                 break; 
             } else {
-                // Это не fstp URL, проверяем, не обычный ли это путь
+                // This is not an fstp URL, check if it's a regular path
                 if (arg_str.length() > 0 && arg_str[0] != '-' && initialPathFromArgs.empty()) {
                      initialPathFromArgs = arg_str;
                      std::cout << "Found potential file path argument (non-fstp): " << initialPathFromArgs << std::endl;
@@ -469,6 +486,7 @@ int main(int argc, char* argv[]) {
     // Это будет переопределено ниже, если should_load_new_file_from_args станет true
     std::cout << "[main.cpp] Before initial updateCopyLinkMenuState(false) in main()" << std::endl;
     updateCopyLinkMenuState(false); 
+    updateCopyScreenshotMenuState(false);
     std::cout << "[main.cpp] After initial updateCopyLinkMenuState(false) in main()" << std::endl;
 #endif
 
@@ -519,6 +537,10 @@ int main(int argc, char* argv[]) {
 
     // Enable file drag and drop support
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+    
+    // Check initial window focus state
+    Uint32 currentWindowFlags = SDL_GetWindowFlags(window);
+    window_has_focus.store((currentWindowFlags & SDL_WINDOW_INPUT_FOCUS) != 0);
 
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer) {
@@ -554,31 +576,31 @@ int main(int argc, char* argv[]) {
         double initialSeekTimeForThisLoad = -1.0; // Время для перемотки *после* загрузки этого файла
 
         if (!fileArgProcessed && should_load_new_file_from_args) {
-            fileToLoadPath = video_path_to_load; // Из URL или обычного аргумента
-            initialSeekTimeForThisLoad = time_to_seek; // Запомненное время из URL
+            fileToLoadPath = video_path_to_load; // From URL or regular argument
+            initialSeekTimeForThisLoad = time_to_seek; // Stored time from URL
             shouldAttemptFileLoadThisIteration = true;
-            fileArgProcessed = true; // Аргументы командной строки обработаны
+            fileArgProcessed = true; // Command line arguments processed
             firstRun = false;
         } else if (firstRun && fstpUrlProcessed && !openFileFromUrl && seekFromFileUrl) {
-            // Особый случай: URL при запуске указывал на текущий (гипотетически) файл и требовал перемотки.
-            // Файл еще не загружен, поэтому fileToLoadPath должен быть пустым, чтобы показать "no file".
-            // Перемотка будет применена, если пользователь откроет *этот* файл позже вручную.
-            // Или, если бы мы знали заранее какой файл "текущий" до первой загрузки.
-            // Пока что, если файл не открывается по URL, но есть seek, мы его не применяем на пустом плеере.
-            // Этот блок может потребовать доработки, если нужно открывать *последний* открытый файл и мотать.
-            // Текущая логика: если URL не привел к открытию файла, то на старте ничего не делаем.
+            // Special case: URL at startup pointed to current (hypothetically) file and requested seek.
+            // File is not loaded yet, so fileToLoadPath should be empty to show "no file".
+            // Seek will be applied if user opens *this* file later manually.
+            // Or if we knew beforehand which file is "current" before first load.
+            // For now, if file is not opened by URL but there's seek, we don't apply it on empty player.
+            // This block may need refinement if we need to open *last* opened file and seek.
+            // Current logic: if URL didn't lead to opening a file, we do nothing at startup.
             fileArgProcessed = true; // URL обработан.
             firstRun = false;
         }
         else if (reload_file_requested.load()) {
-            fileToLoadPath = restart_filename; // Имя файла из запроса на перезагрузку
+            fileToLoadPath = restart_filename; // File name from reload request
             initialSeekTimeForThisLoad = g_seek_after_next_load_time; // Use the stored time for next load
             g_seek_after_next_load_time = -1.0; // Reset it after use
             shouldAttemptFileLoadThisIteration = true;
             reload_file_requested.store(false);
-            firstRun = false; // Если была перезагрузка, это уже не первый запуск в контексте аргументов
+            firstRun = false; // If there was a reload, this is no longer the first run in the context of arguments
         } else if (firstRun) {
-            // Первый запуск, но не было валидных аргументов для автоматической загрузки
+            // First run, but there were no valid arguments for automatic loading
             firstRun = false;
             // shouldAttemptFileLoadThisIteration остается false
             
@@ -592,6 +614,7 @@ int main(int argc, char* argv[]) {
 #ifdef __APPLE__
             std::cout << "[main.cpp] Before updateCopyLinkMenuState(false) in no-file loop" << std::endl;
             updateCopyLinkMenuState(false); // <--- ВЫКЛЮЧИТЬ в цикле "нет файла"
+            updateCopyScreenshotMenuState(false); // <--- ВЫКЛЮЧИТЬ скриншот в цикле "нет файла"
             std::cout << "[main.cpp] After updateCopyLinkMenuState(false) in no-file loop" << std::endl;
 #endif
             bool noFileLoaded = true;
@@ -624,12 +647,18 @@ int main(int argc, char* argv[]) {
                 // Handle fullscreen toggle request from menu
                 if (toggle_fullscreen_requested.load()) {
                     toggle_fullscreen_requested.store(false);
+#ifdef __APPLE__
+                    // Use native macOS fullscreen
+                    toggleNativeFullscreen(window);
+#else
+                    // Use SDL fullscreen for other platforms
                     Uint32 flags = SDL_GetWindowFlags(window);
                     if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) {
                         SDL_SetWindowFullscreen(window, 0);
                     } else {
                         SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
                     }
+#endif
                 }
                 
                 SDL_Event e;
@@ -787,6 +816,7 @@ int main(int argc, char* argv[]) {
 #ifdef __APPLE__
             std::cout << "[main.cpp] Before updateCopyLinkMenuState(true) after successful load" << std::endl;
             updateCopyLinkMenuState(true); // <--- Enable the menu item
+            updateCopyScreenshotMenuState(true); // <--- Enable the screenshot menu item
             std::cout << "[main.cpp] After updateCopyLinkMenuState(true) after successful load" << std::endl;
 #endif
 
@@ -825,6 +855,11 @@ int main(int argc, char* argv[]) {
                 // Однако, seek_to_time уже должен обновить current_audio_time достаточно быстро.
             }
 
+             // Frame transition tracking variables
+            FrameInfo::FrameType lastFrameTypeDisplayed = FrameInfo::EMPTY;
+            int frameTypeTransitionCounter = 0;
+            bool forceFrameUpdate = false; // Force frame selection after seek
+            
              // --- Start of the inner playback loop ---
             while (!shouldExit) {
                 // Process remote commands at the start of each frame
@@ -833,19 +868,30 @@ int main(int argc, char* argv[]) {
                 }
                 
                 bool deep_pause_interrupt_for_immediate_refresh = false; // Flag for this iteration
-
+                
+                // Add delay when in Deep Pause to reduce CPU usage
+                if (is_deep_pause_active.load() && !deep_pause_interrupt_for_immediate_refresh) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 100ms = 10 updates per second, much lower CPU usage
+                }
+                
                 // Check if we need to reset the speed threshold
                 check_and_reset_threshold();
 
                 // Handle fullscreen toggle request from menu
                 if (toggle_fullscreen_requested.load()) {
                     toggle_fullscreen_requested.store(false);
+#ifdef __APPLE__
+                    // Use native macOS fullscreen
+                    toggleNativeFullscreen(window);
+#else
+                    // Use SDL fullscreen for other platforms
                     Uint32 flags = SDL_GetWindowFlags(window);
                     if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) {
                         SDL_SetWindowFullscreen(window, 0);
                     } else {
                         SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
                     }
+#endif
                 }
 
                 Uint32 frameStart = SDL_GetTicks();
@@ -866,6 +912,8 @@ int main(int argc, char* argv[]) {
                                     seek_to_time(target_time);
                                     waiting_for_timecode = false;
                                     input_timecode.clear();
+                                    // Force immediate frame update after seek
+                                    continue;
                                 } catch (const std::exception& ex) {
                                 }
                             } else if (e.key.keysym.sym == SDLK_BACKSPACE && !input_timecode.empty()) {
@@ -984,8 +1032,7 @@ int main(int argc, char* argv[]) {
                                         showIndex = !showIndex;
                                     }
                                     break;
-                                case SDLK_g:
-                                    waiting_for_timecode = true;
+                                // Command-G is now handled through the menu system
                                     break;
                                 case SDLK_1:
                                 case SDLK_2:
@@ -1013,12 +1060,18 @@ int main(int argc, char* argv[]) {
                                 case SDLK_f:
                                     // Toggle fullscreen mode
                                     {
+#ifdef __APPLE__
+                                        // Use native macOS fullscreen
+                                        toggleNativeFullscreen(window);
+#else
+                                        // Use SDL fullscreen for other platforms
                                         Uint32 flags = SDL_GetWindowFlags(window);
                                         if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) {
                                             SDL_SetWindowFullscreen(window, 0);
                                         } else {
                                             SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
                                         }
+#endif
                                     }
                                     break;
                                 case SDLK_z:
@@ -1036,6 +1089,23 @@ int main(int argc, char* argv[]) {
                                 case SDLK_t:
                                     // Toggle thumbnail display
                                     toggle_zoom_thumbnail();
+                                    break;
+                                case SDLK_c:
+                                    // Command+C to take screenshot (on macOS, Command is KMOD_GUI)
+                                    if (e.key.keysym.mod & KMOD_GUI) {
+                                        takeCurrentFrameScreenshot();
+                                    }
+                                    break;
+                                case SDLK_m:
+                                    // Show menu bar temporarily in fullscreen mode
+                                    {
+                                        Uint32 flags = SDL_GetWindowFlags(window);
+                                        if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) {
+#ifdef __APPLE__
+                                            showMenuBarTemporarily();
+#endif
+                                        }
+                                    }
                                     break;
                             }
                         }
@@ -1056,6 +1126,15 @@ int main(int argc, char* argv[]) {
                             if (fullResManagerPtr) {
                                 fullResManagerPtr->checkWindowSizeAndToggleActivity(windowWidth, windowHeight);
                             }
+                        } else if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+                            window_has_focus.store(true);
+                            // Exit deep pause when window gets focus
+                            if (is_deep_pause_active.load()) {
+                                is_deep_pause_active.store(false);
+                                deep_pause_interrupt_for_immediate_refresh = true;
+                            }
+                        } else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                            window_has_focus.store(false);
                         }
                     } else if (e.type == SDL_DROPFILE) {
                         // Handle file drop
@@ -1104,6 +1183,8 @@ int main(int argc, char* argv[]) {
                 int newCurrentFrame = findClosestFrameIndexByTime(frameIndex, target_time_ms);
                  if (!frameIndex.empty()) { newCurrentFrame = std::max(0, std::min(newCurrentFrame, static_cast<int>(frameIndex.size()) - 1)); } else { newCurrentFrame = 0; }
                  
+                 // REMOVED: Frame synchronization - let the natural timestamps work as intended
+                 
                  // Notify managers ONLY if the frame has actually changed
                  if (newCurrentFrame != currentFrame.load()) {
                      currentFrame.store(newCurrentFrame);
@@ -1114,13 +1195,14 @@ int main(int argc, char* argv[]) {
 
                 // --- Deep Pause Activation Check ---
                 if (playback_rate.load() == 0.0 && target_playback_rate.load() == 0.0 && !is_deep_pause_active.load()) {
-                    if (std::chrono::steady_clock::now() - deep_pause_timer_start > DEEP_PAUSE_THRESHOLD) {
+                    // Only activate deep pause if window doesn't have focus
+                    if (!window_has_focus.load() && std::chrono::steady_clock::now() - deep_pause_timer_start > DEEP_PAUSE_THRESHOLD) {
                         is_deep_pause_active.store(true);
                         // Potentially set a flag here to force one OSD update if needed
                     }
                 }
-                // If playback starts, ensure deep pause is off
-                if (playback_rate.load() != 0.0 && is_deep_pause_active.load()) {
+                // If playback starts or window gets focus, ensure deep pause is off
+                if ((playback_rate.load() != 0.0 || window_has_focus.load()) && is_deep_pause_active.load()) {
                     is_deep_pause_active.store(false);
                 }
                 // --- End Deep Pause Activation Check ---
@@ -1128,88 +1210,157 @@ int main(int argc, char* argv[]) {
                 // --- Frame Selection Logic ---
                 std::shared_ptr<AVFrame> frameToDisplay = nullptr;
                 FrameInfo::FrameType frameTypeToDisplay = FrameInfo::EMPTY;
+                const int TRANSITION_THRESHOLD = 3; // Number of frames to wait before switching types
                 double currentPlaybackRate = std::abs(playback_rate.load());
-                if (newCurrentFrame >= 0 && newCurrentFrame < frameIndex.size())
-                {
-                    const FrameInfo &currentFrameInfo = frameIndex[newCurrentFrame];
+                
+                if (newCurrentFrame >= 0 && newCurrentFrame < frameIndex.size()) {
+                    const FrameInfo& currentFrameInfo = frameIndex[newCurrentFrame];
                     std::unique_lock<std::mutex> lock(currentFrameInfo.mutex);
-                    if (!currentFrameInfo.is_decoding)
-                    {
-                        if (currentPlaybackRate <= 1.1)
-                        {
-                            if (currentFrameInfo.frame)
-                            {
-                                frameToDisplay = currentFrameInfo.frame;
-                                frameTypeToDisplay = FrameInfo::FULL_RES;
+                    
+                    if (!currentFrameInfo.is_decoding) {
+                        if (currentPlaybackRate <= 1.1) {
+                            // At normal speed, prefer highest quality available, but with smooth transitions
+                            bool shouldTransition = false;
+                            
+                            // If force update after seek, immediately choose best available
+                            if (forceFrameUpdate) {
+                                shouldTransition = true;
+                                frameTypeTransitionCounter = TRANSITION_THRESHOLD; // Skip transition delay
                             }
-                            else if (currentFrameInfo.low_res_frame)
-                            {
-                                frameToDisplay = currentFrameInfo.low_res_frame;
-                                frameTypeToDisplay = FrameInfo::LOW_RES;
+                            // Otherwise try to maintain the last frame type if available
+                            else if (lastFrameTypeDisplayed != FrameInfo::EMPTY) {
+                                switch (lastFrameTypeDisplayed) {
+                                    case FrameInfo::FULL_RES:
+                                        if (currentFrameInfo.frame) {
+                                            frameToDisplay = currentFrameInfo.frame;
+                                            frameTypeToDisplay = FrameInfo::FULL_RES;
+                                        } else {
+                                            shouldTransition = true;
+                                        }
+                                        break;
+                                    case FrameInfo::LOW_RES:
+                                        if (currentFrameInfo.low_res_frame) {
+                                            frameToDisplay = currentFrameInfo.low_res_frame;
+                                            frameTypeToDisplay = FrameInfo::LOW_RES;
+                                            // If higher quality is available, consider transition
+                                            if (currentFrameInfo.frame) shouldTransition = true;
+                                        } else {
+                                            shouldTransition = true;
+                                        }
+                                        break;
+                                    case FrameInfo::CACHED:
+                                        if (currentFrameInfo.cached_frame) {
+                                            frameToDisplay = currentFrameInfo.cached_frame;
+                                            frameTypeToDisplay = FrameInfo::CACHED;
+                                            // If higher quality is available, consider transition
+                                            if (currentFrameInfo.frame || currentFrameInfo.low_res_frame) shouldTransition = true;
+                                        } else {
+                                            shouldTransition = true;
+                                        }
+                                        break;
+                                    default:
+                                        shouldTransition = true;
+                                        break;
+                                }
+                            } else {
+                                shouldTransition = true;
                             }
-                            else if (currentFrameInfo.cached_frame)
-                            {
-                                frameToDisplay = currentFrameInfo.cached_frame;
-                                frameTypeToDisplay = FrameInfo::CACHED;
+
+                            // Handle transitions
+                            if (shouldTransition) {
+                                frameTypeTransitionCounter++;
+                                if (frameTypeTransitionCounter >= TRANSITION_THRESHOLD) {
+                                    // Reset counter and switch to best available quality
+                                    frameTypeTransitionCounter = 0;
+                                    if (currentFrameInfo.frame) {
+                                        frameToDisplay = currentFrameInfo.frame;
+                                        frameTypeToDisplay = FrameInfo::FULL_RES;
+                                    } else if (currentFrameInfo.low_res_frame) {
+                                        frameToDisplay = currentFrameInfo.low_res_frame;
+                                        frameTypeToDisplay = FrameInfo::LOW_RES;
+                                    } else if (currentFrameInfo.cached_frame) {
+                                        frameToDisplay = currentFrameInfo.cached_frame;
+                                        frameTypeToDisplay = FrameInfo::CACHED;
+                                    }
+                                }
+                            } else {
+                                // If we're maintaining the same type, reset transition counter
+                                frameTypeTransitionCounter = 0;
                             }
                             lock.unlock();
-                        }
-                        else
-                        {
-                            if (currentFrameInfo.low_res_frame)
-                            {
+                        } else {
+                            // At high speed, prefer low_res/cached, but try to maintain consistency if possible
+                            bool foundFrame = false;
+                            
+                            // Try to use the same type as last frame if available for consistency
+                            if (lastFrameTypeDisplayed == FrameInfo::LOW_RES && currentFrameInfo.low_res_frame) {
                                 frameToDisplay = currentFrameInfo.low_res_frame;
                                 frameTypeToDisplay = FrameInfo::LOW_RES;
-                            }
-                            else if (currentFrameInfo.cached_frame)
-                            {
+                                foundFrame = true;
+                            } else if (lastFrameTypeDisplayed == FrameInfo::CACHED && currentFrameInfo.cached_frame) {
                                 frameToDisplay = currentFrameInfo.cached_frame;
                                 frameTypeToDisplay = FrameInfo::CACHED;
+                                foundFrame = true;
                             }
-                            else
-                            {
+                            
+                            // If same type not available, fall back to any available type
+                            if (!foundFrame) {
+                                if (currentFrameInfo.low_res_frame) {
+                                    frameToDisplay = currentFrameInfo.low_res_frame;
+                                    frameTypeToDisplay = FrameInfo::LOW_RES;
+                                    foundFrame = true;
+                                } else if (currentFrameInfo.cached_frame) {
+                                    frameToDisplay = currentFrameInfo.cached_frame;
+                                    frameTypeToDisplay = FrameInfo::CACHED;
+                                    foundFrame = true;
+                                }
+                            }
+                            
+                            if (foundFrame) {
                                 lock.unlock();
+                            } else {
+                                lock.unlock();
+                                // Search for nearby frames
                                 bool isForward = playback_rate.load() >= 0;
-                                int step = isForward ? 1 : 1;
+                                int step = isForward ? 1 : -1;
                                 int searchRange = 15;
-                                for (int i = 1; i <= searchRange; ++i)
-                                {
+                                
+                                for (int i = 1; i <= searchRange; ++i) {
                                     int checkFrameIdx = newCurrentFrame + (i * step);
-                                    if (checkFrameIdx >= 0 && checkFrameIdx < frameIndex.size())
-                                    {
+                                    if (checkFrameIdx >= 0 && checkFrameIdx < frameIndex.size()) {
                                         std::lock_guard<std::mutex> search_lock(frameIndex[checkFrameIdx].mutex);
-                                        if (!frameIndex[checkFrameIdx].is_decoding)
-                                        {
-                                            if (frameIndex[checkFrameIdx].low_res_frame)
-                                            {
+                                        if (!frameIndex[checkFrameIdx].is_decoding) {
+                                            if (frameIndex[checkFrameIdx].low_res_frame) {
                                                 frameToDisplay = frameIndex[checkFrameIdx].low_res_frame;
                                                 frameTypeToDisplay = FrameInfo::LOW_RES;
                                                 break;
-                                            }
-                                            else if (frameIndex[checkFrameIdx].cached_frame)
-                                            {
+                                            } else if (frameIndex[checkFrameIdx].cached_frame) {
                                                 frameToDisplay = frameIndex[checkFrameIdx].cached_frame;
                                                 frameTypeToDisplay = FrameInfo::CACHED;
                                                 break;
                                             }
                                         }
-                                    }
-                                    else
-                                    {
+                                    } else {
                                         break;
                                     }
                                 }
                             }
-                            if (lock.owns_lock())
-                            {
-                                lock.unlock();
-                            }
                         }
-                    }
-                    else
-                    {
+                    } else {
                         lock.unlock();
                     }
+                }
+                
+                // Update last frame type for next iteration
+                if (frameToDisplay != nullptr) {
+                    lastFrameTypeDisplayed = frameTypeToDisplay;
+                    // Reset force update flag after successful frame selection
+                    if (forceFrameUpdate) {
+                        forceFrameUpdate = false;
+                    }
+                } else {
+                    // If no frame was found, reset transition counter
+                    frameTypeTransitionCounter = 0;
                 }
 
                 // Check if seek is complete
@@ -1241,17 +1392,55 @@ int main(int argc, char* argv[]) {
                             showIndex, showOSD, font, isPlaying, is_reverse.load(), waiting_for_timecode,
                             input_timecode, original_fps.load(), jog_forward, jog_backward,
                             ringBufferCapacity, highResWindowSize, 950, // Pass calculated sizes
-                            currentDisplayAspectRatio,
-                            is_deep_pause_active.load()); // Pass deep pause state
+                            currentDisplayAspectRatio);
 
-                // Limit frame rate
-                Uint32 frameTime = SDL_GetTicks() - frameStart;
+                // Handle screenshot request
+                if (screenshot_requested.load() && frameToDisplay) {
+                    screenshot_requested.store(false);
+                    
+                    // Generate timecode for current frame
+                    std::string currentTimecode = get_current_timecode();
+                    
+                    // Get window dimensions
+                    int windowWidth, windowHeight;
+                    SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
+                    
+                    // Take advanced screenshot with zoom and thumbnail support
+                    bool success = takeAdvancedScreenshotWithTimecode(
+                        frameToDisplay.get(), 
+                        currentTimecode, 
+                        windowWidth, 
+                        windowHeight,
+                        zoom_enabled.load(),
+                        zoom_factor.load(),
+                        zoom_center_x.load(),
+                        zoom_center_y.load(),
+                        show_zoom_thumbnail.load()
+                    );
+                    
+                    if (success) {
+                        std::cout << "[Screenshot] Advanced screenshot copied to clipboard successfully!" << std::endl;
+                        std::cout << "[Screenshot] Frame: " << newCurrentFrame << ", Timecode: " << currentTimecode << std::endl;
+                        if (zoom_enabled.load()) {
+                            std::cout << "[Screenshot] Zoom: " << zoom_factor.load() << "x at (" 
+                                      << zoom_center_x.load() << "," << zoom_center_y.load() << ")" << std::endl;
+                        }
+                    } else {
+                        std::cerr << "[Screenshot] Failed to copy advanced screenshot to clipboard" << std::endl;
+                    }
+                }
+
+                // Calculate frame delay based on mode
                 int currentTargetFrameDelay = FRAME_DELAY; // Default delay
-                if (is_deep_pause_active.load() && !deep_pause_interrupt_for_immediate_refresh) {
+                if (is_deep_pause_active.load() && !deep_pause_interrupt_for_immediate_refresh && !zoom_enabled.load()) {
                     currentTargetFrameDelay = DEEP_PAUSE_FRAME_DELAY;
                 }
 
-                if (frameTime < currentTargetFrameDelay) {
+                // Calculate time spent processing this frame
+                Uint32 frameTime = SDL_GetTicks() - frameStart;
+
+                // Skip frame delay if zoom is enabled or if we just performed a seek
+                if (!zoom_enabled.load() && !seek_performed.load() && frameTime < currentTargetFrameDelay) {
                     SDL_Delay(currentTargetFrameDelay - frameTime);
                 }
 
@@ -1260,6 +1449,10 @@ int main(int argc, char* argv[]) {
                     seekInfo.time.store(current_audio_time.load());
                     seekInfo.requested.store(true);
                     seekInfo.completed.store(false);
+                    // Reset frame transition state after seek to ensure best quality frame is selected
+                    lastFrameTypeDisplayed = FrameInfo::EMPTY;
+                    frameTypeTransitionCounter = 0;
+                    forceFrameUpdate = true;
                     // Notify managers immediately on seek request
                      if (fullResManagerPtr) fullResManagerPtr->notifyFrameChange();
                      if (lowCachedManagerPtr) lowCachedManagerPtr->notifyFrameChange();
@@ -1278,6 +1471,7 @@ int main(int argc, char* argv[]) {
 #ifdef __APPLE__
             std::cout << "[main.cpp] Before updateCopyLinkMenuState(false) in playback loop cleanup" << std::endl;
             updateCopyLinkMenuState(false); // <--- ВЫКЛЮЧИТЬ перед очисткой и выходом из этого цикла загрузки
+            updateCopyScreenshotMenuState(false); // <--- ВЫКЛЮЧИТЬ скриншот перед очисткой
             std::cout << "[main.cpp] After updateCopyLinkMenuState(false) in playback loop cleanup" << std::endl;
 #endif
             std::cout << "[Cleanup] Stopping managers..." << std::endl;
@@ -1309,7 +1503,7 @@ int main(int argc, char* argv[]) {
             std::cout << "[Cleanup] Cleaning temp files..." << std::endl; // Debug log
             cleanupTempFiles();
             
-            // If there was a request to exit the program (not reload file), break the outer loop
+            // If there was a request to exit the program (not reload), break the outer loop
             if (!reload_file_requested.load() && !restart_requested) {
                  // Ensure shouldExit is true so the outer loop terminates correctly
                  shouldExit = true; // Set explicitly for clarity
@@ -1448,4 +1642,9 @@ void processIncomingFstpUrl(const char* url_c_str) {
         std::cout << "[main.cpp] URL: Not a valid fstp URL or failed to parse: " << urlString << std::endl;
         log("[main.cpp] URL: Not a valid fstp URL or failed to parse: " + urlString);
     }
+}
+
+// Function to take screenshot of current frame
+void takeCurrentFrameScreenshot() {
+    screenshot_requested.store(true);
 }

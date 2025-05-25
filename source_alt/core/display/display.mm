@@ -31,6 +31,8 @@ extern "C" {
 #include "common.h" // Include common.h for playback_rate access
 #include "display.h"
 #include "metal_renderer.h"
+#include "../audio/mainau.h" // Add this at the top with other includes
+#include "../decode/decode.h" // Include for FrameInfo::FrameType
 
 // --- Move static texture dimensions to file scope --- 
 static int textureWidth = 0; 
@@ -230,23 +232,22 @@ void updateVisualization(SDL_Renderer* renderer, const std::vector<FrameInfo>& f
     }
 }
 
-void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double playbackRate, bool isReverse, double currentTime, int frameNumber, bool showOSD, bool waiting_for_timecode, const std::string& input_timecode, double original_fps, bool jog_forward, bool jog_backward, bool isDeepPauseActive) {
+void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double playbackRate, bool isReverse, double currentTime, int frameNumber, bool showOSD, bool waiting_for_timecode, const std::string& input_timecode, double original_fps, bool jog_forward, bool jog_backward, FrameInfo::FrameType frameTypeToDisplay) {
     int windowWidth, windowHeight;
     SDL_GetRendererOutputSize(renderer, &windowWidth, &windowHeight);
-    SDL_Color textColor = {255, 255, 255, 255};
+    SDL_Color textColor = {255, 255, 255, 255}; // White color
+    SDL_Color grayColor = {128, 128, 128, 255}; // Gray color for timecode input mode
 
     // Draw semi-transparent background for OSD area
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND); // Enable blending
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 150); // Black with alpha ~60%
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 150);
     SDL_Rect osdBackgroundRect = {0, windowHeight - 30, windowWidth, 30};
     SDL_RenderFillRect(renderer, &osdBackgroundRect);
-    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE); // Disable blending for text
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
 
     // Left Text
     std::string leftText;
-    if (isDeepPauseActive) {
-        leftText = "PAUSE";
-    } else if (jog_forward || jog_backward) {
+    if (jog_forward || jog_backward) {
         leftText = "JOG";
     } else if (std::abs(playbackRate) < 0.01) {
         leftText = "STILL";
@@ -257,7 +258,7 @@ void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double pl
     }
 
     SDL_Surface* leftSurface = TTF_RenderText_Blended(font, leftText.c_str(), textColor);
-        if (leftSurface) {
+    if (leftSurface) {
         SDL_Texture* leftTexture = SDL_CreateTextureFromSurface(renderer, leftSurface);
         if (leftTexture) {
             SDL_Rect leftRect = {10, windowHeight - 30 + (30 - leftSurface->h) / 2, leftSurface->w, leftSurface->h};
@@ -268,41 +269,96 @@ void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double pl
     }
 
     // Timecode
-    std::string timecode;
     if (waiting_for_timecode) {
-        timecode = "00:00:00:00"; // Start with placeholder
-        std::string formatted_input = input_timecode;
-        formatted_input.resize(8, '0'); // Pad with zeros if needed
-        size_t tc_idx = 0;
-        for(size_t i = 0; i < formatted_input.length() && tc_idx < timecode.length(); ++i) {
-            timecode[tc_idx++] = formatted_input[i];
-            if (i == 1 || i == 3 || i == 5) { // After HH, MM, SS
-                tc_idx++; // Skip colon
+        // First render the full template in gray to get the total width
+        std::string template_timecode = "00:00:00:00";
+        SDL_Surface* templateSurface = TTF_RenderText_Blended(font, template_timecode.c_str(), grayColor);
+        if (!templateSurface) return;
+        
+        int totalWidth = templateSurface->w;
+        int totalHeight = templateSurface->h;
+        SDL_FreeSurface(templateSurface);
+        
+        // Calculate center position
+        int startX = (windowWidth - totalWidth) / 2;
+        int startY = windowHeight - 30 + (30 - totalHeight) / 2;
+        
+        // Get the width of a single digit for positioning
+        SDL_Surface* digitSurface = TTF_RenderText_Blended(font, "0", grayColor);
+        if (!digitSurface) return;
+        int digitWidth = digitSurface->w;
+        SDL_FreeSurface(digitSurface);
+        
+        // Get the width of a colon for positioning
+        SDL_Surface* colonSurface = TTF_RenderText_Blended(font, ":", textColor);
+        if (!colonSurface) return;
+        int colonWidth = colonSurface->w;
+        SDL_FreeSurface(colonSurface);
+        
+        // Render each character
+        std::string displayTimecode = "00:00:00:00";
+        size_t inputLength = input_timecode.length();
+        int currentX = startX;
+        
+        for (size_t i = 0; i < displayTimecode.length(); ++i) {
+            bool isColon = (displayTimecode[i] == ':');
+            size_t inputPos = i - (i > 7 ? 3 : (i > 5 ? 2 : (i > 2 ? 1 : 0)));
+            
+            // Determine character and color
+            char currentChar = displayTimecode[i];
+            SDL_Color* currentColor = &grayColor;
+            
+            if (isColon) {
+                currentColor = &textColor; // Colons always white
+            } else if (inputPos < inputLength) {
+                currentChar = input_timecode[inputPos];
+                currentColor = &textColor; // Entered digits white
+            }
+            
+            // Render character
+            char charStr[2] = {currentChar, '\0'};
+            SDL_Surface* charSurface = TTF_RenderText_Blended(font, charStr, *currentColor);
+            if (charSurface) {
+                SDL_Texture* charTexture = SDL_CreateTextureFromSurface(renderer, charSurface);
+                if (charTexture) {
+                    SDL_Rect charRect = {
+                        currentX,
+                        startY,
+                        charSurface->w,
+                        charSurface->h
+                    };
+                    SDL_RenderCopy(renderer, charTexture, NULL, &charRect);
+                    SDL_DestroyTexture(charTexture);
+                }
+                currentX += isColon ? colonWidth : digitWidth;
+                SDL_FreeSurface(charSurface);
             }
         }
     } else {
-        int hours = static_cast<int>(currentTime / 3600);
-        int minutes = static_cast<int>(fmod(currentTime, 3600) / 60);
-        int seconds = static_cast<int>(fmod(currentTime, 60));
-        int frames = static_cast<int>(fmod(currentTime, 1.0) * original_fps);
-        char buffer[12];
-        snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d:%02d", hours, minutes, seconds, frames);
-        timecode = buffer;
-    }
-    
-    SDL_Surface* timecodeSurface = TTF_RenderText_Blended(font, timecode.c_str(), textColor);
-    if (timecodeSurface) {
-        SDL_Texture* timecodeTexture = SDL_CreateTextureFromSurface(renderer, timecodeSurface);
-        if (timecodeTexture) {
-            SDL_Rect timecodeRect = {(windowWidth - timecodeSurface->w) / 2, windowHeight - 30 + (30 - timecodeSurface->h) / 2, timecodeSurface->w, timecodeSurface->h};
-            SDL_RenderCopy(renderer, timecodeTexture, NULL, &timecodeRect);
-            SDL_DestroyTexture(timecodeTexture);
+        // Normal timecode display (not in input mode)
+        std::string timecode = generateTXTimecode(currentTime);
+        SDL_Surface* timecodeSurface = TTF_RenderText_Blended(font, timecode.c_str(), textColor);
+        if (timecodeSurface) {
+            SDL_Texture* timecodeTexture = SDL_CreateTextureFromSurface(renderer, timecodeSurface);
+            if (timecodeTexture) {
+                SDL_Rect timecodeRect = {
+                    (windowWidth - timecodeSurface->w) / 2,
+                    windowHeight - 30 + (30 - timecodeSurface->h) / 2,
+                    timecodeSurface->w,
+                    timecodeSurface->h
+                };
+                SDL_RenderCopy(renderer, timecodeTexture, NULL, &timecodeRect);
+                SDL_DestroyTexture(timecodeTexture);
+            }
+            SDL_FreeSurface(timecodeSurface);
         }
-        SDL_FreeSurface(timecodeSurface);
     }
 
     // Right Text
     std::string rightText;
+    if (frameTypeToDisplay == FrameInfo::FULL_RES && std::abs(playbackRate - 1.0) < 0.01) {
+        rightText = "LOCK";
+    } else {
         rightText = isReverse ? "REV " : "FWD ";
         char rateBuffer[10];
         if (std::abs(playbackRate) < 0.01) snprintf(rateBuffer, sizeof(rateBuffer), "0");
@@ -310,6 +366,7 @@ void renderOSD(SDL_Renderer* renderer, TTF_Font* font, bool isPlaying, double pl
         else snprintf(rateBuffer, sizeof(rateBuffer), "%.2f", std::abs(playbackRate));
         rightText += rateBuffer;
         rightText += "x";
+    }
     
     SDL_Surface* rightSurface = TTF_RenderText_Blended(font, rightText.c_str(), textColor);
     if (rightSurface) {
@@ -348,8 +405,7 @@ void displayFrame(
     int highResWindowSize,
     int segmentSize,
     // Add the new parameter to the definition
-    float targetDisplayAspectRatio,
-    bool isDeepPauseActive // Added for deep pause
+    float targetDisplayAspectRatio
 ) {
     auto request_time = std::chrono::high_resolution_clock::now();
     auto ms_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(request_time.time_since_epoch()).count();
@@ -387,18 +443,7 @@ void displayFrame(
     AVFrame* frame = frameToDisplay ? frameToDisplay.get() : nullptr; // Get raw pointer or nullptr
     SDL_Rect destRect = {0,0,0,0}; // Destination rect for rendering
 
-    // --- Handle Deep Pause State ---
-    if (isDeepPauseActive) {
-        // In deep pause, we don't process new frames.
-        // We'll fall through to the final rendering stage which should use lastTexture if available,
-        // or just render OSD/Index over black if no texture has been rendered yet.
-        // The main frame processing block below will be skipped.
-        frame = nullptr; // Ensure no new frame is processed
-        renderedWithMetal = false; // Ensure SW path is taken for potentially showing lastTexture
-    }
-
-
-    if (!isDeepPauseActive && frame) { // --- Start Processing if a valid frame is provided AND NOT in deep pause ---
+    if (frame) { // --- Start Processing if a valid frame is provided ---
         // --- Дополнительная проверка валидности полученного кадра ---
         if (frame) { // This inner check might seem redundant now but keeping for safety
             bool isPotentiallyValidHardwareFrame = (static_cast<AVPixelFormat>(frame->format) == AV_PIX_FMT_VIDEOTOOLBOX);
@@ -423,9 +468,6 @@ void displayFrame(
     // --- Конец дополнительной проверки ---
 
     // --- HSync Loss Effect Logic ---
-    // This effect should likely be skipped in deep pause too, or its state frozen.
-    // For now, it will be skipped because `frame` is nullified in deep pause, preventing SW path.
-    // If we wanted to show effects on a frozen frame, this needs adjustment.
     double absPlaybackRateForEffect = std::abs(currentPlaybackRate); // Use a local copy for this block
     bool hsyncConditionMet = (absPlaybackRateForEffect >= 1.5 && absPlaybackRateForEffect <= 2.2);
 
@@ -670,8 +712,6 @@ void displayFrame(
 
                        // --- Apply Betacam Effects ---
                        // These effects are applied to the new frame data being put into lastTexture.
-                       // In deep pause, this block is skipped because `frame` was nullified.
-                       // If we wanted effects on the *frozen* deep pause frame, this logic would need to be callable separately.
                        double absPlaybackRate = std::abs(currentPlaybackRate);
                        const double effectThreshold = 1.2; // Slightly above 1x to trigger effects
                        if (absPlaybackRate >= effectThreshold && currentTime > 0.1 && (totalDuration - currentTime) > 0.1) {
@@ -1166,12 +1206,45 @@ void displayFrame(
                        }
                        // --- End Edge Fade ---
 
+                       // Apply film grain dithering for LOW_RES frames
+                       if (frameTypeToDisplay == FrameInfo::LOW_RES) {
+                           // Use thread-local random for better performance
+                           static thread_local std::mt19937 rng(std::random_device{}());
+                           std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+                           // Grain intensity (very subtle)
+                           const float grainIntensity = 0.035f; // 3% intensity
+
+                           for (int y = 0; y < textureHeight; ++y) {
+                               uint8_t* rowStart = dst_data[0] + y * pitch;
+                               
+                               if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
+                                   // For UYVY, only modify Y values (every other byte starting at index 1)
+                                   for (int x = 0; x < textureWidth * 2; x += 2) {
+                                       float noise = dist(rng) * grainIntensity;
+                                       int yValue = rowStart[x + 1];
+                                       yValue = std::min(235, std::max(16, static_cast<int>(yValue + yValue * noise)));
+                                       rowStart[x + 1] = static_cast<uint8_t>(yValue);
+                                   }
+                               } else {
+                                   // For planar formats (IYUV/NV12), modify only Y plane
+                                   for (int x = 0; x < textureWidth; ++x) {
+                                       float noise = dist(rng) * grainIntensity;
+                                       int yValue = rowStart[x];
+                                       yValue = std::min(235, std::max(16, static_cast<int>(yValue + yValue * noise)));
+                                       rowStart[x] = static_cast<uint8_t>(yValue);
+                                   }
+                               }
+                           }
+                       }
+
                        SDL_UnlockTexture(lastTexture);
                   } else {
                       std::cerr << "Error locking texture for SW update/effects: " << SDL_GetError() << std::endl;
                       // Skip rendering this texture if lock failed
                       if (lastTexture) { SDL_DestroyTexture(lastTexture); lastTexture = nullptr; }
                   }
+
                   // Mark frame as rendered *only if* texture update was successful
                   if (lastTexture) {
                       firstFrameRendered = true;
@@ -1186,12 +1259,11 @@ void displayFrame(
              } // end if(lastTexture exists after creation/check)
         } // End if (!renderedWithMetal)
 
-    } else if (!isDeepPauseActive) { // No frameToDisplay provided AND not in deep pause
+    } else { // No frameToDisplay provided
         // std::cout << "[TimingDebug:" << ms_since_epoch << "] >> No AVFrame provided for frame " << newCurrentFrame << "! Trying redraw." << std::endl; // Optional log
         // Attempt to redraw the last SW texture only if it exists and something was rendered before
         // Do nothing if Metal was used previously or no SW texture exists
     }
-    // If isDeepPauseActive is true, we skipped the block above and will proceed to render lastTexture.
 
      // --- Final Rendering Stage ---
      // Calculate destRect based on current texture dimensions (could be from Metal or SW path)
@@ -1213,8 +1285,7 @@ void displayFrame(
                       destRect.y = (windowHeight - destRect.h) / 2;
         
         // --- Calculate hsyncMaxSkewAmount now that destRect.w is known, if effect just started ---
-        // This might need adjustment if hsync is desired on a frozen deep pause frame.
-        if (!isDeepPauseActive && hsyncLossActive && hsyncEffectCurrentFrame == 1) { // First frame of an active effect
+        if (hsyncLossActive && hsyncEffectCurrentFrame == 1) { // First frame of an active effect
              static std::mt19937 gen_skew(std::random_device{}()); // Separate generator for amount
              // Max skew is a percentage of the *destination rect width*
              float baseMaxSkew = destRect.w * (0.02f + (static_cast<float>(gen_skew() % 31) / 1000.0f)); // 2% to 5% of width
@@ -1225,7 +1296,7 @@ void displayFrame(
 
         // Apply Jitter Offset just before rendering (conceptually)
         // Jitter calculated earlier within the SW path is used here
-        if (!isDeepPauseActive) { // Jitter only if not in deep pause
+        { // Jitter scope
              double absPlaybackRate = std::abs(currentPlaybackRate); // Use current rate again
              static std::random_device rd_jitter_render; // Separate RNG for render stage jitter
              static std::mt19937 rng_jitter_render(rd_jitter_render());
@@ -1258,15 +1329,14 @@ void displayFrame(
                      }
                  }
              }
-        } // End if (!isDeepPauseActive) for jitter
+        } // End jitter scope
 
 
         // Render the final texture (either Metal's output implicitly, or our SW texture)
         // In deep pause, renderedWithMetal will be false, so it will try to render lastTexture.
         if (!renderedWithMetal && lastTexture) { // Render SW texture if it exists and wasn't Metal
             // --- HSync Loss Effect Rendering ---
-            // Skip HSync effect rendering if in deep pause
-            if (!isDeepPauseActive && hsyncLossActive && hsyncMaxSkewAmount != 0.0f && destRect.h > 0 && textureHeight > 0) {
+            if (hsyncLossActive && hsyncMaxSkewAmount != 0.0f && destRect.h > 0 && textureHeight > 0) {
                 int actualTearLineScreenY = destRect.y + static_cast<int>(tearLineNormalized * destRect.h);
                 actualTearLineScreenY = std::max(destRect.y, std::min(actualTearLineScreenY, destRect.y + destRect.h -1)); // -1 to ensure min 1px for below part
 
@@ -1360,12 +1430,9 @@ void displayFrame(
                  SDL_RenderDrawRect(renderer, &thumbRect);
              }
         }
-    } else if (!firstFrameRendered && !isDeepPauseActive) { // Only show black if not first frame AND not deep pause
+    } else if (!firstFrameRendered) { // Only show black if not first frame
          // Nothing rendered yet, ensure screen is black
          // SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderClear(renderer); // Already cleared at the beginning
-    } else if (isDeepPauseActive && !lastTexture && !firstFrameRendered) {
-        // In deep pause, but no texture was ever rendered (e.g., paused immediately)
-        // Screen is already cleared to black. OSD/Index will draw over it.
     }
 
 
@@ -1383,7 +1450,7 @@ void displayFrame(
 
     // Render OSD (if enabled)
     if (showOSD && font) {
-        renderOSD(renderer, font, isPlaying.load(), currentPlaybackRate, isReverse, currentTime, newCurrentFrame, showOSD, waitingForTimecode, inputTimecode, originalFps, jog_forward.load(), jog_backward.load(), isDeepPauseActive); // Pass isDeepPauseActive
+        renderOSD(renderer, font, isPlaying.load(), currentPlaybackRate, isReverse, currentTime, newCurrentFrame, showOSD, waitingForTimecode, inputTimecode, originalFps, jog_forward.load(), jog_backward.load(), frameTypeToDisplay);
     }
 
     // Update the screen

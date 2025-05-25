@@ -399,6 +399,15 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
             avcodec_flush_buffers(codecCtx_);
             // Comment out timing log
             // std::cout << "[Timing] FullResDecoder::decodeFrameRange: Seek successful in " << seek_duration.count() << " ms. Buffers flushed." << std::endl;
+            
+            // Repair timestamp synchronization after seek to prevent frame jumping
+            double fps = 25.0; // Default fallback
+            if (videoStream_->avg_frame_rate.den != 0) {
+                fps = av_q2d(videoStream_->avg_frame_rate);
+            } else if (videoStream_->r_frame_rate.den != 0) {
+                fps = av_q2d(videoStream_->r_frame_rate);
+            }
+            // REMOVED: Timestamp repair - let original timestamps work naturally
         }
     } else {
         std::cerr << "[Timing] FullResDecoder::decodeFrameRange Warning: Invalid time_ms for startFrame " << startFrame << ". Will attempt decode sequentially." << std::endl;
@@ -478,13 +487,24 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
                 int64_t framePts = frame->best_effort_timestamp;
                 if (framePts == AV_NOPTS_VALUE) framePts = frame->pts;
 
-                int64_t frameTimeMs = (framePts != AV_NOPTS_VALUE)
-                                        ? av_rescale_q(framePts, timeBase, {1, 1000})
-                                        : -1; // Assign -1 if no valid PTS
+                // Enhanced frame timing calculation with microsecond precision
+                int64_t frameTimeMs = -1;
+                if (framePts != AV_NOPTS_VALUE) {
+                    // Convert to microseconds for maximum precision
+                    int64_t pts_us = av_rescale_q(framePts, timeBase, {1, 1000000});
+                    int64_t start_us = (videoStream_->start_time != AV_NOPTS_VALUE) ?
+                        av_rescale_q(videoStream_->start_time, timeBase, {1, 1000000}) : 0;
+                    
+                    // Calculate relative time in microseconds
+                    int64_t relative_us = pts_us - start_us;
+                    
+                    // Convert to milliseconds with proper rounding
+                    frameTimeMs = (relative_us + 500) / 1000;
+                }
 
                 // Check if frame time is reasonable and index is within range
                 if (currentOutputFrameIndex <= endFrame &&
-                    (startTimeMs < 0 || frameTimeMs >= startTimeMs - 50)) // Check time only if seek was attempted/successful
+                    (startTimeMs < 0 || frameTimeMs >= startTimeMs)) // Check time only if seek was attempted/successful
                 {
                     // Store the frame at the currentOutputFrameIndex
                     std::lock_guard<std::mutex> lock(frameIndex[currentOutputFrameIndex].mutex);
@@ -500,9 +520,8 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
                     } else {
                         // Store frame metadata
                         frameIndex[currentOutputFrameIndex].pts = framePts;
-                        int64_t streamStartTime = (videoStream_->start_time != AV_NOPTS_VALUE) ? videoStream_->start_time : 0;
-                        frameIndex[currentOutputFrameIndex].relative_pts = framePts - streamStartTime;
-                        frameIndex[currentOutputFrameIndex].time_ms = frameTimeMs;
+                        frameIndex[currentOutputFrameIndex].relative_pts = framePts - (videoStream_->start_time != AV_NOPTS_VALUE ? videoStream_->start_time : 0);
+                        frameIndex[currentOutputFrameIndex].time_ms = frameTimeMs; // FIXED: Update time_ms consistently
                         frameIndex[currentOutputFrameIndex].type = FrameInfo::FULL_RES; // Mark as full-res attempt
                         frameIndex[currentOutputFrameIndex].time_base = timeBase;
                         frameIndex[currentOutputFrameIndex].format = (AVPixelFormat)frame->format; // <<< STORE THE ACTUAL FORMAT

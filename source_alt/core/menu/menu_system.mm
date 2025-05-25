@@ -6,6 +6,7 @@
 #import "nfd.hpp"
 #include "../remote/remote_control.h"
 #include "../audio/mainau.h" // Include for audio device functions
+#include <SDL2/SDL_syswm.h>
 
 extern RemoteControl* g_remote_control;
 
@@ -17,6 +18,16 @@ extern bool switch_audio_device(int deviceIndex);
 #ifdef __APPLE__
 
 @implementation MenuDelegate
+
+- (void)applicationWillFinishLaunching:(NSNotification *)notification {
+    // Register for URL events
+    [[NSAppleEventManager sharedAppleEventManager]
+        setEventHandler:self
+            andSelector:@selector(handleGetURLEvent:withReplyEvent:)
+          forEventClass:kInternetEventClass
+             andEventID:kAEGetURL];
+    NSLog(@"[MenuDelegate applicationWillFinishLaunching:] Registered kAEGetURL handler.");
+}
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     NSApplication *app = [NSApplication sharedApplication];
@@ -50,13 +61,38 @@ extern bool switch_audio_device(int deviceIndex);
                                               keyEquivalent:@"o"];
     [fileMenu addItem:openItem];
     
+    // File menu items will be added here if needed
+    
+    // Edit menu
+    NSMenuItem *editMenuItem = [[NSMenuItem alloc] initWithTitle:@"Edit" action:nil keyEquivalent:@""];
+    [mainMenu addItem:editMenuItem];
+    NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [editMenuItem setSubmenu:editMenu];
+    
+    NSMenuItem *copyScreenshotItem = [[NSMenuItem alloc] initWithTitle:@"Copy Screenshot to Clipboard"
+                                                               action:@selector(handleMenuAction:)
+                                                        keyEquivalent:@"c"];
+    [copyScreenshotItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand]; // For Cmd+C
+    [copyScreenshotItem setTag:MENU_EDIT_COPY_SCREENSHOT];
+    [copyScreenshotItem setEnabled:NO]; // Initially disabled until file is loaded
+    [editMenu addItem:copyScreenshotItem];
+
     NSMenuItem *copyLinkItem = [[NSMenuItem alloc] initWithTitle:@"Copy Link for Obsidian (fstp://)"
                                                           action:@selector(handleMenuAction:)
-                                                   keyEquivalent:@"l"];
-    [copyLinkItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand]; // For Cmd+L
+                                                   keyEquivalent:@"c"];
+    [copyLinkItem setKeyEquivalentModifierMask:(NSEventModifierFlagCommand | NSEventModifierFlagShift)]; // For Shift+Cmd+C
     [copyLinkItem setTag:MENU_FILE_COPY_FSTP_URL_MARKDOWN];
     [copyLinkItem setEnabled:NO]; // Initially disabled
-    [fileMenu addItem:copyLinkItem];
+    [editMenu addItem:copyLinkItem];
+    
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    
+    NSMenuItem *gotoTimecodeItem = [[NSMenuItem alloc] initWithTitle:@"Go to Timecode"
+                                                            action:@selector(handleMenuAction:)
+                                                     keyEquivalent:@"g"];
+    [gotoTimecodeItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand]; // For Cmd+G
+    [gotoTimecodeItem setTag:MENU_EDIT_GOTO_TIMECODE];
+    [editMenu addItem:gotoTimecodeItem];
     
     // Interface menu
     NSMenuItem *interfaceMenuItem = [[NSMenuItem alloc] init];
@@ -79,14 +115,6 @@ extern bool switch_audio_device(int deviceIndex);
     // Finish launching
     [app finishLaunching];
     [app activateIgnoringOtherApps:YES];
-
-    // Register for GetURL Apple Events
-    [[NSAppleEventManager sharedAppleEventManager]
-        setEventHandler:self
-            andSelector:@selector(handleGetURLEvent:withReplyEvent:)
-          forEventClass:kInternetEventClass
-             andEventID:kAEGetURL];
-    NSLog(@"[MenuDelegate applicationDidFinishLaunching:] Registered kAEGetURL handler.");
 }
 
 - (void)openFile:(id)sender {
@@ -203,10 +231,10 @@ extern bool switch_audio_device(int deviceIndex);
 - (void)updateCopyLinkMenuItemState:(BOOL)isFileLoaded {
     NSLog(@"[menu_system.mm] updateCopyLinkMenuItemState called with isFileLoaded: %d", isFileLoaded);
     NSMenu *mainMenu = [NSApp mainMenu];
-    NSMenuItem *fileMenuItem = [mainMenu itemWithTitle:@"File"];
-    if (fileMenuItem) {
-        NSMenu *fileMenu = [fileMenuItem submenu];
-        NSMenuItem *copyLinkItem = [fileMenu itemWithTag:MENU_FILE_COPY_FSTP_URL_MARKDOWN];
+    NSMenuItem *editMenuItem = [mainMenu itemWithTitle:@"Edit"];
+    if (editMenuItem) {
+        NSMenu *editMenu = [editMenuItem submenu];
+        NSMenuItem *copyLinkItem = [editMenu itemWithTag:MENU_FILE_COPY_FSTP_URL_MARKDOWN];
         if (copyLinkItem) {
             NSLog(@"[menu_system.mm] Found copyLinkItem. Current enabled state: %d. Setting to: %d", [copyLinkItem isEnabled], isFileLoaded);
             [copyLinkItem setEnabled:isFileLoaded];
@@ -215,7 +243,26 @@ extern bool switch_audio_device(int deviceIndex);
             NSLog(@"[menu_system.mm] copyLinkItem with tag %d NOT FOUND.", MENU_FILE_COPY_FSTP_URL_MARKDOWN);
         }
     } else {
-        NSLog(@"[menu_system.mm] File menu item NOT FOUND.");
+        NSLog(@"[menu_system.mm] Edit menu item NOT FOUND.");
+    }
+}
+
+- (void)updateCopyScreenshotMenuItemState:(BOOL)isFileLoaded {
+    NSLog(@"[menu_system.mm] updateCopyScreenshotMenuItemState called with isFileLoaded: %d", isFileLoaded);
+    NSMenu *mainMenu = [NSApp mainMenu];
+    NSMenuItem *editMenuItem = [mainMenu itemWithTitle:@"Edit"];
+    if (editMenuItem) {
+        NSMenu *editMenu = [editMenuItem submenu];
+        NSMenuItem *copyScreenshotItem = [editMenu itemWithTag:MENU_EDIT_COPY_SCREENSHOT];
+        if (copyScreenshotItem) {
+            NSLog(@"[menu_system.mm] Found copyScreenshotItem. Current enabled state: %d. Setting to: %d", [copyScreenshotItem isEnabled], isFileLoaded);
+            [copyScreenshotItem setEnabled:isFileLoaded];
+            NSLog(@"[menu_system.mm] After setEnabled, new state: %d", [copyScreenshotItem isEnabled]);
+        } else {
+            NSLog(@"[menu_system.mm] copyScreenshotItem with tag %d NOT FOUND.", MENU_EDIT_COPY_SCREENSHOT);
+        }
+    } else {
+        NSLog(@"[menu_system.mm] Edit menu item NOT FOUND.");
     }
 }
 
@@ -225,6 +272,9 @@ extern bool switch_audio_device(int deviceIndex);
             return YES;
         }
         if ([menuItem tag] == MENU_FILE_COPY_FSTP_URL_MARKDOWN) {
+            return YES; // Always allow the action if the menu item exists
+        }
+        if ([menuItem tag] == MENU_EDIT_COPY_SCREENSHOT) {
             return [menuItem isEnabled];
         }
     }
@@ -298,9 +348,56 @@ void updateCopyLinkMenuState(bool isFileLoaded) {
     }
 }
 
+void updateCopyScreenshotMenuState(bool isFileLoaded) {
+    if (menuDelegate) {
+        [menuDelegate updateCopyScreenshotMenuItemState:isFileLoaded];
+    }
+}
+
+void showMenuBarTemporarily() {
+    // In fullscreen mode, we can temporarily show the menu bar
+    // by setting the presentation options
+    NSApplication *app = [NSApplication sharedApplication];
+    NSApplicationPresentationOptions opts = [app presentationOptions];
+    
+    // Check if we're in fullscreen mode
+    if (opts & NSApplicationPresentationFullScreen) {
+        // Temporarily show menu bar
+        [app setPresentationOptions:(opts & ~NSApplicationPresentationAutoHideMenuBar) | NSApplicationPresentationAutoHideMenuBar];
+        
+        // You could also try this alternative approach:
+        // This will make the menu bar appear when the mouse moves to the top
+        [NSMenu setMenuBarVisible:YES];
+    }
+}
+
+void toggleNativeFullscreen(void* sdlWindow) {
+    if (!sdlWindow) return;
+    
+    // Get the native NSWindow from SDL window
+    SDL_SysWMinfo wmInfo;
+    SDL_VERSION(&wmInfo.version);
+    
+    if (SDL_GetWindowWMInfo((SDL_Window*)sdlWindow, &wmInfo)) {
+        NSWindow *window = wmInfo.info.cocoa.window;
+        
+        // Enable native fullscreen support if not already enabled
+        if (!([window collectionBehavior] & NSWindowCollectionBehaviorFullScreenPrimary)) {
+            [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
+        }
+        
+        // Toggle fullscreen using the native macOS method
+        [window toggleFullScreen:nil];
+    }
+}
+
 #else // __APPLE__
 
 void initializeMenuSystem() {}
 void cleanupMenuSystem() {}
+void updateCopyLinkMenuState(bool isFileLoaded) {}
+void updateCopyScreenshotMenuState(bool isFileLoaded) {}
+void showMenuBarTemporarily() {}
+void toggleNativeFullscreen(void* sdlWindow) {}
 
 #endif // __APPLE__ 

@@ -194,6 +194,8 @@ bool CachedDecoder::decodeRange(int startFrame, int endFrame) {
     } else {
         avcodec_flush_buffers(codecCtx_); // Flush decoder after successful seek
         // std::cout << "CachedDecoder Seek successful to ~" << seekTargetTimeMs << " ms" << std::endl;
+        
+        // REMOVED: Timestamp repair - let original timestamps work naturally
 
         // --- "Warm-up" decoder: Decode and discard a couple of frames after seek --- 
         int warmup_frames_to_discard = 4; // Increased from 2 to potentially avoid initial green frames
@@ -270,60 +272,75 @@ bool CachedDecoder::decodeRange(int startFrame, int endFrame) {
                 if (framePts == AV_NOPTS_VALUE) framePts = frame->pts;
 
                 // Estimate current frame index based on PTS
-                // This requires frameIndex_ to have valid time_ms
                 if (framePts != AV_NOPTS_VALUE) {
                     // Calculate actual frameTimeMs if PTS is valid
                     frameTimeMs = av_rescale_q(framePts - videoStream_->start_time, timeBase_, {1, 1000});
                     
-                    // Binary search for the closest frame index
+                    // Improved frame finding logic - more robust to time_ms desync
                     if (!frameIndex_.empty()) {
                         int64_t targetTimeMs = frameTimeMs;
                         
+                        // Strategy 1: Try binary search first, but with fallback
+                        int binarySearchResult = -1;
+                        int64_t minDifference = INT64_MAX;
+                        
                         auto it = std::lower_bound(frameIndex_.begin(), frameIndex_.end(), targetTimeMs,
                             [](const FrameInfo& info, int64_t val) {
-                                // Ensure comparison is safe even if some time_ms might be uninitialized (-1)
-                                // However, createFrameIndex should initialize all time_ms.
-                                // For lower_bound, elements considered "less" if their time_ms is less.
-                                if (info.time_ms < 0 && val >= 0) return true; // Uninitialized considered less than initialized
-                                if (info.time_ms >= 0 && val < 0) return false; // Initialized considered not less than uninitialized
+                                // Skip frames with invalid time_ms completely
+                                if (info.time_ms < 0) return true;
                                 return info.time_ms < val; 
                             });
 
-                        int64_t minAbsoluteDifference = INT64_MAX;
-
-                        // Candidate 1: Element at or after targetTimeMs (from std::lower_bound)
-                        if (it != frameIndex_.end()) {
-                            if (it->time_ms >= 0) { // Consider only if time_ms is valid
-                                int64_t diff = std::abs(it->time_ms - targetTimeMs);
-                                if (diff < minAbsoluteDifference) {
-                                    minAbsoluteDifference = diff;
-                                    currentFrameIndex = std::distance(frameIndex_.begin(), it);
+                        // Check the found position and adjacent positions
+                        for (int offset = -2; offset <= 2; ++offset) {
+                            auto candidate_it = it + offset;
+                            if (candidate_it >= frameIndex_.begin() && candidate_it < frameIndex_.end()) {
+                                if (candidate_it->time_ms >= 0) {
+                                    int64_t diff = std::abs(candidate_it->time_ms - targetTimeMs);
+                                    if (diff < minDifference) {
+                                        minDifference = diff;
+                                        binarySearchResult = std::distance(frameIndex_.begin(), candidate_it);
+                                    }
                                 }
                             }
                         }
-
-                        // Candidate 2: Element before targetTimeMs (if 'it' is not the beginning)
-                        if (it != frameIndex_.begin()) {
-                            auto prev_it = std::prev(it);
-                            if (prev_it->time_ms >= 0) { // Consider only if time_ms is valid
-                                int64_t diff = std::abs(prev_it->time_ms - targetTimeMs);
-                                if (diff < minAbsoluteDifference) {
-                                    minAbsoluteDifference = diff;
-                                    currentFrameIndex = std::distance(frameIndex_.begin(), prev_it);
-                                } else if (diff == minAbsoluteDifference) {
-                                    // If differences are equal, std::lower_bound gives the element >= target.
-                                    // If 'it' was valid, currentFrameIndex is already set to it.
-                                    // If 'it' was not valid (e.g. end() or invalid time_ms) and currentFrameIndex is still -1,
-                                    // then prev_it (if equally close) becomes the candidate.
-                                    if (currentFrameIndex == -1) {
-                                         currentFrameIndex = std::distance(frameIndex_.begin(), prev_it);
-                }
+                        
+                        // Strategy 2: Fallback to simple sequential search in current range
+                        // if binary search gives suspicious results or no valid time_ms found
+                        if (binarySearchResult == -1 || minDifference > 1000) { // > 1 second difference
+                            // std::cout << "[CachedDecoder] Binary search failed or suspicious, using sequential search" << std::endl;
+                            
+                            // Use a simple approach: find frames in the expected range
+                            int estimatedIndex = (decodedFramesSinceFirstStore > 0 && firstStoredFrameIndex >= 0) 
+                                                ? firstStoredFrameIndex + decodedFramesSinceFirstStore 
+                                                : startFrame;
+                            
+                            // Search in a small window around the estimated position
+                            int searchStart = std::max(startFrame, estimatedIndex - 5);
+                            int searchEnd = std::min(endFrame, estimatedIndex + 5);
+                            
+                            for (int i = searchStart; i <= searchEnd; ++i) {
+                                if (i >= 0 && i < frameIndex_.size()) {
+                                    // For sequential search, we're less strict about time_ms matching
+                                    // and focus more on logical progression
+                                    std::lock_guard<std::mutex> checkLock(frameIndex_[i].mutex);
+                                    if (!frameIndex_[i].cached_frame) { // Empty slot we can use
+                                        currentFrameIndex = i;
+                                        break;
+                                    }
                                 }
                             }
+                            
+                            // If still not found, just use the estimated index if valid
+                            if (currentFrameIndex == -1 && estimatedIndex >= startFrame && estimatedIndex <= endFrame) {
+                                currentFrameIndex = estimatedIndex;
+                            }
+                        } else {
+                            currentFrameIndex = binarySearchResult;
                         }
                     }
                 }
-                // End of new binary search logic
+                // End of improved frame finding logic
 
                 // --- Logic for deciding whether to store the frame (Counter Based Step) ---
                 if (currentFrameIndex != -1 && currentFrameIndex >= startFrame && currentFrameIndex <= endFrame) {
@@ -333,7 +350,7 @@ bool CachedDecoder::decodeRange(int startFrame, int endFrame) {
                     if (!firstFrameStoredInRange) {
                         // Ensure frameTimeMs is valid for this check
                         // Store the first frame ONLY if it\'s a key frame AND its timestamp is valid and near the target
-                        if (frame->key_frame == 1 && frameTimeMs != -1 && frameTimeMs >= seekTargetTimeMs - 50) { // Re-added key_frame check
+                        if ((frame->flags & AV_FRAME_FLAG_KEY) && frameTimeMs != -1 && frameTimeMs >= seekTargetTimeMs - 50) { // Fixed deprecated key_frame
                             shouldStoreThisFrame = true;
                             firstFrameStoredInRange = true;
                             firstStoredFrameIndex = currentFrameIndex; // Запоминаем, где сохранили первый
@@ -380,7 +397,10 @@ bool CachedDecoder::decodeRange(int startFrame, int endFrame) {
                                         // Update info
                                         frameIndex_[currentFrameIndex].pts = framePts;
                                         frameIndex_[currentFrameIndex].relative_pts = framePts - videoStream_->start_time;
-                                        // frameIndex_[currentFrameIndex].time_ms = av_rescale_q(frameIndex_[currentFrameIndex].relative_pts, timeBase_, {1, 1000});
+                                                                // Ensure time_ms is properly set from the actual decoded frame
+                        if (frameTimeMs >= 0) {
+                            frameIndex_[currentFrameIndex].time_ms = frameTimeMs;
+                        }
                                         frameIndex_[currentFrameIndex].time_base = timeBase_;
 
                                         // Set type

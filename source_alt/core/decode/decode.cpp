@@ -22,10 +22,11 @@
 #include <mutex>
 #include <limits>
 #include <cmath>
+#include <iomanip>
 
 namespace fs = std::filesystem;
 
-// Глобальный промежуточный буфер
+// Global intermediate buffer
 FrameBuffer frameBuffer;
 
 extern std::atomic<bool> speed_reset_requested;
@@ -52,23 +53,129 @@ std::vector<FrameInfo> createFrameIndex(const char* filename) {
         return frameIndex;
     }
 
+    // Check for HEVC/H.265 codec
+    AVCodecParameters* codecParams = formatContext->streams[videoStream]->codecpar;
+    if (codecParams->codec_id == AV_CODEC_ID_HEVC) {
+        std::cerr << "HEVC/H.265 video format is not supported due to high CPU usage." << std::endl;
+        std::cerr << "Please convert the video to H.264 format before loading." << std::endl;
+        avformat_close_input(&formatContext);
+        return frameIndex;
+    }
+
     AVRational timeBase = formatContext->streams[videoStream]->time_base;
     int64_t startTime = formatContext->streams[videoStream]->start_time;
 
+    // Diagnostic info (reduced logging)
+    std::cout << "[TIMESTAMP] Time base: " << timeBase.num << "/" << timeBase.den;
+    if (startTime != AV_NOPTS_VALUE) {
+        double startTimeMs = av_rescale_q(startTime, timeBase, {1, 1000});
+        std::cout << ", Start: " << startTimeMs << "ms";
+    }
+    std::cout << std::endl;
+
     AVPacket packet;
+    int packetCount = 0;
+    int64_t firstPts = AV_NOPTS_VALUE, lastPts = AV_NOPTS_VALUE;
+    int64_t minPts = INT64_MAX, maxPts = INT64_MIN;
+    
+    // Temporary vector to collect all frames before sorting
+    std::vector<FrameInfo> tempFrameIndex;
+    
     while (av_read_frame(formatContext, &packet) >= 0) {
         if (packet.stream_index == videoStream) {
             FrameInfo info;
-            info.pts = packet.pts;
-            info.relative_pts = packet.pts - startTime;
-            info.time_ms = av_rescale_q(info.relative_pts, timeBase, {1, 1000});
+            // Use best_effort_timestamp first, fallback to pts (consistent with decoders)
+            int64_t framePts = packet.pts; // For packets, pts is typically available
+            if (framePts == AV_NOPTS_VALUE) {
+                // Skip frames without valid PTS to avoid negative time_ms
+                av_packet_unref(&packet);
+                continue;
+            }
+            
+            // Collect statistics
+            if (firstPts == AV_NOPTS_VALUE) firstPts = framePts;
+            lastPts = framePts;
+            minPts = std::min(minPts, framePts);
+            maxPts = std::max(maxPts, framePts);
+            
+            info.pts = framePts;
+            info.relative_pts = framePts - startTime;
+            
+            // More precise frame timing calculation
+            if (framePts != AV_NOPTS_VALUE) {
+                // First convert to a common timebase (1/1000000 microseconds) for maximum precision
+                int64_t pts_us = av_rescale_q(framePts, timeBase, {1, 1000000});
+                int64_t start_us = (startTime != AV_NOPTS_VALUE) ? 
+                    av_rescale_q(startTime, timeBase, {1, 1000000}) : 0;
+                
+                // Calculate relative time in microseconds
+                int64_t relative_us = pts_us - start_us;
+                
+                // Convert to milliseconds with rounding
+                info.time_ms = (relative_us + 500) / 1000;
+            } else {
+                info.time_ms = -1;
+            }
+            
             info.frame = nullptr;
             info.low_res_frame = nullptr;
             info.type = FrameInfo::EMPTY;
             info.time_base = timeBase;
-            frameIndex.push_back(info);
+            tempFrameIndex.push_back(info);
+            
+            // Log first few frames for diagnostic (before sorting) - reduced
+            if (packetCount < 5) {
+                double relativeTimeMs = av_rescale_q(info.relative_pts, timeBase, {1, 1000});
+                std::cout << "  Frame " << packetCount << ": " << relativeTimeMs << "ms";
+                if (packetCount == 4) std::cout << " (decode order)";
+                std::cout << std::endl;
+            }
+            packetCount++;
         }
         av_packet_unref(&packet);
+    }
+
+    // Sort frames by presentation timestamp (time_ms) to handle B-frames correctly
+    std::cout << "[TIMESTAMP FIX] Sorting " << tempFrameIndex.size() << " frames..." << std::endl;
+    std::sort(tempFrameIndex.begin(), tempFrameIndex.end(), [](const FrameInfo& a, const FrameInfo& b) {
+        return a.time_ms < b.time_ms;
+    });
+    
+    // Move sorted frames to final frameIndex
+    frameIndex = std::move(tempFrameIndex);
+    
+    // Log first few frames after sorting (reduced)
+    std::cout << "[TIMESTAMP FIX] After sorting: ";
+    for (int i = 0; i < std::min(5, (int)frameIndex.size()); i++) {
+        std::cout << frameIndex[i].time_ms << "ms";
+        if (i < 4 && i < frameIndex.size() - 1) std::cout << " → ";
+    }
+    std::cout << " (display order)" << std::endl;
+
+    // Print summary (reduced)
+    if (firstPts != AV_NOPTS_VALUE && lastPts != AV_NOPTS_VALUE) {
+        double firstTimeMs = av_rescale_q(firstPts, timeBase, {1, 1000});
+        double lastTimeMs = av_rescale_q(lastPts, timeBase, {1, 1000});
+        double durationSec = (lastTimeMs - firstTimeMs) / 1000.0;
+        std::cout << "[TIMESTAMP] " << frameIndex.size() << " frames, " 
+                  << std::fixed << std::setprecision(1) << durationSec << "s duration" << std::endl;
+    }
+    
+    // Check for timestamp consistency after sorting
+    int inconsistentCount = 0;
+    for (int i = 1; i < frameIndex.size(); i++) {
+        if (frameIndex[i].time_ms < frameIndex[i-1].time_ms) {
+            inconsistentCount++;
+            if (inconsistentCount <= 5) { // Log first 5 inconsistencies
+                std::cout << "  WARNING: Frame " << i << " still out of order: " 
+                          << frameIndex[i].time_ms << "ms < " << frameIndex[i-1].time_ms << "ms" << std::endl;
+            }
+        }
+    }
+    if (inconsistentCount > 0) {
+        std::cout << "  Total timestamp inconsistencies after sorting: " << inconsistentCount << std::endl;
+    } else {
+        std::cout << "  ✓ All timestamps are now in correct order!" << std::endl;
     }
 
     avformat_close_input(&formatContext);
@@ -198,7 +305,7 @@ bool downloadVideoFromURL(const std::string& url, std::string& outputFilename) {
     // Формируем команду для yt-dlp
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-             "yt-dlp -f \"bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best\" "
+             "yt-dlp -f \"bestvideo[ext=mp4][height<=1080][vcodec!*=hevc][vcodec!*=h265]+bestaudio[ext=m4a]/best[ext=mp4][vcodec!*=hevc][vcodec!*=h265]/best[vcodec!*=hevc][vcodec!*=h265]\" "
              "--merge-output-format mp4 "
              "--no-playlist "
              "--no-mtime "
@@ -246,22 +353,43 @@ void cleanupTempFiles() {
 
 // Модифицированная функция для обработки как файлов, так и URL с поддержкой отслеживания прогресса
 bool processMediaSource(const std::string& source, std::string& processedFilePath, ProgressCallback progressCallback) {
-    // Проверяем, является ли источник URL
+    // Check if the source is a URL
     if (isURL(source)) {
-        // Если это URL, загружаем видео с отслеживанием прогресса
+        // Add yt-dlp format filter to exclude HEVC/H.265
+        std::string formatFilter = "\"bestvideo[ext=mp4][height<=1080][vcodec!*=hevc][vcodec!*=h265]+bestaudio[ext=m4a]/best[ext=mp4][vcodec!*=hevc][vcodec!*=h265]/best[vcodec!*=hevc][vcodec!*=h265]\"";
+        
+        // If this is URL, download video with progress tracking
         if (!downloadVideoFromURL(source, processedFilePath)) {
             return false;
         }
         
-        // Если загрузка успешна и есть callback, сообщаем о завершении
+        // If download successful and callback exists, report completion
         if (progressCallback) {
             progressCallback(100);
         }
     } else {
-        // Если это локальный файл, просто используем его путь
+        // For local files, check HEVC before proceeding
+        AVFormatContext* formatContext = nullptr;
+        if (avformat_open_input(&formatContext, source.c_str(), nullptr, nullptr) == 0) {
+            if (avformat_find_stream_info(formatContext, nullptr) >= 0) {
+                int videoStream = av_find_best_stream(formatContext, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                if (videoStream >= 0) {
+                    AVCodecParameters* codecParams = formatContext->streams[videoStream]->codecpar;
+                    if (codecParams->codec_id == AV_CODEC_ID_HEVC) {
+                        std::cerr << "HEVC/H.265 video format is not supported due to high CPU usage." << std::endl;
+                        std::cerr << "Please convert the video to H.264 format before loading." << std::endl;
+                        avformat_close_input(&formatContext);
+                        return false;
+                    }
+                }
+            }
+            avformat_close_input(&formatContext);
+        }
+        
+        // If not HEVC, use the file path
         processedFilePath = source;
         
-        // Для локальных файлов прогресс мгновенный
+        // For local files progress is instant
         if (progressCallback) {
             progressCallback(100);
         }
@@ -278,51 +406,37 @@ bool convertToLowRes(const char* filename, std::string& outputFilename) {
 
 // Версия processMediaSource без колбэка прогресса
 bool processMediaSource(const std::string& source, std::string& processedFilePath) {
-    bool result = false;
-    
-    // Проверяем, является ли источник URL
-    if (isURL(source)) {
-        // Если это URL, загружаем видео
-        result = downloadVideoFromURL(source, processedFilePath);
-    } else {
-        // Если это локальный файл, просто используем его путь
-        processedFilePath = source;
-        result = true;
-    }
-    
-    return result;
+    // Simply call the version with progress callback but pass nullptr
+    return processMediaSource(source, processedFilePath, nullptr);
 }
 
 // Helper function to find the frame index closest to a given timestamp
 // Performs a limited linear search around the estimated position
 int findClosestFrameIndexByTime(const std::vector<FrameInfo>& frameIndex, int64_t target_ms) {
     if (frameIndex.empty() || target_ms < 0) {
-        // std::cout << "[SyncDebug] Frame index empty or target_ms < 0. Returning 0." << std::endl; // Optional: Log edge case
+        // std::cout << "[FRAME_SEARCH] Frame index empty or target_ms < 0. Returning 0." << std::endl;
         return 0; // Return first frame if index empty or time invalid
     }
 
     int bestMatchIndex = 0; // Default to first frame
     int64_t maxTimeMsLessOrEqual = -1; // Track the largest timestamp <= target_ms
 
-    // Estimate initial position based on average frame duration if possible
-    // This assumes relatively constant frame rate, which might not hold true
-    // A simple estimate: guess index based on target time / average time per frame
-    // Requires knowing total duration and frame count, or average FPS.
-    // For now, we'll just search linearly from the start, but keep this in mind.
-    
     // Simple linear search for now (can be optimized later)
     int searchStart = 0;
     int searchEnd = frameIndex.size();
 
-    // --- Start Debug Logging ---
-    // static int logCounter = 0; // Log every N calls to avoid spam
-    // logCounter++;
-    bool shouldLog = true; // (logCounter % 10 == 0); // Log every 10th call
-    // --- End Debug Logging ---
+    // Count valid timestamps for diagnostic
+    int validTimestamps = 0;
+    int invalidTimestamps = 0;
+    
+    static int logCounter = 0;
+    logCounter++;
+    bool shouldLog = (logCounter % 100 == 0); // Log every 100th call to avoid spam
 
     for (int i = searchStart; i < searchEnd; ++i) {
         int64_t current_time_ms = frameIndex[i].time_ms;
         if (current_time_ms >= 0) { // Check if the frame has a valid timestamp
+            validTimestamps++;
             // Find the latest frame where time_ms <= target_ms
             if (current_time_ms <= target_ms) {
                 // Update if this frame is later than the previous best match
@@ -333,28 +447,47 @@ int findClosestFrameIndexByTime(const std::vector<FrameInfo>& frameIndex, int64_
             } else {
                 // Optimization: If frame timestamps are generally increasing,
                 // and we've passed the target_ms, we can stop searching.
-                // We already found the best match in the previous iteration (or default 0).
-                 if (shouldLog) {
-                     // std::cout << "[SyncDebug] Optimization break at index " << i << " (time_ms: " << current_time_ms << " > target_ms: " << target_ms << ")" << std::endl;
-                 }
+                if (shouldLog) {
+                    // std::cout << "[FRAME_SEARCH] Optimization break at index " << i 
+                    //          << " (time_ms: " << current_time_ms << " > target_ms: " << target_ms << ")" << std::endl;
+                }
                 break;
             }
+        } else {
+            invalidTimestamps++;
         }
     }
 
-    // --- More Debug Logging ---
+    // Enhanced debug logging
     if (shouldLog) {
-        // std::cout << "[SyncDebug] Target: " << target_ms << "ms. Found Index: " << bestMatchIndex << " (time_ms=" << frameIndex[bestMatchIndex].time_ms << ")" << std::endl;
-        // Optional: Log surrounding frames for context
-        // if (bestMatchIndex > 0) {
-        //     std::cout << "  Prev Frame (" << bestMatchIndex - 1 << "): " << frameIndex[bestMatchIndex - 1].time_ms << "ms" << std::endl;
-        // }
-        // if (bestMatchIndex < frameIndex.size() - 1) {
-        //      std::cout << "  Next Frame (" << bestMatchIndex + 1 << "): " << frameIndex[bestMatchIndex + 1].time_ms << "ms" << std::endl;
-        // }
-        //  std::cout << "----" << std::endl;
+        // std::cout << "[FRAME_SEARCH] Target: " << target_ms << "ms. Found Index: " << bestMatchIndex 
+        //           << " (time_ms=" << frameIndex[bestMatchIndex].time_ms << ")" << std::endl;
+        // std::cout << "  Valid timestamps: " << validTimestamps << ", Invalid: " << invalidTimestamps << std::endl;
+        
+        // Log surrounding frames for context
+        if (bestMatchIndex > 0) {
+        //    std::cout << "  Prev Frame (" << bestMatchIndex - 1 << "): " << frameIndex[bestMatchIndex - 1].time_ms << "ms" << std::endl;
+        }
+        if (bestMatchIndex < frameIndex.size() - 1) {
+        //    std::cout << "  Next Frame (" << bestMatchIndex + 1 << "): " << frameIndex[bestMatchIndex + 1].time_ms << "ms" << std::endl;
+        }
+        
+        // Check for timestamp consistency issues
+        if (bestMatchIndex > 0 && frameIndex[bestMatchIndex].time_ms >= 0 && frameIndex[bestMatchIndex - 1].time_ms >= 0) {
+            int64_t timeDiff = frameIndex[bestMatchIndex].time_ms - frameIndex[bestMatchIndex - 1].time_ms;
+            if (timeDiff < 0) {
+            //    std::cout << "  WARNING: Timestamp goes backwards! Diff: " << timeDiff << "ms" << std::endl;
+            } else if (timeDiff > 200) { // More than 200ms between frames
+            //    std::cout << "  WARNING: Large timestamp gap: " << timeDiff << "ms" << std::endl;
+            }
+        }
+        // std::cout << "----" << std::endl;
     }
-    // --- End More Debug Logging ---
 
     return bestMatchIndex;
 }
+
+// REMOVED: Timestamp synchronization functions
+// These functions were causing more issues than they solved because they tried
+// to "fix" the original video's timestamps, which may be intentionally offset
+// or have specific timing characteristics that shouldn't be altered.

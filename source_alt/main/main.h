@@ -65,6 +65,7 @@ extern std::string generateTXTimecode(double time);
 extern void smooth_speed_change();
 extern void cleanup_audio(); // Defined in mainau.cpp? Needs confirmation.
 extern void log(const std::string& message); // Defined in main.cpp
+extern void takeCurrentFrameScreenshot(); // Function to take screenshot of current frame
 
 // Forward declare from other modules if needed globally
 class RemoteControl; // Forward declaration

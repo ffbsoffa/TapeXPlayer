@@ -1,32 +1,32 @@
 // source_alt/core/display/metal_renderer.cpp
 
-#ifdef __APPLE__ // Весь файл компилируется только на Apple
+#ifdef __APPLE__ // This entire file is compiled only on Apple
 
 #include "metal_renderer.h"
-#include <stdexcept> // Для исключений
+#include <stdexcept> // For exceptions
 #include <iostream>
 
-// Подключаем полные заголовки Metal здесь
+// Include full Metal headers here
 #import <Metal/Metal.h>
-#import <CoreVideo/CVMetalTextureCache.h> // Для функций кэша
-#import <SDL2/SDL_metal.h> // Для интеграции SDL и Metal
+#import <CoreVideo/CVMetalTextureCache.h> // For cache functions
+#import <SDL2/SDL_metal.h> // For SDL and Metal integration
 
-// Конструктор и деструктор
+// Constructor and destructor
 MetalRenderer::MetalRenderer() :
     device(nil),
     commandQueue(nil),
     renderPipelineState(nil),
-    textureCache(nullptr), // Используем nullptr для C-указателей
+    textureCache(nullptr), // Use nullptr for C pointers
     layer(nil),
     initialized(false)
 {}
 
 MetalRenderer::~MetalRenderer() {
-    // Очистка должна быть вызвана явно, но на всякий случай
+    // Cleanup should be called explicitly, but just in case
     cleanup();
 }
 
-// --- Реализация методов ---
+// --- Method implementation ---
 
 bool MetalRenderer::initialize(SDL_Renderer* sdlRenderer) {
     std::cout << "[MetalRenderer] Initializing..." << std::endl;
@@ -93,7 +93,7 @@ bool MetalRenderer::initialize(SDL_Renderer* sdlRenderer) {
 
 void MetalRenderer::cleanup() {
     std::cout << "[MetalRenderer] Cleaning up..." << std::endl;
-    // Освобождаем Obj-C объекты
+    // Release Obj-C objects
     if (renderPipelineState) {
         [renderPipelineState release];
         renderPipelineState = nil;
@@ -103,7 +103,7 @@ void MetalRenderer::cleanup() {
      //    vertexBuffer = nil;
      // }
     if (textureCache) {
-        CVMetalTextureCacheFlush(textureCache, 0); // Очищаем кэш перед освобождением
+        CVMetalTextureCacheFlush(textureCache, 0); // Flush cache before release
         CFRelease(textureCache);
         textureCache = nullptr;
     }
@@ -120,13 +120,13 @@ void MetalRenderer::cleanup() {
     std::cout << "[MetalRenderer] Cleanup complete." << std::endl;
 }
 
-// --- Приватные методы --- 
+// --- Private methods --- 
 
 bool MetalRenderer::setupRenderPipeline() {
     std::cout << "[MetalRenderer] Setting up Metal pipeline state..." << std::endl;
     if (!device) return false;
 
-    // --- Шейдеры --- 
+    // --- Shaders --- 
     const char* vertexShaderSource = R"(
         using namespace metal;
 
@@ -293,7 +293,7 @@ bool MetalRenderer::setupRenderPipeline() {
 //     return true;
 // }
 
-// --- Рендеринг --- 
+// --- Rendering --- 
 bool MetalRenderer::render(CVPixelBufferRef pixelBuffer, SDL_Renderer* sdlRenderer) {
 #ifdef __APPLE__
     if (!initialized || !pixelBuffer || !sdlRenderer) {

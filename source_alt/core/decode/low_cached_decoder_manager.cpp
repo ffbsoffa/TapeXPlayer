@@ -191,6 +191,9 @@ void LowCachedDecoderManager::decodingLoop() {
                      // } else { // directionChanged
                          // std::cout << "LowCachedDecoderManager: Direction changed. Forcing update." << std::endl;
                      // }
+                     
+                     // REMOVED: Timestamp repair - let original timestamps work naturally
+                     
                       std::set<int> targetSegments; 
                       targetSegments.insert(currentSegment);
                       if (isReverse_.load()) {

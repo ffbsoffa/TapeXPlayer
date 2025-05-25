@@ -255,3 +255,5 @@ void stop_jog();
 
 // Helper function to find the frame index closest to a given timestamp
 int findClosestFrameIndexByTime(const std::vector<FrameInfo>& frameIndex, int64_t target_ms);
+
+// REMOVED: Timestamp synchronization functions (caused more issues than they solved)

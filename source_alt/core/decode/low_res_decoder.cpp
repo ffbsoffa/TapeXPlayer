@@ -15,6 +15,8 @@
 #include <vector> // For storing ffprobe output lines
 #include <cstdlib> // For atof
 #include <functional> // For std::function
+#include <mach-o/dyld.h>
+#include <limits.h>
 
 #ifdef __APPLE__
 #include <libavutil/hwcontext.h> // For AV_HWDEVICE_TYPE_VIDEOTOOLBOX and related functions
@@ -289,15 +291,52 @@ bool LowResDecoder::convertToLowRes(const std::string& filename, std::string& ou
     double totalDuration = getVideoDuration(filename);
     if (totalDuration <= 0) {
         std::cerr << "Could not determine video duration. Progress reporting will be inaccurate." << std::endl;
-        // Proceed without accurate progress, or return false? For now, proceed.
     } else {
          std::cout << "Total video duration: " << totalDuration << " seconds." << std::endl;
     }
     // --- End Get Video Duration ---
 
+    // Find ffmpeg executable
+    std::string ffmpegPath;
+    
+    // First try system ffmpeg
+    FILE* which_ffmpeg = popen("which ffmpeg", "r");
+    if (which_ffmpeg) {
+        char path[1024];
+        if (fgets(path, sizeof(path), which_ffmpeg) != nullptr) {
+            // Remove trailing newline
+            path[strcspn(path, "\n")] = 0;
+            ffmpegPath = path;
+        }
+        pclose(which_ffmpeg);
+    }
+
+    // If system ffmpeg not found, try bundled ffmpeg
+    if (ffmpegPath.empty()) {
+        // Get the path to the app bundle's Resources directory
+        char pathbuf[PATH_MAX];
+        uint32_t bufsize = sizeof(pathbuf);
+        if (_NSGetExecutablePath(pathbuf, &bufsize) == 0) {
+            std::string exePath(pathbuf);
+            size_t lastSlash = exePath.find_last_of("/");
+            if (lastSlash != std::string::npos) {
+                std::string bundlePath = exePath.substr(0, lastSlash);
+                // Navigate up to Resources directory
+                ffmpegPath = bundlePath + "/../Resources/ffmpeg";
+                
+                // Check if bundled ffmpeg exists and is executable
+                if (!fs::exists(ffmpegPath) || access(ffmpegPath.c_str(), X_OK) != 0) {
+                    std::cerr << "Neither system nor bundled ffmpeg found!" << std::endl;
+                    return false;
+                }
+            }
+        }
+    }
+
+    std::cout << "Using ffmpeg from: " << ffmpegPath << std::endl;
 
     // Create FFmpeg command for low-res conversion without audio (-an)
-    std::string command = "ffmpeg -nostdin -y -i \"" + filename + "\" -vf \"scale=640:-2\" -c:v libx264 -profile:v baseline -preset medium -b:v 500k -an \"" + cachePath + "\" 2>&1";
+    std::string command = "\"" + ffmpegPath + "\" -nostdin -y -i \"" + filename + "\" -vf \"scale=640:-2\" -c:v libx264 -profile:v baseline -preset medium -b:v 500k -an \"" + cachePath + "\" 2>&1";
 
     FILE* pipe = popen(command.c_str(), "r");
     if (!pipe) {
@@ -305,82 +344,66 @@ bool LowResDecoder::convertToLowRes(const std::string& filename, std::string& ou
         return false;
     }
 
-    char buffer[256]; // Increased buffer size slightly
+    char buffer[256];
     std::string result = "";
-    std::string line_buffer = ""; // Buffer to accumulate lines
+    std::string line_buffer = "";
 
     // Read FFmpeg output to track progress
     while (true) {
         if (fgets(buffer, sizeof(buffer), pipe) == NULL) {
              if (feof(pipe)) {
-                 // End of file reached
                  break;
              } else {
-                 // Error reading from pipe
                  std::cerr << "Error reading FFmpeg output pipe." << std::endl;
-                 pclose(pipe); // Close the pipe before returning
-                 return false; // Indicate failure
+                 pclose(pipe);
+                 return false;
              }
          }
         
-        result += buffer; // Append to the complete result string
-        line_buffer += buffer; // Append to the current line buffer
+        result += buffer;
+        line_buffer += buffer;
 
-        // Process line by line (check for newline)
         size_t newline_pos;
         while ((newline_pos = line_buffer.find('\n')) != std::string::npos || (newline_pos = line_buffer.find('\r')) != std::string::npos) {
              std::string current_line = line_buffer.substr(0, newline_pos);
-             line_buffer.erase(0, newline_pos + 1); // Remove processed line (and newline)
+             line_buffer.erase(0, newline_pos + 1);
 
-            // Parse FFmpeg output to estimate progress
             if (progressCallback) {
                 size_t timePos = current_line.find("time=");
                  if (timePos != std::string::npos) {
-                    // Look for the end of the time string (space or end of string)
                      size_t timeEndPos = current_line.find_first_of(" \t", timePos + 5);
                      std::string timeStr;
                      if (timeEndPos != std::string::npos) {
                          timeStr = current_line.substr(timePos + 5, timeEndPos - (timePos + 5));
                      } else {
-                         timeStr = current_line.substr(timePos + 5); // Take rest of string
+                         timeStr = current_line.substr(timePos + 5);
                      }
 
-
-                    // Convert time to seconds
                     int hours = 0, minutes = 0;
-                    double seconds = 0.0; // Use double for seconds
-                    // Use sscanf which is readily available
+                    double seconds = 0.0;
                     int scanned_items = sscanf(timeStr.c_str(), "%d:%d:%lf", &hours, &minutes, &seconds);
 
-                    if (scanned_items == 3) { // Ensure all parts were scanned
+                    if (scanned_items == 3) {
                          double currentTime = hours * 3600.0 + minutes * 60.0 + seconds;
 
-                        // Calculate progress if duration is known
                         if (totalDuration > 0) {
-                            int progress = std::min(static_cast<int>((currentTime / totalDuration) * 100.0), 99); // Cap at 99% until complete
-                            if (progressCallback) { // Call callback if it's valid (not null)
+                            int progress = std::min(static_cast<int>((currentTime / totalDuration) * 100.0), 99);
+                            if (progressCallback) {
                                 progressCallback(progress);
                             }
-                            // Also print progress to stdout
                             std::cout << "Conversion Progress: " << progress << "%\r" << std::flush; 
-                         } else {
-                             // Optional: Provide some basic indication even without duration?
-                             // e.g., progressCallback(-1); // Indicate unknown progress
                          }
-                    } else {
-                        // std::cerr << "Warning: Could not parse time string: " << timeStr << std::endl;
                     }
                 }
             }
-        } // end while processing lines
-    } // end while reading pipe
+        }
+    }
 
     int status = pclose(pipe);
-    std::cout << std::endl; // Move to next line after progress updates
+    std::cout << std::endl;
     if (status != 0) {
         std::cerr << "FFmpeg command failed with status " << status << std::endl;
         std::cerr << "FFmpeg output:\n" << result << std::endl;
-        // Consider removing the partially created cache file on failure
         fs::remove(cachePath); 
         return false;
     }
@@ -388,9 +411,9 @@ bool LowResDecoder::convertToLowRes(const std::string& filename, std::string& ou
     outputFilename = cachePath;
 
     if (progressCallback) {
-        progressCallback(100); // Indicate completion via callback
+        progressCallback(100);
     }
-    std::cout << "Conversion Progress: 100%" << std::endl; // Final progress output to stdout
+    std::cout << "Conversion Progress: 100%" << std::endl;
 
     return true;
 }
@@ -597,10 +620,10 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex, int st
              av_buffer_unref(&hw_device_ctx_ref);
         }
         
-        std::cout << "[Thread " << threadId << "] Codec " << codec->name << " opened successfully. Initial pix_fmt: " 
-                  << (codecContext->pix_fmt != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(codecContext->pix_fmt) : "N/A") 
-                  << ". HWDevCtx: " << (codecContext->hw_device_ctx ? "Set" : "Not Set") 
-                  << std::endl;
+        // std::cout << "[Thread " << threadId << "] Codec " << codec->name << " opened successfully. Initial pix_fmt: " 
+        //           << (codecContext->pix_fmt != AV_PIX_FMT_NONE ? av_get_pix_fmt_name(codecContext->pix_fmt) : "N/A") 
+        //           << ". HWDevCtx: " << (codecContext->hw_device_ctx ? "Set" : "Not Set") 
+        //           << std::endl;
 
         AVRational timeBase = formatContext->streams[videoStream]->time_base;
         int64_t fileStartTime = (formatContext->streams[videoStream]->start_time != AV_NOPTS_VALUE) ? formatContext->streams[videoStream]->start_time : 0;
@@ -624,7 +647,9 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex, int st
                  avcodec_flush_buffers(codecContext);
             } else {
                  avcodec_flush_buffers(codecContext); // Flush after successful seek too
-                 std::cout << "[Thread " << threadId << "] Seek successful to approx " << seekTargetTimeMs << " ms" << std::endl;
+                 // std::cout << "[Thread " << threadId << "] Seek successful to approx " << seekTargetTimeMs << " ms" << std::endl;
+                 
+                 // REMOVED: Timestamp repair - let original timestamps work naturally
             }
         } else {
             std::cerr << "[Thread " << threadId << "] Warning: No valid timestamp found in range [" << threadStartFrame << ", " << threadEndFrame << "] for seeking. Starting decode from beginning of stream for this thread." << std::endl;
@@ -681,18 +706,30 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex, int st
                     // Log frame format only once per thread after successful receive?
                     static bool format_logged = false;
                     if (!format_logged) {
-                         std::cout << "[Thread " << threadId << "] Received frame format: "
-                                   << (frame->format != -1 ? av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format)) : "UNKNOWN/NONE")
-                                   << ", width: " << frame->width << ", height: " << frame->height << std::endl;
+                       //  std::cout << "[Thread " << threadId << "] Received frame format: "
+                       //             << (frame->format != -1 ? av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format)) : "UNKNOWN/NONE")
+                       //             << ", width: " << frame->width << ", height: " << frame->height << std::endl;
                          format_logged = true;
                     }
 
-                    // --- Frame Timing Calculation (Remains the same) ---
+                    // --- Frame Timing Calculation (FIXED: Consistent with other decoders) ---
                     int64_t framePts = frame->best_effort_timestamp;
                     if (framePts == AV_NOPTS_VALUE) framePts = frame->pts;
-                    int64_t frameTimeMs = (framePts != AV_NOPTS_VALUE)
-                                          ? av_rescale_q(framePts, timeBase, {1, 1000})
-                                          : -1;
+
+                    // Enhanced frame timing calculation with microsecond precision
+                    int64_t frameTimeMs = -1;
+                    if (framePts != AV_NOPTS_VALUE) {
+                        // Convert to microseconds for maximum precision
+                        int64_t pts_us = av_rescale_q(framePts, timeBase, {1, 1000000});
+                        int64_t start_us = (fileStartTime != AV_NOPTS_VALUE) ?
+                            av_rescale_q(fileStartTime, timeBase, {1, 1000000}) : 0;
+                        
+                        // Calculate relative time in microseconds
+                        int64_t relative_us = pts_us - start_us;
+                        
+                        // Convert to milliseconds with proper rounding
+                        frameTimeMs = (relative_us + 500) / 1000;
+                    }
                     // --- End Frame Timing Calculation ---
 
                     // --- Frame Storage Logic (Refined to reduce lock scope) ---
@@ -713,7 +750,10 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex, int st
                             frameIndex[currentFrame].low_res_frame = std::shared_ptr<AVFrame>(cloned_av_frame, [](AVFrame* f) { av_frame_free(&f); });
                             frameIndex[currentFrame].pts = framePts;
                             frameIndex[currentFrame].relative_pts = framePts - fileStartTime;
-                            frameIndex[currentFrame].time_ms = frameTimeMs; // <<<< USER SUGGESTION: Comment out this line
+                            // Ensure time_ms is properly set from the actual decoded frame, similar to other decoders
+                            if (frameTimeMs >= 0) {
+                                frameIndex[currentFrame].time_ms = frameTimeMs;
+                            }
                             frameIndex[currentFrame].time_base = timeBase;
                             frameIndex[currentFrame].type = FrameInfo::LOW_RES;
 
@@ -768,7 +808,7 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex, int st
         if (formatContext) {
              avformat_close_input(&formatContext);
         }
-        std::cout << "[Thread " << threadId << "] Segment processing finished." << std::endl;
+        // std::cout << "[Thread " << threadId << "] Segment processing finished." << std::endl;
     };
 
     int totalFramesInRange = endFrame - startFrame + 1;

@@ -1,5 +1,5 @@
 #include "remote_control.h"
-#include "common.h"  // Добавляем явное включение common.h
+#include "common.h"  // Add explicit include of common.h
 #include <iostream>
 #include <cstring>
 #include <algorithm>

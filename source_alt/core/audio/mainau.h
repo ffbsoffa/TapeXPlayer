@@ -22,5 +22,10 @@ extern void seek_to_time(double target_time);
 extern void increase_volume();
 extern void decrease_volume();
 
+// Timecode functions
+extern std::string generateTXTimecode(double time);
+extern std::string format_time(double time_in_seconds, int fps);
+extern double parse_timecode(const std::string& timecode);
+
 // Global variables
 extern std::atomic<int> selected_audio_device_index; 

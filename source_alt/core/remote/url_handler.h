@@ -7,33 +7,33 @@
 #include <iomanip> // Required for parseFstpUrl (potentially for logging or advanced parsing)
 #include <stdexcept> // Required for parseFstpUrl (std::stoi exceptions)
 
-// Структура для распарсенного URL
+// Structure for parsed URL
 struct ParsedFstpUrl {
     std::string videoPath;
-    double timeInSeconds = -1.0; // -1.0 если время не указано
+    double timeInSeconds = -1.0; // -1.0 if time is not specified
     bool isValid = false;
-    std::string originalUrl; // Для логирования
+    std::string originalUrl; // For logging
 };
 
-// Вспомогательная функция для URL-декодирования
+// Helper function for URL decoding
 std::string urlDecode(const std::string& encoded_string);
 
-// Функция парсинга URL fstp://
-// Примечание: original_fps используется для расчета времени из кадров. 
-// Если он недоступен в момент парсинга, передайте <= 0.
+// Function for parsing fstp:// URL
+// Note: original_fps is used to calculate time from frames.
+// If it's not available at parsing time, pass <= 0.
 ParsedFstpUrl parseFstpUrl(const std::string& url_arg, double current_original_fps);
 
-// Основная функция для обработки URL-аргумента
-// Возвращает true, если URL-аргумент был fstp схемой и был обработан (даже если парсинг не удался).
-// Возвращает false, если это не fstp URL.
+// Main function for processing URL argument
+// Returns true if URL argument was fstp scheme and was processed (even if parsing failed).
+// Returns false if this is not an fstp URL.
 // 
-// @param url_arg: Полная строка URL (например, "fstp:///path/to/video&t=00102000")
-// @param currentOpenFilePath: Полный путь к текущему открытому видеофайлу. Пустая строка, если файл не открыт.
-// @param current_original_fps: FPS текущего видео (для парсинга времени из кадров в URL).
-// @param outVideoPath: Сюда будет записан декодированный путь к видео из URL.
-// @param outTimeToSeek: Сюда будет записано время для перемотки в секундах (-1.0 если нет).
-// @param shouldOpenFile: Установится в true, если нужно открыть файл (путь отличается от currentOpenFilePath или currentOpenFilePath пуст).
-// @param shouldSeek: Установится в true, если в URL указано валидное время и либо открывается новый файл, либо текущий файл совпадает.
+// @param url_arg: Full URL string (e.g., "fstp:///path/to/video&t=00102000")
+// @param currentOpenFilePath: Full path to currently open video file. Empty string if no file is open.
+// @param current_original_fps: FPS of current video (for parsing time from frames in URL).
+// @param outVideoPath: Decoded video path from URL will be written here.
+// @param outTimeToSeek: Time to seek in seconds will be written here (-1.0 if none).
+// @param shouldOpenFile: Will be set to true if file needs to be opened (path differs from currentOpenFilePath or currentOpenFilePath is empty).
+// @param shouldSeek: Will be set to true if URL contains valid time and either opening new file or current file matches.
 bool handleFstpUrlArgument(const std::string& url_arg,
                            const std::string& currentOpenFilePath,
                            double current_original_fps,

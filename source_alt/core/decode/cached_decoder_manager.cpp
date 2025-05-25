@@ -18,7 +18,7 @@ CachedDecoderManager::CachedDecoderManager(
     frameIndex_(frameIndex),
     currentFrame_(currentFrame),
     isReverse_(isReverseRef),
-    segmentSize_(segmentSize > 0 ? segmentSize : 10000),
+    segmentSize_(segmentSize > 0 ? segmentSize : 14000),
     stopRequested_(false),
     isRunning_(false),
     previousSegment_(-1),
@@ -27,7 +27,7 @@ CachedDecoderManager::CachedDecoderManager(
 {
     // std::cout << "CachedDecoderManager: Initializing..." << std::endl;
     // Calculate preload threshold (e.g., 75% of segment size)
-    preloadThreshold_ = static_cast<int>(segmentSize_ * 0.75);
+    preloadThreshold_ = static_cast<int>(segmentSize_ * 0.65);
 
     // Create the CachedDecoder instance
     try {

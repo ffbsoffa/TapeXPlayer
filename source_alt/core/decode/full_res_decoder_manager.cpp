@@ -254,6 +254,8 @@ void FullResDecoderManager::decodingLoop() {
             int highResStart = std::max(0, currentFrame - sizeBehind);
             int highResEnd = std::min(static_cast<int>(frameIndex_.size()) - 1, currentFrame + sizeAhead);
             
+            // REMOVED: Timestamp repair - let original timestamps work naturally
+            
             // Decode if high-res conditions are met AND (
             //   current frame changed OR
             //   we just returned to high-res mode OR
