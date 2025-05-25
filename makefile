@@ -137,6 +137,27 @@ DYLIB_PATTERNS_TO_BUNDLE = \
 		libcrypto.3 \
 		libGLEW
 
+# Add ffmpeg binary location variables
+X86_FFMPEG = $(X86_PREFIX)/bin/ffmpeg
+ARM_FFMPEG = $(ARM_PREFIX)/bin/ffmpeg
+
+# Define a helper function for copying ffmpeg
+define copy_ffmpeg
+	@echo "Copying ffmpeg to bundle..."
+	if [ -f "$(X86_FFMPEG)" ] && [ -f "$(ARM_FFMPEG)" ]; then \
+		echo "Creating universal ffmpeg binary..."; \
+		lipo -create -output "./$(APP_BUNDLE_DIR)/$(RESOURCES_DIR_REL)/ffmpeg" "$(X86_FFMPEG)" "$(ARM_FFMPEG)"; \
+	elif [ -f "$(X86_FFMPEG)" ]; then \
+		echo "Copying x86_64 ffmpeg..."; \
+		cp "$(X86_FFMPEG)" "./$(APP_BUNDLE_DIR)/$(RESOURCES_DIR_REL)/ffmpeg"; \
+	elif [ -f "$(ARM_FFMPEG)" ]; then \
+		echo "Copying arm64 ffmpeg..."; \
+		cp "$(ARM_FFMPEG)" "./$(APP_BUNDLE_DIR)/$(RESOURCES_DIR_REL)/ffmpeg"; \
+	else \
+		echo "Warning: ffmpeg not found in either $(X86_FFMPEG) or $(ARM_FFMPEG)"; \
+	fi
+endef
+
 # Define a helper function (multi-line variable) for processing each dylib
 # Args: $(1)=pattern, $(2)=exec_path_in_bundle, $(3)=frameworks_dir_in_bundle
 define process_dylib
@@ -219,6 +240,12 @@ bundle: $(UNIVERSAL_TARGET)
 		$(call process_dylib,$$_pattern_loop_var,$$_SHELL_CURRENT_EXEC_PATH_,$$_SHELL_CURRENT_FW_PATH_); \
 	done; \
 	echo "--- Dylib processing finished ---"
+
+	# Copy ffmpeg to Resources
+	$(call copy_ffmpeg)
+
+	# Make ffmpeg executable
+	chmod +x "./$(APP_BUNDLE_DIR)/$(RESOURCES_DIR_REL)/ffmpeg"
 
 	# Сюда можно добавить копирование других ресурсов, например, иконки
 	if [ -f "TapeXPlayer.icns" ]; then \
