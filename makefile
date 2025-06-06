@@ -285,5 +285,5 @@ clean:
 	@rm -rf obj "./$(APP_BUNDLE_DIR)"
 	@echo "Cleanup complete."
 
-export MACOSX_DEPLOYMENT_TARGET=14.3
+export MACOSX_DEPLOYMENT_TARGET=10.15
 export SDKROOT=$(shell xcrun --show-sdk-path)

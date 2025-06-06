@@ -344,20 +344,34 @@ bool FullResDecoder::isHardwareAccelerated() const {
 bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame) {
     std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange ENTERED. File: " << sourceFilename_ << " Range: [" << startFrame << "-" << endFrame <<"] hw_failed_flag is: " << hw_irrecoverably_failed_.load() << std::endl;
     stop_requested_ = false;
+    is_decoding_ = true; // Mark that we're actively decoding
 
+    // Check if HW failed but enough time has passed to retry (5 seconds)
     if (hw_irrecoverably_failed_.load()) {
-        std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange Error: HW irrecoverably failed previously. FLAG IS TRUE. ABORTING for " << sourceFilename_ << std::endl;
-        return false;
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - hw_failure_time_).count();
+        
+        if (elapsed >= 5) {
+            std::cout << "[FullResDecoder] " << elapsed << " seconds passed since HW failure. Attempting to reset and retry." << std::endl;
+            hw_irrecoverably_failed_ = false;
+            // Continue with decoding attempt
+        } else {
+            std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange Error: HW failed " << elapsed << " seconds ago (need 5s before retry). ABORTING for " << sourceFilename_ << std::endl;
+            is_decoding_ = false; // Clear decoding flag
+            return false;
+        }
     }
 
     auto function_start_time = std::chrono::high_resolution_clock::now();
     if (!initialized_ || !formatCtx_ || !codecCtx_ || videoStreamIndex_ < 0) {
         std::cerr << "FullResDecoder::decodeFrameRange Error: Decoder not initialized." << std::endl;
+        is_decoding_ = false; // Clear decoding flag
         return false;
     }
 
     if (frameIndex.empty()) {
         std::cerr << "FullResDecoder::decodeFrameRange Warning: Frame index is empty." << std::endl;
+        is_decoding_ = false; // Clear decoding flag
         return true; // Nothing to do
     }
 
@@ -367,6 +381,7 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
 
     if (startFrame > endFrame) {
          std::cerr << "FullResDecoder::decodeFrameRange Error: Invalid frame range requested after clamping (" << startFrame << " - " << endFrame << ")" << std::endl;
+         is_decoding_ = false; // Clear decoding flag
          return false;
     }
 
@@ -421,6 +436,7 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
         std::cerr << "FullResDecoder::decodeFrameRange Error: Failed to allocate packet or frame." << std::endl;
         av_packet_free(&packet);
         av_frame_free(&frame);
+        is_decoding_ = false; // Clear decoding flag
         return false;
     }
 
@@ -441,16 +457,21 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
                 //         hw_irrecoverably_failed_ = true;
                 //     }
                 // }
-                // --- NEW AGGRESSIVE CHECK ---
+                // --- LESS AGGRESSIVE CHECK ---
                 if (ret != AVERROR(EAGAIN)) { // Still ignore EAGAIN
                     std::cerr << "FullResDecoder::decodeFrameRange Warning: Error sending packet: " << av_err2str(ret) << " (code: " << ret << ") for " << sourceFilename_ << std::endl;
                     if (hw_accel_enabled_) {
-                        std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange: AGGRESSIVE CHECK - Marking HW as irrecoverably failed due to ANY critical send_packet error." << std::endl;
-                        hw_irrecoverably_failed_ = true;
-                        std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange hw_failed_flag SET TO TRUE after send_packet error." << std::endl;
+                        // Only mark as irrecoverably failed for specific critical errors
+                        if (ret == AVERROR_INVALIDDATA || ret == AVERROR_EXTERNAL || ret == AVERROR_UNKNOWN || ret == AVERROR_PATCHWELCOME) {
+                            std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange: Marking HW as irrecoverably failed due to critical send_packet error: " << ret << std::endl;
+                            hw_irrecoverably_failed_ = true;
+                            hw_failure_time_ = std::chrono::steady_clock::now(); // Record failure time
+                            std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange hw_failed_flag SET TO TRUE after critical send_packet error." << std::endl;
+                        }
+                        // For other errors, just log and continue - might be temporary
                     }
                 }
-                // --- END NEW AGGRESSIVE CHECK ---
+                // --- END LESS AGGRESSIVE CHECK ---
                     av_packet_unref(packet);
                     if (hw_irrecoverably_failed_.load()) { success = false; goto decode_loop_end; } // Exit if HW failed
                     continue;
@@ -471,16 +492,21 @@ bool FullResDecoder::decodeFrameRange(std::vector<FrameInfo>& frameIndex, int st
                     //     }
                     // success = false; 
                     // goto decode_loop_end;
-                    // --- NEW AGGRESSIVE CHECK ---
+                    // --- LESS AGGRESSIVE CHECK ---
                     std::cerr << "FullResDecoder::decodeFrameRange Error: Error receiving frame: " << av_err2str(ret) << " (code: " << ret << ") for " << sourceFilename_ << std::endl;
                     if (hw_accel_enabled_) {
-                         std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange: AGGRESSIVE CHECK - Marking HW as irrecoverably failed due to ANY critical receive_frame error." << std::endl;
-                         hw_irrecoverably_failed_ = true;
-                         std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange hw_failed_flag SET TO TRUE after receive_frame error." << std::endl;
+                        // Only mark as irrecoverably failed for specific critical errors
+                        if (ret == AVERROR_INVALIDDATA || ret == AVERROR_EXTERNAL || ret == AVERROR_UNKNOWN || ret == AVERROR_PATCHWELCOME) {
+                            std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange: Marking HW as irrecoverably failed due to critical receive_frame error: " << ret << std::endl;
+                            hw_irrecoverably_failed_ = true;
+                            hw_failure_time_ = std::chrono::steady_clock::now(); // Record failure time
+                            std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange hw_failed_flag SET TO TRUE after critical receive_frame error." << std::endl;
+                        }
+                        // For other errors, might be temporary - try to continue
                     }
                     success = false; 
-                        goto decode_loop_end;
-                    // --- END NEW AGGRESSIVE CHECK ---
+                    goto decode_loop_end;
+                    // --- END LESS AGGRESSIVE CHECK ---
                 }
 
                 // --- Frame Identification & Storage ---
@@ -579,6 +605,15 @@ decode_loop_end:
     if (hw_irrecoverably_failed_.load()) {
          std::cerr << "[FullResDecoder TID:" << std::this_thread::get_id() << "] decodeFrameRange EXITING due to hw_failed_flag=true for " << sourceFilename_ << std::endl;
     }
+    
+    // Clear decoding flag and flush buffers if stop was requested
+    is_decoding_ = false;
+    if (stop_requested_.load() && codecCtx_ && codecCtx_->codec && codecCtx_->codec_id != AV_CODEC_ID_NONE) {
+        // Now it's safe to flush buffers after decoding is done
+        avcodec_flush_buffers(codecCtx_);
+        stop_requested_ = false; // Reset stop flag
+    }
+    
     return success; // Indicate operation completed (or if errors occurred)
 }
 
@@ -661,7 +696,15 @@ float FullResDecoder::getDisplayAspectRatio() const {
 
 // --- Public method to request stop --- 
 void FullResDecoder::requestStop() {
+    // Set the stop flag first
     stop_requested_ = true;
+    
+    // DO NOT flush buffers here - it can cause VideoToolbox to enter invalid state
+    // if called during active decoding. The buffers will be flushed when needed
+    // (e.g., before the next decode operation or during cleanup)
+    
+    // Note: We don't close formatCtx_ or codecCtx_ here anymore
+    // They will be properly cleaned up in the destructor
 }
 
 // --- ADDED: Implementation for checking irrecoverable HW failure ---
@@ -669,4 +712,11 @@ bool FullResDecoder::hasHardwareFailedIrrecoverably() const {
     // Added log to see when this is called
     std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] hasHardwareFailedIrrecoverably() CALLED. Returning: " << hw_irrecoverably_failed_.load() << " for " << sourceFilename_ << std::endl;
     return hw_irrecoverably_failed_.load();
+}
+
+// --- ADDED: Implementation for resetting HW failure flag ---
+void FullResDecoder::resetHardwareFailureFlag() {
+    std::cout << "[FullResDecoder TID:" << std::this_thread::get_id() << "] resetHardwareFailureFlag() CALLED. Resetting hw_irrecoverably_failed_ flag for " << sourceFilename_ << std::endl;
+    hw_irrecoverably_failed_ = false;
+    stop_requested_ = false;  // Also reset stop flag to allow retry
 } 

@@ -21,6 +21,7 @@ extern "C" {
 #include <map>
 #include <limits> // Needed for std::numeric_limits
 #include <cstring> // For strerror
+#include <algorithm> // For std::remove
 
 // Headers for mmap and file operations
 #include <sys/mman.h>
@@ -75,9 +76,9 @@ std::vector<std::string> get_audio_output_devices();
 
 void smooth_speed_change() {
     const double normal_step = 2.0;
-    const double pause_step = 1.0; // Still needed for pausing interpolation
+    const double pause_step = 2.0; // Still needed for pausing interpolation
     const int normal_interval = 14; // Re-add missing constant
-    const int pause_interval = 4;  // Still needed for pausing interpolation
+    const int pause_interval = 14;  // Still needed for pausing interpolation
 
     // --- Base Overshoot Curve Parameters (for scaling) ---
     const double baseOvershootTotalDurationMs = 350.0;
@@ -287,33 +288,42 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
     (void) statusFlags;
     (void) userData;
 
+    static double beep_phase = 0.0;
+    static int beep_counter = 0;
+    
     // Get mmap pointer and decoded count (check if ready)
-    const int16_t* current_read_ptr = audio_read_ptr; // Get current pointer atomically? No, ptr setup is mutexed.
-    size_t current_total_samples = audio_total_samples; // Get total expected size
+    const int16_t* current_read_ptr = audio_read_ptr;
+    size_t current_total_samples = audio_total_samples;
     size_t available_samples = audio_decoded_samples_count.load(std::memory_order_acquire);
+    double rate = playback_rate.load();
+    double target_rate = target_playback_rate.load();
+    
+    // Check boundaries based on target rate instead of current rate
+    const bool is_at_start = (audio_buffer_index <= 0.1) && std::abs(target_rate) >= 1.5;
+    const bool is_at_end = (audio_buffer_index >= ((available_samples / 2) - 1)) && std::abs(target_rate) >= 1.5;
+    const bool is_at_boundary = is_at_start || is_at_end;
 
     // If mmap not ready or no samples available/decoded yet, output silence
     if (current_read_ptr == nullptr || current_total_samples == 0) {
-        for (unsigned int i = 0; i < framesPerBuffer * 2; ++i) { // Assuming stereo
+        for (unsigned int i = 0; i < framesPerBuffer * 2; ++i) {
             *out++ = 0.0f;
         }
         return paContinue;
     }
 
-    // Get playback state
-    double rate = playback_rate.load();
-    if (std::abs(rate) < 0.001) { // Paused state
-        for (unsigned int i = 0; i < framesPerBuffer * 2; ++i) { // Assuming stereo
+    // Check for pause state
+    if (std::abs(rate) < 0.001) {
+        for (unsigned int i = 0; i < framesPerBuffer * 2; ++i) {
             *out++ = 0.0f;
         }
         return paContinue;
     }
 
     float current_volume = volume.load();
-    double current_position = audio_buffer_index; // Local copy for this callback run
+    double current_position = audio_buffer_index;
     bool reverse = is_reverse.load();
-    int current_channels = 2; // Assuming stereo - TODO: get from variable?
-    size_t buffer_num_sample_pairs = current_total_samples / current_channels; // Total number of sample pairs expected
+    int current_channels = 2;
+    size_t buffer_num_sample_pairs = current_total_samples / current_channels;
 
     // Helper function for converting int16_t sample to float
     auto int16_to_float = [](int16_t sample) -> float {
@@ -335,88 +345,84 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
     };
 
     for (unsigned int i = 0; i < framesPerBuffer; i++) {
+        float left_sample = 0.0f;
+        float right_sample = 0.0f;
+
+        // Generate beep if at boundary - independent of main volume
+        if (is_at_boundary) {
+            beep_counter++;
+            if (beep_counter < sample_rate.load() * 0.048) { // 48ms on
+                beep_phase += 2.0 * M_PI * 2000.0 / sample_rate.load();
+                if (beep_phase >= 2.0 * M_PI) beep_phase -= 2.0 * M_PI;
+                // 0.02 amplitude = -34 dB
+                const float beep_volume = 0.02f;
+                float beep = sinf(beep_phase) * beep_volume;
+                // Add beep directly to output, will not be affected by main volume
+                *out++ = beep;
+                *out++ = beep;
+                continue; // Skip normal audio processing when beeping
+            } else if (beep_counter >= sample_rate.load() * 0.096) { // Reset after 96ms (48ms on + 48ms off)
+                beep_counter = 0;
+            }
+        } else {
+            beep_counter = 0;
+            beep_phase = 0.0;
+        }
+
+        // Normal audio processing
         // --- Calculate next position --- 
         if (reverse) {
-             current_position -= rate;
-             // Wrap around or clamp at beginning
-             while (current_position < 0.0 && buffer_num_sample_pairs > 0) current_position += buffer_num_sample_pairs; 
-             current_position = std::max(0.0, current_position); // Clamp lower bound
+            current_position -= rate;
+            current_position = std::max(0.0, current_position);
         } else {
-             current_position += rate;
-             // Check against *available* samples for forward playback limit before wrapping
-             size_t available_pairs = available_samples / current_channels;
-             if (available_pairs > 0 && current_position >= static_cast<double>(available_pairs)) {
-                 // Reached end of currently decoded data, clamp or wrap?
-                 // Clamping might be safer to avoid reading potentially unwritten data if wrap calculation is imperfect
-                 current_position = std::max(0.0, static_cast<double>(available_pairs - 1)); // Clamp to last available pair
-                 // Or wrap: 
-                 // while (current_position >= static_cast<double>(available_pairs) && available_pairs > 0) current_position -= available_pairs;
-             }
-             // Prevent going beyond the *total* expected pairs, even if wrapped/clamped
-             if (buffer_num_sample_pairs > 0) {
-                  current_position = std::min(current_position, static_cast<double>(buffer_num_sample_pairs - 1));
-             }
+            current_position += rate;
+            size_t available_pairs = available_samples / current_channels;
+            if (available_pairs > 0) {
+                current_position = std::min(current_position, static_cast<double>(available_pairs - 1));
+            }
         }
-        
-        // --- Check Data Availability and Interpolate --- 
-        size_t index1 = static_cast<size_t>(current_position); // Integer part of position (sample pair index)
-        float frac = static_cast<float>(current_position - index1); // Fractional part
 
-        // Determine sample pair indices needed for interpolation
-        // Ensure indices stay within the bounds of a valid size_t
+        // --- Check Data Availability and Interpolate --- 
+        size_t index1 = static_cast<size_t>(current_position);
+        float frac = static_cast<float>(current_position - index1);
+
         size_t idx_pair0_rel = (index1 >= 1) ? index1 - 1 : 0;
         size_t idx_pair1_rel = index1;
         size_t idx_pair2_rel = index1 + 1;
         size_t idx_pair3_rel = index1 + 2;
 
-        // Convert to absolute *sample* indices for the int16_t buffer
         size_t max_needed_abs_sample_index = idx_pair3_rel * current_channels + (current_channels - 1);
 
-        // *** CRUCIAL CHECK: Are all needed samples already decoded? ***
-        // Also check if indices are within the *total* expected bounds
-        if (idx_pair3_rel < buffer_num_sample_pairs && // Ensure highest pair index is within total bounds
-            max_needed_abs_sample_index < available_samples) // Ensure highest sample index is within *decoded* bounds
-        { 
-            // Indices are valid and data is available - proceed with interpolation
-
-            // Calculate absolute sample indices
+        if (idx_pair3_rel < buffer_num_sample_pairs && max_needed_abs_sample_index < available_samples) {
             size_t abs_idx0 = idx_pair0_rel * current_channels;
             size_t abs_idx1 = idx_pair1_rel * current_channels;
             size_t abs_idx2 = idx_pair2_rel * current_channels;
             size_t abs_idx3 = idx_pair3_rel * current_channels;
 
-            // Get the 4 points (int16_t) for interpolation from mmap
-            // Left channel
             int16_t sL0 = current_read_ptr[abs_idx0];
             int16_t sL1 = current_read_ptr[abs_idx1];
             int16_t sL2 = current_read_ptr[abs_idx2];
             int16_t sL3 = current_read_ptr[abs_idx3];
-            // Right channel (index + 1)
             int16_t sR0 = current_read_ptr[abs_idx0 + 1];
             int16_t sR1 = current_read_ptr[abs_idx1 + 1];
             int16_t sR2 = current_read_ptr[abs_idx2 + 1];
             int16_t sR3 = current_read_ptr[abs_idx3 + 1];
 
-            // Convert points to float (using existing helper)
             float yL0 = int16_to_float(sL0); float yL1 = int16_to_float(sL1);
             float yL2 = int16_to_float(sL2); float yL3 = int16_to_float(sL3);
             float yR0 = int16_to_float(sR0); float yR1 = int16_to_float(sR1);
             float yR2 = int16_to_float(sR2); float yR3 = int16_to_float(sR3);
 
-            // Interpolate (using existing helper)
             float interpolated_left = interpolate_catmull_rom(yL0, yL1, yL2, yL3, frac);
             float interpolated_right = interpolate_catmull_rom(yR0, yR1, yR2, yR3, frac);
 
-             // Apply volume and output
-            *out++ = interpolated_left * current_volume;
-            *out++ = interpolated_right * current_volume;
-
-        } else {
-            // Data not yet available or too close to edge (within total bounds), output silence
-            *out++ = 0.0f;
-            *out++ = 0.0f;
+            left_sample = interpolated_left;
+            right_sample = interpolated_right;
         }
-        // --- End Check and Interpolate ---
+
+        // Apply main volume only to normal audio
+        *out++ = left_sample * current_volume;
+        *out++ = right_sample * current_volume;
     }
 
     // Store the final position back to the global variable
@@ -428,16 +434,15 @@ static int patestCallback(const void *inputBuffer, void *outputBuffer,
         double time_per_sample_pair = 1.0 / current_sample_rate;
         double elapsed_time = audio_buffer_index * time_per_sample_pair; 
         
-        // Clamp time to total duration if known (using total_duration global)
-        double total_dur = total_duration.load(); // Get the total duration set elsewhere
+        // Clamp time to total duration if known
+        double total_dur = total_duration.load();
         if (total_dur > 0) {
-             elapsed_time = std::min(elapsed_time, total_dur - 0.01); // Prevent exceeding total duration slightly
+            elapsed_time = std::min(elapsed_time, total_dur - 0.01);
         }
-        elapsed_time = std::max(0.0, elapsed_time); // Ensure non-negative
+        elapsed_time = std::max(0.0, elapsed_time);
         
         current_audio_time.store(elapsed_time, std::memory_order_release);
     }
-    // --- End Time Update --- 
 
     return paContinue;
 }
@@ -529,11 +534,13 @@ void decode_audio(const char* filename) {
              throw std::runtime_error("Could not determine audio duration/parameters for mmap.");
         }
 
-        audio_total_samples = static_cast<size_t>(duration_sec * current_sample_rate * current_channels + 0.5); // +0.5 for rounding
+        // Add 10% safety margin to the calculated size
+        double duration_with_margin = duration_sec * 1.1; // Add 10% margin
+        audio_total_samples = static_cast<size_t>(duration_with_margin * current_sample_rate * current_channels + 0.5); // +0.5 for rounding
         audio_total_bytes = audio_total_samples * sizeof(int16_t);
         sample_rate.store(current_sample_rate);
 
-        std::cout << "Estimated duration: " << duration_sec << "s, Sample Rate: " << current_sample_rate << " Hz, Channels: " << current_channels << std::endl;
+        std::cout << "Estimated duration: " << duration_sec << "s (with 10% margin: " << duration_with_margin << "s), Sample Rate: " << current_sample_rate << " Hz, Channels: " << current_channels << std::endl;
         std::cout << "Calculated total size: " << audio_total_samples << " samples, " << audio_total_bytes / (1024.0*1024.0) << " MB." << std::endl;
 
         char temp_filename_template[] = "/tmp/tapexplayer_audio_XXXXXX";
@@ -594,7 +601,10 @@ void decode_audio(const char* filename) {
 
                     // Check if write would exceed total allocated size
                     if (current_write_offset + frame->nb_samples * current_channels > audio_total_samples) {
-                        std::cerr << "Warning: Decoded samples exceed estimated file size. Stopping decode prematurely." << std::endl;
+                        std::cerr << "Warning: Decoded samples exceed estimated file size. Current offset: " << current_write_offset 
+                                 << ", Frame samples: " << frame->nb_samples * current_channels
+                                 << ", Total allocated: " << audio_total_samples 
+                                 << ". Stopping decode prematurely." << std::endl;
                         ret = AVERROR_EOF; // Force loop exit
                         break;
                     }
@@ -996,19 +1006,32 @@ std::string generateTXTimecode(double time) {
     double fps = original_fps.load();
     double total_dur = total_duration.load();
 
+    // Safety check for fps - use 25 fps as a safe default if fps is 0 or negative
+    if (fps <= 0.0) {
+        fps = 25.0;
+    }
+
     // Hard limit time to file duration
     time = std::min(std::max(time, 0.0), total_dur);
 
-    int64_t total_frames = static_cast<int64_t>(std::round(time * fps));
-    int64_t max_frames = static_cast<int64_t>(std::floor(total_dur * fps));
-
-    // Hard limit frame count
-    total_frames = std::min(total_frames, max_frames);
-
-    int hours = static_cast<int>(total_frames / (3600 * fps));
-    int minutes = static_cast<int>((total_frames / (60 * fps))) % 60;
-    int seconds = static_cast<int>((total_frames / fps)) % 60;
-    int frames = static_cast<int>(total_frames % static_cast<int64_t>(std::round(fps)));
+    // Direct calculation from time to components
+    int hours = static_cast<int>(time / 3600.0);
+    time -= hours * 3600.0;
+    
+    int minutes = static_cast<int>(time / 60.0);
+    time -= minutes * 60.0;
+    
+    int seconds = static_cast<int>(time);
+    double fractional_seconds = time - seconds;
+    
+    // Calculate frames from fractional seconds
+    int frames = static_cast<int>(fractional_seconds * fps);
+    
+    // Ensure frames are within valid range [0, fps-1]
+    // This handles rounding errors
+    if (frames >= static_cast<int>(fps)) {
+        frames = static_cast<int>(fps) - 1;
+    }
 
     std::ostringstream oss;
     oss << std::setfill('0') << std::setw(2) << hours << ":"
@@ -1145,7 +1168,15 @@ void seek_to_time(double target_time) {
 }
 
 double parse_timecode(const std::string& timecode) {
-    std::string padded_timecode = timecode + std::string(8 - timecode.length(), '0');
+    // Pad with leading zeros if less than 8 characters (standard timecode behavior)
+    std::string padded_timecode = timecode;
+    if (padded_timecode.length() < 8) {
+        padded_timecode = std::string(8 - padded_timecode.length(), '0') + padded_timecode;
+    }
+    // Truncate if more than 8 characters
+    if (padded_timecode.length() > 8) {
+        padded_timecode = padded_timecode.substr(0, 8);
+    }
 
     int hours = std::stoi(padded_timecode.substr(0, 2));
     int minutes = std::stoi(padded_timecode.substr(2, 2));
@@ -1161,7 +1192,13 @@ double parse_timecode(const std::string& timecode) {
         throw std::runtime_error("Invalid timecode: frames exceed FPS");
     }
 
-    return hours * 3600.0 + minutes * 60.0 + seconds + frames / fps;
+    double result = hours * 3600.0 + minutes * 60.0 + seconds + frames / fps;
+    
+    std::cout << "[parse_timecode] Input: \"" << timecode << "\" -> Padded: \"" << padded_timecode 
+              << "\" -> " << hours << ":" << minutes << ":" << seconds << ":" << frames 
+              << " (FPS: " << fps << ") -> " << std::fixed << std::setprecision(6) << result << "s" << std::endl;
+
+    return result;
 }
 
 // Function to get the number of available audio devices

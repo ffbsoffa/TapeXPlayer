@@ -77,6 +77,20 @@ FullResDecoderManager::FullResDecoderManager(
 
 FullResDecoderManager::~FullResDecoderManager() {
     stop(); // Ensure thread is stopped and joined
+    
+    // Ensure any remaining async operation is finished
+    {
+        std::lock_guard<std::mutex> lock(decodingFutureMutex_);
+        if (decodingFuture_.valid()) {
+            try {
+                decodingFuture_.wait(); // Wait for completion
+                decodingFuture_.get();  // Get result to clear state
+            } catch (...) {
+                // Ignore exceptions during cleanup
+            }
+        }
+    }
+    
     // std::cout << "FullResDecoderManager: Destroyed." << std::endl;
 }
 
@@ -97,24 +111,26 @@ void FullResDecoderManager::run() {
 
 void FullResDecoderManager::stop() {
     if (!isRunning_ && !managerThread_.joinable()) {
-        return; // Already stopped or never started
+        return;
     }
-    // std::cout << "[LOG] FullResDecoderManager: Stopping manager thread requested..." << std::endl;
+    
     stopRequested_ = true;
-    cv_.notify_one(); // Wake up the thread if it's waiting
     
-    // Request the decoder itself to stop its internal loops
-    if (decoder_) {
-        // std::cout << "[LOG] FullResDecoderManager: Requesting FullResDecoder to stop..." << std::endl;
-        decoder_->requestStop();
-    }
+    // Cancel any ongoing async decode
+    cancelOngoingDecode();
     
-    // std::cout << "[LOG] FullResDecoderManager: Waiting for manager thread to join..." << std::endl;
+    cv_.notify_one();
+    
     if (managerThread_.joinable()) {
         managerThread_.join();
     }
-    isRunning_ = false; // Mark as stopped *after* join
-    // std::cout << "[LOG] FullResDecoderManager: Manager thread stopped and joined." << std::endl;
+    
+    isRunning_ = false;
+    
+    // Clear any remaining high-res frames after stop
+    if (decoder_) {
+        decoder_->clearHighResFrames(frameIndex_);
+    }
 }
 
 void FullResDecoderManager::notifyFrameChange() {
@@ -220,13 +236,10 @@ void FullResDecoderManager::decodingLoop() {
         if (isHighResActive_.load()) { // Only do speed-based clearing if active
             double current_speed = std::abs(playbackRateAbs); 
             if (current_speed > 1.1) { 
-                // Comment out debug log
-                // std::cout << "[FullResManager] Speed > 1.1x. Requesting decoder stop and clearing high-res frames." << std::endl;
-                if (decoder_) {
-                    decoder_->requestStop(); // Signal the decoder to stop its current long-running operation
-                }
-                // Consider a very brief pause to allow the decoder to acknowledge the stop request
-                // std::this_thread::sleep_for(std::chrono::microseconds(100)); // Optional short yield
+                // std::cout << "[FullResManager] Speed > 1.1x. Cancelling async decode and clearing high-res frames." << std::endl;
+                
+                // Cancel any ongoing async decode
+                cancelOngoingDecode();
 
                 if (decoder_) {
                      decoder_->clearHighResFrames(frameIndex_); // Clear existing high-res frames
@@ -264,28 +277,50 @@ void FullResDecoderManager::decodingLoop() {
                                        (frameChanged || justReturnedToHighRes || now >= nextScheduledHighResTime_);
 
             if (shouldTriggerDecode && highResStart <= highResEnd) {
-                // --- ADDED: Detailed pre-call log ---
-                std::cout << "[FRDM TID:" << std::this_thread::get_id() << "] PRE-CALL decodeFrameRange. Decoder ptr: " << decoder_.get() 
+                // Check if there's an ongoing decode
+                {
+                    std::lock_guard<std::mutex> lock(decodingFutureMutex_);
+                    if (decodingFuture_.valid()) {
+                        // Check if previous decode finished
+                        auto status = decodingFuture_.wait_for(std::chrono::milliseconds(0));
+                        if (status != std::future_status::ready) {
+                            // Previous decode still running, skip this iteration
+                            // Commented out to reduce log spam
+                            // std::cout << "[FRDM] Previous decode still running, skipping new decode request" << std::endl;
+                            continue;
+                        } else {
+                            // Get result to clear the future
+                            try {
+                                bool prevResult = decodingFuture_.get();
+                                if (!prevResult && decoder_ && decoder_->isHardwareAccelerated() && decoder_->hasHardwareFailedIrrecoverably()) {
+                                    std::cerr << "[FRDM] Previous decode failed with HW error" << std::endl;
+                                    current_decoder_hw_failed_permanently_ = true;
+                                }
+                            } catch (...) {
+                                std::cerr << "[FRDM] Exception getting previous decode result" << std::endl;
+                            }
+                        }
+                    }
+                }
+                
+                // Launch async decode
+                std::cout << "[FRDM TID:" << std::this_thread::get_id() << "] Launching ASYNC decodeFrameRange. Decoder ptr: " << decoder_.get() 
                           << ", isHW: " << (decoder_ ? decoder_->isHardwareAccelerated() : -1) 
                           << ", hasHWfailed_flag: " << (decoder_ ? decoder_->hasHardwareFailedIrrecoverably() : -1) 
                           << ", Range: [" << highResStart << "-" << highResEnd << "]" << std::endl;
                 
-                bool success = decoder_->decodeFrameRange(frameIndex_, highResStart, highResEnd);
-
-                // --- ADDED: Detailed post-call log ---
-                std::cout << "[FRDM TID:" << std::this_thread::get_id() << "] POST-CALL decodeFrameRange. Decoder ptr: " << decoder_.get() 
-                          << ", Success: " << success 
-                          << ", hasHWfailed_flag: " << (decoder_ ? decoder_->hasHardwareFailedIrrecoverably() : -1) << std::endl;
-
-                if (!success) {
-                    std::cerr << "FullResDecoderManager Warning: decodeFrameRange failed for [" 
-                              << highResStart << "-" << highResEnd << "]" << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(decodingFutureMutex_);
+                    // Capture necessary values for lambda
+                    auto localDecoder = decoder_.get();
+                    auto& localFrameIndex = frameIndex_;
                     
-                    if (decoder_ && decoder_->isHardwareAccelerated() && decoder_->hasHardwareFailedIrrecoverably()) {
-                        std::cerr << "[FRDM TID:" << std::this_thread::get_id() << "] DETECTED irrecoverable HW failure from decoder. Setting manager_hw_failed_flag = true. Decoder ptr: " << decoder_.get() << std::endl;
-                        current_decoder_hw_failed_permanently_ = true;
-                    }
+                    decodingFuture_ = std::async(std::launch::async, [localDecoder, &localFrameIndex, highResStart, highResEnd]() {
+                        if (!localDecoder) return false;
+                        return localDecoder->decodeFrameRange(localFrameIndex, highResStart, highResEnd);
+                    });
                 }
+                
                 nextScheduledHighResTime_ = now + highResUpdateInterval; // Schedule next forced update
             }
 
@@ -357,9 +392,10 @@ void FullResDecoderManager::checkWindowSizeAndToggleActivity(int windowWidth, in
                   << windowWidth << "x" << windowHeight << " vs native " 
                   << nativeWidth << "x" << nativeHeight << ")." << std::endl;
         isHighResActive_ = false;
-        decoder_->requestStop(); // Stop any current long decoding
-        // Brief pause to allow decoder to acknowledge stop before clearing
-        std::this_thread::sleep_for(std::chrono::milliseconds(20)); 
+        
+        // Cancel any ongoing async decode
+        cancelOngoingDecode();
+        
         decoder_->clearHighResFrames(frameIndex_); // Clear frames
     } else if (!isHighResActive_ && shouldBeActive) {
         // Transitioning from inactive to active
@@ -379,6 +415,33 @@ void FullResDecoderManager::checkWindowSizeAndToggleActivity(int windowWidth, in
 
 bool FullResDecoderManager::isCurrentlyActive() const {
     return isHighResActive_.load();
+}
+
+void FullResDecoderManager::cancelOngoingDecode() {
+    std::lock_guard<std::mutex> lock(decodingFutureMutex_);
+    
+    if (decodingFuture_.valid()) {
+        // Signal decoder to stop
+        if (decoder_) {
+            decoder_->requestStop();
+        }
+        
+        // Wait for decode to finish with timeout
+        auto status = decodingFuture_.wait_for(std::chrono::milliseconds(100));
+        
+        if (status == std::future_status::timeout) {
+            std::cerr << "[FRDM] Warning: Decode operation did not finish within timeout after stop request" << std::endl;
+            // Note: we can't force-terminate the thread, but at least we tried
+        } else {
+            // Get the result to clear the future state
+            try {
+                bool result = decodingFuture_.get();
+                std::cout << "[FRDM] Async decode cancelled, result was: " << result << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "[FRDM] Exception while getting decode result: " << e.what() << std::endl;
+            }
+        }
+    }
 }
 
 // Helper function (could be moved or made static if appropriate)

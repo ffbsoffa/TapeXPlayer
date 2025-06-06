@@ -73,6 +73,7 @@ private:
     int height_ = 0;
     AVPixelFormat pixFmt_ = AV_PIX_FMT_NONE;
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> is_decoding_{false}; // Track if actively decoding
     AVBufferRef *global_hw_device_ctx_ = nullptr;
     bool hw_accel_available_ = false;
 };

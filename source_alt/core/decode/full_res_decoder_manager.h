@@ -9,6 +9,7 @@
 #include <condition_variable> // Added
 #include <memory>            // Added for unique_ptr
 #include <chrono>            // Added for std::chrono
+#include <future>            // Added for std::future
 #include "decode.h" // Includes FrameInfo definition
 #include "full_res_decoder.h"
 
@@ -72,8 +73,12 @@ private:
     std::atomic<bool> isHighResActive_{true}; // Default to active
     std::mutex activityCheckMutex_; // For protecting decoder access during activity check
 
-    // REMOVED: size_t ringBufferCapacity; (Less relevant here)
-    // REMOVED: std::future<void> highResFuture;
+    // Async decoding support
+    std::future<bool> decodingFuture_;
+    std::mutex decodingFutureMutex_; // Protect access to decodingFuture_
+    
+    // Helper method to cancel ongoing decode
+    void cancelOngoingDecode();
 };
 
 #endif // FULL_RES_DECODER_MANAGER_H 

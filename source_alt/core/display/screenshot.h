@@ -48,4 +48,7 @@ bool saveFrameAsPNGWithTimecode(
 );
 
 // Generate filename with timestamp (PNG format)
-std::string generateScreenshotFilename(const std::string& timecode); 
+std::string generateScreenshotFilename(const std::string& timecode);
+
+// Function to trigger screenshot from remote control
+void trigger_screenshot(); 

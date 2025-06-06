@@ -1,5 +1,6 @@
 #include "remote_control.h"
 #include "common.h"  // Add explicit include of common.h
+#include "../display/screenshot.h"  // Include screenshot functionality
 #include <iostream>
 #include <cstring>
 #include <algorithm>
@@ -377,11 +378,14 @@ void RemoteControl::update_timecode() {
         bool is_playing_state = true;  // Should be logical value from player state
         bool is_reverse_state = is_reverse.load();
         float current_rate_value = static_cast<float>(get_playback_rate().load());
+        double current_fps = original_fps.load();
         
         // Update all fields in shared memory
         shared_cmd->flags.is_playing = is_playing_state ? 1 : 0;
         shared_cmd->flags.is_reverse = is_reverse_state ? 1 : 0;
         shared_cmd->current_rate = current_rate_value;
+        shared_cmd->total_duration = total_duration.load();
+        shared_cmd->current_fps = current_fps;  // Add FPS to shared memory
         
         // Update timecode only if changed
         if (strncmp(shared_cmd->timecode, current_tc.c_str(), 11) != 0) {
@@ -454,22 +458,20 @@ void RemoteControl::process_commands() {
             case RemoteCommand::Type::SEEK_TIMECODE:
                 {
                     std::string tc_str(cmd.seek_timecode, static_cast<size_t>(8));
-                    int hours = std::stoi(tc_str.substr(0,2));
-                    int minutes = std::stoi(tc_str.substr(2,2));
-                    int seconds = std::stoi(tc_str.substr(4,2));
-                    int frames = std::stoi(tc_str.substr(6,2));
-                    
-                    // Use real video FPS instead of hardcoded 30
-                    double fps = original_fps.load();
-                    if (fps <= 0) fps = 30.0;  // Use 30 as default value if FPS is not yet defined
-                    
-                    double target_time = hours * 3600.0 + 
-                                       minutes * 60.0 + 
-                                       seconds + 
-                                       frames / fps;
-                    
-                    handle_seek(target_time);
+                    handle_seek_timecode(tc_str);
                 }
+                break;
+            case RemoteCommand::Type::SCREENSHOT:
+                trigger_screenshot();
+                break;
+            case RemoteCommand::Type::SET_REVERSE:
+                is_reverse.store(cmd.speed_value > 0);
+                break;
+            case RemoteCommand::Type::SEEK_AND_SCREENSHOT:
+                handle_seek(cmd.seek_time);
+                // Wait a bit for seek to complete
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                trigger_screenshot();
                 break;
             case RemoteCommand::Type::NONE:
                 break;
@@ -568,6 +570,8 @@ bool RemoteControl::create_shared_memory() {
     shared_cmd->flags.is_playing = 0;
     shared_cmd->flags.is_reverse = 0;
     shared_cmd->current_rate = 1.0f;
+    shared_cmd->total_duration = 0.0;
+    shared_cmd->current_fps = 25.0;  // Default FPS
     
     // Force synchronization
     msync(shared_cmd, sizeof(RemoteCommand), MS_SYNC);
@@ -640,7 +644,7 @@ void RemoteControl::handle_play() {
         // If speed is high, reset it
         reset_to_normal_speed();
     } else {
-        // Otherwise normal pause toggle
+        // O3therwise normal pause toggle
         toggle_pause();
     }
 }
@@ -691,23 +695,27 @@ void RemoteControl::displayTimecode(int hours, int minutes, int seconds, int fra
         {DISPLAY_FRAMES_ONES, frames % 10}
     };
 
-    // Get current speed for display (1-18)
+    // Get current speed and FPS for display
     double current_speed = get_playback_rate().load();
-    int speed_display = static_cast<int>(std::abs(current_speed));
+    double current_fps = original_fps.load();
     
-    // Add speed digits (01-18)
+    // Format speed as integer percentage (1-24 -> 100-2400)
+    int speed_display = static_cast<int>(std::abs(current_speed * 100));
+    speed_display = std::min(speed_display, 2400); // Cap at 2400%
+    
+    // Add speed digits (100-2400)
     digits.insert(digits.begin(), {
-        {DISPLAY_SPEED_HUNDREDS, speed_display / 10},
-        {DISPLAY_SPEED_TENS, speed_display % 10}
+        {DISPLAY_SPEED_HUNDREDS, (speed_display / 100) % 10},
+        {DISPLAY_SPEED_TENS, (speed_display / 10) % 10}
     });
 
-    // Clear position 0x49 (DISPLAY_HOURS_HUNDREDS)
-    std::vector<unsigned char> clear_msg = {
+    // Show FPS in the HOURS_HUNDREDS position
+    std::vector<unsigned char> fps_msg = {
         0xB0,  // CC on channel 1
         DISPLAY_HOURS_HUNDREDS,
-        0x00   // Clear value
+        static_cast<unsigned char>(static_cast<int>(current_fps) % 100)  // Show FPS value
     };
-    midi_out->sendMessage(&clear_msg);
+    midi_out->sendMessage(&fps_msg);
 
     // Send each digit using CC messages
     for (const auto& [position, digit] : digits) {
@@ -717,6 +725,20 @@ void RemoteControl::displayTimecode(int hours, int minutes, int seconds, int fra
             static_cast<unsigned char>(0x30 + digit)  // Convert digit to ASCII-like value
         };
         midi_out->sendMessage(&message);
+    }
+}
+
+void RemoteControl::handle_seek_timecode(const std::string& timecode) {
+    try {
+        // Use the same parse_timecode function as GUI (command-g)
+        // This ensures consistent behavior across all input methods
+        double target_time = parse_timecode(timecode);
+        
+        // Perform seek using the parsed time
+        handle_seek(target_time);
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error parsing timecode: " << e.what() << std::endl;
     }
 }
 

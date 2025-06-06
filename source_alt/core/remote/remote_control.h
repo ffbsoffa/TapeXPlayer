@@ -29,6 +29,7 @@ std::atomic<double>& get_playback_rate();
 std::atomic<double>& get_target_playback_rate();
 std::string get_current_timecode();
 double parse_timecode(const std::string& timecode);
+void trigger_screenshot();
 
 // Ensure consistent memory layout
 #pragma pack(push, 1)
@@ -40,7 +41,10 @@ struct RemoteCommand {
         STOP = 3,
         SET_SPEED = 4,
         ADJUST_SPEED = 5,
-        SEEK_TIMECODE = 6
+        SEEK_TIMECODE = 6,
+        SCREENSHOT = 7,
+        SET_REVERSE = 8,
+        SEEK_AND_SCREENSHOT = 9
     };
     
     Type command_type;      // 4 bytes
@@ -62,11 +66,13 @@ struct RemoteCommand {
         } flags;
         float current_rate;            // 4 bytes (overlaps with flags)
     };
+    double total_duration;             // 8 bytes - total video duration in seconds
+    double current_fps;                // 8 bytes - current video frame rate
 };
 #pragma pack(pop)
 
 // Ensure the size matches between Python and C++
-static_assert(sizeof(RemoteCommand) == 32, "RemoteCommand size must be 32 bytes");
+static_assert(sizeof(RemoteCommand) == 48, "RemoteCommand size must be 48 bytes");
 
 // Structure for internal command queue
 struct CommandQueueItem {
@@ -102,6 +108,7 @@ private:
     
     // Command handlers
     void handle_seek(double time);
+    void handle_seek_timecode(const std::string& timecode);
     void handle_play();
     void handle_stop();
     void handle_set_speed(double speed);

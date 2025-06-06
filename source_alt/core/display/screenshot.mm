@@ -1,8 +1,11 @@
 #include "screenshot.h"
 #include "../audio/mainau.h"
+#include "../../main/main.h"
 #include <iostream>
 #include <chrono>
 #include <ctime>
+#include <thread>
+#include <string>
 
 #import <AppKit/AppKit.h> // For NSPasteboard and NSImage
 
@@ -1034,4 +1037,12 @@ bool takeScreenshotWithTimecode(void* renderer, AVFrame* frame, const std::strin
     
     // Pass the exact timecode from display.mm to ensure synchronization
     return saveFrameAsPNGWithTimecode(frame, timecode, outputPath);
+}
+
+// Function to trigger screenshot from remote control  
+void trigger_screenshot() {
+    // Use the existing takeCurrentFrameScreenshot function
+    std::cout << "[RemoteControl] Triggering screenshot..." << std::endl;
+    takeCurrentFrameScreenshot();
+    std::cout << "[RemoteControl] Screenshot command executed" << std::endl;
 } 

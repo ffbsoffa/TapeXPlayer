@@ -12,14 +12,15 @@ enum MenuCommand {
     MENU_AUDIO_DEVICE_SELECT = 3,
     MENU_FILE_COPY_FSTP_URL_MARKDOWN = 102,
     MENU_EDIT_COPY_SCREENSHOT = 103,
-    MENU_EDIT_GOTO_TIMECODE = 104
+    MENU_EDIT_GOTO_TIMECODE = 104,
+    MENU_VIEW_TOGGLE_BETACAM_EFFECT = 105
 };
 
 void initializeMenuSystem();
 void cleanupMenuSystem();
-void handleMenuCommand(int command);
 void updateCopyLinkMenuState(bool isFileLoaded);
 void updateCopyScreenshotMenuState(bool isFileLoaded);
+void updateBetacamEffectMenuState(bool isEnabled);
 void showMenuBarTemporarily();
 void toggleNativeFullscreen(void* sdlWindow);
 

@@ -48,6 +48,9 @@ public:
 
     // --- ADDED: Method to check for irrecoverable HW failure ---
     bool hasHardwareFailedIrrecoverably() const;
+    
+    // --- ADDED: Method to reset HW failure flag for retry ---
+    void resetHardwareFailureFlag();
 
 private:
     // Initialization and cleanup
@@ -78,9 +81,11 @@ private:
     AVPixelFormat hw_pix_fmt_ = AV_PIX_FMT_NONE; // Will be AV_PIX_FMT_VIDEOTOOLBOX if enabled
 
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> is_decoding_{false}; // Track if actively decoding
 
     // --- ADDED: Flag for irrecoverable HW failure ---
     std::atomic<bool> hw_irrecoverably_failed_;
+    std::chrono::steady_clock::time_point hw_failure_time_; // Track when HW failed
 
     // --- ADDED: Static counter for instances ---
     static std::atomic<int> instance_counter_;

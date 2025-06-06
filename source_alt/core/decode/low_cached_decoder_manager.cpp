@@ -80,17 +80,25 @@ void LowCachedDecoderManager::run() {
 
 void LowCachedDecoderManager::stop() {
     if (!isRunning_ && !managerThread_.joinable()) {
-        // Already stopped or never started
         return;
     }
-    // std::cout << "LowCachedDecoderManager: Stopping manager thread..." << std::endl;
+    
     stopRequested_ = true;
-    cv_.notify_one(); // Wake up the thread if it's waiting
+    
+    // Aggressively stop any active decoders
+    if (decoder_) {
+        decoder_->requestStop();
+        // Give a very short time for the decoder to abort
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    
+    cv_.notify_one();
+    
     if (managerThread_.joinable()) {
         managerThread_.join();
     }
-    isRunning_ = false; // Mark as not running after thread finishes
-    // std::cout << "LowCachedDecoderManager: Manager thread stopped." << std::endl;
+    
+    isRunning_ = false;
 }
 
 void LowCachedDecoderManager::notifyFrameChange() {

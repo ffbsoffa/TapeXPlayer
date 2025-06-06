@@ -6,6 +6,8 @@
 #import "nfd.hpp"
 #include "../remote/remote_control.h"
 #include "../audio/mainau.h" // Include for audio device functions
+#include "../../main/globals.h"
+#include "../../main/keyboard_manager.h"
 #include <SDL2/SDL_syswm.h>
 
 extern RemoteControl* g_remote_control;
@@ -112,17 +114,35 @@ extern bool switch_audio_device(int deviceIndex);
     // Initial population of audio menu
     [self updateAudioMenu:audioMenu];
     
+    // View menu
+    NSMenuItem *viewMenuItem = [[NSMenuItem alloc] init];
+    [mainMenu addItem:viewMenuItem];
+    NSMenu *viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+    [viewMenuItem setSubmenu:viewMenu];
+    
+    NSMenuItem *betacamEffectItem = [[NSMenuItem alloc] initWithTitle:@"Betacam Effect"
+                                                              action:@selector(handleMenuAction:)
+                                                       keyEquivalent:@"b"];
+    [betacamEffectItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand]; // For Cmd+B
+    [betacamEffectItem setTag:MENU_VIEW_TOGGLE_BETACAM_EFFECT];
+    [betacamEffectItem setState:betacam_effect_enabled.load() ? NSControlStateValueOn : NSControlStateValueOff];
+    [viewMenu addItem:betacamEffectItem];
+    
     // Finish launching
     [app finishLaunching];
     [app activateIgnoringOtherApps:YES];
 }
 
 - (void)openFile:(id)sender {
-    handleMenuCommand(MENU_FILE_OPEN);
+    if (g_keyboardManager) {
+        g_keyboardManager->handleMenuCommand(MENU_FILE_OPEN);
+    }
 }
 
 - (void)handleMenuAction:(NSMenuItem *)sender {
-    handleMenuCommand((int)[sender tag]);
+    if (g_keyboardManager) {
+        g_keyboardManager->handleMenuCommand((int)[sender tag]);
+    }
 }
 
 - (void)updateInterfaceMenu:(NSMenu *)menu {
@@ -266,6 +286,18 @@ extern bool switch_audio_device(int deviceIndex);
     }
 }
 
+- (void)updateBetacamEffectMenuItemState:(BOOL)isEnabled {
+    NSMenu *mainMenu = [NSApp mainMenu];
+    NSMenuItem *viewMenuItem = [mainMenu itemWithTitle:@"View"];
+    if (viewMenuItem) {
+        NSMenu *viewMenu = [viewMenuItem submenu];
+        NSMenuItem *betacamItem = [viewMenu itemWithTag:MENU_VIEW_TOGGLE_BETACAM_EFFECT];
+        if (betacamItem) {
+            [betacamItem setState:isEnabled ? NSControlStateValueOn : NSControlStateValueOff];
+        }
+    }
+}
+
 - (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
     if ([menuItem action] == @selector(handleMenuAction:)) {
         if ([menuItem tag] == MENU_FILE_OPEN) {
@@ -354,6 +386,12 @@ void updateCopyScreenshotMenuState(bool isFileLoaded) {
     }
 }
 
+void updateBetacamEffectMenuState(bool isEnabled) {
+    if (menuDelegate) {
+        [menuDelegate updateBetacamEffectMenuItemState:isEnabled];
+    }
+}
+
 void showMenuBarTemporarily() {
     // In fullscreen mode, we can temporarily show the menu bar
     // by setting the presentation options
@@ -397,6 +435,7 @@ void initializeMenuSystem() {}
 void cleanupMenuSystem() {}
 void updateCopyLinkMenuState(bool isFileLoaded) {}
 void updateCopyScreenshotMenuState(bool isFileLoaded) {}
+void updateBetacamEffectMenuState(bool isEnabled) {}
 void showMenuBarTemporarily() {}
 void toggleNativeFullscreen(void* sdlWindow) {}
 

@@ -169,7 +169,14 @@ void LowResDecoder::cleanup() {
 
 // --- Public method to request stop --- 
 void LowResDecoder::requestStop() {
+    // Set the stop flag first
     stop_requested_ = true;
+    
+    // Note: For LowResDecoder, we don't close any contexts here because:
+    // 1. The decoder uses thread-local contexts in decodeLowResRange
+    // 2. Member contexts (formatCtx_, codecCtx_) are only used for initialization info
+    // 3. Closing them here would break subsequent decode attempts
+    // The contexts will be properly cleaned up in the destructor
 }
 
 // --- Static Methods --- 
@@ -463,12 +470,17 @@ void LowResDecoder::removeLowResFrames(std::vector<FrameInfo>& frameIndex, int s
 
 bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex, int startFrame, int endFrame, int highResStart, int highResEnd, bool skipHighResWindow) {
     // Reverting to the user-provided multi-threaded logic from the older build
+    stop_requested_ = false; // Reset stop flag at start
+    is_decoding_ = true; // Mark that we're actively decoding
+    
     if (!initialized_) {
         std::cerr << "LowResDecoder::decodeLowResRange Error: Decoder object not initialized (cannot get filename)." << std::endl;
+        is_decoding_ = false;
         return false;
     }
     if (frameIndex.empty()) {
         std::cerr << "LowResDecoder::decodeLowResRange Warning: Frame index is empty." << std::endl;
+        is_decoding_ = false;
         return true; // Nothing to do
     }
 
@@ -477,6 +489,7 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex, int st
 
     if (startFrame > endFrame) {
          std::cerr << "LowResDecoder::decodeLowResRange Error: Invalid frame range requested after clamping (" << startFrame << " - " << endFrame << ")" << std::endl;
+        is_decoding_ = false;
         return false; 
     }
 
@@ -846,6 +859,7 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex, int st
     }
     std::cout << "LowResDecoder: All threads joined. Final success status: " << (success.load() ? "true" : "false") << std::endl;
 
+    is_decoding_ = false; // Clear decoding flag
     return success.load(); // Return the final success status
 }
 

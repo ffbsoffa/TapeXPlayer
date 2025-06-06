@@ -12,6 +12,7 @@
 #include <memory> // For std::unique_ptr
 #include <cmath>   // For sin, M_PI (อาจจะต้องมี _USE_MATH_DEFINES ใน Windows)
 #include <random>  // For random number generation
+#include "../../main/globals.h" // For betacam_effect_enabled
 
 #ifdef __APPLE__ // Include macOS specific headers only on Apple platforms
 #include <CoreVideo/CoreVideo.h>
@@ -714,7 +715,7 @@ void displayFrame(
                        // These effects are applied to the new frame data being put into lastTexture.
                        double absPlaybackRate = std::abs(currentPlaybackRate);
                        const double effectThreshold = 1.2; // Slightly above 1x to trigger effects
-                       if (absPlaybackRate >= effectThreshold && currentTime > 0.1 && (totalDuration - currentTime) > 0.1) {
+                       if (betacam_effect_enabled && absPlaybackRate >= effectThreshold && currentTime > 0.1 && (totalDuration - currentTime) > 0.1) {
                            // Apply B&W effect for high speeds (>= 10.0x)
                            if (absPlaybackRate >= 10.0) {
                                if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
@@ -741,12 +742,15 @@ void displayFrame(
                             if ((absPlaybackRate >= 0.2 && absPlaybackRate < 0.9) || (absPlaybackRate >= 1.1 && absPlaybackRate < 2.0)) {
                                 double t = (absPlaybackRate < 0.9) ? (absPlaybackRate - 0.2) / 0.7 : (absPlaybackRate - 1.2) / 0.8;
                                 t = t * t * (3 - 2 * t); stripeHeight = static_cast<int>(maxStripeHeight * (1 - t) + midStripeHeight * t); stripeSpacing = baseStripeSpacing;
-                            } else if (absPlaybackRate >= 2.0 && absPlaybackRate < 4.0) {
-                                stripeHeight = baseStripeHeight; stripeSpacing = baseStripeSpacing;
-                            } else if (absPlaybackRate >= 3.5 && absPlaybackRate < 14.0) {
-                                double t = (absPlaybackRate - 4.0) / 10.0; t = std::pow(t, 0.7);
-                                stripeHeight = static_cast<int>(baseStripeHeight * (1.0 - t) + currentMinStripeHeight * t);
-                                stripeSpacing = static_cast<int>(baseStripeSpacing * (1.0 - t) + minStripeSpacing * t);
+                            } else if (absPlaybackRate >= 2.0 && absPlaybackRate < 3.7) {
+                                // Smooth transition zone for 2.0x to 3.7x (Betacam fix)
+                                double t = (absPlaybackRate - 2.0) / 1.7; // 0 to 1 over 2.0-3.7 range
+                                stripeHeight = static_cast<int>(baseStripeHeight * (1.0 - t * 0.3)); // Gradual height reduction
+                                stripeSpacing = static_cast<int>(baseStripeSpacing * (1.0 - t * 0.2)); // Gradual spacing reduction
+                            } else if (absPlaybackRate >= 3.7 && absPlaybackRate < 14.0) {
+                                double t = (absPlaybackRate - 3.7) / 10.3; t = std::pow(t, 0.7); // Adjusted range
+                                stripeHeight = static_cast<int>(baseStripeHeight * 0.7 * (1.0 - t) + currentMinStripeHeight * t);
+                                stripeSpacing = static_cast<int>(baseStripeSpacing * 0.8 * (1.0 - t) + minStripeSpacing * t);
                             } else { // Covers >= 14.0x
                                  stripeHeight = currentMinStripeHeight; 
                                  stripeSpacing = minStripeSpacing; 
@@ -769,14 +773,14 @@ void displayFrame(
                                 double cycleDuration = (baseDuration / absPlaybackRate) * 3.0; // Simple inverse relation + factor
                                 cycleDuration = std::max(minCycleDuration, cycleDuration); // Apply minimum duration
                                 cycleProgress = std::fmod(currentTime, cycleDuration) / cycleDuration;
-                           } else if (absPlaybackRate >= 3.5) { // Covers 3.5x up to 12.0x (Old medium speed logic)
-                                double normalizedSpeed = (absPlaybackRate - 3.5) / 8.5; // Normalize in 3.5-12 range
+                           } else if (absPlaybackRate >= 3.7) { // Covers 3.7x up to 12.0x (Aligned with stripe ranges)
+                                double normalizedSpeed = (absPlaybackRate - 3.7) / 8.3; // Normalize in 3.7-12 range
                                 double speedMultiplier = 0.08 + (std::pow(normalizedSpeed, 3) * 0.15);
                                 if (absPlaybackRate < 8.0) speedMultiplier *= 0.7; // Keep the old adjustment for < 8x
                                 double mediumSpeedDuration = baseDuration / (absPlaybackRate * speedMultiplier);
                                 mediumSpeedDuration = std::max(minCycleDuration, mediumSpeedDuration); // Apply minimum duration
                                 cycleProgress = std::fmod(currentTime, mediumSpeedDuration) / mediumSpeedDuration;
-                           } else { // Covers >= effectThreshold (1.1x) up to 3.5x (unchanged)
+                           } else { // Covers >= effectThreshold (1.1x) up to 3.7x (Extended range for smooth transition)
                                 double speedFactor = std::min(absPlaybackRate / 2.0, 2.0) * 0.5; 
                                 double adjustedDuration = baseDuration / speedFactor; 
                                 if (adjustedDuration <= 0) adjustedDuration = 1.0; // Fallback
@@ -1206,38 +1210,6 @@ void displayFrame(
                        }
                        // --- End Edge Fade ---
 
-                       // Apply film grain dithering for LOW_RES frames
-                       if (frameTypeToDisplay == FrameInfo::LOW_RES) {
-                           // Use thread-local random for better performance
-                           static thread_local std::mt19937 rng(std::random_device{}());
-                           std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-
-                           // Grain intensity (very subtle)
-                           const float grainIntensity = 0.035f; // 3% intensity
-
-                           for (int y = 0; y < textureHeight; ++y) {
-                               uint8_t* rowStart = dst_data[0] + y * pitch;
-                               
-                               if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
-                                   // For UYVY, only modify Y values (every other byte starting at index 1)
-                                   for (int x = 0; x < textureWidth * 2; x += 2) {
-                                       float noise = dist(rng) * grainIntensity;
-                                       int yValue = rowStart[x + 1];
-                                       yValue = std::min(235, std::max(16, static_cast<int>(yValue + yValue * noise)));
-                                       rowStart[x + 1] = static_cast<uint8_t>(yValue);
-                                   }
-                               } else {
-                                   // For planar formats (IYUV/NV12), modify only Y plane
-                                   for (int x = 0; x < textureWidth; ++x) {
-                                       float noise = dist(rng) * grainIntensity;
-                                       int yValue = rowStart[x];
-                                       yValue = std::min(235, std::max(16, static_cast<int>(yValue + yValue * noise)));
-                                       rowStart[x] = static_cast<uint8_t>(yValue);
-                                   }
-                               }
-                           }
-                       }
-
                        SDL_UnlockTexture(lastTexture);
                   } else {
                       std::cerr << "Error locking texture for SW update/effects: " << SDL_GetError() << std::endl;
@@ -1308,7 +1280,7 @@ void displayFrame(
              else if (absPlaybackRate >= 4.0 && absPlaybackRate < 16.0) { double t = (absPlaybackRate - 4.0) / 12.0; jitterAmplitude = 1.4 + t * 2.2; }
              else if (absPlaybackRate >= 20.0) jitterAmplitude = 2.0;
 
-             if (jitterAmplitude > 0) {
+             if (betacam_effect_enabled && jitterAmplitude > 0) {
                  if (newFrameProcessed) { // Apply jitter ONLY if a new frame was processed
                      if (absPlaybackRate >= 0.20 && absPlaybackRate < 1.0) {
                          int baseOffset = static_cast<int>(floor(jitterAmplitude));
@@ -1317,9 +1289,9 @@ void displayFrame(
                      }
                      // --- Existing Random Jitter for other speeds ---
                      else {
-                         // Sharp random jitter for specific higher speed range
+                         // Skip jitter for 1.3x-2.0x range (not needed)
                          if (absPlaybackRate >= 1.3 && absPlaybackRate < 2.0) {
-                              std::uniform_real_distribution<> sharpJitterDist(-1.0, 1.0); destRect.y += static_cast<int>(sharpJitterDist(rng_jitter_render) * jitterAmplitude);
+                              // No jitter applied for this range
                          }
                          // Normal random jitter for other speeds >= 1.0x (and specifically >= 4.0x based on amplitude calc)
                          else { // This covers >=1.0x, excluding 1.3-2.0, but amplitude is only > 0 for >= 1.9, 4.0-16.0, >=20.0
@@ -1336,7 +1308,7 @@ void displayFrame(
         // In deep pause, renderedWithMetal will be false, so it will try to render lastTexture.
         if (!renderedWithMetal && lastTexture) { // Render SW texture if it exists and wasn't Metal
             // --- HSync Loss Effect Rendering ---
-            if (hsyncLossActive && hsyncMaxSkewAmount != 0.0f && destRect.h > 0 && textureHeight > 0) {
+            if (betacam_effect_enabled && hsyncLossActive && hsyncMaxSkewAmount != 0.0f && destRect.h > 0 && textureHeight > 0) {
                 int actualTearLineScreenY = destRect.y + static_cast<int>(tearLineNormalized * destRect.h);
                 actualTearLineScreenY = std::max(destRect.y, std::min(actualTearLineScreenY, destRect.y + destRect.h -1)); // -1 to ensure min 1px for below part
 
