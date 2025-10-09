@@ -13,7 +13,7 @@
 
 ## ✨ Key Features
 
-TapeXPlayer is built with **C++** using industry-standard libraries: **FFmpeg**, **SDL2**, **PortAudio**, and **RtMidi**. It brings professional tape-based video player functionality to modern computers, enabling thorough video sequence examination with frame-accurate control.
+TapeXPlayer is built with **C**,**C++**, **Objective-C**, **Swift** using industry-standard libraries: **FFmpeg**, **SDL2**, **PortAudio**, and **RtMidi**. It brings professional tape-based video player functionality to modern computers, enabling thorough video sequence examination with frame-accurate control.
 
 - 🎬 **Smooth Shuttle Control**: Forward/backward playback up to 32x speed with minimal CPU usage
 - 🎯 **Frame-Accurate Seeking**: Timecode-based navigation (HH:MM:SS:FF)
