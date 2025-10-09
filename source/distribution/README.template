@@ -1,0 +1,31 @@
+TapeXPlayer 2026 - Build %BUILD_NUMBER%
+========================================
+
+Профессиональное приложение для воспроизведения видео.
+
+Содержимое пакета:
+- TapeXPlayer.app - главное приложение
+- INSTALL_MACOS.txt - инструкции по установке
+- README.txt - этот файл
+
+Системные требования:
+- macOS 13.0 (Ventura) или новее
+- Intel или Apple Silicon (Universal Binary)
+
+Первый запуск:
+⚠️  Обязательно прочитайте INSTALL_MACOS.txt!
+
+Возможности:
+- Профессиональное воспроизведение видео
+- Поддержка всех популярных форматов
+- Hardware acceleration (VideoToolbox, Metal)
+- MIDI control support
+- Memory Locations
+- Frame-accurate playback
+
+Версия: %VERSION%
+Сборка: %BUILD_NUMBER%
+Дата: %BUILD_DATE%
+Кодовое имя: %CODE_NAME%
+
+(c) 2025 TapeXPlayer Project
