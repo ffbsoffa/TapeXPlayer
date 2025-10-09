@@ -8,8 +8,6 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)]()
 [![Architecture](https://img.shields.io/badge/arch-Universal%20Binary%20(x86__64%20%2B%20arm64)-brightgreen)]()
 
-[📺 Watch Demo Video](https://www.youtube.com/watch?v=Mm4c1lp7Gz0)
-
 ---
 
 ## ✨ Key Features
