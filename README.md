@@ -26,14 +26,13 @@ TapeXPlayer is built with **C**,**C++**, **Objective-C**, **Swift** using indust
 - 📊 **Performance**: ~52% CPU @ 32x shuttle, ~11-32% CPU @ 1x playback
 
 ---
-
 ## 🖥️ Platform Support
 
-| Platform | Status | Architecture |
-|----------|--------|--------------|
-| **macOS** | ✅ Available | Universal Binary (Intel + Apple Silicon) |
-| **Linux** | 🚧 In Development | x86_64, arm64 |
-| **Windows** | 🚧 In Development | x86_64 |
+| Platform | Status | Architecture | Build |
+|----------|--------|--------------|-------|
+| **macOS** | ✅ Available | Universal Binary (Intel + Apple Silicon) | Build 1229 |
+| **Linux** | ✅ Available (DEB) | x86_64 | Build 1179 |
+| **Windows** | 🚧 In Development | x86_64 | - |
 
 ---
 
