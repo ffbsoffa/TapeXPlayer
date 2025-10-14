@@ -26,6 +26,7 @@ typedef struct {
     bool is_active;
     bool has_focus;
     bool is_minimized;
+    bool is_closing;  // Set to true when close is requested, prevents OSD updates
     int player_instance_id;  // ID of bound player instance (-1 if not bound)
     char window_title[256];
 

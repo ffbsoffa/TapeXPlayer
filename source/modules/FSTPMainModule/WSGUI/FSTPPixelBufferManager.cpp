@@ -234,8 +234,10 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                 std::cout << "🔄 [PIXEL BUFFER] Settings changed for player " << player_id
                           << ": " << current_width << "x" << current_height
                           << " format=" << current_format
+                          << " (" << (current_format == SDL_PIXELFORMAT_NV12 ? "NV12" : "IYUV") << ")"
                           << " → " << buffer->width << "x" << buffer->height
                           << " format=" << buffer->format
+                          << " (" << (buffer->format == SDL_PIXELFORMAT_NV12 ? "NV12" : "IYUV") << ")"
                           << " (recreating YUV renderer)" << std::endl;
 
                 // Simply delete renderer - it will delete texture in Cleanup()
@@ -298,6 +300,9 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                 // Proxy: AVCOL_RANGE_JPEG (full range 0-255)
                 // Full-res: usually AVCOL_RANGE_MPEG (limited range 16-235)
                 planes.is_full_range = (buffer->av_frame->color_range == AVCOL_RANGE_JPEG);
+
+                // CRITICAL: Pass format so renderer knows if it's NV12 (2 planes) or YUV420P (3 planes)
+                planes.format = buffer->av_frame->format;
 
                 // Logging color_range and linesize for diagnostics
                 static int render_log = 0;

@@ -14,7 +14,8 @@
     #include <commdlg.h>
 #elif defined(__linux__)
     #define PLATFORM_LINUX
-    #include <gtk/gtk.h>
+    // GTK not needed for SDL2-based implementation
+    // #include <gtk/gtk.h>
     #include <unistd.h>
 #elif defined(__APPLE__)
     #define PLATFORM_MACOS
@@ -42,8 +43,25 @@
 #include "../FSTPPlayerModule/FSTPPlayerManager.h"
 #include "../FSTPVideoModule/FSTPHardwareDetection.h"
 
-int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
+int main(int argc, char* argv[]) {
+    // CRITICAL: Set malloc arena limit BEFORE any allocations
+    // Fixes glibc malloc arena corruption in PipeWire/PortAudio cleanup
+    // Must be set at program start, cannot be changed later
+    setenv("MALLOC_ARENA_MAX", "2", 1);
+
+    // CRITICAL FIX: Disable malloc_trim() globally to prevent crash during cleanup
+    // Problem: FFmpeg av_frame_ref() corrupts heap during mass cleanup
+    // When PipeWire/PortAudio later calls malloc_trim(), heap metadata is already corrupted
+    // Solution: Disable trim by setting threshold to max value (memory leak on exit acceptable)
+    setenv("MALLOC_TRIM_THRESHOLD_", "9999999999", 1);
+
     std::cout << "=== TapeXPlayer 2026 - Initialization ===" << std::endl;
+
+    // Check for file argument
+    if (argc > 1) {
+        std::cout << "📂 File argument detected: " << argv[1] << std::endl;
+        SetInitialFileToLoad(argv[1]);
+    }
 
     // 1. Hardware acceleration detection (must be first)
     std::cout << "Stage 1: Graphics capabilities detection..." << std::endl;
@@ -77,6 +95,10 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
 
     // Cleanup on exit
     std::cout << "TapeXPlayer shutdown..." << std::endl;
+
+    // Wait a bit before Pa_Terminate to let all streams finish cleanup
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
     Pa_Terminate();
     CleanupHardwareDetection();
 

@@ -19,13 +19,7 @@
 #include <vector>
 #include <cstring>
 #include <utility>
-
-// Platform-specific memory headers
-#ifdef __linux__
-    #include <malloc.h>
-#else
-    #include <stdlib.h>  // macOS uses stdlib.h for malloc functions
-#endif
+#include <malloc.h>
 
 namespace fs = std::filesystem;
 
@@ -238,36 +232,31 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
     SetPlayerLoadingProgress(osdPlayerId, 75);
     UpdateOSDLoadingProgress(osdPlayerId, 75);
 
-    // CRITICAL: Initialize m_frames pointer if needed (leak on exit acceptable)
-    if (!m_frames) {
-        m_frames = new std::vector<FSTP::FrameInfo>();
-    }
-
-    m_frames->clear();
-    m_frames->resize(m_frame_index->GetTotalFrames());
+    m_frames.clear();
+    m_frames.resize(m_frame_index->GetTotalFrames());
     
     // Initialize time_ms and keyframe info from original video index for seeking reference
     // LowResDecoder will update time_ms with actual proxy file timing during decode
-    for (size_t i = 0; i < m_frames->size(); ++i) {
+    for (size_t i = 0; i < m_frames.size(); ++i) {
         const SimpleFrameInfo* frame_info = m_frame_index->GetFrameInfo(static_cast<int>(i));
         if (frame_info) {
                 // CRITICAL: Use ROUNDING instead of truncation (like in old decode.cpp)
                 // At 29.97fps (33.367ms per frame) truncation creates jitter, rounding fixes it!
                 // Old solution: (relative_us + 500) / 1000 = rounding to nearest
-            (*m_frames)[i].time_ms = static_cast<int64_t>(std::round(frame_info->time_seconds * 1000.0));
+            m_frames[i].time_ms = static_cast<int64_t>(std::round(frame_info->time_seconds * 1000.0));
 
             // CRITICAL: Copy is_keyframe for GOP-aware decoding
-            (*m_frames)[i].is_keyframe = frame_info->is_keyframe;
+            m_frames[i].is_keyframe = frame_info->is_keyframe;
 
             static int debug_count = 0;
             if (debug_count++ < 5) {
-                std::cout << "[VIDEO] Frame " << i << ": initial time_ms=" << (*m_frames)[i].time_ms
+                std::cout << "[VIDEO] Frame " << i << ": initial time_ms=" << m_frames[i].time_ms
                           << " (from original " << std::fixed << std::setprecision(3) << frame_info->time_seconds << "s)"
                           << (frame_info->is_keyframe ? " [KEYFRAME]" : "") << std::endl;
             }
         } else {
-            (*m_frames)[i].time_ms = -1; // Invalid time
-            (*m_frames)[i].is_keyframe = false;
+            m_frames[i].time_ms = -1; // Invalid time
+            m_frames[i].is_keyframe = false;
         }
     }
     
@@ -310,81 +299,22 @@ void FSTPVideoModuleWrapper::UnloadFile() {
         return;
     }
 
-    // CRITICAL FIX: CORRECT cleanup order to prevent heap corruption!
-    // AVFrames have internal references to decoder contexts.
-    // MUST free frames BEFORE destroying contexts!
-    //
-    // WRONG ORDER (causes heap corruption):
-    //   1. ShutdownDecoders() - destroys contexts
-    //   2. Free AVFrames - tries to access destroyed contexts → CRASH
-    //
-    // CORRECT ORDER:
-    //   1. Free AVFrames first
-    //   2. Then ShutdownDecoders() - safe to destroy contexts
-
-    // STEP 1: Free AVFrames first (while decoder contexts are still valid)
-    // CAREFUL GRADUAL CLEANUP: Clean frames in small batches with pauses
-    // Now that Audio uses direct ALSA (no PipeWire crash), we can try careful cleanup
-    // Strategy: Clear 100 frames at a time with 2ms pause between batches
-    // This prevents heap allocator overload while avoiding 200MB leak
-    size_t frame_count = m_frames->size();
-    if (frame_count > 0) {
-        std::cout << "[VIDEO] Starting careful gradual frame cleanup ("
-                  << frame_count << " frames in batches of 100)" << std::endl;
-
-        const size_t BATCH_SIZE = 100;  // Clean 100 frames at a time
-        const int PAUSE_MS = 2;         // 2ms pause between batches
-
-        size_t cleaned = 0;
-        auto cleanup_start = std::chrono::steady_clock::now();
-
-        // Clear frames in small batches
-        for (size_t i = 0; i < frame_count; i += BATCH_SIZE) {
-            size_t batch_end = std::min(i + BATCH_SIZE, frame_count);
-
-            // Reset shared_ptrs in this batch
-            for (size_t j = i; j < batch_end; j++) {
-                // Lock mutex to safely reset frame pointers
-                try {
-                    std::lock_guard<std::mutex> lock((*m_frames)[j].mutex);
-                    (*m_frames)[j].low_res_frame.reset();
-                    (*m_frames)[j].frame.reset();
-                    (*m_frames)[j].cached_frame.reset();
-                } catch (...) {
-                    // Mutex might be in bad state, skip this frame
-                }
-            }
-
-            cleaned += (batch_end - i);
-
-            // Progress report every 1000 frames
-            if (cleaned % 1000 == 0 || cleaned == frame_count) {
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - cleanup_start).count();
-                std::cout << "[VIDEO] Cleanup progress: " << cleaned << "/" << frame_count
-                          << " frames (" << (cleaned * 100 / frame_count) << "%, "
-                          << elapsed_ms << "ms elapsed)" << std::endl;
-            }
-
-            // Pause between batches to let heap allocator breathe
-            if (batch_end < frame_count) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(PAUSE_MS));
-            }
-        }
-
-        // Finally clear the vector itself
-        m_frames->clear();
-
-        auto cleanup_end = std::chrono::steady_clock::now();
-        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(cleanup_end - cleanup_start).count();
-        std::cout << "[VIDEO] Frame cleanup completed: " << frame_count
-                  << " frames in " << total_ms << "ms" << std::endl;
-    }
-
-    // STEP 2: Now safe to shutdown decoders (all AVFrames freed)
-    std::cout << "[VIDEO] All frames freed, now shutting down decoder contexts..." << std::endl;
     ShutdownDecoders();
-    std::cout << "[VIDEO] Decoder contexts shutdown complete" << std::endl;
+
+    // CRITICAL FIX: SKIP ALL FRAME CLEANUP - prevents heap corruption
+    // Problem: Even with NOP deleter, shared_ptr control blocks cause heap corruption
+    // When control blocks are freed, PipeWire's malloc_trim() crashes on corrupted heap
+    // Solution: DO NOT call reset() or clear() - leave frames in memory
+    // Memory leak ~200MB but acceptable on program exit (OS frees everything)
+    size_t frame_count = m_frames.size();
+    if (frame_count > 0) {
+        std::cout << "[VIDEO] Skipping frame cleanup to prevent heap corruption ("
+                  << frame_count << " frames, ~200MB leak on exit - acceptable)" << std::endl;
+
+        // DO NOT call reset() - causes shared_ptr control block cleanup → heap corruption
+        // DO NOT call clear() - calls destructors → same problem
+        // Just leave m_frames as-is, OS will clean up on process exit
+    }
 
     if (m_frame_index) {
         m_frame_index->Clear();
@@ -399,10 +329,12 @@ void FSTPVideoModuleWrapper::UnloadFile() {
     m_last_displayed_frame = -1; // Reset for forced rendering of first frame
     m_loaded = false;
 
-    // DON'T switch OSD to NO_FILE mode here - it causes visual glitch during exit
-    // When closing window: UnloadFile() is called → NO_FILE screen briefly appears
-    // UpdateWindowOSD() will handle NO_FILE mode if needed when user explicitly unloads file
-    // During exit/close, window closes immediately after this anyway
+    // Switch OSD to "no file" mode only if it's NOT reload
+    // On reload mode is already set to LOADING in LoadFile()
+    if (!m_file_reloading.load()) {
+        const int osdPlayerId = (m_instance_id >= 0 ? m_instance_id : 0);
+        UpdateOSDDisplayMode(osdPlayerId, OSD_MODE_NO_FILE);
+    }
 }
 
 bool FSTPVideoModuleWrapper::InitializeDecoders() {
@@ -412,7 +344,7 @@ bool FSTPVideoModuleWrapper::InitializeDecoders() {
     try {
         m_low_cached_manager = std::make_unique<FSTP::LowCachedDecoderManager>(
             m_proxy_path,
-            *m_frames,  // Dereference pointer to get reference
+            m_frames,
             m_current_index,
             m_low_res_range,
             m_high_res_window,
@@ -579,8 +511,7 @@ std::string FSTPVideoModuleWrapper::GetVideoCodecName() const {
 
 // Functions for developer visualization
 const std::vector<FSTP::FrameInfo>& FSTPVideoModuleWrapper::GetFrameIndex() const {
-    static std::vector<FSTP::FrameInfo> empty;
-    return m_frames ? *m_frames : empty;
+    return m_frames;
 }
 
 int FSTPVideoModuleWrapper::GetCurrentFrameIndex() const {
@@ -589,7 +520,7 @@ int FSTPVideoModuleWrapper::GetCurrentFrameIndex() const {
 
 void FSTPVideoModuleWrapper::GetBufferRanges(int& bufferStart, int& bufferEnd, int& highResStart, int& highResEnd) const {
     int current_frame = m_current_index.load();
-    int total_frames = static_cast<int>(m_frames->size());
+    int total_frames = static_cast<int>(m_frames.size());
 
     if (total_frames == 0) {
         bufferStart = bufferEnd = highResStart = highResEnd = 0;
@@ -832,15 +763,15 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         return;
     }
     // Use frames decoded by LowCachedDecoderManager (the proven solution)
-    if (clamped >= static_cast<int>(m_frames->size())) {
+    if (clamped >= static_cast<int>(m_frames.size())) {
         if (debug_call_count <= 3) {
-            std::cout << "[VIDEO] Frame index " << clamped << " out of range (size=" << m_frames->size() << ")" << std::endl;
+            std::cout << "[VIDEO] Frame index " << clamped << " out of range (size=" << m_frames.size() << ")" << std::endl;
         }
         return;
     }
 
     // SAFE CHECK: make sure m_frames was not cleared between checks
-    if (!m_loaded || clamped >= static_cast<int>(m_frames->size())) {
+    if (!m_loaded || clamped >= static_cast<int>(m_frames.size())) {
         if (debug_call_count <= 3) {
             std::cout << "[VIDEO] Race condition detected: frames cleared during DisplayFrame" << std::endl;
         }
@@ -850,7 +781,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     auto t_after_checks = std::chrono::high_resolution_clock::now();
     total_checks_us += std::chrono::duration_cast<std::chrono::microseconds>(t_after_checks - t_df_start).count();
 
-    FSTP::FrameInfo& info = (*m_frames)[clamped];
+    FSTP::FrameInfo& info = m_frames[clamped];
     std::shared_ptr<AVFrame> frame;
 
     // CRITICAL: Use DECODED time (info.time_ms) if available,
@@ -1075,13 +1006,13 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             // Try: -1, -2, -4, -8, -16, -32, -64
             for (int step = 1; step <= search_radius; step *= 2) {
                 int idx = clamped - step;
-                if (idx >= 0 && idx < static_cast<int>(m_frames->size())) {
+                if (idx >= 0 && idx < static_cast<int>(m_frames.size())) {
                     // Quick check without lock first (peek at atomic state)
                     // This avoids expensive mutex locks on empty frames
-                    std::lock_guard<std::mutex> search_lock((*m_frames)[idx].mutex);
-                    if ((*m_frames)[idx].low_res_frame &&
-                        (*m_frames)[idx].low_res_frame->data[0]) {
-                        nearest_frame = (*m_frames)[idx].low_res_frame;
+                    std::lock_guard<std::mutex> search_lock(m_frames[idx].mutex);
+                    if (m_frames[idx].low_res_frame &&
+                        m_frames[idx].low_res_frame->data[0]) {
+                        nearest_frame = m_frames[idx].low_res_frame;
                         found_idx = idx;
                         if (debug_call_count <= 3) {
                             std::cout << "⚡ [FAST SEARCH] Found backward frame " << idx
@@ -1097,11 +1028,11 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             if (!nearest_frame) {
                 for (int step = 1; step <= search_radius; step *= 2) {
                     int idx = clamped + step;
-                    if (idx >= 0 && idx < static_cast<int>(m_frames->size())) {
-                        std::lock_guard<std::mutex> search_lock((*m_frames)[idx].mutex);
-                        if ((*m_frames)[idx].low_res_frame &&
-                            (*m_frames)[idx].low_res_frame->data[0]) {
-                            nearest_frame = (*m_frames)[idx].low_res_frame;
+                    if (idx >= 0 && idx < static_cast<int>(m_frames.size())) {
+                        std::lock_guard<std::mutex> search_lock(m_frames[idx].mutex);
+                        if (m_frames[idx].low_res_frame &&
+                            m_frames[idx].low_res_frame->data[0]) {
+                            nearest_frame = m_frames[idx].low_res_frame;
                             found_idx = idx;
                             if (debug_call_count <= 3) {
                                 std::cout << "⚡ [FAST SEARCH] Found forward frame " << idx
@@ -1118,11 +1049,11 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             if (!nearest_frame) {
                 for (int offset = 1; offset <= 8 && (clamped - offset) >= 0; offset++) {
                     int idx = clamped - offset;
-                    if (idx < static_cast<int>(m_frames->size())) {
-                        std::lock_guard<std::mutex> search_lock((*m_frames)[idx].mutex);
-                        if ((*m_frames)[idx].low_res_frame &&
-                            (*m_frames)[idx].low_res_frame->data[0]) {
-                            nearest_frame = (*m_frames)[idx].low_res_frame;
+                    if (idx < static_cast<int>(m_frames.size())) {
+                        std::lock_guard<std::mutex> search_lock(m_frames[idx].mutex);
+                        if (m_frames[idx].low_res_frame &&
+                            m_frames[idx].low_res_frame->data[0]) {
+                            nearest_frame = m_frames[idx].low_res_frame;
                             found_idx = idx;
                             if (debug_call_count <= 3) {
                                 std::cout << "⚡ [NEIGHBOR SEARCH] Found nearby backward frame " << idx
@@ -1147,7 +1078,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                 double found_frame_time = -1.0;
 
                 // Get FrameInfo for found frame
-                const FSTP::FrameInfo& found_info = (*m_frames)[found_idx];
+                const FSTP::FrameInfo& found_info = m_frames[found_idx];
 
                 // Try best_effort_timestamp (most accurate)
                 if (nearest_frame->best_effort_timestamp != AV_NOPTS_VALUE) {
@@ -1241,19 +1172,19 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                 }
 
                 // Try to use the last good frame if available
-                if (m_last_good_frame_number >= 0 && m_last_good_frame_number < static_cast<int>(m_frames->size())) {
-                    std::lock_guard<std::mutex> last_lock((*m_frames)[m_last_good_frame_number].mutex);
-                    if ((*m_frames)[m_last_good_frame_number].low_res_frame) {
-                        frame = (*m_frames)[m_last_good_frame_number].low_res_frame;
+                if (m_last_good_frame_number >= 0 && m_last_good_frame_number < static_cast<int>(m_frames.size())) {
+                    std::lock_guard<std::mutex> last_lock(m_frames[m_last_good_frame_number].mutex);
+                    if (m_frames[m_last_good_frame_number].low_res_frame) {
+                        frame = m_frames[m_last_good_frame_number].low_res_frame;
                     }
                 }
 
                 // If still no frame, keep showing last good frame (sticky frame for pause)
-                if (!frame && m_last_good_frame_number >= 0 && m_last_good_frame_number < static_cast<int>(m_frames->size())) {
+                if (!frame && m_last_good_frame_number >= 0 && m_last_good_frame_number < static_cast<int>(m_frames.size())) {
                     // Force re-submit last good frame to prevent black screen during pause
-                    std::lock_guard<std::mutex> last_lock((*m_frames)[m_last_good_frame_number].mutex);
-                    if ((*m_frames)[m_last_good_frame_number].low_res_frame) {
-                        if (SubmitFrameToTexture((*m_frames)[m_last_good_frame_number].low_res_frame,
+                    std::lock_guard<std::mutex> last_lock(m_frames[m_last_good_frame_number].mutex);
+                    if (m_frames[m_last_good_frame_number].low_res_frame) {
+                        if (SubmitFrameToTexture(m_frames[m_last_good_frame_number].low_res_frame,
                                                m_last_good_frame_number, timestamp)) {
                             if (debug_call_count <= 3) {
                                 std::cout << "[VIDEO] Re-submitted sticky frame " << m_last_good_frame_number
@@ -1430,7 +1361,7 @@ void FSTPVideoModuleWrapper::SetPosition(double position_seconds) {
     }
 
     int frameNumber = m_frame_index->FindFrameByTime(position_seconds);
-    frameNumber = std::max(0, std::min(frameNumber, static_cast<int>(m_frames->size()) - 1));
+    frameNumber = std::max(0, std::min(frameNumber, static_cast<int>(m_frames.size()) - 1));
     NotifyDecodersOfFrameChange(frameNumber);
 }
 

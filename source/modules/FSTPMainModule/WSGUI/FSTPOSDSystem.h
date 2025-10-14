@@ -100,6 +100,13 @@ bool IsPlayerInStillMode(int player_id);
 // Returns true if can render at reduced frequency (10 FPS instead of 60)
 bool ShouldThrottleRendering(int player_id);
 
+// Menu bar rendering (Linux)
+void RenderMenuBar(SDL_Renderer* renderer, int window_width, int window_height);
+
+// Check if mouse click is on menu bar
+// Returns: -1 = no menu, 0 = File, 1 = Edit, 2 = View
+int CheckMenuBarClick(int mouse_x, int mouse_y, int window_width);
+
 #ifdef __cplusplus
 }
 #endif

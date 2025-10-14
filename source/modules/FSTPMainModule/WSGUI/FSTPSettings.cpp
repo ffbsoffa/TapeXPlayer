@@ -192,12 +192,18 @@ int LoadSettings() {
     return 0;
 }
 
-// Show settings window (macOS implementation)
-// Implementation moved to FSTPDarwinWS.mm for proper Cocoa code compilation
+// Forward declarations for platform-specific implementations
+#ifdef __linux__
+extern "C" void ShowGTKSettingsDialog();
+#endif
+
+// Show settings window (platform-specific implementation)
 void ShowSettingsDialog() {
 #ifdef __APPLE__
     // Function implemented in FSTPDarwinWS.mm as ShowNativeSettingsDialog()
     std::cout << "ShowSettingsDialog called - implementation in FSTPDarwinWS.mm" << std::endl;
+#elif defined(__linux__)
+    ShowGTKSettingsDialog();
 #else
     std::cout << "Settings dialog not implemented for this platform" << std::endl;
 #endif

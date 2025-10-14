@@ -3,6 +3,8 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <sys/mman.h>
+#include <unistd.h>
 
 extern "C" {
 #include <libswscale/swscale.h>
@@ -173,8 +175,9 @@ bool TakeScreenshotFromPixelBuffer(
 
     // Ensure even dimensions AND that width/2 and height/2 are also even (divisible by 4)
     // This is critical for YUV420P where U/V planes are half resolution
-    final_width = (final_width + 3) & ~3;  // Round up to multiple of 4
-    final_height = (final_height + 3) & ~3;
+    // Round DOWN to avoid adding black padding
+    final_width = final_width & ~3;  // Round DOWN to multiple of 4
+    final_height = final_height & ~3;
 
     std::cout << "📸 [SCREENSHOT] Output: " << final_width << "x" << final_height << std::endl;
 
@@ -187,8 +190,20 @@ bool TakeScreenshotFromPixelBuffer(
     const uint8_t* src_u = yuv_data + y_size;
     const uint8_t* src_v = yuv_data + y_size + uv_size;
 
-    // Create RGB output buffer directly
-    std::vector<uint8_t> rgb_data(final_width * final_height * 3);
+    // Create RGB output buffer using mmap (avoid malloc heap corruption from GTK)
+    size_t rgb_buffer_size = final_width * final_height * 3;
+    void* rgb_mmap = mmap(nullptr, rgb_buffer_size,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS,
+                          -1, 0);
+
+    if (rgb_mmap == MAP_FAILED) {
+        std::cerr << "❌ [SCREENSHOT] Failed to allocate RGB buffer via mmap" << std::endl;
+        return false;
+    }
+
+    uint8_t* rgb_data = (uint8_t*)rgb_mmap;
+    std::cout << "📸 [SCREENSHOT] Allocated " << rgb_buffer_size << " bytes via mmap for RGB data" << std::endl;
 
     // Direct YUV -> RGB conversion in one pass
     SwsContext* sws_ctx = nullptr;
@@ -201,8 +216,9 @@ bool TakeScreenshotFromPixelBuffer(
         int src_h = (int)(height / zoom_factor);
 
         // Ensure even dimensions for YUV420P
-        src_w = (src_w + 1) & ~1;
-        src_h = (src_h + 1) & ~1;
+        // Round DOWN to avoid black padding
+        src_w = src_w & ~1;
+        src_h = src_h & ~1;
 
         int src_x = (int)(width * zoom_center_x) - src_w / 2;
         int src_y_offset = (int)(height * zoom_center_y) - src_h / 2;
@@ -236,7 +252,7 @@ bool TakeScreenshotFromPixelBuffer(
         );
 
         if (sws_ctx) {
-            uint8_t* rgb_dst[4] = {rgb_data.data(), nullptr, nullptr, nullptr};
+            uint8_t* rgb_dst[4] = {rgb_data, nullptr, nullptr, nullptr};
             int rgb_linesize[4] = {final_width * 3, 0, 0, 0};
             sws_scale(sws_ctx, src_data, src_linesize, 0, src_h, rgb_dst, rgb_linesize);
         }
@@ -256,7 +272,7 @@ bool TakeScreenshotFromPixelBuffer(
         );
 
         if (sws_ctx) {
-            uint8_t* rgb_dst[4] = {rgb_data.data(), nullptr, nullptr, nullptr};
+            uint8_t* rgb_dst[4] = {rgb_data, nullptr, nullptr, nullptr};
             int rgb_linesize[4] = {final_width * 3, 0, 0, 0};
             sws_scale(sws_ctx, src_data, src_linesize, 0, height, rgb_dst, rgb_linesize);
         }
@@ -278,7 +294,7 @@ bool TakeScreenshotFromPixelBuffer(
     for (int y = timecode_y - 2; y < timecode_y + text_height + 2; y++) {
         for (int x = timecode_x - 2; x < timecode_x + text_width + 2; x++) {
             if (x >= 0 && x < final_width && y >= 0 && y < final_height) {
-                uint8_t* pixel = rgb_data.data() + (y * final_width + x) * 3;
+                uint8_t* pixel = rgb_data + (y * final_width + x) * 3;
                 pixel[0] = pixel[1] = pixel[2] = 32; // Dark gray
             }
         }
@@ -299,7 +315,7 @@ bool TakeScreenshotFromPixelBuffer(
 
                 if (px >= final_width) break;
                 if (rowData & (0x80 >> col)) {
-                    uint8_t* pixel = rgb_data.data() + (py * final_width + px) * 3;
+                    uint8_t* pixel = rgb_data + (py * final_width + px) * 3;
                     pixel[0] = pixel[1] = pixel[2] = 255; // White
                 }
             }
@@ -313,8 +329,9 @@ bool TakeScreenshotFromPixelBuffer(
         float aspect_ratio = (float)width / (float)height;
         int thumb_width = std::min(180, static_cast<int>(final_width * 0.15f));
         int thumb_height = (int)(thumb_width / aspect_ratio);
-        thumb_width = (thumb_width + 1) & ~1;
-        thumb_height = (thumb_height + 1) & ~1;
+        // Round DOWN to avoid black padding
+        thumb_width = thumb_width & ~1;
+        thumb_height = thumb_height & ~1;
 
         // Create thumbnail RGB buffer
         std::vector<uint8_t> thumb_rgb(thumb_width * thumb_height * 3);
@@ -336,10 +353,11 @@ bool TakeScreenshotFromPixelBuffer(
             sws_freeContext(thumb_ctx);
 
             // Draw white border (2px)
+            uint8_t* thumb_data = thumb_rgb.data();
             for (int y = 0; y < thumb_height; y++) {
                 for (int x = 0; x < thumb_width; x++) {
                     if (y < 2 || y >= thumb_height - 2 || x < 2 || x >= thumb_width - 2) {
-                        uint8_t* pixel = thumb_rgb.data() + (y * thumb_width + x) * 3;
+                        uint8_t* pixel = thumb_data + (y * thumb_width + x) * 3;
                         pixel[0] = pixel[1] = pixel[2] = 255; // White
                     }
                 }
@@ -362,12 +380,12 @@ bool TakeScreenshotFromPixelBuffer(
                 if (x >= 0 && x < thumb_width) {
                     // Top edge
                     if (rect_y >= 0 && rect_y < thumb_height) {
-                        uint8_t* pixel = thumb_rgb.data() + (rect_y * thumb_width + x) * 3;
+                        uint8_t* pixel = thumb_data + (rect_y * thumb_width + x) * 3;
                         pixel[0] = 255; pixel[1] = 0; pixel[2] = 0; // Red
                     }
                     // Bottom edge
                     if (rect_y + rect_h - 1 >= 0 && rect_y + rect_h - 1 < thumb_height) {
-                        uint8_t* pixel = thumb_rgb.data() + ((rect_y + rect_h - 1) * thumb_width + x) * 3;
+                        uint8_t* pixel = thumb_data + ((rect_y + rect_h - 1) * thumb_width + x) * 3;
                         pixel[0] = 255; pixel[1] = 0; pixel[2] = 0; // Red
                     }
                 }
@@ -376,12 +394,12 @@ bool TakeScreenshotFromPixelBuffer(
                 if (y >= 0 && y < thumb_height) {
                     // Left edge
                     if (rect_x >= 0 && rect_x < thumb_width) {
-                        uint8_t* pixel = thumb_rgb.data() + (y * thumb_width + rect_x) * 3;
+                        uint8_t* pixel = thumb_data + (y * thumb_width + rect_x) * 3;
                         pixel[0] = 255; pixel[1] = 0; pixel[2] = 0; // Red
                     }
                     // Right edge
                     if (rect_x + rect_w - 1 >= 0 && rect_x + rect_w - 1 < thumb_width) {
-                        uint8_t* pixel = thumb_rgb.data() + (y * thumb_width + rect_x + rect_w - 1) * 3;
+                        uint8_t* pixel = thumb_data + (y * thumb_width + rect_x + rect_w - 1) * 3;
                         pixel[0] = 255; pixel[1] = 0; pixel[2] = 0; // Red
                     }
                 }
@@ -397,8 +415,8 @@ bool TakeScreenshotFromPixelBuffer(
                     int dst_y = thumb_dst_y + y;
 
                     if (dst_x >= 0 && dst_x < final_width && dst_y >= 0 && dst_y < final_height) {
-                        uint8_t* src_pixel = thumb_rgb.data() + (y * thumb_width + x) * 3;
-                        uint8_t* dst_pixel = rgb_data.data() + (dst_y * final_width + dst_x) * 3;
+                        uint8_t* src_pixel = thumb_data + (y * thumb_width + x) * 3;
+                        uint8_t* dst_pixel = rgb_data + (dst_y * final_width + dst_x) * 3;
                         dst_pixel[0] = src_pixel[0];
                         dst_pixel[1] = src_pixel[1];
                         dst_pixel[2] = src_pixel[2];
@@ -412,13 +430,17 @@ bool TakeScreenshotFromPixelBuffer(
     }
 
     // Copy to clipboard
-    bool success = CopyImageToClipboard(rgb_data.data(), final_width, final_height);
+    bool success = CopyImageToClipboard(rgb_data, final_width, final_height);
 
     if (success) {
         std::cout << "✅ [SCREENSHOT] Copied to clipboard: " << final_width << "x" << final_height << std::endl;
     } else {
         std::cerr << "❌ [SCREENSHOT] Failed to copy to clipboard" << std::endl;
     }
+
+    // Free mmap'd RGB buffer
+    munmap(rgb_mmap, rgb_buffer_size);
+    std::cout << "📋 [SCREENSHOT] Freed RGB buffer (" << rgb_buffer_size << " bytes)" << std::endl;
 
     return success;
 }

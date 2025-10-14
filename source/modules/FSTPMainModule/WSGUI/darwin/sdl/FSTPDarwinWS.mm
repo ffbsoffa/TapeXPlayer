@@ -1380,4 +1380,13 @@ extern "C" void RequestForceRender() {
     g_forceRender.store(true);
 }
 
+// Initial file to load from command line
+static std::string g_initial_file_to_load;
+
+// Set initial file to load from command line
+void SetInitialFileToLoad(const char* filepath) {
+    g_initial_file_to_load = filepath;
+    std::cout << "📂 Initial file to load set: " << filepath << std::endl;
+}
+
 #endif // __APPLE__

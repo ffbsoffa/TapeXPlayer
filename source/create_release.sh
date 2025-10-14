@@ -373,8 +373,8 @@ chmod +x "$RELEASE_CONTENT/uninstall.command"
 # Create ZIP
 echo "5️⃣  Creating ZIP archive..."
 rm -f "$RELEASE_ZIP"
-cd "$RELEASE_DIR/.."
-zip -r -q "$(basename "$RELEASE_ZIP")" "release/$(basename "$RELEASE_CONTENT")"
+cd "$RELEASE_DIR"
+zip -r -q "../../$(basename "$RELEASE_ZIP")" "$(basename "$RELEASE_CONTENT")"
 cd - > /dev/null
 
 # Cleanup

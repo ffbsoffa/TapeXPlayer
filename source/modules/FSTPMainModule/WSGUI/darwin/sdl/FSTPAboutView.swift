@@ -281,9 +281,9 @@ private var aboutWindowController: NSWindowController?
 @available(macOS 13.0, *)
 @_cdecl("ShowSwiftUIAboutWindow")
 public func ShowSwiftUIAboutWindow() {
-    if aboutWindowController == nil {
-        aboutWindowController = FSTPAboutWindowController()
-    }
+    // Always recreate window to ensure BuildInfo is up to date
+    // (BuildInfo.swift is regenerated on each build)
+    aboutWindowController = FSTPAboutWindowController()
 
     aboutWindowController?.showWindow(nil)
     NSApp.activate(ignoringOtherApps: true)

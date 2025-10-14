@@ -47,7 +47,11 @@ public:
     void stop();
 
     // Notify the manager about a potential seek or change in current frame
-    void notifyFrameChange(); 
+    void notifyFrameChange();
+
+    // Adaptive segment sizing based on GOP structure
+    void setSegmentSizeFromGOP(int gopSize);
+    static int calculateOptimalSegmentSize(int gopSize); 
 
 private:
     // The main loop running on the background thread

@@ -12,7 +12,7 @@ bool HandleKeyboardEvents(SDL_Event& event);
 void HandleNativeEvents();
 
 // Mouse Shuttle functions
-void StartMouseShuttle(int x);
+void StartMouseShuttle(int x, int y);
 void UpdateMouseShuttle(int x);
 void StopMouseShuttle();
 

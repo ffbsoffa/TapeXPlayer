@@ -7,4 +7,7 @@ int ui_main();
 // Platform-specific main UI loop (implementation in corresponding WS file)
 int RunMainUILoop();
 
+// Set initial file to load (called before RunMainUILoop)
+void SetInitialFileToLoad(const char* filepath);
+
 #endif // MAIN_H

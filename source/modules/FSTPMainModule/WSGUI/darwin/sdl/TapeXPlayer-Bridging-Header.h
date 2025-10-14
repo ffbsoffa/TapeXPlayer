@@ -9,7 +9,7 @@
 #define TapeXPlayer_Bridging_Header_h
 
 // Import FSTPSettings C API
-#include "../../FSTPSettings.h"
+#include "FSTPSettings.h"
 
 // Import PortAudio for audio device enumeration
 #include <portaudio.h>

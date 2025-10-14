@@ -186,20 +186,42 @@ int CreateNewWindow(const char* title, int width, int height) {
     // Try creating renderer with fallback strategy
     SDL_Renderer* renderer = nullptr;
 
-    // Attempt 1: METAL RENDERER (native GPU API for macOS!)
-    // Metal faster than OpenGL on macOS, especially for YUV textures
-    // VSync disabled - use our timing for FPS control
-    // IMPORTANT: Pixel Buffer Manager now ensures synchronized texture updates in main thread
-    std::cout << "🔧 [RENDERER] Trying Metal renderer (native macOS GPU)..." << std::endl;
+    // Attempt 1: Try SOFTWARE renderer first on Linux for debugging
+    // SOFTWARE renderer should always work
+    std::cout << "🔧 [RENDERER] Trying SOFTWARE renderer for debugging..." << std::endl;
 
-    // Force use Metal instead of OpenGL
-    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
-
-    // CRITICAL: Explicitly disable VSync to eliminate 15ms blocking when multiple windows!
-    // Metal by default includes VSync through CAMetalLayer, which blocks SDL_RenderPresent
-    SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
-
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    #ifdef __linux__
+        // On Linux: try hardware acceleration first for Intel Celeron + VA-API
+        std::cout << "🔧 [RENDERER] Trying hardware acceleration for Intel Celeron + VA-API..." << std::endl;
+        
+        // Try OpenGL with VA-API support first
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+        SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        
+        if (!renderer) {
+            std::cout << "⚠️  OpenGL failed, trying Vulkan..." << std::endl;
+            SDL_SetHint(SDL_HINT_RENDER_DRIVER, "vulkan");
+            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        }
+        
+        if (!renderer) {
+            std::cout << "⚠️  Vulkan failed, trying Direct3D..." << std::endl;
+            SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d");
+            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        }
+        
+        if (!renderer) {
+            std::cout << "⚠️  All hardware renderers failed, falling back to software..." << std::endl;
+            SDL_SetHint(SDL_HINT_RENDER_DRIVER, "");  // Reset hint
+            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+        }
+    #else
+        // On macOS: use Metal
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
+        SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    #endif
 
     if (!renderer) {
         std::cout << "⚠️  Hardware accelerated renderer failed (" << SDL_GetError() << "), trying default..." << std::endl;
@@ -262,6 +284,7 @@ int CreateNewWindow(const char* title, int width, int height) {
     g_windows[window_index].is_active = true;
     g_windows[window_index].has_focus = true;
     g_windows[window_index].is_minimized = false;
+    g_windows[window_index].is_closing = false;
 
     // Hard binding: window N bound to player N
     g_windows[window_index].player_instance_id = WINDOW_PLAYER_BINDING(window_index);
@@ -437,6 +460,9 @@ void HandleWindowEvents(SDL_Event* event) {
                         int player_id = g_windows[i].player_instance_id;
                         std::cout << "Window " << i << " close requested - stopping player " << player_id << std::endl;
 
+                        // Mark window as closing to prevent OSD updates during cleanup
+                        g_windows[i].is_closing = true;
+
                         // First stop player, then destroy
                         if (player_id >= 0 && IsPlayerInstanceActive(player_id)) {
                             std::cout << "Stopping player " << player_id << " before destroying..." << std::endl;
@@ -557,11 +583,11 @@ void RenderAllWindows() {
             SDL_Renderer* renderer = g_windows[i].renderer;
             int player_id = g_windows[i].player_instance_id;
 
-            // OPTIMIZATION: Skip entire rendering loop if player is in still mode
-            // and not yet time to update (throttling to 10 FPS)
-            if (player_id >= 0 && !ShouldRenderOSDForPlayer(player_id)) {
-                continue;  // Skip entire rendering for this window
-            }
+            // REMOVED: Throttling optimization that prevented OSD from showing immediately
+            // macOS version doesn't have this check and renders every frame
+            // if (player_id >= 0 && !ShouldRenderOSDForPlayer(player_id)) {
+            //     continue;  // Skip entire rendering for this window
+            // }
 
             // Update video for this player
             if (player_id >= 0) {
@@ -725,6 +751,8 @@ void RenderAllWindows() {
             auto t_after_osd = std::chrono::high_resolution_clock::now();
             total_osd_render_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_osd - t_before_osd).count());
 
+            // 3.5. MENU BAR removed - using GTK context menu instead
+
             // 4. Final Present
             auto t_before_present = std::chrono::high_resolution_clock::now();
             SDL_RenderPresent(renderer);
@@ -757,7 +785,32 @@ void UpdateWindowOSD(int window_index, double current_time, double total_duratio
     UpdateOSDPosition(player_id, current_time, total_duration);
     UpdateOSDPlayState(player_id, is_playing, false, false);
     UpdateOSDSpeed(player_id, speed, is_reverse);
-    UpdateOSDDisplayMode(player_id, OSD_MODE_NORMAL);
+
+    // CRITICAL FIX: Set correct display mode based on player state
+    // Check if player has loaded file (duration > 0) or is loading
+    bool is_loading = (player_id >= 0) ? IsPlayerLoading(player_id) : false;
+    bool has_file = (total_duration > 0.0);
+
+    // CRITICAL: Don't update OSD if window or player instance is being destroyed
+    // This prevents "no file" flash when closing window or exiting application
+    if (!g_windows[window_index].is_active || g_windows[window_index].is_closing) {
+        return;  // Window is closing, don't update OSD
+    }
+
+    if (player_id >= 0 && !IsPlayerInstanceActive(player_id)) {
+        return;  // Player instance destroyed, don't update OSD
+    }
+
+    if (is_loading) {
+        // Keep LOADING mode (don't override it)
+        // Mode is set by LoadFileIntoPlayerInstance
+    } else if (!has_file) {
+        // No file loaded - show NO_FILE screen
+        UpdateOSDDisplayMode(player_id, OSD_MODE_NO_FILE);
+    } else {
+        // File loaded - normal mode
+        UpdateOSDDisplayMode(player_id, OSD_MODE_NORMAL);
+    }
 
     // Update frame number for OSD if frame mode is enabled
     FSTPAudioModuleWrapper* audio_module = GetInstanceAudioModule(player_id);
@@ -900,13 +953,19 @@ void UpdateWindowTitle(int window_index, int instance_id, const char* filename) 
                  "TapeXPlayer - Instance #%d - %s", instance_id + 1, file_name_only);
     }
 
-        // Update SDL window title - ONLY in main thread (macOS requirement)
+        // Update SDL window title
     if (g_windows[window_index].window) {
+#ifdef __APPLE__
+        // On macOS - ONLY in main thread (requirement)
         SDL_Window* window = g_windows[window_index].window;
         std::string title_copy = g_windows[window_index].window_title;
 
         dispatch_async(dispatch_get_main_queue(), ^{
             SDL_SetWindowTitle(window, title_copy.c_str());
         });
+#else
+        // On Linux/Windows - can update directly
+        SDL_SetWindowTitle(g_windows[window_index].window, g_windows[window_index].window_title);
+#endif
     }
 }

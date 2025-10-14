@@ -34,6 +34,9 @@
     #include <va/va_drm.h>
     #include <fcntl.h>
     #include <unistd.h>
+    #include <fstream>
+    #include <sstream>
+    #include <cstring>
 #endif
 
 // FFmpeg includes for testing
@@ -51,11 +54,20 @@ FSTPHardwareDetection::FSTPHardwareDetection() {
 }
 
 FSTPHardwareDetection::~FSTPHardwareDetection() {
+    // Restore original power mode on exit
+    RestorePowerMode();
     detected_hardware_.clear();
 }
 
 bool FSTPHardwareDetection::DetectAllHardware() {
     std::cout << "FSTPHardwareDetection: Starting full hardware acceleration detection..." << std::endl;
+
+    // Detect CPU and set performance mode if needed
+    cpu_info_ = DetectCPU();
+
+    if (cpu_info_.requires_performance_mode) {
+        SetPerformanceMode();
+    }
 
     detected_hardware_.clear();
     bool found_any = false;
@@ -164,6 +176,18 @@ bool FSTPHardwareDetection::DetectVideoToolbox() {
     sysctlbyname("hw.optional.arm64", nullptr, &size, nullptr, 0);
     bool is_apple_silicon = (size > 0);
 
+    // Get Mac model and year to detect old hardware with poor VideoToolbox performance
+    char model[256];
+    size_t model_size = sizeof(model);
+    sysctlbyname("hw.model", model, &model_size, nullptr, 0);
+    std::string mac_model(model);
+
+    // Get CPU brand string for Intel Macs
+    char cpu_brand[256];
+    size_t cpu_brand_size = sizeof(cpu_brand);
+    sysctlbyname("machdep.cpu.brand_string", cpu_brand, &cpu_brand_size, nullptr, 0);
+    std::string cpu_name(cpu_brand);
+
     if (is_apple_silicon) {
         vt_info.device_name = "Apple VideoToolbox (Apple Silicon)";
         vt_info.supported_codecs = FSTPCodecSupport::H264_DECODE | FSTPCodecSupport::H264_ENCODE |
@@ -172,13 +196,50 @@ bool FSTPHardwareDetection::DetectVideoToolbox() {
                                   FSTPCodecSupport::MPEG2_DECODE | FSTPCodecSupport::MPEG4_DECODE;
         vt_info.supports_10bit = true;
         vt_info.performance_score = 95.0;
+
+        std::cout << "  ⚡ Apple Silicon detected: " << mac_model << std::endl;
+        std::cout << "     VideoToolbox hardware acceleration: EXCELLENT" << std::endl;
     } else {
-        vt_info.device_name = "Apple VideoToolbox (Intel)";
-        vt_info.supported_codecs = FSTPCodecSupport::H264_DECODE | FSTPCodecSupport::H264_ENCODE |
-                                  FSTPCodecSupport::H265_DECODE | FSTPCodecSupport::H265_ENCODE |
-                                  FSTPCodecSupport::MPEG2_DECODE | FSTPCodecSupport::MPEG4_DECODE;
-        vt_info.supports_10bit = false;
-        vt_info.performance_score = 85.0;
+        // Intel Mac - check for old models with poor VideoToolbox performance
+        bool is_old_intel = false;
+
+        // MacBook Pro 2016-2017 with Intel HD Graphics 530/630 have poor VideoToolbox performance
+        // Better to use CPU decoding with SIMD optimizations
+        if (mac_model.find("MacBookPro13") != std::string::npos ||  // 2016 models
+            mac_model.find("MacBookPro14") != std::string::npos ||  // 2017 models
+            cpu_name.find("i5-6") != std::string::npos ||           // Skylake 6th gen
+            cpu_name.find("i7-6") != std::string::npos ||           // Skylake 6th gen
+            cpu_name.find("i5-7") != std::string::npos ||           // Kaby Lake 7th gen
+            cpu_name.find("i7-7") != std::string::npos) {           // Kaby Lake 7th gen
+            is_old_intel = true;
+        }
+
+        if (is_old_intel) {
+            // On old Intel Macs (2016-2017), VideoToolbox is SLOWER than CPU decoding
+            // Reduce performance score significantly to prefer CPU decoding
+            vt_info.device_name = "Apple VideoToolbox (Intel - OLD, NOT RECOMMENDED)";
+            vt_info.supported_codecs = FSTPCodecSupport::H264_DECODE | FSTPCodecSupport::H264_ENCODE |
+                                      FSTPCodecSupport::H265_DECODE | FSTPCodecSupport::H265_ENCODE |
+                                      FSTPCodecSupport::MPEG2_DECODE | FSTPCodecSupport::MPEG4_DECODE;
+            vt_info.supports_10bit = false;
+            vt_info.performance_score = 30.0;  // LOW score - prefer CPU decoding
+
+            std::cout << "  ⚠️  Old Intel Mac detected: " << mac_model << std::endl;
+            std::cout << "     CPU: " << cpu_name << std::endl;
+            std::cout << "     VideoToolbox hardware acceleration: POOR (use CPU decoding instead)" << std::endl;
+            std::cout << "     Recommendation: CPU with AVX2 SIMD is FASTER than VideoToolbox on this hardware" << std::endl;
+        } else {
+            // Newer Intel Mac (2018+) - VideoToolbox is acceptable
+            vt_info.device_name = "Apple VideoToolbox (Intel)";
+            vt_info.supported_codecs = FSTPCodecSupport::H264_DECODE | FSTPCodecSupport::H264_ENCODE |
+                                      FSTPCodecSupport::H265_DECODE | FSTPCodecSupport::H265_ENCODE |
+                                      FSTPCodecSupport::MPEG2_DECODE | FSTPCodecSupport::MPEG4_DECODE;
+            vt_info.supports_10bit = false;
+            vt_info.performance_score = 85.0;
+
+            std::cout << "  ✅ Intel Mac detected: " << mac_model << std::endl;
+            std::cout << "     VideoToolbox hardware acceleration: GOOD" << std::endl;
+        }
     }
 
     vt_info.driver_version = "System";
@@ -317,4 +378,238 @@ bool InitializeHardwareDetection() {
 void CleanupHardwareDetection() {
     delete g_hardware_detection;
     g_hardware_detection = nullptr;
+}
+
+// CPU Detection Implementation
+FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
+    FSTPCPUInfo info;
+
+    // Initialize defaults
+    info.model_name = "Unknown CPU";
+    info.vendor = "Unknown";
+    info.physical_cores = 2;
+    info.logical_cores = 4;
+    info.base_frequency_ghz = 2.0;
+    info.max_frequency_ghz = 3.0;
+    info.has_avx = false;
+    info.has_avx2 = false;
+    info.has_avx512 = false;
+    info.has_sse4_2 = false;
+    info.power_governor = "unknown";
+    info.recommended_max_speed = 32;  // Default: keep original 32x
+    info.optimal_segment_size = 500;
+    info.optimal_preload_count = 8;
+    info.decode_throughput_fps = 800.0;
+    info.requires_performance_mode = false;
+    info.is_compact_device = false;  // Default: not a compact device
+    info.device_model = "";
+
+#ifdef PLATFORM_LINUX
+    // Detect compact devices (GPD Pocket, etc.)
+    std::ifstream dmi_file("/sys/class/dmi/id/product_name");
+    if (dmi_file.is_open()) {
+        std::string product_name;
+        std::getline(dmi_file, product_name);
+        dmi_file.close();
+
+        // GPD Pocket 3, GPD Pocket 4, or other GPD compact devices
+        if (product_name.find("GPD") != std::string::npos &&
+            product_name.find("Pocket") != std::string::npos) {
+            info.is_compact_device = true;
+            info.device_model = product_name;
+            std::cout << "🎮 [COMPACT DEVICE] Detected: " << product_name << std::endl;
+            std::cout << "   Mouse shuttle mode: LEFT CLICK (no modifiers required)" << std::endl;
+        }
+    }
+    // Read CPU model name from /proc/cpuinfo
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(cpuinfo, line)) {
+        if (line.find("model name") != std::string::npos) {
+            size_t pos = line.find(':');
+            if (pos != std::string::npos) {
+                info.model_name = line.substr(pos + 2);
+                break;
+            }
+        }
+    }
+
+    // Detect CPU features
+    DetectCPUFeatures(info);
+
+    // Detect power mode
+    DetectCPUPowerMode(info);
+
+    // Apply CPU-specific optimizations
+    ApplyCPUSpecificOptimizations(info);
+#endif
+
+#ifdef PLATFORM_MACOS
+    // Get CPU brand string
+    char cpu_brand[256];
+    size_t cpu_brand_size = sizeof(cpu_brand);
+    sysctlbyname("machdep.cpu.brand_string", cpu_brand, &cpu_brand_size, nullptr, 0);
+    info.model_name = std::string(cpu_brand);
+
+    // Get CPU vendor
+    char cpu_vendor[256];
+    size_t cpu_vendor_size = sizeof(cpu_vendor);
+    sysctlbyname("machdep.cpu.vendor", cpu_vendor, &cpu_vendor_size, nullptr, 0);
+    info.vendor = std::string(cpu_vendor);
+
+    // Get core counts
+    int physical_cores = 0;
+    size_t size = sizeof(physical_cores);
+    sysctlbyname("hw.physicalcpu", &physical_cores, &size, nullptr, 0);
+    info.physical_cores = physical_cores;
+
+    int logical_cores = 0;
+    size = sizeof(logical_cores);
+    sysctlbyname("hw.logicalcpu", &logical_cores, &size, nullptr, 0);
+    info.logical_cores = logical_cores;
+
+    // Get CPU frequency (in Hz, convert to GHz)
+    int64_t freq = 0;
+    size = sizeof(freq);
+    sysctlbyname("hw.cpufrequency", &freq, &size, nullptr, 0);
+    info.base_frequency_ghz = freq / 1000000000.0;
+    info.max_frequency_ghz = info.base_frequency_ghz * 1.5; // Estimate
+
+    // Detect SIMD features via sysctl
+    int feature_val = 0;
+    size = sizeof(feature_val);
+
+    sysctlbyname("hw.optional.sse4_2", &feature_val, &size, nullptr, 0);
+    info.has_sse4_2 = (feature_val == 1);
+
+    sysctlbyname("hw.optional.avx1_0", &feature_val, &size, nullptr, 0);
+    info.has_avx = (feature_val == 1);
+
+    sysctlbyname("hw.optional.avx2_0", &feature_val, &size, nullptr, 0);
+    info.has_avx2 = (feature_val == 1);
+
+    sysctlbyname("hw.optional.avx512f", &feature_val, &size, nullptr, 0);
+    info.has_avx512 = (feature_val == 1);
+
+    // macOS doesn't have power governors like Linux
+    info.power_governor = "n/a";
+    info.requires_performance_mode = false;
+
+    std::cout << "🖥️  [CPU] Detected: " << info.model_name << std::endl;
+    std::cout << "   Cores: " << info.physical_cores << " physical, " << info.logical_cores << " logical" << std::endl;
+    std::cout << "   Frequency: " << info.base_frequency_ghz << " GHz" << std::endl;
+    std::cout << "   SIMD: SSE4.2=" << (info.has_sse4_2 ? "✅" : "❌")
+              << " AVX=" << (info.has_avx ? "✅" : "❌")
+              << " AVX2=" << (info.has_avx2 ? "✅" : "❌")
+              << " AVX512=" << (info.has_avx512 ? "✅" : "❌") << std::endl;
+#endif
+
+    return info;
+}
+
+void FSTPHardwareDetection::DetectCPUFeatures(FSTPCPUInfo& info) {
+#ifdef PLATFORM_LINUX
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    std::string line;
+
+    while (std::getline(cpuinfo, line)) {
+        if (line.find("flags") != std::string::npos || line.find("Features") != std::string::npos) {
+            info.has_sse4_2 = (line.find("sse4_2") != std::string::npos);
+            info.has_avx = (line.find("avx") != std::string::npos);
+            info.has_avx2 = (line.find("avx2") != std::string::npos);
+            info.has_avx512 = (line.find("avx512f") != std::string::npos);
+            break;
+        }
+    }
+#endif
+}
+
+void FSTPHardwareDetection::DetectCPUPowerMode(FSTPCPUInfo& info) {
+#ifdef PLATFORM_LINUX
+    std::ifstream governor("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+    if (governor.is_open()) {
+        std::getline(governor, info.power_governor);
+    }
+#endif
+}
+
+void FSTPHardwareDetection::ApplyCPUSpecificOptimizations(FSTPCPUInfo& info) {
+    // Check for Intel Pentium Gold 7505 and similar low-power CPUs
+    if (info.model_name.find("Pentium") != std::string::npos &&
+        info.model_name.find("7505") != std::string::npos) {
+
+        std::cout << "  🎯 Intel Pentium Gold 7505 detected" << std::endl;
+        std::cout << "     Max speed limited to 24x (tested stable with performance mode)" << std::endl;
+        info.requires_performance_mode = true;
+        info.recommended_max_speed = 24;  // Limit to 24x for this CPU
+    }
+    // Check for other Pentium Gold/Silver CPUs (low-power, similar performance)
+    else if (info.model_name.find("Pentium") != std::string::npos &&
+             (info.model_name.find("Gold") != std::string::npos ||
+              info.model_name.find("Silver") != std::string::npos)) {
+
+        std::cout << "  🔧 Intel Pentium Gold/Silver detected" << std::endl;
+        std::cout << "     Max speed limited to 24x (conservative for low-power CPUs)" << std::endl;
+        info.requires_performance_mode = true;
+        info.recommended_max_speed = 24;  // Conservative for low-power Pentiums
+    }
+    // Generic check for AVX-512 CPUs (likely higher-end, keep 32x)
+    else if (info.has_avx512) {
+        std::cout << "  ⚡ AVX-512 CPU detected" << std::endl;
+        std::cout << "     Max speed: 32x (default for high-performance CPUs)" << std::endl;
+        info.requires_performance_mode = true;
+        info.recommended_max_speed = 32;  // Keep original 32x
+    }
+}
+
+bool FSTPHardwareDetection::SetPerformanceMode() {
+#ifdef PLATFORM_LINUX
+    // Save original governor
+    std::ifstream gov_file("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+    if (gov_file.is_open()) {
+        std::getline(gov_file, original_governor_);
+        gov_file.close();
+    }
+
+    std::cout << "  ⚡ Switching CPU to performance mode..." << std::endl;
+    std::cout << "     Original mode: " << original_governor_ << std::endl;
+
+    // Try to set performance mode for all CPUs
+    int result = system("for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance | sudo tee $cpu > /dev/null 2>&1; done");
+
+    if (result == 0) {
+        std::cout << "  ✅ CPU switched to performance mode" << std::endl;
+        std::cout << "     Will be restored to '" << original_governor_ << "' on exit" << std::endl;
+        return true;
+    } else {
+        std::cout << "  ⚠️  Could not switch to performance mode (need sudo)" << std::endl;
+        std::cout << "     Run with: sudo or grant permissions:" << std::endl;
+        std::cout << "     echo 'performance' | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor" << std::endl;
+        return false;
+    }
+#endif
+    return false;
+}
+
+bool FSTPHardwareDetection::RestorePowerMode() {
+#ifdef PLATFORM_LINUX
+    if (original_governor_.empty() || original_governor_ == "performance") {
+        return true; // Nothing to restore
+    }
+
+    std::cout << "  🔄 Restoring CPU power mode to: " << original_governor_ << std::endl;
+
+    std::string cmd = "for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo " +
+                      original_governor_ + " | sudo tee $cpu > /dev/null 2>&1; done";
+    int result = system(cmd.c_str());
+
+    if (result == 0) {
+        std::cout << "  ✅ CPU power mode restored" << std::endl;
+        return true;
+    } else {
+        std::cout << "  ⚠️  Could not restore power mode" << std::endl;
+        return false;
+    }
+#endif
+    return false;
 }

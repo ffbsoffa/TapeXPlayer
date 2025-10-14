@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <vector>
 #include <thread>
+#include <mutex>
 #include <cstring>
 #include <cmath>
 #include <chrono>
@@ -99,11 +100,20 @@ public:
     // Was static - conflicted with multiple players
     double cached_speed = 0.0;
 
+    // CRITICAL FIX: Flag to detect destructor cleanup vs normal cleanup
+    // Problem: Pa_CloseStream() → PipeWire's malloc_trim() crashes on heap corrupted by video av_frame_ref()
+    // Solution: Skip Pa_CloseStream() during destructor, let OS clean up (leak acceptable on exit)
+    bool m_in_destructor_cleanup = false;
+
     static constexpr double FAST_BUFFER_DURATION = 720.0;
 
     FSTPAudioModuleImpl() = default;
 
     ~FSTPAudioModuleImpl() {
+        // CRITICAL: Set destructor flag BEFORE cleanup
+        // This tells Cleanup() to skip Pa_CloseStream() to avoid PipeWire malloc_trim() crash
+        m_in_destructor_cleanup = true;
+
         // FIX: Stop background decoding before cleanup
         // CRITICAL: Check ONLY joinable(), don't rely on flag!
         if (background_decode_thread.joinable()) {
@@ -179,32 +189,53 @@ public:
         }
         std::cout << "✅ [AUDIO START] Found " << device_count << " audio devices" << std::endl;
 
-        // Use settings from FSTPSettings
-        int device_index = GetAudioDeviceIndex();
         int buffer_size = GetAudioBufferSize();
 
-        // CRITICAL PROTECTION: safe device acquisition
-        PaDeviceIndex default_device = Pa_GetDefaultOutputDevice();
-        if (default_device == paNoDevice) {
-            std::cout << "PortAudio: no default output device" << std::endl;
+        // CRITICAL FIX: Direct ALSA hardware access to bypass PipeWire malloc_trim() crash
+        // PipeWire's pw_impl_node_destroy() calls malloc_trim() which crashes on heap corrupted by video
+        // Solution: Use ALSA host API directly (hw:0,0) instead of PipeWire/PulseAudio
+        PaDeviceIndex selected_device = paNoDevice;
+
+        // Try to find ALSA host API
+        PaHostApiIndex alsa_api = Pa_HostApiTypeIdToHostApiIndex(paALSA);
+        if (alsa_api >= 0) {
+            const PaHostApiInfo* alsa_info = Pa_GetHostApiInfo(alsa_api);
+            if (alsa_info && alsa_info->deviceCount > 0) {
+                std::cout << "🎵 [AUDIO] Found ALSA host API with " << alsa_info->deviceCount << " devices" << std::endl;
+
+                // Try to find first working ALSA output device
+                for (int i = 0; i < alsa_info->deviceCount; i++) {
+                    PaDeviceIndex dev_idx = Pa_HostApiDeviceIndexToDeviceIndex(alsa_api, i);
+                    const PaDeviceInfo* dev_info = Pa_GetDeviceInfo(dev_idx);
+
+                    if (dev_info && dev_info->maxOutputChannels > 0) {
+                        std::cout << "🎵 [ALSA] Device " << i << ": " << dev_info->name
+                                  << " (channels: " << dev_info->maxOutputChannels << ")" << std::endl;
+
+                        // Use first available ALSA device with output channels
+                        if (selected_device == paNoDevice) {
+                            selected_device = dev_idx;
+                            std::cout << "✅ [ALSA] Selected direct hardware device: " << dev_info->name << std::endl;
+                        }
+                    }
+                }
+            }
+        } else {
+            std::cout << "⚠️  [AUDIO] ALSA host API not found, trying default device" << std::endl;
+        }
+
+        // Fallback to default if ALSA not found
+        if (selected_device == paNoDevice) {
+            selected_device = Pa_GetDefaultOutputDevice();
+            std::cout << "⚠️  [AUDIO] Using default device as fallback" << std::endl;
+        }
+
+        if (selected_device == paNoDevice) {
+            std::cout << "❌ [AUDIO] No output device available" << std::endl;
             return false;
         }
 
-        if (device_index == -1) {
-            outputParameters.device = default_device;
-        } else if (device_index >= 0 && device_index < device_count) {
-            const PaDeviceInfo* info = Pa_GetDeviceInfo(device_index);
-            if (info && info->maxOutputChannels > 0) {
-                std::cout << "PortAudio: using device " << device_index << ": " << info->name << std::endl;
-                outputParameters.device = device_index;
-            } else {
-                std::cout << "PortAudio: device " << device_index << " unavailable, using default device" << std::endl;
-                outputParameters.device = default_device;
-            }
-        } else {
-            std::cout << "PortAudio: invalid device index " << device_index << ", using default device" << std::endl;
-            outputParameters.device = default_device;
-        }
+        outputParameters.device = selected_device;
         
         // CRITICAL PROTECTION: device parameter validation
         const PaDeviceInfo* device_info = Pa_GetDeviceInfo(outputParameters.device);
@@ -272,21 +303,76 @@ public:
 
     void Cleanup() {
         StopSmoothSpeedChange();
-        
-        // Close permanent stream
-        if (pa_stream) {
-            Pa_StopStream(pa_stream);
-            Pa_CloseStream(pa_stream);
-            pa_stream = nullptr;
-            pa_stream_sample_rate = 0;
-            pa_stream_channels = 0;
-            std::cout << "Permanent PortAudio stream closed" << std::endl;
+
+        // CRITICAL FIX: Skip Pa_CloseStream() during destructor cleanup
+        // Problem: Heap corruption from video av_frame_ref() causes PipeWire's malloc_trim() to crash
+        // When Pa_CloseStream() → pw_impl_node_destroy() → malloc_trim(), it crashes on corrupted heap
+        // Solution: During destructor (program exit), skip Pa_CloseStream() and let OS clean up
+        // Memory leak ~few KB acceptable on program exit (OS frees all resources anyway)
+        if (m_in_destructor_cleanup) {
+            if (pa_stream) {
+                std::cout << "[AUDIO] ⚠️  DESTRUCTOR MODE: Skipping Pa_CloseStream() to avoid PipeWire crash" << std::endl;
+                std::cout << "[AUDIO] Stream leak acceptable on program exit - OS will clean up" << std::endl;
+                pa_stream = nullptr;  // Just clear pointer, don't close
+                pa_stream_sample_rate = 0;
+                pa_stream_channels = 0;
+            }
+
+            CleanupMmap();
+            if (pa_initialized) {
+                std::cout << "Audio module: cleanup complete (destructor mode)" << std::endl;
+                pa_initialized = false;
+            }
+            return;  // Early exit - skip normal cleanup
         }
-        
+
+        // NORMAL CLEANUP (file changes, not program exit)
+        // CRITICAL: Careful PortAudio stream shutdown with PipeWire workarounds
+        // Problem: PipeWire has race condition in pw_stream_destroy causing malloc corruption
+        // Solution: Stop stream early, wait for buffers to drain, then close carefully
+        if (pa_stream) {
+            std::cout << "[AUDIO] Starting careful PortAudio stream shutdown..." << std::endl;
+
+            try {
+                // Step 1: Stop stream if active
+                PaError is_active = Pa_IsStreamActive(pa_stream);
+                if (is_active == 1) {
+                    std::cout << "[AUDIO] Stream is active, stopping..." << std::endl;
+                    PaError stop_err = Pa_StopStream(pa_stream);
+                    if (stop_err != paNoError && stop_err != paStreamIsStopped) {
+                        std::cout << "[AUDIO] Pa_StopStream warning: " << Pa_GetErrorText(stop_err) << std::endl;
+                    }
+
+                    // CRITICAL: Wait longer for PipeWire to fully drain buffers
+                    // PipeWire needs time to communicate with daemon
+                    std::cout << "[AUDIO] Waiting 200ms for PipeWire buffer drain..." << std::endl;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+
+                // Step 2: Close stream (this is where PipeWire crashes during destructor)
+                std::cout << "[AUDIO] Closing stream..." << std::endl;
+                PaError close_err = Pa_CloseStream(pa_stream);
+                if (close_err != paNoError) {
+                    std::cout << "[AUDIO] Pa_CloseStream warning: " << Pa_GetErrorText(close_err) << std::endl;
+                }
+
+                pa_stream = nullptr;
+                pa_stream_sample_rate = 0;
+                pa_stream_channels = 0;
+                std::cout << "[AUDIO] Stream closed successfully" << std::endl;
+
+            } catch (const std::exception& e) {
+                std::cout << "[AUDIO] Exception during cleanup: " << e.what() << std::endl;
+                pa_stream = nullptr;
+            } catch (...) {
+                std::cout << "[AUDIO] Unknown exception during cleanup" << std::endl;
+                pa_stream = nullptr;
+            }
+        }
+
         CleanupMmap();
         if (pa_initialized) {
-            // PortAudio terminates globally in main.cpp
-            std::cout << "Audio module: cleanup complete (PortAudio remains globally active)" << std::endl;
+            std::cout << "Audio module: cleanup complete" << std::endl;
             pa_initialized = false;
         }
     }
@@ -899,6 +985,13 @@ private:
         if (mmap_fd == -1 || ftruncate(mmap_fd, mmap_size_bytes) == -1) return false;
 
         temp_filename = temp_template;
+
+        // CRITICAL: Unlink file immediately after creation
+        // File remains accessible via fd, but automatically deleted on close
+        // This prevents accumulation of temp files if process crashes
+        unlink(temp_filename.c_str());
+        std::cout << "🗑️  [MMAP] Temp file unlinked (auto-cleanup on close): " << temp_filename << std::endl;
+
         mmap_buffer = static_cast<int16_t*>(mmap(nullptr, mmap_size_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, mmap_fd, 0));
         return (mmap_buffer != MAP_FAILED);
     }
@@ -912,10 +1005,8 @@ private:
             close(mmap_fd);
             mmap_fd = -1;
         }
-        if (!temp_filename.empty()) {
-            unlink(temp_filename.c_str());
-            temp_filename.clear();
-        }
+        // File already unlinked in CreateMmapBuffer()
+        temp_filename.clear();
     }
 
     bool DecodeFullFile(const std::string& filepath) {

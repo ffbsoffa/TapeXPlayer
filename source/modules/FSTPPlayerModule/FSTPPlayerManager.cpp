@@ -5,6 +5,7 @@
 #include "../FSTPMainModule/WSGUI/FSTPSettings.h"
 #include "../FSTPMainModule/WSGUI/FSTPWindowManager.h"
 #include "../FSTPAudioModule/FSTPAudioModule_wrapper.h"
+#include "../FSTPVideoModule/FSTPHardwareDetection.h"
 #include <iostream>
 #include <memory>
 #include <array>
@@ -177,6 +178,24 @@ int CreatePlayerInstance(const char* filepath, int player_id) {
     if (!filepath) {
         std::cerr << "Invalid file path" << std::endl;
         return -2;
+    }
+
+    // CPU-based instance limiting: Check if we can create new instance on Pentium CPUs
+    if (g_hardware_detection) {
+        const FSTPCPUInfo& cpu_info = g_hardware_detection->GetCPUInfo();
+
+        // Check if CPU is a Pentium processor
+        if (cpu_info.model_name.find("Pentium") != std::string::npos) {
+            int active_count = GetActiveInstanceCount();
+
+            // Limit to 1 instance on Pentium CPUs
+            if (active_count >= 1 && (player_id == -1 || !g_manager_state.instances[player_id].is_active)) {
+                std::cerr << "⚠️  Instance limit reached for " << cpu_info.model_name << std::endl;
+                std::cerr << "    Pentium CPUs are limited to 1 player instance for optimal performance." << std::endl;
+                std::cerr << "    Please close the existing instance before opening a new file." << std::endl;
+                return -4;
+            }
+        }
     }
 
     int instance_id = -1;

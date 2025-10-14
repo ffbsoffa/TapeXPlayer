@@ -45,7 +45,10 @@ private:
     mutable int m_last_displayed_frame = -1;
 
     std::unique_ptr<FSTPSimpleVideoIndex> m_frame_index;
-    std::vector<FSTP::FrameInfo> m_frames;
+    // CRITICAL FIX: Use raw pointer to prevent destructor cleanup
+    // Problem: vector destructor calls shared_ptr destructors → heap corruption
+    // Solution: Allocate dynamically and NEVER free (leak on exit acceptable)
+    std::vector<FSTP::FrameInfo>* m_frames = nullptr;
     std::atomic<int> m_current_index{0};
     std::atomic<bool> m_decoders_active{false};
     std::atomic<bool> m_file_reloading{false}; // Protection from race condition when changing file

@@ -4,14 +4,14 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #include "FSTPToolsMenu.h"
-#include "../FSTPPlayerModule/FSTPPlayerManager.h"
+#include "../../FSTPPlayerModule/FSTPPlayerManager.h"
 #include "FSTPWindowManager.h"
 #include "FSTPPixelBufferManager.h"
 #include "FSTPScreenshot.h"
 #include "FSTPMemoryLocations.h"
 #include "FSTPZoom.h"
 #include "darwin/sdl/FSTPDarwinWS.h"
-#include "../FSTPVideoModule/FSTPVideoFrame.h"
+#include "../../FSTPVideoModule/FSTPVideoFrame.h"
 #include <vector>
 #include <algorithm>
 
@@ -439,7 +439,7 @@ void CopyScreenshotToClipboard() {
     // Format timecode (HH:MM:SS:FF)
     int hours = (int)(current_time / 3600);
     int minutes = (int)((current_time - hours * 3600) / 60);
-    int seconds = (int)current_time % 60;
+    int seconds = (int)(current_time - hours * 3600 - minutes * 60);  // FIX: calculate from remaining time
     int frames = (int)((current_time - (int)current_time) * video_fps); // Use actual FPS
 
     char timecode_buf[32];

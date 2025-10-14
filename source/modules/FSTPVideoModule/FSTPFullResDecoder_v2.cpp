@@ -9,8 +9,13 @@
 #include <thread>
 #include <pthread.h>
 #include <sys/resource.h>
+
+#ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/thread_info.h>
+#elif defined(__linux__)
+#include <time.h>
+#endif
 
 // Debug control: set to true to enable verbose logging
 static constexpr bool ENABLE_FULLRES_V2_DEBUG = false;
@@ -20,6 +25,7 @@ static std::atomic<int> g_active_decoder_count{0};
 
 // Helper: Get real CPU time of current thread (user + system) in microseconds
 static uint64_t GetThreadCPUTimeMicroseconds() {
+#ifdef __APPLE__
     mach_port_t thread = mach_thread_self();
     thread_basic_info_data_t info;
     mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
@@ -33,6 +39,17 @@ static uint64_t GetThreadCPUTimeMicroseconds() {
 
     mach_port_deallocate(mach_task_self(), thread);
     return 0;
+#elif defined(__linux__)
+    // Linux implementation using clock_gettime
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+        return ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
+    }
+    return 0;
+#else
+    // Fallback for other platforms
+    return 0;
+#endif
 }
 
 FSTPFullResDecoderV2::FSTPFullResDecoderV2(const std::string& sourceFilename)
@@ -221,31 +238,57 @@ bool FSTPFullResDecoderV2::Initialize() {
 }
 
 bool FSTPFullResDecoderV2::InitializeHardwareAcceleration(const AVCodec* codec) {
-    // Try VideoToolbox for H.264/HEVC on macOS
+    // Hardware acceleration: VideoToolbox (macOS) or VA-API (Linux)
     if (codec_params_->codec_id != AV_CODEC_ID_H264 && codec_params_->codec_id != AV_CODEC_ID_HEVC) {
-        std::cout << "ℹ️  [FULL-RES V2] Codec doesn't support VideoToolbox, using software" << std::endl;
+        std::cout << "ℹ️  [FULL-RES V2] Codec doesn't support hardware acceleration, using software" << std::endl;
         return false;
     }
 
-    // Create hardware device context
-    if (av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0) < 0) {
+    int ret = -1;
+
+#ifdef __APPLE__
+    // macOS: Use VideoToolbox
+    ret = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0);
+    if (ret < 0) {
         std::cerr << "⚠️  [FULL-RES V2] Failed to create VideoToolbox device" << std::endl;
         return false;
     }
+    hw_pix_fmt_ = AV_PIX_FMT_VIDEOTOOLBOX;
+    std::cout << "✅ [FULL-RES V2] VideoToolbox hardware acceleration enabled" << std::endl;
+
+#elif defined(__linux__)
+    // Linux: Use VA-API (modern Intel GPU driver, Tiger Lake and newer)
+    ret = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128", nullptr, 0);
+    if (ret < 0) {
+        std::cerr << "⚠️  [FULL-RES V2] VA-API init failed, falling back to software decode" << std::endl;
+        std::cerr << "      Error code: " << ret << " (" << av_err2str(ret) << ")" << std::endl;
+        return false;
+    }
+    hw_pix_fmt_ = AV_PIX_FMT_VAAPI;
+    std::cout << "✅ [FULL-RES V2] VA-API hardware acceleration enabled (Intel GPU)" << std::endl;
+
+#else
+    std::cerr << "⚠️  [FULL-RES V2] Hardware acceleration not supported on this platform" << std::endl;
+    return false;
+#endif
 
     codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
     codec_ctx_->get_format = FSTPFullResDecoderV2::GetHWFormat;
-    hw_pix_fmt_ = AV_PIX_FMT_VIDEOTOOLBOX;
 
-    std::cout << "✅ [FULL-RES V2] VideoToolbox hardware acceleration enabled" << std::endl;
     return true;
 }
 
 AVPixelFormat FSTPFullResDecoderV2::GetHWFormat(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
     for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+#ifdef __APPLE__
         if (*p == AV_PIX_FMT_VIDEOTOOLBOX) {
             return *p;
         }
+#elif defined(__linux__)
+        if (*p == AV_PIX_FMT_VAAPI) {
+            return *p;
+        }
+#endif
     }
     return AV_PIX_FMT_NONE;
 }
@@ -427,11 +470,13 @@ bool FSTPFullResDecoderV2::DownscaleFrame(AVFrame* src, AVFrame* dst) {
 
     AVPixelFormat src_format = static_cast<AVPixelFormat>(src->format);
 
-    // Handle hardware frame transfer first
+    // Handle hardware frame transfer first (VideoToolbox on macOS, VA-API on Linux)
     AVFrame* sw_src = src;
     AVFrame* temp_hw_frame = nullptr;
 
-    if (src_format == AV_PIX_FMT_VIDEOTOOLBOX) {
+    bool is_hw_frame = (src_format == AV_PIX_FMT_VIDEOTOOLBOX) || (src_format == AV_PIX_FMT_VAAPI);
+
+    if (is_hw_frame) {
         temp_hw_frame = av_frame_alloc();
         if (!temp_hw_frame) return false;
 
@@ -555,11 +600,14 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
 
                 total_receive_frame_us += std::chrono::duration_cast<std::chrono::microseconds>(receive_end - receive_start).count();
                 // FFPLAY STYLE: Keep original resolution (without downscale)
-                // Handle hardware frame transfer if needed
+                // Handle hardware frame transfer if needed (VideoToolbox on macOS, VA-API on Linux)
                 AVFrame* final_frame = decoded_frame;
                 AVFrame* temp_hw_frame = nullptr;
 
-                if (decoded_frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+                bool is_hw_frame = (decoded_frame->format == AV_PIX_FMT_VIDEOTOOLBOX) ||
+                                   (decoded_frame->format == AV_PIX_FMT_VAAPI);
+
+                if (is_hw_frame) {
                     // PROFILING: Measurement of av_frame_alloc
                     auto alloc_start = std::chrono::high_resolution_clock::now();
                     temp_hw_frame = av_frame_alloc();
@@ -574,6 +622,8 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
                         total_hw_transfer_us += std::chrono::duration_cast<std::chrono::microseconds>(transfer_end - transfer_start).count();
 
                         if (transfer_result >= 0) {
+                            // CRITICAL: Copy ALL properties from hardware frame
+                            av_frame_copy_props(temp_hw_frame, decoded_frame);
                             temp_hw_frame->pts = decoded_frame->pts;
                             temp_hw_frame->time_base = video_stream_->time_base;
                             final_frame = temp_hw_frame;
@@ -685,9 +735,14 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
             AVFrame* final_frame = decoded_frame;
             AVFrame* temp_hw_frame = nullptr;
 
-            if (decoded_frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
+            bool is_hw_frame = (decoded_frame->format == AV_PIX_FMT_VIDEOTOOLBOX) ||
+                               (decoded_frame->format == AV_PIX_FMT_VAAPI);
+
+            if (is_hw_frame) {
                 temp_hw_frame = av_frame_alloc();
                 if (temp_hw_frame && av_hwframe_transfer_data(temp_hw_frame, decoded_frame, 0) >= 0) {
+                    // CRITICAL: Copy ALL properties from hardware frame
+                    av_frame_copy_props(temp_hw_frame, decoded_frame);
                     temp_hw_frame->pts = decoded_frame->pts;
                     temp_hw_frame->time_base = video_stream_->time_base;
                     final_frame = temp_hw_frame;

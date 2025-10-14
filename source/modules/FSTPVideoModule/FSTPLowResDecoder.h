@@ -110,6 +110,13 @@ private:
     // Global mutex created serialization bottleneck when 2+ players
     static std::map<std::string, std::unique_ptr<std::mutex>> perFileMutexes_;
     static std::mutex globalMutexForMapAccess_;  // Only for map access, not for decoding!
+
+    // CRITICAL FIX FOR RACE CONDITION: Global mutex to serialize av_frame_unref() calls
+    // When using av_frame_ref() (zero-copy), frames share buffers via FFmpeg refcounting
+    // During batch cleanup of 156K+ frames, simultaneous av_frame_unref() calls cause
+    // race condition in av_buffer_unref() leading to double-free corruption
+    // This mutex serializes cleanup to prevent the race
+    static std::mutex frameCleanupMutex_;
 };
 
 } // namespace FSTP

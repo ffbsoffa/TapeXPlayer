@@ -765,14 +765,6 @@ void RenderOSD() {
 void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
     if (!renderer) return;
 
-    // PROFILING OSD elements (DISABLED)
-    // static uint64_t total_timecode_us = 0;
-    // static uint64_t total_status_us = 0;
-    // static uint64_t total_other_us = 0;
-    // static int osd_profile_samples = 0;
-
-    // auto osd_start = std::chrono::high_resolution_clock::now();
-
     // Save current renderer
     SDL_Renderer* original_renderer = g_osd_renderer;
 
@@ -1283,3 +1275,88 @@ bool ShouldRenderOSDForPlayer(int player_id) {
     return true;  // Can render
 }
 
+
+// ========== MENU BAR RENDERING (LINUX) ==========
+
+// Render menu bar at top of window
+extern "C" void RenderMenuBar(SDL_Renderer* renderer, int window_width, int window_height) {
+    (void)window_height;  // Unused
+    
+    if (!renderer || !g_normal_font) return;
+
+    const int MENU_BAR_HEIGHT = 24;
+    const int MENU_ITEM_PADDING = 20;
+    
+    // Background for menu bar
+    SDL_SetRenderDrawColor(renderer, 240, 240, 240, 255);
+    SDL_Rect menu_bg = {0, 0, window_width, MENU_BAR_HEIGHT};
+    SDL_RenderFillRect(renderer, &menu_bg);
+    
+    // Bottom border
+    SDL_SetRenderDrawColor(renderer, 180, 180, 180, 255);
+    SDL_RenderDrawLine(renderer, 0, MENU_BAR_HEIGHT - 1, window_width, MENU_BAR_HEIGHT - 1);
+    
+    // Menu items
+    SDL_Color text_color = {0, 0, 0, 255};
+    SDL_Color no_outline = {0, 0, 0, 0};  // No outline for menu text
+    
+    int x = 10;
+    
+    // File
+    RenderCachedText(renderer, "File", x, 4, text_color, no_outline, g_normal_font);
+    int file_width, file_height;
+    TTF_SizeText(g_normal_font, "File", &file_width, &file_height);
+    x += file_width + MENU_ITEM_PADDING;
+    
+    // Edit
+    RenderCachedText(renderer, "Edit", x, 4, text_color, no_outline, g_normal_font);
+    int edit_width, edit_height;
+    TTF_SizeText(g_normal_font, "Edit", &edit_width, &edit_height);
+    x += edit_width + MENU_ITEM_PADDING;
+    
+    // View
+    RenderCachedText(renderer, "View", x, 4, text_color, no_outline, g_normal_font);
+}
+
+// Check if mouse click is on menu bar and which item
+// Returns: -1 = no menu, 0 = File, 1 = Edit, 2 = View
+extern "C" int CheckMenuBarClick(int mouse_x, int mouse_y, int window_width) {
+    (void)window_width;  // Unused
+    
+    if (!g_normal_font) return -1;
+    
+    const int MENU_BAR_HEIGHT = 24;
+    const int MENU_ITEM_PADDING = 20;
+    
+    // Check if click is in menu bar area
+    if (mouse_y < 0 || mouse_y >= MENU_BAR_HEIGHT) {
+        return -1;  // Not in menu bar
+    }
+    
+    int x = 10;
+    
+    // File
+    int file_width, file_height;
+    TTF_SizeText(g_normal_font, "File", &file_width, &file_height);
+    if (mouse_x >= x && mouse_x < x + file_width) {
+        return 0;  // File menu
+    }
+    x += file_width + MENU_ITEM_PADDING;
+    
+    // Edit
+    int edit_width, edit_height;
+    TTF_SizeText(g_normal_font, "Edit", &edit_width, &edit_height);
+    if (mouse_x >= x && mouse_x < x + edit_width) {
+        return 1;  // Edit menu
+    }
+    x += edit_width + MENU_ITEM_PADDING;
+    
+    // View
+    int view_width, view_height;
+    TTF_SizeText(g_normal_font, "View", &view_width, &view_height);
+    if (mouse_x >= x && mouse_x < x + view_width) {
+        return 2;  // View menu
+    }
+    
+    return -1;  // Clicked in menu bar but not on any item
+}

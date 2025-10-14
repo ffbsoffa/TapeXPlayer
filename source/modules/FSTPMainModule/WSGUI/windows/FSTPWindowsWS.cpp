@@ -1,6 +1,6 @@
 #ifdef _WIN32
 
-#include "../main.h"
+#include "main.h"
 #include <iostream>
 
 // Stub for Windows main loop - not yet implemented

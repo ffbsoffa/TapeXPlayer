@@ -27,6 +27,7 @@ struct YUVPlanes {
     int width;
     int height;
     bool is_full_range;  // true = 0-255 (JPEG/proxy), false = 16-235 (TV/BT.709)
+    int format;  // AVPixelFormat (AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV12, etc.)
 };
 
 class FSTPYUVRenderer {
@@ -80,6 +81,7 @@ private:
     struct SwsContext* sws_ctx_;
     uint8_t* rgb_buffer_;
     size_t rgb_buffer_size_;
+    int current_sws_format_;  // Track current AVPixelFormat for SwsContext
 };
 
 // Global function for determining optimal YUV format for platform

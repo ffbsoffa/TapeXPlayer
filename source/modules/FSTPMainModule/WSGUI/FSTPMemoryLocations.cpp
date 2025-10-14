@@ -241,8 +241,8 @@ bool MemoryLocationsManager::LoadFromFile(const std::string& filepath) {
 std::string MemoryLocationsManager::SecondsToTimecode(double seconds, double fps) {
     int hours = static_cast<int>(seconds / 3600);
     int minutes = static_cast<int>((seconds - hours * 3600) / 60);
-    int secs = static_cast<int>(seconds) % 60;
-    int frames = static_cast<int>((seconds - static_cast<int>(seconds)) * fps) % static_cast<int>(fps);
+    int secs = static_cast<int>(seconds - hours * 3600 - minutes * 60);
+    int frames = static_cast<int>(round((seconds - static_cast<int>(seconds)) * fps)) % static_cast<int>(fps);
 
     char buffer[32];
     snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d:%02d", hours, minutes, secs, frames);
@@ -289,11 +289,15 @@ bool FSTP_AddMemoryLocationAtCurrentTime(int player_id, const char* name, const 
         return false;
     }
 
+    // Get real FPS from player
+    double fps = GetInstanceVideoFPS(player_id);
+    if (fps <= 0) fps = 25.0;  // fallback
+
     FSTP::MemoryLocation loc;
     loc.name = name ? name : "";
     loc.comments = comments ? comments : "";
     loc.timecode_seconds = current_time;
-    loc.timecode_display = FSTP::MemoryLocationsManager::SecondsToTimecode(current_time);
+    loc.timecode_display = FSTP::MemoryLocationsManager::SecondsToTimecode(current_time, fps);
 
     return FSTP::MemoryLocationsManager::GetInstance().AddLocation(loc);
 }
@@ -304,24 +308,31 @@ bool FSTP_AddMemoryLocationWithID(int player_id, int id, const char* name, const
         return false;
     }
 
+    // Get real FPS from player
+    double fps = GetInstanceVideoFPS(player_id);
+    if (fps <= 0) fps = 25.0;  // fallback
+
     FSTP::MemoryLocation loc;
     loc.id = id;  // Set user-specified ID
     loc.name = name ? name : "";
     loc.comments = comments ? comments : "";
     loc.timecode_seconds = current_time;
-    loc.timecode_display = FSTP::MemoryLocationsManager::SecondsToTimecode(current_time);
+    loc.timecode_display = FSTP::MemoryLocationsManager::SecondsToTimecode(current_time, fps);
 
     return FSTP::MemoryLocationsManager::GetInstance().AddLocation(loc);
 }
 
 bool FSTP_AddMemoryLocationWithTimecode(int player_id, int id, const char* name, const char* comments, double timecode_seconds) {
-    (void)player_id; // Reserved for future use
+    // Get real FPS from player
+    double fps = GetInstanceVideoFPS(player_id);
+    if (fps <= 0) fps = 25.0;  // fallback
+
     FSTP::MemoryLocation loc;
     loc.id = id;  // Set user-specified ID
     loc.name = name ? name : "";
     loc.comments = comments ? comments : "";
     loc.timecode_seconds = timecode_seconds;
-    loc.timecode_display = FSTP::MemoryLocationsManager::SecondsToTimecode(timecode_seconds);
+    loc.timecode_display = FSTP::MemoryLocationsManager::SecondsToTimecode(timecode_seconds, fps);
 
     return FSTP::MemoryLocationsManager::GetInstance().AddLocation(loc);
 }
@@ -329,13 +340,16 @@ bool FSTP_AddMemoryLocationWithTimecode(int player_id, int id, const char* name,
 bool FSTP_AddMemoryLocationWithZoom(int player_id, int id, const char* name, const char* comments,
                                      double timecode_seconds, bool recall_zoom,
                                      float zoom_factor, float zoom_center_x, float zoom_center_y) {
-    (void)player_id; // Reserved for future use
+    // Get real FPS from player
+    double fps = GetInstanceVideoFPS(player_id);
+    if (fps <= 0) fps = 25.0;  // fallback
+
     FSTP::MemoryLocation loc;
     loc.id = id;
     loc.name = name ? name : "";
     loc.comments = comments ? comments : "";
     loc.timecode_seconds = timecode_seconds;
-    loc.timecode_display = FSTP::MemoryLocationsManager::SecondsToTimecode(timecode_seconds);
+    loc.timecode_display = FSTP::MemoryLocationsManager::SecondsToTimecode(timecode_seconds, fps);
     loc.recall_zoom = recall_zoom;
     loc.zoom_factor = zoom_factor;
     loc.zoom_center_x = zoom_center_x;

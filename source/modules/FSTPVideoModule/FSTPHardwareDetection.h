@@ -41,6 +41,32 @@ enum class FSTPCodecSupport {
     MPEG4_DECODE = 1 << 9
 };
 
+// CPU capabilities and performance profile
+struct FSTPCPUInfo {
+    std::string model_name;
+    std::string vendor;
+    int physical_cores;
+    int logical_cores;
+    double base_frequency_ghz;
+    double max_frequency_ghz;
+    bool has_avx;
+    bool has_avx2;
+    bool has_avx512;
+    bool has_sse4_2;
+    std::string power_governor;  // Linux: powersave/performance/schedutil
+
+    // Performance characteristics for reverse playback
+    int recommended_max_speed;      // Maximum recommended playback speed (e.g., 24)
+    int optimal_segment_size;       // Optimal segment size in frames (e.g., 500)
+    int optimal_preload_count;      // Optimal preload count for high speeds
+    double decode_throughput_fps;   // Expected decode throughput in fps
+    bool requires_performance_mode; // Whether performance CPU governor is required
+
+    // Device type detection (for UI optimizations)
+    bool is_compact_device;         // GPD Pocket, etc. - enable mouse shuttle by default
+    std::string device_model;       // e.g. "GPD Pocket 3"
+};
+
 inline FSTPCodecSupport operator|(FSTPCodecSupport a, FSTPCodecSupport b) {
     return static_cast<FSTPCodecSupport>(static_cast<int>(a) | static_cast<int>(b));
 }
@@ -72,6 +98,21 @@ public:
     // Main detection method - starts when program starts
     bool DetectAllHardware();
 
+    // CPU detection
+    FSTPCPUInfo DetectCPU();
+    const FSTPCPUInfo& GetCPUInfo() const { return cpu_info_; }
+
+    // CPU power mode control
+    bool SetPerformanceMode();  // Switch to performance mode
+    bool RestorePowerMode();    // Restore original mode on exit
+
+    // CPU-specific speed limit
+    double GetMaxRecommendedSpeed() const { return cpu_info_.recommended_max_speed; }
+
+    // Device type detection
+    bool IsCompactDevice() const { return cpu_info_.is_compact_device; }
+    std::string GetDeviceModel() const { return cpu_info_.device_model; }
+
     // Getting results
     const std::vector<FSTPHardwareInfo>& GetDetectedHardware() const;
     FSTPHardwareInfo GetBestDecoder() const;
@@ -92,6 +133,8 @@ public:
 
 private:
     std::vector<FSTPHardwareInfo> detected_hardware_;
+    FSTPCPUInfo cpu_info_;
+    std::string original_governor_;  // Store original power governor
 
     // Platform-specific detection methods
 #ifdef PLATFORM_MACOS
@@ -117,6 +160,11 @@ private:
     bool DetectOpenCL();
     bool DetectVulkan();
     bool TestFFmpegHWAccel(FSTPHWAccelType type);
+
+    // CPU detection helpers
+    void DetectCPUFeatures(FSTPCPUInfo& info);
+    void DetectCPUPowerMode(FSTPCPUInfo& info);
+    void ApplyCPUSpecificOptimizations(FSTPCPUInfo& info);
 
     // Utilities
     double CalculatePerformanceScore(const FSTPHardwareInfo& info) const;
