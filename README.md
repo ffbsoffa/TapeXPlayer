@@ -182,43 +182,13 @@ open /Applications/TapeXPlayer.app
 
 ## ⚙️ Features Deep Dive
 
-### Playback Engine
-- **Frame-Accurate Playback**: Professional-grade accuracy for scientific analysis
-- **Hardware Acceleration**: Automatic selection of best backend (VideoToolbox → Metal → FFmpeg)
-- **Variable Speed**: 0.1x to 32x in both directions
-- **Smart Proxy Caching**: Automatic low-resolution proxy generation for smooth scrubbing
-- **Multiple Instances**: Run several players simultaneously
+The playback engine delivers frame-accurate precision at a professional level, suitable for scientific and technical analysis. Hardware acceleration is automatically optimized, choosing the best backend from VideoToolbox to Metal or FFmpeg. Playback speed ranges from 0.1x to 32x in both directions, while smart proxy caching generates low-resolution proxies for smooth scrubbing. Multiple instances of the player can run simultaneously, allowing seamless comparison or parallel playback of different sources.
 
-### Audio System
-- **Configurable Device**: Select any audio output device
-- **Buffer Size Control**: Adjust for latency vs. stability (128 - 4096 samples)
-- **Master Volume**: Global volume control with VU meters
-- **Multi-Channel**: Full support for surround sound formats
-- **Sample Rate**: Automatic conversion to match device
+The audio system offers full control over output configuration. You can select any audio device, fine-tune buffer size for the right balance between latency and stability, and manage global levels through a master volume with VU metering.
 
-### Memory Locations
-- **Quick Navigation**: Store up to 999 positions
-- **Zoom Recall**: Automatically restore zoom settings
-- **Timecode Display**: HH:MM:SS:FF format
-- **Import/Export**: Save and load location sets
-- **Comments**: Add notes to each location
+Memory locations allow for instant navigation and precision recall. Up to 999 positions can be stored, each remembering the zoom level automatically. Every location includes a timecode in HH:MM:SS:FF format, supports personal notes, and can be imported or exported for backup or collaboration.
 
-### MIDI Control (Mackie HUI Protocol)
-- **Transport Control**: Play, Stop, Rewind, Fast Forward
-- **Jog/Shuttle**: Frame-accurate control via hardware
-- **VU Meters**: Real-time audio level display on controller
-- **Timecode Display**: Show current position on controller screen
-- **Button Feedback**: LED feedback for transport state
-
-**Tested Controllers**:
-- ✅ Behringer X-Touch One
-- ✅ Any Mackie HUI-compatible controller
-
-**Setup**:
-1. Open Settings (`Cmd+,`) → MIDI tab
-2. Enable "Enable MIDI Controller"
-3. Select Input/Output ports for your device
-4. Configure controller to HUI/Mackie mode
+MIDI control via the Mackie HUI protocol provides full transport functionality: play, stop, rewind, and fast-forward, all with frame-level accuracy. Real-time VU meters and timecode are displayed directly on the controller, while LED feedback on the buttons mirrors the player’s transport state
 
 ### Settings
 
