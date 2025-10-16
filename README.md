@@ -101,7 +101,6 @@ open /Applications/TapeXPlayer.app
 ### Video Codecs
 - **Containers**: MP4, MOV, AVI, MKV, WebM
 - **Codecs**: H.264, H.265/HEVC, ProRes, DNxHD, VP9, AV1
-- All formats supported by FFmpeg
 
 ### Audio Codecs
 - **Formats**: MP3, WAV, FLAC, AAC, M4A, OGG, Opus
@@ -178,8 +177,6 @@ open /Applications/TapeXPlayer.app
 | `T` | Toggle timecode/frame display |
 | `I` | Show info (console) |
 | `Cmd+Q` | Quit |
-
-> 📖 Full shortcuts reference available in `FSTPKeyboard.cpp` in the repository
 
 ---
 
@@ -342,15 +339,6 @@ xattr -cr TapeXPlayer.app
 **Q: Changed Buffer Size in settings but no effect**
 
 **A**: Audio buffer size changes require application restart.
-
----
-
-## 📚 Documentation
-
-- [Build Instructions](docs/BUILDING.md) *(Coming Soon)*
-- [MIDI Protocol Reference](docs/MIDI.md) *(Coming Soon)*
-- [API Documentation](docs/API.md) *(Coming Soon)*
-
 ---
 
 ## 🤝 Contributing
