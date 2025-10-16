@@ -190,23 +190,6 @@ Memory locations allow for instant navigation and precision recall. Up to 999 po
 
 MIDI control via the Mackie HUI protocol provides full transport functionality: play, stop, rewind, and fast-forward, all with frame-level accuracy. Real-time VU meters and timecode are displayed directly on the controller, while LED feedback on the buttons mirrors the player’s transport state
 
-### Settings
-
-**Audio Tab**:
-- Audio device selection
-- Buffer size (128 - 4096 samples)
-- Master volume control
-
-**Video & Sync Tab**:
-- Frame offset (-10 to +10 frames) for monitor sync compensation
-- Auto-freeze inactive players (resource management)
-
-**MIDI Tab**:
-- Enable/disable MIDI controller
-- Input/Output port selection
-
-> ⚠️ **Note**: Changes to audio buffer size require app restart
-
 ---
 
 ## 🛠️ Building from Source
