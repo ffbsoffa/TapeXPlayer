@@ -81,18 +81,18 @@ open /Applications/TapeXPlayer.app
 ### macOS
 - **OS**: macOS 13.0 Ventura or later
 - **CPU**: Apple Silicon (M1/M2/M3) or Intel processor
-- **RAM**: 4 GB minimum, 8 GB recommended
+- **RAM**: 8-16 GB minimum, 32 GB recommended
 - **GPU**: Metal-capable graphics
 
-### Linux (Coming Soon)
+### Linux
 - Modern Linux distribution (Ubuntu 20.04+, Fedora 35+, etc.)
-- x86_64 or arm64 processor
-- 4 GB RAM minimum
+- x86_64 or arm64 processor (Tested on Intel Gold Pentium 7505 @ Ubuntu 25.04)
+- 8 GB RAM minimum
 
 ### Windows (Coming Soon)
 - Windows 10 or later
 - x86_64 processor
-- 4 GB RAM minimum
+- 8 GB RAM minimum
 
 ---
 
