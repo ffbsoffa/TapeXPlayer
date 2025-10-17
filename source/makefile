@@ -48,8 +48,12 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Platform detection and configuration
-ifneq (,$(findstring NT-,$(UNAME_S)))
+ifneq (,$(findstring MINGW,$(MSYSTEM)))
     # Windows (MSYS2/MinGW) configuration
+    PLATFORM = windows
+    BUILD_TYPE = Windows (SDL2/MinGW)
+else ifneq (,$(findstring MINGW,$(shell uname -s)))
+    # Windows (MSYS2/MinGW) configuration through other environments
     PLATFORM = windows
     BUILD_TYPE = Windows (SDL2/MinGW)
     ARCH_FLAGS =
