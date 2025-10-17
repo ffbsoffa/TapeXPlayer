@@ -52,33 +52,21 @@ ifneq (,$(findstring MINGW,$(MSYSTEM)))
     # Windows (MSYS2/MinGW) configuration
     PLATFORM = windows
     BUILD_TYPE = Windows (SDL2/MinGW)
-else ifneq (,$(findstring MINGW,$(shell uname -s)))
-    # Windows (MSYS2/MinGW) configuration through other environments
-    PLATFORM = windows
-    BUILD_TYPE = Windows (SDL2/MinGW)
     ARCH_FLAGS =
     
     # Windows-specific paths and flags
     MINGW_PATH = /mingw64
     HOMEBREW_PATH = $(MINGW_PATH)
     
-    # Output directories
-    OBJ_DIR = ../builds/obj_windows
-    BIN_DIR = ../builds/binaries
-    TARGET = $(BIN_DIR)/TapeXPlayer.exe
-    
     # Disable macOS-specific settings
     BUILD_INFO_SWIFT =
     SWIFT_TARGET =
+    USE_SWIFT = no
     
     # Windows compilation flags
-    CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -msse2 -msse4.1 -mavx -mavx2 -Wno-unused-parameter
-    INCLUDES = -I$(MINGW_PATH)/include -I$(MINGW_PATH)/include/SDL2 \
-              -Imodules/FSTPMainModule -Imodules/FSTPMainModule/WSGUI \
-              -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule \
-              -I$(MINGW_PATH)/include/ffmpeg
-    LDFLAGS = -L$(MINGW_PATH)/lib
-    LIBS = -lSDL2 -lportaudio -lwinmm -lole32 -lgdi32
+    CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g \
+               -msse2 -msse4.1 -mavx -mavx2 \
+               -Wno-unused-parameter
     
     # Include paths
     INCLUDES = -I$(MINGW_PATH)/include \
@@ -86,22 +74,23 @@ else ifneq (,$(findstring MINGW,$(shell uname -s)))
               -Imodules/FSTPMainModule \
               -Imodules/FSTPMainModule/WSGUI \
               -Imodules/FSTPPlayerModule \
-              -Imodules/FSTPVideoModule
+              -Imodules/FSTPVideoModule \
+              -I$(MINGW_PATH)/include/ffmpeg
     
-    # Compiler flags
-    CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g \
-               -msse2 -msse4.1 -mavx -mavx2 \
-               -Wno-unused-parameter \
-               $(INCLUDES)
+    # Add includes to CXXFLAGS
+    CXXFLAGS += $(INCLUDES)
     
     # Library paths and libs
     LDFLAGS = -L$(MINGW_PATH)/lib
-    LIBS = -lSDL2 -lportaudio -lwinmm -lole32 -lgdi32
+    LIBS = -lSDL2 -lportaudio -lavformat -lavcodec -lavutil -lswscale \
+           -lwinmm -lole32 -lgdi32
     
     # Output directories
-    OBJ_DIR = ../builds/obj_windows
-    BIN_DIR = ../builds/binaries
-    TARGET = $(BIN_DIR)/TapeXPlayer.exe
+    OBJDIR = ../builds/obj_windows
+    TARGET = ../builds/binaries/TapeXPlayer.exe
+    
+    # Use g++ as linker
+    LINKER = $(CXX)
 
 else ifeq ($(UNAME_S),Linux)
     # Linux - no architecture flags needed for g++
