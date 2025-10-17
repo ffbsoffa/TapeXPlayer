@@ -12,6 +12,7 @@
     #define PLATFORM_WINDOWS
     #include <windows.h>
     #include <commdlg.h>
+    #include "WSGUI/windows/FSTPWindowsWS.h"
 #elif defined(__linux__)
     #define PLATFORM_LINUX
     // GTK not needed for SDL2-based implementation

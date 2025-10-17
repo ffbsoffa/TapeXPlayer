@@ -9,9 +9,14 @@
 #include <chrono>
 #include <atomic>
 
-// Headers for mmap
+// Headers for memory mapping
+#ifdef _WIN32
+#include "../FSTPMainModule/WSGUI/windows/FSTPMemoryMap.h"
+#include <io.h>
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 #include <fcntl.h>
 #include <cstdio>
 
