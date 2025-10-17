@@ -13,6 +13,10 @@
 #ifdef _WIN32
 #include "../FSTPMainModule/WSGUI/windows/FSTPMemoryMap.h"
 #include <io.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <windows.h>
+#define mkstemp _mktemp_s
 #else
 #include <sys/mman.h>
 #include <unistd.h>
@@ -985,29 +989,38 @@ private:
 
     bool CreateMmapBuffer() {
         mmap_size_bytes = total_samples * sizeof(int16_t);
+#ifdef _WIN32
+        char temp_path[MAX_PATH];
+        GetTempPathA(MAX_PATH, temp_path);
+        char temp_filename[MAX_PATH];
+        GetTempFileNameA(temp_path, "fstp", 0, temp_filename);
+        mmap_fd = _open(temp_filename, _O_RDWR | _O_CREAT | _O_BINARY, _S_IREAD | _S_IWRITE);
+        if (mmap_fd == -1) return false;
+        _chsize(mmap_fd, mmap_size_bytes);
+#else
         char temp_template[] = "/tmp/fstp_audio_XXXXXX";
         mmap_fd = mkstemp(temp_template);
         if (mmap_fd == -1 || ftruncate(mmap_fd, mmap_size_bytes) == -1) return false;
-
         temp_filename = temp_template;
-
-        // CRITICAL: Unlink file immediately after creation
-        // File remains accessible via fd, but automatically deleted on close
-        // This prevents accumulation of temp files if process crashes
         unlink(temp_filename.c_str());
-        std::cout << "🗑️  [MMAP] Temp file unlinked (auto-cleanup on close): " << temp_filename << std::endl;
+#endif
 
-        mmap_buffer = static_cast<int16_t*>(mmap(nullptr, mmap_size_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, mmap_fd, 0));
+        // Map buffer to memory using our cross-platform wrapper
+        mmap_buffer = static_cast<int16_t*>(fstp_mmap(nullptr, mmap_size_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, mmap_fd, 0));
         return (mmap_buffer != MAP_FAILED);
     }
 
     void CleanupMmap() {
         if (mmap_buffer && mmap_buffer != MAP_FAILED) {
-            munmap(mmap_buffer, mmap_size_bytes);
+            fstp_munmap(mmap_buffer, mmap_size_bytes);
             mmap_buffer = nullptr;
         }
         if (mmap_fd != -1) {
+#ifdef _WIN32
+            _close(mmap_fd);
+#else
             close(mmap_fd);
+#endif
             mmap_fd = -1;
         }
         // File already unlinked in CreateMmapBuffer()
