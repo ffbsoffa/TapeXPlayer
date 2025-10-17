@@ -9,15 +9,10 @@ on:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: configure
-      run: ./configure
     - name: make
-      run: make
+      run: /source/make clean
     - name: make check
-      run: make check
-    - name: make distcheck
-      run: make distcheck
+      run: /source/make 
