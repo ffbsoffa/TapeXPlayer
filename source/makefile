@@ -71,7 +71,8 @@ ifneq (,$(findstring NT-,$(UNAME_S)))
     CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -msse2 -msse4.1 -mavx -mavx2 -Wno-unused-parameter
     INCLUDES = -I$(MINGW_PATH)/include -I$(MINGW_PATH)/include/SDL2 \
               -Imodules/FSTPMainModule -Imodules/FSTPMainModule/WSGUI \
-              -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule
+              -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule \
+              -I$(MINGW_PATH)/include/ffmpeg
     LDFLAGS = -L$(MINGW_PATH)/lib
     LIBS = -lSDL2 -lportaudio -lwinmm -lole32 -lgdi32
     

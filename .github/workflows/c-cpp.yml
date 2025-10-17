@@ -25,6 +25,7 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-SDL2
             mingw-w64-x86_64-portaudio
+            mingw-w64-x86_64-ffmpeg
             make
             
       - name: Build
