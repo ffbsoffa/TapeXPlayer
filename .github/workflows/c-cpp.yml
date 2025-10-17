@@ -10,9 +10,10 @@ jobs:
   build:
 
     runs-on: windows-latest
-
     steps:
-    - name: make
-      run: /source/make clean
-    - name: make check
-      run: /source/make 
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cd source
+          make clean
+          make
