@@ -50,9 +50,36 @@ UNAME_M := $(shell uname -m)
 # Detect MSYS2/MinGW environment
 ifneq (,$(findstring MSYS_NT,$(UNAME_S)))
     PLATFORM = windows
-    CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -msse2 -msse4.1 -mavx -mavx2 -Wno-unused-parameter
-    INCLUDES = -I/usr/local/include -Imodules/FSTPMainModule -Imodules/FSTPMainModule/WSGUI -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule
     BUILD_TYPE = Windows (SDL2/MinGW)
+    ARCH_FLAGS =
+    
+    # Windows-specific paths and flags
+    MINGW_PATH = /mingw64
+    HOMEBREW_PATH = $(MINGW_PATH)
+    
+    # Include paths
+    INCLUDES = -I$(MINGW_PATH)/include \
+              -I$(MINGW_PATH)/include/SDL2 \
+              -Imodules/FSTPMainModule \
+              -Imodules/FSTPMainModule/WSGUI \
+              -Imodules/FSTPPlayerModule \
+              -Imodules/FSTPVideoModule
+    
+    # Compiler flags
+    CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g \
+               -msse2 -msse4.1 -mavx -mavx2 \
+               -Wno-unused-parameter \
+               $(INCLUDES)
+    
+    # Library paths and libs
+    LDFLAGS = -L$(MINGW_PATH)/lib
+    LIBS = -lSDL2 -lportaudio -lwinmm -lole32 -lgdi32
+    
+    # Output directories
+    OBJ_DIR = ../builds/obj_windows
+    BIN_DIR = ../builds/binaries
+    TARGET = $(BIN_DIR)/TapeXPlayer.exe
+
 else ifeq ($(UNAME_S),Linux)
     # Linux - no architecture flags needed for g++
     ARCH_FLAGS =
@@ -294,7 +321,12 @@ endif
 # Clean
 clean:
 	@echo "Cleaning build artifacts..."
-ifeq ($(UNAME_S),Linux)
+ifneq (,$(findstring MSYS_NT,$(UNAME_S)))
+	@echo "Cleaning Windows build..."
+	rm -rf ../builds/obj_windows
+	rm -f ../builds/binaries/TapeXPlayer.exe
+	rm -f modules/FSTPMainModule/WSGUI/windows/BuildInfo.h
+else ifeq ($(UNAME_S),Linux)
 	@echo "Cleaning Linux build..."
 	rm -rf ../builds/obj_linux
 	rm -f ../builds/binaries/TapeXPlayer_linux
