@@ -47,7 +47,13 @@ SWIFTC = swiftc
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
-ifeq ($(UNAME_S),Linux)
+# Detect MSYS2/MinGW environment
+ifneq (,$(findstring MSYS_NT,$(UNAME_S)))
+    PLATFORM = windows
+    CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -msse2 -msse4.1 -mavx -mavx2 -Wno-unused-parameter
+    INCLUDES = -I/usr/local/include -Imodules/FSTPMainModule -Imodules/FSTPMainModule/WSGUI -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule
+    BUILD_TYPE = Windows (SDL2/MinGW)
+else ifeq ($(UNAME_S),Linux)
     # Linux - no architecture flags needed for g++
     ARCH_FLAGS =
     HOMEBREW_PATH = /usr/local
@@ -57,7 +63,11 @@ else ifeq ($(UNAME_M),arm64)
     HOMEBREW_PATH = /opt/homebrew
 else
     # Intel Mac - use /usr/local
-    ARCH_FLAGS = -arch x86_64
+    ifeq ($(PLATFORM),windows)
+        ARCH_FLAGS =
+    else
+        ARCH_FLAGS = -arch x86_64
+    endif
     HOMEBREW_PATH = /usr/local
 endif
 
