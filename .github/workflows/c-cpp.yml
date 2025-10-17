@@ -15,5 +15,8 @@ jobs:
       - name: Build
         run: |
           cd source
+          pacman -S mingw-w64-x86_64-gcc
+          pacman -S mingw-w64-x86_64-SDL2
+          pacman -S mingw-w64-x86_64-portaudio   
           make clean
           make
