@@ -47,8 +47,9 @@ SWIFTC = swiftc
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
-# Detect MSYS2/MinGW environment
-ifneq (,$(findstring MSYS_NT,$(UNAME_S)))
+# Platform detection and configuration
+ifneq (,$(findstring NT-,$(UNAME_S)))
+    # Windows (MSYS2/MinGW) configuration
     PLATFORM = windows
     BUILD_TYPE = Windows (SDL2/MinGW)
     ARCH_FLAGS =
@@ -56,6 +57,23 @@ ifneq (,$(findstring MSYS_NT,$(UNAME_S)))
     # Windows-specific paths and flags
     MINGW_PATH = /mingw64
     HOMEBREW_PATH = $(MINGW_PATH)
+    
+    # Output directories
+    OBJ_DIR = ../builds/obj_windows
+    BIN_DIR = ../builds/binaries
+    TARGET = $(BIN_DIR)/TapeXPlayer.exe
+    
+    # Disable macOS-specific settings
+    BUILD_INFO_SWIFT =
+    SWIFT_TARGET =
+    
+    # Windows compilation flags
+    CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -msse2 -msse4.1 -mavx -mavx2 -Wno-unused-parameter
+    INCLUDES = -I$(MINGW_PATH)/include -I$(MINGW_PATH)/include/SDL2 \
+              -Imodules/FSTPMainModule -Imodules/FSTPMainModule/WSGUI \
+              -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule
+    LDFLAGS = -L$(MINGW_PATH)/lib
+    LIBS = -lSDL2 -lportaudio -lwinmm -lole32 -lgdi32
     
     # Include paths
     INCLUDES = -I$(MINGW_PATH)/include \
