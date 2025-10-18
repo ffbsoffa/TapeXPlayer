@@ -15,15 +15,15 @@
 
 TapeXPlayer is built with **C**,**C++**, **Objective-C**, **Swift** using industry-standard libraries: **FFmpeg**, **SDL2**, **PortAudio**, and **RtMidi**. It brings professional tape-based video player functionality to modern computers, enabling thorough video sequence examination with frame-accurate control.
 
-- 🎬 **Smooth Shuttle Control**: Forward/backward playback up to 32x speed with minimal CPU usage
-- 🎯 **Frame-Accurate Seeking**: Timecode-based navigation (HH:MM:SS:FF)
-- 🎛️ **MIDI Controller Support**: Full integration with Mackie HUI protocol (tested with Behringer X-Touch One)
-- 📍 **Memory Locations**: Quick navigation to important points with zoom recall
-- 🎨 **Real-Time Zoom & Pan**: Mouse-based zoom with thumbnail preview
-- 📸 **Screenshot Capture**: Export frames with timecode overlay
-- 🚀 **Hardware Acceleration**: VideoToolbox (macOS), with Metal and FFmpeg fallbacks
-- 💾 **Smart Caching**: Low-resolution proxy for smooth scrubbing
-- 📊 **Performance**: ~52% CPU @ 32x shuttle, ~11-32% CPU @ 1x playback
+- **Smooth Shuttle Control**: Forward/backward playback up to 32x speed with minimal CPU usage
+- **Frame-Accurate Seeking**: Timecode-based navigation (HH:MM:SS:FF)
+- **MIDI Controller Support**: Full integration with Mackie HUI protocol (tested with Behringer X-Touch One)
+- **Memory Locations**: Quick navigation to important points with zoom recall
+- **Real-Time Zoom & Pan**: Mouse-based zoom with thumbnail preview
+- **Screenshot Capture**: Export frames with timecode overlay
+- **Hardware Acceleration**: VideoToolbox (macOS), with Metal and FFmpeg fallbacks
+- **Smart Caching**: Low-resolution proxy for smooth scrubbing
+- **Performance**: ~52% CPU @ 32x shuttle, ~11-32% CPU @ 1x playback
 
 ---
 ## 🖥️ Platform Support
