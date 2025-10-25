@@ -165,7 +165,7 @@ else
     endif
     SWIFTFLAGS = -target $(SWIFT_TARGET) -import-objc-header modules/FSTPMainModule/WSGUI/darwin/sdl/TapeXPlayer-Bridging-Header.h -parse-as-library
     SDL_PATH = $(HOMEBREW_PATH)
-    INCLUDES = -I$(SDL_PATH)/include -Imodules/FSTPMainModule -Imodules/FSTPMainModule/WSGUI -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule
+    INCLUDES = -I$(SDL_PATH)/include -Imodules/FSTPMainModule -Imodules/FSTPMainModule/WSGUI -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule -Imodules/FSTPAudioModule
     LIBS = -L$(SDL_PATH)/lib -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavutil -lswscale -lssl -lcrypto -lrtmidi -framework Cocoa -framework CoreFoundation -framework CoreVideo -framework UniformTypeIdentifiers -framework VideoToolbox -framework IOKit -framework QuartzCore -framework CoreMIDI
     LINKER = $(SWIFTC)
     LINKER_FLAGS = $(SWIFT_TARGET:%= -target %) -Xlinker -lc++
