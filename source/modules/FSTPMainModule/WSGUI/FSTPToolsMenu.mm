@@ -12,6 +12,7 @@
 #include "FSTPZoom.h"
 #include "darwin/sdl/FSTPDarwinWS.h"
 #include "../../FSTPVideoModule/FSTPVideoFrame.h"
+#include "FSTPSettings.h"
 #include <vector>
 #include <algorithm>
 
@@ -349,6 +350,21 @@ void InitToolsMenu() {
     [showInspectorItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
     [showInspectorItem setTarget:[NSApp delegate]];
     [toolsMenu addItem:showInspectorItem];
+
+    if (GetYTDLPExtensionEnabled()) {
+        [toolsMenu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem* downloadItem = [[NSMenuItem alloc]
+            initWithTitle:@"Download via yt-dlp..."
+            action:@selector(downloadFromNetworkAction:)
+            keyEquivalent:@"d"];
+        [downloadItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
+        [downloadItem setTarget:[NSApp delegate]];
+        if (!FSTP_YTDLP_IsAvailable()) {
+            [downloadItem setEnabled:NO];
+            [downloadItem setTitle:@"Download via yt-dlp... (yt-dlp not installed)"];
+        }
+        [toolsMenu addItem:downloadItem];
+    }
 
     NSLog(@"✅ Tools Menu initialized successfully");
 }

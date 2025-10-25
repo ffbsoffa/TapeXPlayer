@@ -38,6 +38,9 @@ typedef struct {
     bool texture_buffer_valid[2];          // Validity of each buffer
     int current_buffer_index;              // Current active buffer (0 or 1)
     int write_buffer_index;                // Buffer for writing (0 or 1)
+    int last_rendered_frame;               // Last frame number rendered (for effects)
+    int betacam_hold_frames;
+    double last_effect_speed;
     
     // DEPRECATED fields - kept for compatibility but use new buffers
     SDL_Texture* video_texture;            // -> texture_buffer[current_buffer_index]
@@ -112,6 +115,9 @@ void SubmitPixelData(int player_id, const uint8_t* pixel_data, int width, int he
                     unsigned int format, double timestamp, int frame_number);
 
 FSTPPixelBufferManager* GetPixelBufferManager();
+
+// Runtime control over Betacam effect
+void SetBetacamEffectEnabled(int enabled);
 
 // REMOVED: RenderVideoTextures() - now only RenderAllWindows() is used
 

@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "FSTPAboutDialog.h"
 #include "BuildInfo.h"
 #include <string>
@@ -64,3 +65,6 @@ INT_PTR CALLBACK FSTPAboutDialog::DialogProc(HWND hwnd, UINT message, WPARAM wPa
     }
     return FALSE;
 }
+#else
+// Stub translation unit for non-Windows builds.
+#endif

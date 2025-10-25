@@ -24,6 +24,13 @@ int GetMIDIOutputDeviceCount(void);
 const char* GetMIDIInputDeviceName(int index);
 const char* GetMIDIOutputDeviceName(int index);
 void ApplyMIDISettings(void);
+void SetBetacamEffectEnabled(int enabled);
+const char* GetExtensionLanguage(void);
+void InitToolsMenu(void);
+int FSTP_YTDLP_IsAvailable(void);
+int FSTP_YTDLP_Download(const char* url, char* out_path, int out_path_size, char* error_buf, int error_buf_size);
+const char* FSTP_YTDLP_GetDownloadsDir(void);
+void SetYTDLPExtensionEnabled(int enabled);
 
 // Inspector API - Player Instance Management
 int GetActiveInstanceCount(void);

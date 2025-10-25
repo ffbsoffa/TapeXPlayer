@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "FSTPMemoryMap.h"
 
 void* fstp_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
@@ -50,3 +51,15 @@ int fstp_munmap(void* addr, size_t length) {
     (void)length; // Unused in Windows implementation
     return UnmapViewOfFile(addr) ? 0 : -1;
 }
+#else
+#include <sys/mman.h>
+
+// No-op stubs for non-Windows builds (should never be called).
+void* fstp_mmap(void* /*addr*/, size_t /*length*/, int /*prot*/, int /*flags*/, int /*fd*/, off_t /*offset*/) {
+    return MAP_FAILED;
+}
+
+int fstp_munmap(void* /*addr*/, size_t /*length*/) {
+    return -1;
+}
+#endif

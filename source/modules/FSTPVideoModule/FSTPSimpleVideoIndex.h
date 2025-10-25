@@ -62,9 +62,12 @@ private:
     int64_t m_start_time = 0;  // Start time thread for calculating relative time
     int m_max_gop_size = 0;    // Maximum GOP size for decoder adaptation
     std::atomic<bool> m_ready{false};
+    bool m_intraframe_codec = false;
     // Mutex removed: BuildIndex works in one thread, after m_ready=true data is read-only
-    
+
     // Helper methods
     bool OpenFile(AVFormatContext** fmt_ctx, int* video_stream_idx);
     void ExtractMetadata(AVFormatContext* fmt_ctx, int video_stream_idx);
+    bool BuildIndexFromStreamInfo(AVFormatContext* fmt_ctx, int video_stream_idx);
+    bool BuildIndexIntraframe(AVFormatContext* fmt_ctx, int video_stream_idx);
 };

@@ -12,6 +12,8 @@ class SettingsViewModel: ObservableObject {
     // Video & Sync Settings
     @Published var frameOffset: Int = 0
     @Published var autoFreezeInactive: Bool = true
+    @Published var betacamEffectEnabled: Bool = false
+    @Published var ytDlpEnabled: Bool = false
 
     // MIDI Settings
     @Published var midiEnabled: Bool = false
@@ -24,8 +26,10 @@ class SettingsViewModel: ObservableObject {
     @Published var midiOutputDevices: [String] = []
 
     let bufferSizes = [512, 1024, 2048, 4096]
+    let ytDlpAvailable: Bool
 
     init() {
+        ytDlpAvailable = FSTP_YTDLP_IsAvailable() != 0
         loadSettings()
         loadDevices()
     }
@@ -38,9 +42,15 @@ class SettingsViewModel: ObservableObject {
             bufferSize = Int(s.pointee.audio_buffer_size)
             frameOffset = Int(s.pointee.frame_offset)
             autoFreezeInactive = s.pointee.auto_freeze_inactive != 0
+            betacamEffectEnabled = s.pointee.betacam_effect_enabled != 0
+            ytDlpEnabled = s.pointee.yt_dlp_extension_enabled != 0
             midiEnabled = s.pointee.midi_enabled != 0
             midiInputPort = Int(s.pointee.midi_input_port)
             midiOutputPort = Int(s.pointee.midi_output_port)
+        }
+
+        if !ytDlpAvailable {
+            ytDlpEnabled = false
         }
     }
 
@@ -95,6 +105,8 @@ class SettingsViewModel: ObservableObject {
         settings.pointee.audio_buffer_size = Int32(bufferSize)
         settings.pointee.frame_offset = Int32(frameOffset)
         settings.pointee.auto_freeze_inactive = autoFreezeInactive ? 1 : 0
+        settings.pointee.betacam_effect_enabled = betacamEffectEnabled ? 1 : 0
+        settings.pointee.yt_dlp_extension_enabled = ytDlpEnabled ? 1 : 0
         settings.pointee.midi_enabled = midiEnabled ? 1 : 0
         settings.pointee.midi_input_port = Int32(midiInputPort)
         settings.pointee.midi_output_port = Int32(midiOutputPort)
@@ -105,6 +117,9 @@ class SettingsViewModel: ObservableObject {
         // Apply settings
         ApplyAudioSettings()
         ApplyMIDISettings()
+        SetYTDLPExtensionEnabled(ytDlpEnabled ? 1 : 0)
+        InitToolsMenu()
+        SetBetacamEffectEnabled(betacamEffectEnabled ? 1 : 0)
 
         return bufferSizeChanged
     }
@@ -112,6 +127,8 @@ class SettingsViewModel: ObservableObject {
     func resetToDefaults() {
         ResetSettingsToDefault()
         loadSettings()
+        SetYTDLPExtensionEnabled(ytDlpEnabled ? 1 : 0)
+        InitToolsMenu()
     }
 }
 
@@ -219,6 +236,15 @@ struct VideoSyncSettingsView: View {
                 Text("Prevents forgotten players from consuming resources")
                     .font(.caption)
                     .foregroundColor(.secondary)
+            }
+
+            Section(header: Text("Visual Effects").font(.headline)) {
+                Toggle("Enable Betacam tape artefact emulation", isOn: $viewModel.betacamEffectEnabled)
+
+                Text("Adds rewind/fast-forward tape jitter. May impact performance on slower GPUs.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .formStyle(.grouped)
@@ -448,6 +474,42 @@ struct CacheDataSettingsView: View {
     }
 }
 
+// MARK: - Extensions Settings Tab
+@available(macOS 13.0, *)
+struct ExtensionsSettingsView: View {
+    @ObservedObject var viewModel: SettingsViewModel
+    private let language = String(cString: GetExtensionLanguage())
+
+    var body: some View {
+        Form {
+            Section(header: Text("Extension Language").font(.headline)) {
+                Text("TapeXPlayer extensions are scripted in \(language) (.lua) files.")
+                    .font(.body)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section(header: Text("Status").font(.headline)) {
+                Toggle("Enable yt-dlp network downloader", isOn: $viewModel.ytDlpEnabled)
+                    .disabled(!viewModel.ytDlpAvailable)
+
+                if !viewModel.ytDlpAvailable {
+                    Text("yt-dlp not detected. Install it (e.g. via Homebrew) to enable network downloading.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Text("Extension loading and management tools are being prepared. This area will expand as the Lua pipeline evolves.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
+        .padding(20)
+    }
+}
+
 // MARK: - Settings Navigation Item
 @available(macOS 13.0, *)
 enum SettingsPage: String, CaseIterable {
@@ -455,6 +517,7 @@ enum SettingsPage: String, CaseIterable {
     case videoSync = "Video & Sync"
     case midi = "MIDI"
     case cacheData = "Cache & Data"
+    case extensions = "Extensions"
 
     var icon: String {
         switch self {
@@ -462,6 +525,7 @@ enum SettingsPage: String, CaseIterable {
         case .videoSync: return "tv.fill"
         case .midi: return "pianokeys"
         case .cacheData: return "externaldrive.fill"
+        case .extensions: return "puzzlepiece"
         }
     }
 }
@@ -499,6 +563,8 @@ struct SettingsView: View {
                         MIDISettingsView(viewModel: viewModel)
                     case .cacheData:
                         CacheDataSettingsView()
+                    case .extensions:
+                        ExtensionsSettingsView(viewModel: viewModel)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

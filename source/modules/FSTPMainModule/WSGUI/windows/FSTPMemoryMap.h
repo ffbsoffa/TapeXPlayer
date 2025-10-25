@@ -1,6 +1,7 @@
 #ifndef FSTP_MEMORY_MAP_H
 #define FSTP_MEMORY_MAP_H
 
+#ifdef _WIN32
 #include <windows.h>
 #include <cstddef>
 
@@ -22,5 +23,6 @@ int fstp_munmap(void* addr, size_t length);
 
 // Error return
 #define MAP_FAILED    ((void *)-1)
+#endif
 
 #endif // FSTP_MEMORY_MAP_H

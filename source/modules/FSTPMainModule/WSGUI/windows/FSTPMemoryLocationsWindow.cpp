@@ -1,6 +1,6 @@
+#ifdef _WIN32
 #include "FSTPMemoryLocationsWindow.h"
 #include <commctrl.h>
-#pragma comment(lib, "comctl32.lib")
 
 FSTPMemoryLocationsWindow::FSTPMemoryLocationsWindow(HWND parentWindow)
     : hwndParent(parentWindow), hwndWindow(NULL), hwndList(NULL), isVisible(false) {
@@ -145,3 +145,6 @@ LRESULT CALLBACK FSTPMemoryLocationsWindow::WindowProc(HWND hwnd, UINT uMsg, WPA
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
+#else
+// Stub implementation for non-Windows builds.
+#endif

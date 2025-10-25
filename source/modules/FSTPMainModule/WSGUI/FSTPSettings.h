@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+#define FSTP_EXTENSION_SCRIPT_LANGUAGE "Lua"
+
 // TapeXPlayer settings structure (minimal version)
 typedef struct {
     // Audio settings
@@ -17,6 +19,8 @@ typedef struct {
 
     // Multi-instance settings (protection from forgotten players)
     int auto_freeze_inactive;       // 1 = automatically freeze inactive players, 0 = disabled
+    int betacam_effect_enabled;     // 1 = Betacam effect enabled, 0 = disabled
+    int yt_dlp_extension_enabled;   // 1 = yt-dlp extension enabled, 0 = disabled
 
     // MIDI settings
     int midi_enabled;               // 1 = MIDI controller enabled, 0 = disabled
@@ -45,9 +49,18 @@ float GetMasterVolume();
 int GetAudioBufferSize();
 int GetFrameOffset();          // Get frame offset
 int GetAutoFreezeInactive();   // Get auto-freeze setting
+int GetBetacamEffectEnabled(); // Get Betacam effect state
+int GetYTDLPExtensionEnabled(); // Get yt-dlp extension state
+void SetYTDLPExtensionEnabled(int enabled);
 int GetMIDIEnabled();          // Get MIDI state
 int GetMIDIInputPort();        // Get input MIDI port
 int GetMIDIOutputPort();       // Get output MIDI port
+const char* GetExtensionLanguage(); // Get script language for extensions
+
+// yt-dlp integration helpers
+int FSTP_YTDLP_IsAvailable(void);
+int FSTP_YTDLP_Download(const char* url, char* out_path, int out_path_size, char* error_buf, int error_buf_size);
+const char* FSTP_YTDLP_GetDownloadsDir(void);
 
 #ifdef __cplusplus
 }

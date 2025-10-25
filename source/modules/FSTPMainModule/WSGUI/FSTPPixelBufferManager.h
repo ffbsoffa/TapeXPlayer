@@ -1,13 +1,15 @@
 #pragma once
 
 #include <SDL2/SDL.h>
-#include <memory>
+#include <array>
 #include <atomic>
-#include <mutex>
 #include <chrono>
-#include <vector>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <vector>
 #include "FSTPYUVRenderer.h"
+#include "FSTPBetacamEffect.h"
 
 // Forward declaration for AVFrame (zero-copy architecture)
 struct AVFrame;
@@ -37,6 +39,10 @@ public:
         int frame_number = 0;               // Frame number
         bool is_valid = false;              // Data validity flag
         double playback_speed = 1.0;        // Playback speed
+        double current_time = 0.0;          // Playback position (seconds)
+        double total_duration = 0.0;        // Total duration (seconds)
+        double frame_rate = 25.0;           // Source FPS
+        bool new_frame = false;             // True when freshly submitted
 
         PixelBuffer() = default;
 
@@ -60,6 +66,20 @@ private:
     // Statistics
     std::atomic<size_t> m_total_bytes_processed{0};
     std::atomic<size_t> m_total_frames_processed{0};
+
+    struct EffectScratch {
+        std::vector<uint8_t> plane0;
+        std::vector<uint8_t> plane1;
+        std::vector<uint8_t> plane2;
+        Uint32 format = SDL_PIXELFORMAT_IYUV;
+        int width = 0;
+        int height = 0;
+    };
+
+    FSTPBetacamEffect m_betacam_effect;
+    std::array<FSTPBetacamEffect::PlaybackMetrics, MAX_PLAYERS> m_playback_metrics{};
+    std::array<EffectScratch, MAX_PLAYERS> m_effect_scratch{};
+    std::array<int, MAX_PLAYERS> m_last_effect_frame{};
 
 public:
     FSTPPixelBufferManager();
@@ -110,6 +130,26 @@ public:
      * @return Pointer to buffer or nullptr if no data
      */
     const PixelBuffer* GetPixelBuffer(int player_id);
+
+    /**
+     * @brief Update playback metrics used by Betacam effect.
+     */
+    void UpdatePlaybackMetrics(int player_id, const FSTPBetacamEffect::PlaybackMetrics& metrics);
+
+    /**
+     * @brief Enable or disable Betacam visual effect.
+     */
+    void SetBetacamEffectEnabled(bool enabled);
+
+    /**
+     * @brief Check if Betacam effect is enabled.
+     */
+    bool IsBetacamEffectEnabled() const { return m_betacam_effect.IsEnabled(); }
+
+    /**
+     * @brief Apply render-time jitter adjustments for Betacam effect.
+     */
+    bool ApplyRenderJitter(int player_id, FSTPBetacamEffect::RenderContext& render_ctx);
 
 
     /**
@@ -171,3 +211,5 @@ private:
     // Flag for using YUV mode
     bool m_use_yuv_mode[MAX_PLAYERS];
 };
+#include <memory>
+struct SwsContext;

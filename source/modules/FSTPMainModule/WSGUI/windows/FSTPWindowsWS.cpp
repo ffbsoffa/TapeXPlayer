@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "FSTPWindowsWS.h"
 #include "BuildInfo.h"
 #include <SDL.h>
@@ -64,7 +65,12 @@ bool FSTPWindowsWS::CreateMainWindow(const char* title, int width, int height) {
         hwnd = wmInfo.info.win.window;
     }
 
-    sdlRenderer = SDL_CreateRenderer(sdlWindow, -1, SDL_RENDERER_ACCELERATED);
+    sdlRenderer = SDL_CreateRenderer(sdlWindow, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+#if SDL_VERSION_ATLEAST(2,0,18)
+    if (sdlRenderer) {
+        SDL_RenderSetVSync(sdlRenderer, 1);
+    }
+#endif
     if (!sdlRenderer) {
         DestroyMainWindow();
         return false;
@@ -183,3 +189,6 @@ void FSTPWindowsWS::SetWindowSize(int width, int height) {
         SDL_SetWindowSize(sdlWindow, width, height);
     }
 }
+#else
+// Stub translation unit for non-Windows builds.
+#endif

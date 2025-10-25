@@ -4,7 +4,10 @@
 #include <portaudio.h>
 #include <iostream>
 #include <cmath>
+#include <string>
+#include <string>
 #include "../FSTPSettings.h"
+#include "../FSTPWindowManager.h"
 #include "FSTPSettingsDialog.h"
 
 // GTK initialization flag (shared across dialogs)
@@ -135,6 +138,14 @@ void ShowGTKSettingsDialog() {
     gtk_widget_set_margin_bottom(cache_row, 10);
     gtk_list_box_insert(GTK_LIST_BOX(sidebar), cache_row, -1);
 
+    GtkWidget* extensions_row = gtk_label_new("Extensions");
+    gtk_widget_set_halign(extensions_row, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(extensions_row, 16);
+    gtk_widget_set_margin_end(extensions_row, 16);
+    gtk_widget_set_margin_top(extensions_row, 10);
+    gtk_widget_set_margin_bottom(extensions_row, 10);
+    gtk_list_box_insert(GTK_LIST_BOX(sidebar), extensions_row, -1);
+
     // Select first item
     gtk_list_box_select_row(GTK_LIST_BOX(sidebar), gtk_list_box_get_row_at_index(GTK_LIST_BOX(sidebar), 0));
 
@@ -158,8 +169,8 @@ void ShowGTKSettingsDialog() {
         GtkStack* stack = GTK_STACK(data);
         int index = gtk_list_box_row_get_index(row);
 
-        const char* page_names[] = {"audio", "video", "midi", "cache"};
-        if (index >= 0 && index < 4) {
+        const char* page_names[] = {"audio", "video", "midi", "cache", "extensions"};
+        if (index >= 0 && index < 5) {
             gtk_stack_set_visible_child_name(stack, page_names[index]);
         }
     };
@@ -288,6 +299,26 @@ void ShowGTKSettingsDialog() {
     gtk_box_pack_start(GTK_BOX(freeze_box), freeze_note, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(video_page), freeze_box, FALSE, FALSE, 0);
+
+    GtkWidget* betacam_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget* betacam_title = gtk_label_new(nullptr);
+    gtk_label_set_markup(GTK_LABEL(betacam_title), "<b>Visual Effects</b>");
+    gtk_widget_set_halign(betacam_title, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(betacam_box), betacam_title, FALSE, FALSE, 0);
+
+    GtkWidget* betacam_check = gtk_check_button_new_with_label("Enable Betacam tape artefact emulation");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(betacam_check), settings->betacam_effect_enabled);
+    gtk_box_pack_start(GTK_BOX(betacam_box), betacam_check, FALSE, FALSE, 0);
+
+    GtkWidget* betacam_note = gtk_label_new("Adds rewind/fast-forward tape jitter. May impact performance on slower GPUs.");
+    gtk_widget_set_halign(betacam_note, GTK_ALIGN_START);
+    attrs = pango_attr_list_new();
+    pango_attr_list_insert(attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
+    gtk_label_set_attributes(GTK_LABEL(betacam_note), attrs);
+    pango_attr_list_unref(attrs);
+    gtk_box_pack_start(GTK_BOX(betacam_box), betacam_note, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(video_page), betacam_box, FALSE, FALSE, 0);
 
     gtk_stack_add_named(GTK_STACK(stack), video_page, "video");
 
@@ -467,6 +498,52 @@ void ShowGTKSettingsDialog() {
 
     gtk_stack_add_named(GTK_STACK(stack), cache_page, "cache");
 
+    // ===== EXTENSIONS PAGE =====
+    GtkWidget* extensions_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_container_set_border_width(GTK_CONTAINER(extensions_page), 20);
+
+    GtkWidget* extensions_title = gtk_label_new(nullptr);
+    gtk_label_set_markup(GTK_LABEL(extensions_title), "<b>Extensions</b>");
+    gtk_widget_set_halign(extensions_title, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(extensions_page), extensions_title, FALSE, FALSE, 0);
+
+    std::string extension_language = GetExtensionLanguage();
+    GtkWidget* yt_dlp_check = nullptr;
+    bool yt_dlp_available = FSTP_YTDLP_IsAvailable();
+
+    if (yt_dlp_available) {
+        yt_dlp_check = gtk_check_button_new_with_label("Enable yt-dlp network downloader");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(yt_dlp_check), settings->yt_dlp_extension_enabled);
+        gtk_box_pack_start(GTK_BOX(extensions_page), yt_dlp_check, FALSE, FALSE, 0);
+    } else {
+        GtkWidget* yt_dlp_info = gtk_label_new("yt-dlp binary not found. Install it (e.g. via package manager) to enable network downloads.");
+        gtk_widget_set_halign(yt_dlp_info, GTK_ALIGN_START);
+        GtkWidget* info_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+        attrs = pango_attr_list_new();
+        pango_attr_list_insert(attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
+        gtk_label_set_attributes(GTK_LABEL(yt_dlp_info), attrs);
+        pango_attr_list_unref(attrs);
+        gtk_box_pack_start(GTK_BOX(info_box), yt_dlp_info, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(extensions_page), info_box, FALSE, FALSE, 0);
+    }
+
+    std::string extensions_info_text =
+        "TapeXPlayer extensions are scripted using " + extension_language +
+        " (.lua) files. Drop .lua bundles into your extensions directory to augment playback workflows.\n\n"
+        "Extension loading is being prepared; this section will expand with management tools as the system evolves.";
+
+    GtkWidget* extensions_info = gtk_label_new(extensions_info_text.c_str());
+    gtk_widget_set_halign(extensions_info, GTK_ALIGN_START);
+    gtk_label_set_line_wrap(GTK_LABEL(extensions_info), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(extensions_info), 0.0f);
+    attrs = pango_attr_list_new();
+    pango_attr_list_insert(attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
+    gtk_label_set_attributes(GTK_LABEL(extensions_info), attrs);
+    pango_attr_list_unref(attrs);
+    gtk_box_pack_start(GTK_BOX(extensions_page), extensions_info, FALSE, FALSE, 0);
+
+    gtk_stack_add_named(GTK_STACK(stack), extensions_page, "extensions");
+
     // Set initial visible page
     gtk_stack_set_visible_child_name(GTK_STACK(stack), "audio");
 
@@ -513,6 +590,18 @@ void ShowGTKSettingsDialog() {
 
         // Auto-freeze
         writable_settings->auto_freeze_inactive = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(freeze_check));
+
+        // Betacam effect
+        writable_settings->betacam_effect_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(betacam_check));
+        SetBetacamEffectEnabled(writable_settings->betacam_effect_enabled);
+
+        // yt-dlp extension
+        if (yt_dlp_available && yt_dlp_check) {
+            writable_settings->yt_dlp_extension_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(yt_dlp_check));
+        } else {
+            writable_settings->yt_dlp_extension_enabled = 0;
+        }
+        SetYTDLPExtensionEnabled(writable_settings->yt_dlp_extension_enabled);
 
         // MIDI
         writable_settings->midi_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(midi_enable_check));

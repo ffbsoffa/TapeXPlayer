@@ -2,17 +2,20 @@
 #include "FSTPOSDSystem.h"
 #include "FSTPOSDInstance.h"
 #include "FSTPPixelBufferManager.h"
+#include "FSTPBetacamEffect.h"
 #include "FSTPSettings.h"
 #include "FSTPZoom.h"
 #include "FSTPKeyboard.h"
 #include "../FSTPPlayerModule/FSTPPlayerManager.h"
 #include "../FSTPAudioModule/FSTPAudioModule_API.h"
+#include "../FSTPAudioModule/FSTPAudioModule_wrapper.h"
 #include <iostream>
 #include <cstring>
 #include <mutex>
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <cmath>
 
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
@@ -54,6 +57,19 @@ static SDL_Rect ComputeAspectFitRect(int texture_width, int texture_height, int 
     return dst;
 }
 
+static SDL_Renderer* CreateRendererWithVSync(SDL_Window* window, int index, Uint32 flags) {
+#if !SDL_VERSION_ATLEAST(2,0,18)
+    SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");
+#endif
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, index, flags);
+#if SDL_VERSION_ATLEAST(2,0,18)
+    if (renderer) {
+        SDL_RenderSetVSync(renderer, 1);
+    }
+#endif
+    return renderer;
+}
+
 // Global array of windows
 static FSTPWindow g_windows[MAX_WINDOWS];
 static bool g_window_manager_initialized = false;
@@ -75,6 +91,8 @@ int InitWindowManager() {
         std::cerr << "Failed to initialize pixel buffer manager" << std::endl;
         return -1;
     }
+
+    SetBetacamEffectEnabled(GetBetacamEffectEnabled());
 
     // Initialize array of windows
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -101,7 +119,10 @@ int InitWindowManager() {
         g_windows[i].texture_buffer_valid[1] = false;
         g_windows[i].current_buffer_index = 0;  // Start with buffer 0
         g_windows[i].write_buffer_index = 1;    // Write to buffer 1
-        
+        g_windows[i].last_rendered_frame = -1;
+        g_windows[i].betacam_hold_frames = 0;
+        g_windows[i].last_effect_speed = 0.0;
+
         // Deprecated fields for compatibility
         g_windows[i].video_texture = nullptr;
         g_windows[i].previous_video_texture = nullptr;
@@ -197,30 +218,30 @@ int CreateNewWindow(const char* title, int width, int height) {
         // Try OpenGL with VA-API support first
         SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
         SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        renderer = CreateRendererWithVSync(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
         
         if (!renderer) {
             std::cout << "⚠️  OpenGL failed, trying Vulkan..." << std::endl;
             SDL_SetHint(SDL_HINT_RENDER_DRIVER, "vulkan");
-            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+            renderer = CreateRendererWithVSync(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
         }
         
         if (!renderer) {
             std::cout << "⚠️  Vulkan failed, trying Direct3D..." << std::endl;
             SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d");
-            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+            renderer = CreateRendererWithVSync(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
         }
         
         if (!renderer) {
             std::cout << "⚠️  All hardware renderers failed, falling back to software..." << std::endl;
             SDL_SetHint(SDL_HINT_RENDER_DRIVER, "");  // Reset hint
-            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+            renderer = CreateRendererWithVSync(window, -1, SDL_RENDERER_SOFTWARE);
         }
     #else
         // On macOS: use Metal
         SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
         SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+        renderer = CreateRendererWithVSync(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     #endif
 
     if (!renderer) {
@@ -228,13 +249,13 @@ int CreateNewWindow(const char* title, int width, int height) {
 
         // Attempt 2: Any available renderer
         SDL_SetHint(SDL_HINT_RENDER_DRIVER, "");  // Reset hint
-        renderer = SDL_CreateRenderer(window, -1, 0); // Without flags
+        renderer = CreateRendererWithVSync(window, -1, SDL_RENDERER_PRESENTVSYNC);
 
         if (!renderer) {
             std::cout << "⚠️  Default renderer failed (" << SDL_GetError() << "), trying software..." << std::endl;
 
             // Attempt 3: Software fallback (last attempt)
-            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+            renderer = CreateRendererWithVSync(window, -1, SDL_RENDERER_SOFTWARE);
 
             if (!renderer) {
                 std::cout << "⚠️  Software renderer failed (" << SDL_GetError() << "), trying with index..." << std::endl;
@@ -245,7 +266,7 @@ int CreateNewWindow(const char* title, int width, int height) {
                     SDL_RendererInfo info;
                     if (SDL_GetRenderDriverInfo(i, &info) == 0) {
                         std::cout << "Available driver " << i << ": " << info.name << std::endl;
-                        renderer = SDL_CreateRenderer(window, i, 0);
+                        renderer = CreateRendererWithVSync(window, i, SDL_RENDERER_PRESENTVSYNC);
                         if (renderer) {
                             std::cout << "✅ Success with driver: " << info.name << std::endl;
                             break;
@@ -358,6 +379,8 @@ void CloseWindow(int window_index) {
     g_windows[window_index].is_minimized = false;
     g_windows[window_index].player_instance_id = -1;
     memset(g_windows[window_index].window_title, 0, sizeof(g_windows[window_index].window_title));
+    g_windows[window_index].betacam_hold_frames = 0;
+    g_windows[window_index].last_effect_speed = 0.0;
 
     std::cout << "Window " << window_index << " closed" << std::endl;
 }
@@ -610,6 +633,33 @@ void RenderAllWindows() {
             bool is_loading = (player_id >= 0) ? IsPlayerLoading(player_id) : false;
 
             if (player_id >= 0 && g_pixel_buffer_manager && !is_loading) {
+                FSTPBetacamEffect::PlaybackMetrics playback_metrics{};
+                double actual_speed = GetInstanceActualSpeed(player_id);
+                bool is_reverse_playback = IsInstanceReverse(player_id);
+                playback_metrics.playback_rate = is_reverse_playback ? -std::fabs(actual_speed) : actual_speed;
+                playback_metrics.is_reverse = is_reverse_playback;
+                playback_metrics.position_seconds = GetInstancePosition(player_id);
+                playback_metrics.duration_seconds = GetInstanceDuration(player_id);
+                playback_metrics.frame_rate = GetInstanceVideoFPS(player_id);
+                g_pixel_buffer_manager->UpdatePlaybackMetrics(player_id, playback_metrics);
+
+                const double holdSpeedThreshold = 0.05;
+                double absPlaybackRate = std::fabs(playback_metrics.playback_rate);
+                int holdFramesTarget = 0;
+                if (playback_metrics.frame_rate > 1.0) {
+                    holdFramesTarget = static_cast<int>(std::round(playback_metrics.frame_rate * 0.5));
+                } else {
+                    holdFramesTarget = 30;
+                }
+                holdFramesTarget = std::clamp(holdFramesTarget, 15, 90);
+
+                if (g_windows[i].last_effect_speed >= holdSpeedThreshold && absPlaybackRate < holdSpeedThreshold) {
+                    g_windows[i].betacam_hold_frames = std::max(g_windows[i].betacam_hold_frames, holdFramesTarget);
+                } else if (absPlaybackRate >= holdSpeedThreshold) {
+                    g_windows[i].betacam_hold_frames = 0;
+                }
+                g_windows[i].last_effect_speed = absPlaybackRate;
+
                 const FSTPPixelBufferManager::PixelBuffer* pixel_buffer =
                     g_pixel_buffer_manager->GetPixelBuffer(player_id);
 
@@ -623,6 +673,11 @@ void RenderAllWindows() {
                         need_update = false;
                         // Debug log disabled for performance
                     }
+                    if (g_windows[i].betacam_hold_frames > 0) {
+                        need_update = true;
+                        g_windows[i].betacam_hold_frames--;
+                    }
+                    bool is_new_frame = need_update || (pixel_buffer->frame_number != g_windows[i].last_rendered_frame);
 
                     SDL_Texture* new_texture = nullptr;
                     if (need_update) {
@@ -663,6 +718,19 @@ void RenderAllWindows() {
                             win_h
                         );
 
+                        if (g_pixel_buffer_manager) {
+                            FSTPBetacamEffect::RenderContext render_ctx;
+                            render_ctx.dest_rect = &dst_rect;
+                            render_ctx.window_width = win_w;
+                            render_ctx.window_height = win_h;
+                            render_ctx.target_aspect_ratio = (pixel_buffer->height > 0)
+                                ? static_cast<float>(pixel_buffer->width) / static_cast<float>(pixel_buffer->height)
+                                : 1.0f;
+                            render_ctx.frame_number = pixel_buffer->frame_number;
+                            render_ctx.new_frame = is_new_frame;
+                            g_pixel_buffer_manager->ApplyRenderJitter(player_id, render_ctx);
+                        }
+
                         // Apply zoom if enabled for this window
                         FSTPZoomState* zoom_state = GetZoomState(i);
                         SDL_Rect src_rect_for_zoom = {0, 0, pixel_buffer->width, pixel_buffer->height};
@@ -686,6 +754,10 @@ void RenderAllWindows() {
                         }
 
                         SDL_RenderCopy(renderer, new_texture, src_rect_ptr, &dst_rect);
+
+                        if (is_new_frame) {
+                            g_windows[i].last_rendered_frame = pixel_buffer->frame_number;
+                        }
 
                         // Render zoom thumbnail if enabled
                         if (zoom_state && zoom_state->enabled && zoom_state->show_thumbnail && zoom_state->factor > 1.0f) {
@@ -928,6 +1000,23 @@ extern "C" void FSTP_UpdatePlayerColorMetadata(int player_id, int colorspace, in
     meta.color_primaries = color_primaries;
     meta.color_trc = color_trc;
     g_pixel_buffer_manager->UpdateColorMetadata(player_id, meta);
+}
+
+extern "C" void SetBetacamEffectEnabled(int enabled) {
+    if (!g_pixel_buffer_manager) {
+        return;
+    }
+
+    // Enable visual Betacam effect
+    g_pixel_buffer_manager->SetBetacamEffectEnabled(enabled != 0);
+
+    // Enable audio servomotor for all active players
+    for (int player_id = 0; player_id < MAX_PLAYER_INSTANCES; player_id++) {
+        FSTPAudioModuleWrapper* audio_module = GetInstanceAudioModule(player_id);
+        if (audio_module) {
+            audio_module->SetBetacamAudioEnabled(enabled != 0);
+        }
+    }
 }
 
 // Update window title with instance number and filename

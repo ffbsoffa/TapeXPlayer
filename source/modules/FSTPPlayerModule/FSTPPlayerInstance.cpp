@@ -3,9 +3,12 @@
 #include "../FSTPVideoModule/FSTPVideoModule_wrapper.h"
 #include "../FSTPMainModule/WSGUI/FSTPOSDSystem.h"
 #include "../FSTPMainModule/WSGUI/FSTPWindowManager.h"
+#include "../FSTPMainModule/WSGUI/FSTPSettings.h"
 #include <iostream>
 #include <string>
 #include <algorithm>
+#include <limits>
+#include <cmath>
 
 FSTPPlayerInstance::FSTPPlayerInstance()
     : m_initialized(false), m_file_loaded(false), m_instance_id(-1), m_window_index(-1),
@@ -95,6 +98,11 @@ int FSTPPlayerInstance::LoadFile(const std::string& filepath) {
     if (!m_audio_module->LoadFile(filepath)) {
         std::cerr << "Failed to load file into audio module: " << filepath << std::endl;
         return -3;
+    }
+
+    // Enable Betacam audio servomotor if Betacam effect is enabled in settings
+    if (GetBetacamEffectEnabled()) {
+        m_audio_module->SetBetacamAudioEnabled(true);
     }
 
     if (m_video_module && !m_video_module->LoadFile(filepath)) {
@@ -243,10 +251,17 @@ int FSTPPlayerInstance::SetSpeed(double speed) {
         return -2;
     }
 
-    std::cout << "Setting playback speed to: " << speed << "x" << std::endl;
+    static double last_logged_speed = std::numeric_limits<double>::quiet_NaN();
+    bool should_log = std::isnan(last_logged_speed) || std::abs(last_logged_speed - speed) >= 0.5;
+    if (should_log) {
+        std::cout << "Setting playback speed to: " << speed << "x" << std::endl;
+    }
+    last_logged_speed = speed;
 
     m_audio_module->SetSpeed(speed);
-    std::cout << "Speed changed successfully" << std::endl;
+    if (should_log) {
+        std::cout << "Speed changed successfully" << std::endl;
+    }
     return 0;
 }
 

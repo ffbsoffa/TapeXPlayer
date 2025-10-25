@@ -68,6 +68,9 @@ struct PlayerOSDData {
     float smooth_left_peak = 0.0f;
     float smooth_right_peak = 0.0f;
 
+    // Full-res decoder status (for "lock" indicator)
+    bool is_fullres_active = false;
+
     // Optimization: last render time for throttling
     std::chrono::steady_clock::time_point last_render_time;
 };

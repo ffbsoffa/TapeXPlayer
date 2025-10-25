@@ -1,11 +1,22 @@
 #include "FSTPSimpleVideoIndex.h"
 #include <iostream>
 #include <algorithm>
+#include <cctype>
 #include <iomanip>
 #include <cmath>
+#include <limits>
+
+extern "C" {
+#include <libavformat/version.h>
+#include <libavcodec/avcodec.h>
+}
 
 // Debug control: set to true to enable verbose logging
 static constexpr bool ENABLE_INDEX_DEBUG = false;
+static constexpr int kMaxSamplePackets = 20000;
+static constexpr int kMaxSampleFrames = 15000;
+static constexpr int kMaxIntraSamplePackets = 2000;
+static constexpr int kMaxIntraSampleFrames = 1500;
 
 void FSTPSimpleVideoIndex::Clear() {
     m_frames.clear();
@@ -14,6 +25,7 @@ void FSTPSimpleVideoIndex::Clear() {
     m_time_base = {1, 25};
     m_start_time = 0;
     m_max_gop_size = 0;
+    m_intraframe_codec = false;
     m_ready = false;
 }
 
@@ -54,7 +66,9 @@ bool FSTPSimpleVideoIndex::OpenFile(AVFormatContext** fmt_ctx, int* video_stream
         return false;
     }
     
-    std::cout << "[SimpleIndex] File opened successfully, video stream: " << *video_stream_idx << std::endl;
+    if (ENABLE_INDEX_DEBUG) {
+        std::cout << "[SimpleIndex] File opened successfully, video stream: " << *video_stream_idx << std::endl;
+    }
     return true;
 }
 
@@ -66,7 +80,7 @@ void FSTPSimpleVideoIndex::ExtractMetadata(AVFormatContext* fmt_ctx, int video_s
     // Like in old decode.cpp - audio gives relative time, video should too
     m_start_time = (video_stream->start_time != AV_NOPTS_VALUE) ? video_stream->start_time : 0;
 
-    if (m_start_time != 0) {
+    if (ENABLE_INDEX_DEBUG && m_start_time != 0) {
         double start_time_sec = m_start_time * av_q2d(m_time_base);
         std::cout << "[SimpleIndex] Video stream start_time: " << m_start_time
                   << " (" << start_time_sec << " seconds) - will use RELATIVE timestamps" << std::endl;
@@ -95,6 +109,27 @@ void FSTPSimpleVideoIndex::ExtractMetadata(AVFormatContext* fmt_ctx, int video_s
         } else {
             m_codec_name = "Unknown";
         }
+
+        m_intraframe_codec = false;
+        switch (codec_params->codec_id) {
+            case AV_CODEC_ID_DNXHD:  // includes DNxHR variants
+            case AV_CODEC_ID_PRORES:
+                m_intraframe_codec = true;
+                break;
+            default:
+                break;
+        }
+
+        if (!m_intraframe_codec) {
+            std::string codec_name_lower = m_codec_name;
+            for (char& ch : codec_name_lower) {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+            if (codec_name_lower.find("dnx") != std::string::npos ||
+                codec_name_lower.find("prores") != std::string::npos) {
+                m_intraframe_codec = true;
+            }
+        }
     }
 
     // Get duration
@@ -106,9 +141,11 @@ void FSTPSimpleVideoIndex::ExtractMetadata(AVFormatContext* fmt_ctx, int video_s
         m_duration = 0.0;
     }
 
-    std::cout << "[SimpleIndex] Metadata: " << m_width << "x" << m_height
-              << ", " << m_frame_rate << " fps, " << m_duration << " seconds"
-              << ", codec: " << m_codec_name << std::endl;
+    if (ENABLE_INDEX_DEBUG) {
+        std::cout << "[SimpleIndex] Metadata: " << m_width << "x" << m_height
+                  << ", " << m_frame_rate << " fps, " << m_duration << " seconds"
+                  << ", codec: " << m_codec_name << std::endl;
+    }
 }
 
 bool FSTPSimpleVideoIndex::BuildIndex(const std::string& video_file) {
@@ -123,6 +160,18 @@ bool FSTPSimpleVideoIndex::BuildIndex(const std::string& video_file) {
     }
     
     ExtractMetadata(fmt_ctx, video_stream_idx);
+
+    // Fast path: try to build index using stream metadata without full packet scan
+    if (BuildIndexFromStreamInfo(fmt_ctx, video_stream_idx)) {
+        avformat_close_input(&fmt_ctx);
+        return true;
+    }
+
+    if (m_intraframe_codec) {
+        bool ok = BuildIndexIntraframe(fmt_ctx, video_stream_idx);
+        avformat_close_input(&fmt_ctx);
+        return ok;
+    }
     
     // Reserve space for frames
     size_t estimated_frames = (size_t)(m_duration * m_frame_rate);
@@ -130,7 +179,9 @@ bool FSTPSimpleVideoIndex::BuildIndex(const std::string& video_file) {
         m_frames.reserve(estimated_frames);
     }
     
-    std::cout << "[SimpleIndex] Starting to read packets..." << std::endl;
+    if (ENABLE_INDEX_DEBUG) {
+        std::cout << "[SimpleIndex] Starting to read packets..." << std::endl;
+    }
     
     AVPacket* packet = av_packet_alloc();
     if (!packet) {
@@ -141,13 +192,22 @@ bool FSTPSimpleVideoIndex::BuildIndex(const std::string& video_file) {
     
     int frame_count = 0;
     int packet_count = 0;
+    const double time_base_seconds = av_q2d(m_time_base);
+    const double fallback_frame_step = (m_frame_rate > 0.0) ? (1.0 / m_frame_rate) : 0.0;
+    double last_frame_time = -std::numeric_limits<double>::infinity();
+    bool needs_sort = false;
+    constexpr double kTimeEpsilon = 1e-9;
     
     // Read all packets
+    const int frame_limit = m_intraframe_codec ? kMaxIntraSampleFrames : kMaxSampleFrames;
+    const int packet_limit = m_intraframe_codec ? kMaxIntraSamplePackets : kMaxSamplePackets;
+
+    bool sample_limit_reached = false;
     int ret;
     while ((ret = av_read_frame(fmt_ctx, packet)) >= 0) {
         packet_count++;
         
-        if (packet_count <= 5) {
+        if (ENABLE_INDEX_DEBUG && packet_count <= 5) {
             std::cout << "[SimpleIndex] Packet " << packet_count 
                       << ": stream=" << packet->stream_index 
                       << ", pts=" << packet->pts 
@@ -160,20 +220,30 @@ bool FSTPSimpleVideoIndex::BuildIndex(const std::string& video_file) {
             frame_info.frame_number = frame_count;
             frame_info.pts = packet->pts;
             frame_info.file_position = packet->pos;
-            frame_info.is_keyframe = (packet->flags & AV_PKT_FLAG_KEY) != 0;
+            bool packet_is_keyframe = (packet->flags & AV_PKT_FLAG_KEY) != 0;
+            if (m_intraframe_codec) {
+                packet_is_keyframe = true;
+            }
+            frame_info.is_keyframe = packet_is_keyframe;
 
             // CRITICAL: Calculate RELATIVE time (like in old decode.cpp)
             // Audio gives relative time from 0, video should match!
             if (packet->pts != AV_NOPTS_VALUE) {
-                // Convert to microseconds for accuracy (like in old code)
-                int64_t pts_us = av_rescale_q(packet->pts, m_time_base, {1, 1000000});
-                int64_t start_us = av_rescale_q(m_start_time, m_time_base, {1, 1000000});
-                int64_t relative_us = pts_us - start_us;  // RELATIVE time!
-
-                // Convert to seconds with full precision
-                frame_info.time_seconds = relative_us / 1000000.0;
+                frame_info.time_seconds = (packet->pts - m_start_time) * time_base_seconds;
+            } else if (fallback_frame_step > 0.0) {
+                frame_info.time_seconds = frame_count * fallback_frame_step;
             } else {
-                frame_info.time_seconds = frame_count / m_frame_rate;
+                frame_info.time_seconds = static_cast<double>(frame_count);
+            }
+
+            if (!needs_sort) {
+                if (frame_count == 0) {
+                    last_frame_time = frame_info.time_seconds;
+                } else if (frame_info.time_seconds + kTimeEpsilon < last_frame_time) {
+                    needs_sort = true;
+                } else {
+                    last_frame_time = frame_info.time_seconds;
+                }
             }
             
             // BuildIndex() called only when loading file
@@ -182,84 +252,168 @@ bool FSTPSimpleVideoIndex::BuildIndex(const std::string& video_file) {
             
             frame_count++;
             
-            if (frame_count % 1000 == 0) {
+            if (ENABLE_INDEX_DEBUG && frame_count % 1000 == 0) {
                 std::cout << "[SimpleIndex] Processed " << frame_count << " video frames..." << std::endl;
             }
+
+            if (!sample_limit_reached && (frame_count >= frame_limit || packet_count >= packet_limit)) {
+                sample_limit_reached = true;
+                av_packet_unref(packet);
+                break;
+            }
         }
-        
+
         av_packet_unref(packet);
+
+        if (sample_limit_reached) {
+            break;
+        }
+    }
+
+    av_packet_free(&packet);
+    if (sample_limit_reached) {
+        const double observed_span = (frame_count > 1)
+            ? (m_frames.back().time_seconds - m_frames.front().time_seconds)
+            : 0.0;
+        const double avg_step_from_frames = (frame_count > 1)
+            ? observed_span / static_cast<double>(frame_count - 1)
+            : 0.0;
+        const double fallback_step = (m_frame_rate > 0.0) ? (1.0 / m_frame_rate) : (1.0 / 25.0);
+        const double average_step = (avg_step_from_frames > 1e-9) ? avg_step_from_frames : fallback_step;
+        const double time_base_seconds = av_q2d(m_time_base);
+
+        int estimated_total_frames = static_cast<int>(std::llround(m_duration * (m_frame_rate > 0.0 ? m_frame_rate : 25.0)));
+        if (estimated_total_frames <= frame_count) {
+            estimated_total_frames = frame_count;
+        }
+
+        std::vector<int> keyframe_indices;
+        keyframe_indices.reserve(frame_count);
+        for (size_t i = 0; i < m_frames.size(); ++i) {
+            if (m_frames[i].is_keyframe) {
+                keyframe_indices.push_back(static_cast<int>(i));
+            }
+        }
+
+        int gop_interval = 0;
+        if (m_intraframe_codec) {
+            gop_interval = 1;
+        } else if (keyframe_indices.size() >= 2) {
+            long long interval_sum = 0;
+            for (size_t i = 1; i < keyframe_indices.size(); ++i) {
+                interval_sum += keyframe_indices[i] - keyframe_indices[i - 1];
+            }
+            gop_interval = static_cast<int>(std::llround(static_cast<double>(interval_sum) / (keyframe_indices.size() - 1)));
+        }
+        if (gop_interval <= 0) {
+            gop_interval = static_cast<int>(std::max(1.0, m_frame_rate > 0.0 ? std::round(m_frame_rate) : 1.0));
+        }
+
+        const size_t original_size = m_frames.size();
+        if (estimated_total_frames > frame_count) {
+            m_frames.resize(static_cast<size_t>(estimated_total_frames));
+        }
+
+        double current_time = (frame_count > 0) ? m_frames.back().time_seconds : 0.0;
+        int last_keyframe_idx = !keyframe_indices.empty() ? keyframe_indices.back() : (frame_count > 0 ? frame_count - 1 : 0);
+
+        for (size_t i = original_size; i < m_frames.size(); ++i) {
+            current_time += average_step;
+            auto& frame = m_frames[i];
+            frame.frame_number = static_cast<int>(i);
+            frame.time_seconds = std::min(current_time, m_duration);
+            frame.file_position = -1;
+            frame.pts = m_start_time + static_cast<int64_t>(std::llround(frame.time_seconds / time_base_seconds));
+
+            if (m_intraframe_codec) {
+                frame.is_keyframe = true;
+                last_keyframe_idx = static_cast<int>(i);
+            } else {
+                const int delta_from_last_key = static_cast<int>(i) - last_keyframe_idx;
+                if (delta_from_last_key >= gop_interval) {
+                    frame.is_keyframe = true;
+                    last_keyframe_idx = static_cast<int>(i);
+                } else {
+                    frame.is_keyframe = false;
+                }
+            }
+        }
+
+        frame_count = static_cast<int>(m_frames.size());
     }
     
-    av_packet_free(&packet);
     avformat_close_input(&fmt_ctx);
     
     // Check result
-    if (ret < 0 && ret != AVERROR_EOF) {
+    if (!sample_limit_reached && ret < 0 && ret != AVERROR_EOF) {
         char error_buf[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, error_buf, sizeof(error_buf));
         std::cerr << "[SimpleIndex] Read error: " << error_buf << std::endl;
         return false;
     }
     
-    std::cout << "[SimpleIndex] Completed: " << packet_count << " total packets, " 
-              << frame_count << " video frames indexed" << std::endl;
+    if (ENABLE_INDEX_DEBUG) {
+        std::cout << "[SimpleIndex] Completed: " << packet_count << " total packets, " 
+                  << frame_count << " video frames indexed" << std::endl;
+    }
     
     if (frame_count > 0) {
-        // Sort frames by presentation time (like old decode.cpp)
-        std::cout << "[SimpleIndex] Sorting " << m_frames.size() << " frames by presentation time..." << std::endl;
+        if (needs_sort) {
+            if (ENABLE_INDEX_DEBUG) {
+                std::cout << "[SimpleIndex] Sorting " << m_frames.size() << " frames by presentation time..." << std::endl;
+            }
 
-        // BuildIndex() works in one thread when loading file
-        std::sort(m_frames.begin(), m_frames.end(), [](const SimpleFrameInfo& a, const SimpleFrameInfo& b) {
-            return a.time_seconds < b.time_seconds;
-        });
+            std::sort(m_frames.begin(), m_frames.end(), [](const SimpleFrameInfo& a, const SimpleFrameInfo& b) {
+                return a.time_seconds < b.time_seconds;
+            });
 
-        // Update frame numbers after sorting
-        for (int i = 0; i < static_cast<int>(m_frames.size()); ++i) {
-            m_frames[i].frame_number = i;
+            for (size_t i = 0; i < m_frames.size(); ++i) {
+                m_frames[i].frame_number = static_cast<int>(i);
+            }
+
+            if (ENABLE_INDEX_DEBUG) {
+                std::cout << "[SimpleIndex] Frames sorted by presentation time for proper B-frame handling" << std::endl;
+            }
         }
-
-        std::cout << "[SimpleIndex] Frames sorted by presentation time for proper B-frame handling" << std::endl;
 
         // GOP STRUCTURE DIAGNOSIS: Analyze GOP size to identify problematic files
         int keyframe_count = 0;
-        m_max_gop_size = 0;  // Save in class member for use by decoder
         int current_gop_size = 0;
-        std::vector<int> gop_sizes;
+        int min_gop_size = std::numeric_limits<int>::max();
+        m_max_gop_size = 0;
+        int gop_sample_count = 0;
+        double gop_mean = 0.0;
+        double gop_m2 = 0.0;
 
-        for (size_t i = 0; i < m_frames.size(); ++i) {
+        for (const auto& frame : m_frames) {
             current_gop_size++;
-            if (m_frames[i].is_keyframe) {
+            if (frame.is_keyframe) {
                 keyframe_count++;
                 if (current_gop_size > 1) {  // Skip first GOP (may be incomplete)
-                    gop_sizes.push_back(current_gop_size);
-                    m_max_gop_size = std::max(m_max_gop_size, current_gop_size);
+                    const int gop_size = current_gop_size;
+                    m_max_gop_size = std::max(m_max_gop_size, gop_size);
+                    min_gop_size = std::min(min_gop_size, gop_size);
+
+                    gop_sample_count++;
+                    const double delta = gop_size - gop_mean;
+                    gop_mean += delta / gop_sample_count;
+                    const double delta2 = gop_size - gop_mean;
+                    gop_m2 += delta * delta2;
                 }
                 current_gop_size = 0;
             }
         }
 
-        // Calculate GOP statistics to identify irregularity
-        if (!gop_sizes.empty()) {
-            int min_gop = *std::min_element(gop_sizes.begin(), gop_sizes.end());
-            int total_gop = 0;
-            for (int size : gop_sizes) total_gop += size;
-            double avg_gop = static_cast<double>(total_gop) / gop_sizes.size();
-
-            // Calculate standard deviation to determine "irregularity"
-            double variance = 0.0;
-            for (int size : gop_sizes) {
-                variance += (size - avg_gop) * (size - avg_gop);
-            }
-            double stddev = std::sqrt(variance / gop_sizes.size());
+        if (ENABLE_INDEX_DEBUG && gop_sample_count > 0) {
+            const double stddev = (gop_sample_count > 0) ? std::sqrt(gop_m2 / gop_sample_count) : 0.0;
 
             std::cout << "[SimpleIndex] GOP analysis: " << keyframe_count << " keyframes, "
-                      << gop_sizes.size() << " GOPs" << std::endl;
-            std::cout << "              GOP size: min=" << min_gop
+                      << gop_sample_count << " GOPs" << std::endl;
+            std::cout << "              GOP size: min=" << min_gop_size
                       << ", max=" << m_max_gop_size
-                      << ", avg=" << std::fixed << std::setprecision(1) << avg_gop
+                      << ", avg=" << std::fixed << std::setprecision(1) << gop_mean
                       << ", stddev=" << std::setprecision(1) << stddev << std::endl;
 
-            // WARNING about problematic GOP structures
             if (m_max_gop_size > 100) {
                 std::cout << "              ⚠️  CRITICAL: Very large GOP detected (" << m_max_gop_size
                           << " frames) - decoder will use adaptive margins" << std::endl;
@@ -268,20 +422,20 @@ bool FSTPSimpleVideoIndex::BuildIndex(const std::string& video_file) {
                           << " frames) - decoder will use extended margins" << std::endl;
             }
 
-            // Irregularity: stddev > 50% from average
-            if (stddev > avg_gop * 0.5) {
+            if (stddev > gop_mean * 0.5) {
                 std::cout << "              ⚠️  WARNING: Irregular GOP structure detected (high variance)"
                           << " - frame timing may be unpredictable" << std::endl;
             }
         }
 
-        // Log first few frames after sorting
-        std::cout << "[SimpleIndex] After sorting: ";
-        for (int i = 0; i < std::min(5, static_cast<int>(m_frames.size())); i++) {
-            std::cout << std::fixed << std::setprecision(3) << m_frames[i].time_seconds << "s";
-            if (i < 4 && i < static_cast<int>(m_frames.size()) - 1) std::cout << " → ";
+        if (ENABLE_INDEX_DEBUG) {
+            std::cout << "[SimpleIndex] After sorting: ";
+            for (int i = 0; i < std::min(5, static_cast<int>(m_frames.size())); i++) {
+                std::cout << std::fixed << std::setprecision(3) << m_frames[i].time_seconds << "s";
+                if (i < 4 && i < static_cast<int>(m_frames.size()) - 1) std::cout << " → ";
+            }
+            std::cout << " (display order)" << std::endl;
         }
-        std::cout << " (display order)" << std::endl;
 
         m_ready = true;
         return true;
@@ -372,4 +526,234 @@ void FSTPSimpleVideoIndex::UpdateFrameTime(int frame_number, double time_seconds
         // Update frame time with data from decoder for precise synchronization
         m_frames[frame_number].time_seconds = time_seconds;
     }
+}
+
+bool FSTPSimpleVideoIndex::BuildIndexFromStreamInfo(AVFormatContext* fmt_ctx, int video_stream_idx) {
+    AVStream* video_stream = fmt_ctx->streams[video_stream_idx];
+    if (!video_stream) {
+        return false;
+    }
+
+    if (m_frame_rate <= 0.0) {
+        return false;
+    }
+
+    int64_t total_frames = video_stream->nb_frames;
+    if (total_frames <= 0) {
+        total_frames = static_cast<int64_t>(std::llround(m_duration * m_frame_rate));
+    }
+
+    if (total_frames <= 0) {
+        return false;
+    }
+
+    // Guard against unreasonable estimates (e.g., corrupted metadata)
+    constexpr int64_t kMaxReasonableFrames = 10'000'000;
+    if (total_frames > kMaxReasonableFrames) {
+        return false;
+    }
+
+    m_frames.clear();
+    m_frames.resize(static_cast<size_t>(total_frames));
+
+    const double time_step = 1.0 / m_frame_rate;
+    const double time_base_seconds = av_q2d(m_time_base);
+    if (!(time_base_seconds > 0.0)) {
+        m_frames.clear();
+        return false;
+    }
+
+    for (int64_t i = 0; i < total_frames; ++i) {
+        auto& frame = m_frames[static_cast<size_t>(i)];
+        frame.frame_number = static_cast<int>(i);
+        frame.time_seconds = std::min(i * time_step, m_duration);
+        frame.file_position = -1;
+        frame.is_keyframe = false;
+        frame.pts = m_start_time + static_cast<int64_t>(std::llround(frame.time_seconds / time_base_seconds));
+    }
+
+    bool has_keyframe_info = false;
+#if LIBAVFORMAT_VERSION_MAJOR < 59
+    if (video_stream->index_entries && video_stream->nb_index_entries > 0) {
+        has_keyframe_info = true;
+        const AVIndexEntry* entries = video_stream->index_entries;
+        const int entry_count = video_stream->nb_index_entries;
+
+        for (int i = 0; i < entry_count; ++i) {
+            const int64_t timestamp = entries[i].timestamp;
+            const double relative_seconds = (timestamp - m_start_time) * time_base_seconds;
+            int frame_idx = static_cast<int>(std::llround(relative_seconds * m_frame_rate));
+            frame_idx = std::clamp(frame_idx, 0, static_cast<int>(total_frames) - 1);
+            m_frames[static_cast<size_t>(frame_idx)].is_keyframe = true;
+        }
+    }
+#else
+    const int entry_count = avformat_index_get_entries_count(video_stream);
+    if (entry_count > 0) {
+        has_keyframe_info = true;
+        for (int i = 0; i < entry_count; ++i) {
+            const AVIndexEntry* entry = avformat_index_get_entry(video_stream, i);
+            if (!entry) {
+                continue;
+            }
+
+            const int64_t timestamp = entry->timestamp;
+            const double relative_seconds = (timestamp - m_start_time) * time_base_seconds;
+            int frame_idx = static_cast<int>(std::llround(relative_seconds * m_frame_rate));
+            frame_idx = std::clamp(frame_idx, 0, static_cast<int>(total_frames) - 1);
+            m_frames[static_cast<size_t>(frame_idx)].is_keyframe = true;
+        }
+    }
+#endif
+
+    if (!has_keyframe_info) {
+        const AVCodecParameters* codecpar = video_stream->codecpar;
+        bool assume_all_i_frames = false;
+        if (codecpar) {
+            switch (codecpar->codec_id) {
+                case AV_CODEC_ID_DNXHD:      // includes DNxHR family
+                case AV_CODEC_ID_PRORES:
+                    assume_all_i_frames = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        if (assume_all_i_frames) {
+            for (auto& frame : m_frames) {
+                frame.is_keyframe = true;
+            }
+            has_keyframe_info = true;
+        } else {
+            m_frames.clear();
+            return false;
+        }
+    }
+
+    if (!m_frames.empty() && !m_frames.front().is_keyframe) {
+        m_frames.front().is_keyframe = true;
+    }
+
+    m_max_gop_size = 0;
+    int current_gop = 0;
+    for (const auto& frame : m_frames) {
+        current_gop++;
+        if (frame.is_keyframe) {
+            if (current_gop > 1) {
+                m_max_gop_size = std::max(m_max_gop_size, current_gop);
+            }
+            current_gop = 0;
+        }
+    }
+    if (current_gop > 0) {
+        m_max_gop_size = std::max(m_max_gop_size, current_gop);
+    }
+
+    if (ENABLE_INDEX_DEBUG) {
+        std::cout << "[SimpleIndex] Fast index build succeeded using stream metadata: "
+                  << m_frames.size() << " frames" << std::endl;
+    }
+
+    m_ready = true;
+    return true;
+}
+
+bool FSTPSimpleVideoIndex::BuildIndexIntraframe(AVFormatContext* fmt_ctx, int video_stream_idx) {
+    const double time_base_seconds = av_q2d(m_time_base);
+    double fps = (m_frame_rate > 0.0) ? m_frame_rate : 25.0;
+    if (fps <= 0.0) {
+        fps = 25.0;
+    }
+
+    int64_t estimated_frames = static_cast<int64_t>(std::llround(m_duration * fps));
+    if (estimated_frames <= 0) {
+        estimated_frames = static_cast<int64_t>(fps * std::max(1.0, m_duration));
+        if (estimated_frames <= 0) {
+            estimated_frames = static_cast<int64_t>(fps * 60.0); // fallback to 1 minute
+        }
+    }
+    const int64_t kMaxFrames = 2'000'000;
+    estimated_frames = std::clamp<int64_t>(estimated_frames, 1, kMaxFrames);
+
+    m_frames.clear();
+    m_frames.resize(static_cast<size_t>(estimated_frames));
+
+    const double time_step = 1.0 / fps;
+    for (size_t i = 0; i < m_frames.size(); ++i) {
+        auto& frame = m_frames[i];
+        frame.frame_number = static_cast<int>(i);
+        frame.time_seconds = std::min(i * time_step, m_duration);
+        frame.file_position = -1;
+        frame.is_keyframe = true;
+        frame.pts = m_start_time + static_cast<int64_t>(std::llround(frame.time_seconds / time_base_seconds));
+    }
+
+    int sample_count = static_cast<int>(std::min<size_t>(m_frames.size(), 256));
+    if (sample_count <= 0) {
+        sample_count = 1;
+    }
+
+    AVPacket* packet = av_packet_alloc();
+    if (!packet) {
+        return false;
+    }
+
+    for (int s = 0; s < sample_count; ++s) {
+        double ratio = (sample_count > 1) ? static_cast<double>(s) / static_cast<double>(sample_count - 1) : 0.0;
+        size_t frame_idx = std::min<size_t>(m_frames.size() - 1, static_cast<size_t>(std::llround(ratio * (m_frames.size() - 1))));
+        double sample_time = m_frames[frame_idx].time_seconds;
+        int64_t target_pts = m_start_time + static_cast<int64_t>(std::llround(sample_time / time_base_seconds));
+
+        if (av_seek_frame(fmt_ctx, video_stream_idx, target_pts, AVSEEK_FLAG_BACKWARD) < 0) {
+            continue;
+        }
+
+        int tries = 0;
+        while (tries < 50 && av_read_frame(fmt_ctx, packet) >= 0) {
+            ++tries;
+            if (packet->stream_index != video_stream_idx) {
+                av_packet_unref(packet);
+                continue;
+            }
+
+            double actual_time = sample_time;
+            if (packet->pts != AV_NOPTS_VALUE) {
+                actual_time = (packet->pts - m_start_time) * time_base_seconds;
+            } else if (packet->dts != AV_NOPTS_VALUE) {
+                actual_time = (packet->dts - m_start_time) * time_base_seconds;
+            }
+
+            actual_time = std::clamp(actual_time, 0.0, (m_duration > 0.0) ? m_duration : actual_time);
+
+            m_frames[frame_idx].time_seconds = actual_time;
+            m_frames[frame_idx].pts = packet->pts;
+            m_frames[frame_idx].file_position = packet->pos;
+            m_frames[frame_idx].is_keyframe = true;
+
+            break;
+        }
+
+        av_packet_unref(packet);
+    }
+
+    av_packet_free(&packet);
+
+    double last_time = 0.0;
+    for (size_t i = 0; i < m_frames.size(); ++i) {
+        auto& frame = m_frames[i];
+        if (i == 0) {
+            last_time = frame.time_seconds;
+        } else {
+            if (frame.time_seconds + 1e-9 < last_time) {
+                frame.time_seconds = last_time;
+            } else {
+                last_time = frame.time_seconds;
+            }
+        }
+    }
+
+    m_max_gop_size = 1;
+    m_ready = true;
+    return true;
 }

@@ -51,7 +51,11 @@ public:
     float GetAudioLevelRight() const;
     float GetAudioPeakLeft() const;
     float GetAudioPeakRight() const;
-    
+
+    // Betacam servomotor sound effect
+    void SetBetacamAudioEnabled(bool enabled);
+    bool IsBetacamAudioEnabled() const;
+
     // Restart audio stream with new settings
     bool RestartAudioStream();
 

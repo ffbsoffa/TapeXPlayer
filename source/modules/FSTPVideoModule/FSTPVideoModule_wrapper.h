@@ -16,6 +16,8 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 }
 
+struct SwsContext;
+
 // Forward declaration
 class FSTPAudioModuleWrapper;
 
@@ -55,6 +57,7 @@ private:
 
     std::unique_ptr<FSTP::LowCachedDecoderManager> m_low_cached_manager;
     std::unique_ptr<FSTPFullResDecoderV2> m_full_res_decoder;  // V2: Streaming decoder
+
 
     mutable FSTP::FrameBuffer m_display_buffer;
 

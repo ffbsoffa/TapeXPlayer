@@ -32,6 +32,9 @@ static auto mouse_shuttle_click_time = std::chrono::steady_clock::now();
 // Zoom Panning variables (for increased FPS during active panning)
 static bool zoom_panning_active = false;
 
+// ALT shuttle state
+static bool g_alt_shuttle_active = false;
+
 // Timecode Seek variables
 static bool timecode_seek_active = false;
 static std::string timecode_input = "";
@@ -117,6 +120,21 @@ static void HandlePlaybackControl(int player_id, const char* action) {
 
     // Update OSD for specific window
     UpdateWindowOSD(window_index, current_position, duration, is_playing, speed, is_reverse);
+}
+
+static void ApplyReverseState(int player_id, bool reverse) {
+    if (player_id < 0) return;
+    double speed = std::fabs(GetInstanceSpeed(player_id));
+    SetInstanceReverse(player_id, reverse);
+    SetInstanceSpeed(player_id, speed);
+
+    int window_index = GetWindowIndexByPlayerID(player_id);
+    if (window_index >= 0) {
+        bool is_playing = IsInstancePlaying(player_id);
+        double current_position = GetInstancePosition(player_id);
+        double duration = GetInstanceDuration(player_id);
+        UpdateWindowOSD(window_index, current_position, duration, is_playing, GetInstanceSpeed(player_id), reverse);
+    }
 }
 
 static void HandleSpeedControl(int player_id, double speed_change) {
@@ -491,14 +509,56 @@ bool HandleKeyboardEvents(SDL_Event& event) {
 
                 // === Speed Control ===
                 case SDLK_UP:
-                    // Arrow up - increase speed
-                    HandleSpeedStepUp(active_player_id);
-                    break;
-
                 case SDLK_DOWN:
-                    // Arrow down - decrease speed
-                    HandleSpeedStepDown(active_player_id);
+                case SDLK_LEFT:
+                case SDLK_RIGHT: {
+                    bool altHeld = (event.key.keysym.mod & (KMOD_ALT | KMOD_GUI)) != 0;
+                    if (altHeld) {
+                        if (event.key.keysym.sym == SDLK_LEFT) {
+                            SetInstanceSpeedInstant(active_player_id, 10.0);
+                            ApplyReverseState(active_player_id, true);
+                            if (!IsInstancePlaying(active_player_id)) {
+                                PlayInstance(active_player_id);
+                            }
+                            g_alt_shuttle_active = true;
+                        } else if (event.key.keysym.sym == SDLK_RIGHT) {
+                            SetInstanceSpeedInstant(active_player_id, 10.0);
+                            ApplyReverseState(active_player_id, false);
+                            if (!IsInstancePlaying(active_player_id)) {
+                                PlayInstance(active_player_id);
+                            }
+                            g_alt_shuttle_active = true;
+                        }
+                        break;
+                    }
+
+                    bool shiftHeld = (event.key.keysym.mod & KMOD_SHIFT) != 0;
+                    switch (event.key.keysym.sym) {
+                        case SDLK_UP:
+                            HandleSpeedStepUp(active_player_id);
+                            break;
+                        case SDLK_DOWN:
+                            HandleSpeedStepDown(active_player_id);
+                            break;
+                        case SDLK_LEFT:
+                            if (shiftHeld) {
+                                double amount = (event.key.keysym.mod & KMOD_CTRL) ? -300.0 : -60.0;
+                                HandleSeekControl(active_player_id, amount);
+                            } else {
+                                ApplyReverseState(active_player_id, true);
+                            }
+                            break;
+                        case SDLK_RIGHT:
+                            if (shiftHeld) {
+                                double amount = (event.key.keysym.mod & KMOD_CTRL) ? 300.0 : 60.0;
+                                HandleSeekControl(active_player_id, amount);
+                            } else {
+                                ApplyReverseState(active_player_id, false);
+                            }
+                            break;
+                    }
                     break;
+                }
 
                 case SDLK_PLUS:
                 case SDLK_EQUALS:
@@ -557,27 +617,6 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                         HandleSpeedControl(active_player_id, 0.5);
                     }
                     break;
-
-                // === Position Control ===
-                case SDLK_LEFT:
-                    // Arrow left - back 10 seconds
-                    if (event.key.keysym.mod & KMOD_SHIFT) {
-                        HandleSeekControl(active_player_id, -60.0); // Shift+Left = 1 minute back
-                    } else {
-                        HandleSeekControl(active_player_id, -10.0); // 10 seconds back
-                    }
-                    break;
-
-                case SDLK_RIGHT:
-                    // Arrow right - forward 10 seconds
-                    if (event.key.keysym.mod & KMOD_SHIFT) {
-                        HandleSeekControl(active_player_id, 60.0); // Shift+Right = 1 minute forward
-                    } else {
-                        HandleSeekControl(active_player_id, 10.0); // 10 seconds forward
-                    }
-                    break;
-
-                // SDLK_UP and SDLK_DOWN now used for speed control
 
                 case SDLK_HOME:
                     // Home - to beginning
@@ -806,6 +845,16 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                 if (zoom_panning_active) {
                     zoom_panning_active = false;
                 }
+                if (g_alt_shuttle_active) {
+                    int alt_player = GetActivePlayerID();
+                    if (alt_player >= 0) {
+                        SetInstanceSpeedInstant(alt_player, 1.0);
+                        SetInstanceSpeed(alt_player, 1.0);
+                        ApplyReverseState(alt_player, false);
+                        PlayInstance(alt_player);
+                    }
+                    g_alt_shuttle_active = false;
+                }
             }
             break;
 
@@ -855,6 +904,21 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                         }
                     }
                 }
+            }
+            break;
+
+        case SDL_KEYUP:
+            if (g_alt_shuttle_active &&
+                (event.key.keysym.sym == SDLK_LEFT || event.key.keysym.sym == SDLK_RIGHT ||
+                 event.key.keysym.sym == SDLK_LALT || event.key.keysym.sym == SDLK_RALT)) {
+                int alt_player = GetActivePlayerID();
+                if (alt_player >= 0) {
+                    SetInstanceSpeedInstant(alt_player, 1.0);
+                    SetInstanceSpeed(alt_player, 1.0);
+                    ApplyReverseState(alt_player, false);
+                    PlayInstance(alt_player);
+                }
+                g_alt_shuttle_active = false;
             }
             break;
 

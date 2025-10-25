@@ -2,6 +2,17 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <filesystem>
+#include <vector>
+#include <set>
+#include <unordered_map>
+#include <algorithm>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #ifdef __APPLE__
 #include <portaudio.h>
@@ -54,6 +65,8 @@ void ResetSettingsToDefault() {
 
     // Multi-instance settings
     g_settings.auto_freeze_inactive = 1;       // ENABLED BY DEFAULT (protection from forgotten players)
+    g_settings.betacam_effect_enabled = 0;     // Disabled by default
+    g_settings.yt_dlp_extension_enabled = 0;   // Disabled by default
 
     // MIDI settings
     g_settings.midi_enabled = 0;              // Disabled by default
@@ -75,6 +88,10 @@ int InitSettings() {
         std::cout << "Settings file not found or corrupted, using defaults" << std::endl;
     } else {
         std::cout << "Settings loaded from: " << g_settings_path << std::endl;
+    }
+
+    if (g_settings.yt_dlp_extension_enabled && !FSTP_YTDLP_IsAvailable()) {
+        g_settings.yt_dlp_extension_enabled = 0;
     }
 
     g_settings_initialized = true;
@@ -126,6 +143,16 @@ int SaveSettings() {
     // Multi-instance settings
     file << "[MultiInstance]\n";
     file << "auto_freeze_inactive=" << g_settings.auto_freeze_inactive << "\n";
+    file << "\n";
+
+    // Video settings
+    file << "[Video]\n";
+    file << "betacam_effect_enabled=" << g_settings.betacam_effect_enabled << "\n";
+    file << "\n";
+
+    file << "[Extensions]\n";
+    file << "yt_dlp_enabled=" << g_settings.yt_dlp_extension_enabled << "\n";
+    file << "\n";
 
     // MIDI settings
     file << "[MIDI]\n";
@@ -180,6 +207,12 @@ int LoadSettings() {
         }
         else if (current_section == "MultiInstance") {
             if (key == "auto_freeze_inactive") g_settings.auto_freeze_inactive = std::stoi(value);
+        }
+        else if (current_section == "Video") {
+            if (key == "betacam_effect_enabled") g_settings.betacam_effect_enabled = std::stoi(value);
+        }
+        else if (current_section == "Extensions") {
+            if (key == "yt_dlp_enabled") g_settings.yt_dlp_extension_enabled = std::stoi(value);
         }
         else if (current_section == "MIDI") {
             if (key == "enabled") g_settings.midi_enabled = std::stoi(value);
@@ -260,6 +293,30 @@ int GetAutoFreezeInactive() {
     return g_settings.auto_freeze_inactive;
 }
 
+int GetBetacamEffectEnabled() {
+    if (!g_settings_initialized) {
+        InitSettings();
+    }
+    return g_settings.betacam_effect_enabled;
+}
+
+int GetYTDLPExtensionEnabled() {
+    if (!g_settings_initialized) {
+        InitSettings();
+    }
+    return g_settings.yt_dlp_extension_enabled;
+}
+
+void SetYTDLPExtensionEnabled(int enabled) {
+    if (!g_settings_initialized) {
+        InitSettings();
+    }
+    if (enabled && !FSTP_YTDLP_IsAvailable()) {
+        enabled = 0;
+    }
+    g_settings.yt_dlp_extension_enabled = enabled ? 1 : 0;
+}
+
 int GetMIDIEnabled() {
     if (!g_settings_initialized) {
         InitSettings();
@@ -279,4 +336,237 @@ int GetMIDIOutputPort() {
         InitSettings();
     }
     return g_settings.midi_output_port;
+}
+
+const char* GetExtensionLanguage() {
+    return FSTP_EXTENSION_SCRIPT_LANGUAGE;
+}
+
+namespace {
+namespace fs = std::filesystem;
+
+static std::string& GetDownloadsDirectoryInternal() {
+    static std::string downloads_dir;
+    if (!downloads_dir.empty()) {
+        return downloads_dir;
+    }
+
+    const char* home = std::getenv("HOME");
+    fs::path base = home ? fs::path(home) : fs::temp_directory_path();
+#ifdef __APPLE__
+    base /= "Movies";
+#else
+    base /= "Videos";
+#endif
+    fs::path target = base / "TapeXDownloads";
+
+    std::error_code ec;
+    fs::create_directories(target, ec);
+    downloads_dir = target.lexically_normal().string();
+    return downloads_dir;
+}
+
+static bool CopyToBuffer(const std::string& src, char* dest, int capacity) {
+    if (!dest || capacity <= 0) {
+        return false;
+    }
+    if ((int)src.size() >= capacity) {
+        std::snprintf(dest, capacity, "%s", src.substr(0, capacity - 1).c_str());
+        return false;
+    }
+    std::snprintf(dest, capacity, "%s", src.c_str());
+    return true;
+}
+
+static std::string ShellQuote(const std::string& value) {
+    std::string result = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            result += "'\\''";
+        } else {
+            result += c;
+        }
+    }
+    result += "'";
+    return result;
+}
+
+static bool LocateYTDLPBinary(std::string& binary_path) {
+    static bool cached = false;
+    static std::string cached_path;
+    static bool cached_result = false;
+
+    if (cached) {
+        binary_path = cached_path;
+        return cached_result;
+    }
+
+    cached = true;
+
+    std::set<std::string> search_dirs;
+    const char* path_env = std::getenv("PATH");
+    if (path_env) {
+        std::string path_str(path_env);
+        size_t start = 0;
+        while (start <= path_str.size()) {
+            size_t end = path_str.find(':', start);
+            std::string part = path_str.substr(start, end == std::string::npos ? std::string::npos : end - start);
+            if (!part.empty()) {
+                search_dirs.insert(part);
+            }
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+    }
+#ifdef __APPLE__
+    search_dirs.insert("/opt/homebrew/bin");
+    search_dirs.insert("/usr/local/bin");
+#endif
+
+    for (const auto& dir : search_dirs) {
+        fs::path candidate = fs::path(dir) / "yt-dlp";
+        std::error_code ec;
+        if (fs::exists(candidate, ec) && fs::is_regular_file(candidate, ec)) {
+            if (::access(candidate.c_str(), X_OK) == 0) {
+                cached_path = candidate.string();
+                cached_result = true;
+                binary_path = cached_path;
+                return true;
+            }
+        }
+    }
+
+    cached_path.clear();
+    cached_result = false;
+    binary_path.clear();
+    return false;
+}
+
+static bool DetectDownloadedFile(const fs::path& download_dir,
+                                 const std::unordered_map<std::string, fs::file_time_type>& before,
+                                 fs::path& out_path) {
+    bool found = false;
+    fs::file_time_type latest_time = fs::file_time_type::min();
+
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(download_dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+
+        const std::string name = entry.path().filename().string();
+        fs::file_time_type mod_time = entry.last_write_time(ec);
+        if (ec) {
+            continue;
+        }
+
+        auto it = before.find(name);
+        bool is_new = false;
+        if (it == before.end()) {
+            is_new = true;
+        } else if (mod_time > it->second) {
+            is_new = true;
+        }
+
+        if (is_new && (!found || mod_time > latest_time)) {
+            found = true;
+            latest_time = mod_time;
+            out_path = entry.path();
+        }
+    }
+
+    return found;
+}
+} // namespace
+
+int FSTP_YTDLP_IsAvailable(void) {
+    std::string path;
+    return LocateYTDLPBinary(path) ? 1 : 0;
+}
+
+const char* FSTP_YTDLP_GetDownloadsDir(void) {
+    static std::string dir = GetDownloadsDirectoryInternal();
+    return dir.c_str();
+}
+
+int FSTP_YTDLP_Download(const char* url,
+                        char* out_path,
+                        int out_path_size,
+                        char* error_buf,
+                        int error_buf_size) {
+    if (!url || std::strlen(url) == 0) {
+        CopyToBuffer("Empty URL", error_buf, error_buf_size);
+        return 0;
+    }
+
+    std::string binary_path;
+    if (!LocateYTDLPBinary(binary_path)) {
+        CopyToBuffer("yt-dlp is not installed or not found in PATH", error_buf, error_buf_size);
+        return 0;
+    }
+
+    fs::path download_dir = fs::path(GetDownloadsDirectoryInternal());
+
+    std::unordered_map<std::string, fs::file_time_type> before;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(download_dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (entry.is_regular_file(ec)) {
+            before.emplace(entry.path().filename().string(), entry.last_write_time(ec));
+        }
+    }
+
+    std::string output_template = (download_dir / "%(title)s.%(ext)s").string();
+    std::string command = ShellQuote(binary_path) +
+        " --no-progress --no-playlist --merge-output-format mp4" +
+        " -o " + ShellQuote(output_template) +
+        " " + ShellQuote(url) + " 2>&1";
+
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        CopyToBuffer("Failed to spawn yt-dlp process", error_buf, error_buf_size);
+        return 0;
+    }
+
+    std::string output;
+    char buffer[4096];
+    while (std::fgets(buffer, sizeof(buffer), pipe)) {
+        output += buffer;
+    }
+
+    int status = pclose(pipe);
+    int exit_code = -1;
+    if (WIFEXITED(status)) {
+        exit_code = WEXITSTATUS(status);
+    }
+
+    if (exit_code != 0) {
+        if (output.empty()) {
+            output = "yt-dlp failed with exit code " + std::to_string(exit_code);
+        }
+        CopyToBuffer(output, error_buf, error_buf_size);
+        return 0;
+    }
+
+    fs::path downloaded_file;
+    if (!DetectDownloadedFile(download_dir, before, downloaded_file)) {
+        CopyToBuffer("Download completed but output file was not detected", error_buf, error_buf_size);
+        return 0;
+    }
+
+    if (!CopyToBuffer(downloaded_file.string(), out_path, out_path_size)) {
+        CopyToBuffer("Downloaded file path is too long", error_buf, error_buf_size);
+        return 0;
+    }
+
+    if (error_buf && error_buf_size > 0) {
+        error_buf[0] = '\0';
+    }
+
+    return 1;
 }

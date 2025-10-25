@@ -3,11 +3,11 @@
 #include "../../FSTPVideoModule/FSTPCallCounter.h"
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 
 extern "C" {
-#include <libswscale/swscale.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/frame.h>
 }
@@ -22,6 +22,8 @@ FSTPPixelBufferManager::FSTPPixelBufferManager() {
         m_read_buffer_index[i].store(1);
         m_buffer_ready[i].store(false);
         m_use_yuv_mode[i] = false;
+        m_last_effect_frame[i] = -1;
+        m_playback_metrics[i] = {};
     }
 
     std::cout << "🎯 [PIXEL BUFFER] Manager created" << std::endl;
@@ -94,8 +96,14 @@ bool FSTPPixelBufferManager::SubmitAVFrame(int player_id, std::shared_ptr<AVFram
             buffer.format = SDL_PIXELFORMAT_IYUV; // YUV420P / YUVJ420P
         }
 
+        const auto& metrics = m_playback_metrics[player_id];
+        buffer.playback_speed = metrics.playback_rate;
+        buffer.current_time = metrics.position_seconds;
+        buffer.total_duration = metrics.duration_seconds;
+        buffer.frame_rate = metrics.frame_rate;
         buffer.timestamp = timestamp;
         buffer.frame_number = frame_number;
+        buffer.new_frame = true;
         buffer.is_valid = true;
 
         // Atomic switch buffers
@@ -150,8 +158,14 @@ bool FSTPPixelBufferManager::SubmitPixelData(int player_id, const uint8_t* pixel
         buffer.width = width;
         buffer.height = height;
         buffer.format = format;
+        const auto& metrics = m_playback_metrics[player_id];
+        buffer.playback_speed = metrics.playback_rate;
+        buffer.current_time = metrics.position_seconds;
+        buffer.total_duration = metrics.duration_seconds;
+        buffer.frame_rate = metrics.frame_rate;
         buffer.timestamp = timestamp;
         buffer.frame_number = frame_number;
+        buffer.new_frame = true;
         buffer.is_valid = true;
 
         // Atomic switch buffers
@@ -186,6 +200,39 @@ const FSTPPixelBufferManager::PixelBuffer* FSTPPixelBufferManager::GetPixelBuffe
     const PixelBuffer& buffer = m_pixel_buffers[player_id][read_idx];
     
     return buffer.is_valid ? &buffer : nullptr;
+}
+
+void FSTPPixelBufferManager::UpdatePlaybackMetrics(int player_id,
+                                                   const FSTPBetacamEffect::PlaybackMetrics& metrics) {
+    if (!ValidatePlayerID(player_id)) {
+        return;
+    }
+    m_playback_metrics[player_id] = metrics;
+    m_betacam_effect.UpdatePlaybackMetrics(player_id, metrics);
+}
+
+void FSTPPixelBufferManager::SetBetacamEffectEnabled(bool enabled) {
+    const bool was_enabled = m_betacam_effect.IsEnabled();
+    if (was_enabled == enabled) {
+        return;
+    }
+
+    m_betacam_effect.SetEnabled(enabled);
+
+    if (!enabled) {
+        for (int i = 0; i < MAX_PLAYERS; ++i) {
+            m_betacam_effect.ResetPlayer(i);
+            m_last_effect_frame[i] = -1;
+        }
+    }
+}
+
+bool FSTPPixelBufferManager::ApplyRenderJitter(int player_id,
+                                               FSTPBetacamEffect::RenderContext& render_ctx) {
+    if (!ValidatePlayerID(player_id)) {
+        return false;
+    }
+    return m_betacam_effect.ApplyRenderJitter(player_id, render_ctx);
 }
 
 SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Renderer* renderer, const PixelBuffer* buffer,
@@ -286,15 +333,107 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
             planes.height = buffer->height;
 
             if (buffer->av_frame) {
-                // ZERO-COPY: Use pointers directly from AVFrame
-                // SDL_UpdateYUVTexture will copy data to GPU (~50-100μs)
-                // Support padding via linesize
-                planes.y_plane = buffer->av_frame->data[0];
-                planes.u_plane = buffer->av_frame->data[1];
-                planes.v_plane = buffer->av_frame->data[2];
-                planes.y_pitch = buffer->av_frame->linesize[0];
-                planes.u_pitch = buffer->av_frame->linesize[1];
-                planes.v_pitch = buffer->av_frame->linesize[2];
+                const uint8_t* y_plane = buffer->av_frame->data[0];
+                const uint8_t* u_plane = buffer->av_frame->data[1];
+                const uint8_t* v_plane = buffer->av_frame->data[2];
+                int y_pitch = buffer->av_frame->linesize[0];
+                int u_pitch = buffer->av_frame->linesize[1];
+                int v_pitch = buffer->av_frame->linesize[2];
+
+                if (m_betacam_effect.IsEnabled() && y_plane && y_pitch > 0) {
+                    const auto& metrics = m_playback_metrics[player_id];
+                    bool candidate_effect = (std::abs(metrics.playback_rate) >= 1.2) &&
+                                             (metrics.position_seconds > 0.1) &&
+                                             ((metrics.duration_seconds <= 0.0) ||
+                                              ((metrics.duration_seconds - metrics.position_seconds) > 0.1)) &&
+                                             buffer->width > 0 && buffer->height > 0;
+
+                    if (candidate_effect) {
+                        bool have_planes = true;
+                        if (buffer->format == SDL_PIXELFORMAT_NV12) {
+                            have_planes = (u_plane != nullptr && u_pitch > 0);
+                        } else if (buffer->format == SDL_PIXELFORMAT_IYUV ||
+                                   buffer->format == SDL_PIXELFORMAT_YV12) {
+                            have_planes = (u_plane != nullptr && v_plane != nullptr &&
+                                           u_pitch > 0 && v_pitch > 0);
+                        }
+
+                        if (have_planes) {
+                            EffectScratch& scratch = m_effect_scratch[player_id];
+                            scratch.format = buffer->format;
+                            scratch.width = buffer->width;
+                            scratch.height = buffer->height;
+
+                            scratch.plane0.resize(static_cast<size_t>(y_pitch) * buffer->height);
+                            for (int y = 0; y < buffer->height; ++y) {
+                                std::memcpy(&scratch.plane0[y * y_pitch],
+                                            buffer->av_frame->data[0] + y * buffer->av_frame->linesize[0],
+                                            y_pitch);
+                            }
+
+                            if (buffer->format == SDL_PIXELFORMAT_IYUV ||
+                                buffer->format == SDL_PIXELFORMAT_YV12) {
+                                int chroma_height = buffer->height / 2;
+                                scratch.plane1.resize(static_cast<size_t>(u_pitch) * chroma_height);
+                                scratch.plane2.resize(static_cast<size_t>(v_pitch) * chroma_height);
+                                for (int y = 0; y < chroma_height; ++y) {
+                                    std::memcpy(&scratch.plane1[y * u_pitch],
+                                                buffer->av_frame->data[1] + y * buffer->av_frame->linesize[1],
+                                                u_pitch);
+                                    std::memcpy(&scratch.plane2[y * v_pitch],
+                                                buffer->av_frame->data[2] + y * buffer->av_frame->linesize[2],
+                                                v_pitch);
+                                }
+                            } else if (buffer->format == SDL_PIXELFORMAT_NV12) {
+                                int chroma_height = buffer->height / 2;
+                                scratch.plane1.resize(static_cast<size_t>(u_pitch) * chroma_height);
+                                scratch.plane2.clear();
+                                for (int y = 0; y < chroma_height; ++y) {
+                                    std::memcpy(&scratch.plane1[y * u_pitch],
+                                                buffer->av_frame->data[1] + y * buffer->av_frame->linesize[1],
+                                                u_pitch);
+                                }
+                            } else {
+                                scratch.plane1.clear();
+                                scratch.plane2.clear();
+                            }
+
+                            FSTPBetacamEffect::FrameContext frame_ctx;
+                            frame_ctx.pixel_format = buffer->format;
+                            frame_ctx.width = buffer->width;
+                            frame_ctx.height = buffer->height;
+                            frame_ctx.frame_number = buffer->frame_number;
+                            frame_ctx.new_frame = (m_last_effect_frame[player_id] != buffer->frame_number);
+                            frame_ctx.planes[0] = scratch.plane0.data();
+                            frame_ctx.linesize[0] = y_pitch;
+                            frame_ctx.planes[1] = scratch.plane1.empty() ? nullptr : scratch.plane1.data();
+                            frame_ctx.linesize[1] = u_pitch;
+                            frame_ctx.planes[2] = scratch.plane2.empty() ? nullptr : scratch.plane2.data();
+                            frame_ctx.linesize[2] = v_pitch;
+                            frame_ctx.source_frame = buffer->av_frame.get();
+
+                            if (m_betacam_effect.ApplyPixelFX(player_id, frame_ctx)) {
+                                y_plane = scratch.plane0.data();
+                                if (buffer->format == SDL_PIXELFORMAT_IYUV ||
+                                    buffer->format == SDL_PIXELFORMAT_YV12) {
+                                    u_plane = scratch.plane1.data();
+                                    v_plane = scratch.plane2.data();
+                                } else if (buffer->format == SDL_PIXELFORMAT_NV12) {
+                                    u_plane = scratch.plane1.data();
+                                    v_plane = nullptr;
+                                }
+                            }
+                            m_last_effect_frame[player_id] = buffer->frame_number;
+                        }
+                    }
+                }
+
+                planes.y_plane = y_plane;
+                planes.u_plane = u_plane;
+                planes.v_plane = v_plane;
+                planes.y_pitch = y_pitch;
+                planes.u_pitch = u_pitch;
+                planes.v_pitch = v_pitch;
 
                 // CRITICAL: Pass color_range for correct YUV→RGB conversion
                 // Proxy: AVCOL_RANGE_JPEG (full range 0-255)
@@ -380,6 +519,10 @@ void FSTPPixelBufferManager::ClearPlayerBuffers(int player_id) {
     }
     
     m_buffer_ready[player_id].store(false);
+    m_effect_scratch[player_id] = EffectScratch();
+    m_last_effect_frame[player_id] = -1;
+    m_playback_metrics[player_id] = {};
+    m_betacam_effect.ResetPlayer(player_id);
 }
 
 size_t FSTPPixelBufferManager::CalculatePixelDataSize(int width, int height, Uint32 format) const {
@@ -400,4 +543,3 @@ size_t FSTPPixelBufferManager::CalculatePixelDataSize(int width, int height, Uin
 bool FSTPPixelBufferManager::ValidatePlayerID(int player_id) const {
     return player_id >= 0 && player_id < MAX_PLAYERS;
 }
-

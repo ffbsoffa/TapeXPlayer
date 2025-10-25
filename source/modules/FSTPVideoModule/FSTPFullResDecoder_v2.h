@@ -134,7 +134,7 @@ private:
     std::condition_variable cv_;
     std::mutex cv_mutex_;
 
-    double buffer_window_ahead_ = 1.0;  // Decode 1.0 sec ahead
+    double buffer_window_ahead_ = 3.0;  // Decode at least 3.0 sec ahead
     double buffer_window_behind_ = 2.0; // Keep 2.0 sec behind (DO NOT aggressively remove frames!)
 };
 

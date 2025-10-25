@@ -20,6 +20,11 @@
 #include <cstring>
 #include <utility>
 
+extern "C" {
+#include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
+}
+
 // Platform-specific memory headers
 #ifdef __linux__
     #include <malloc.h>
@@ -730,40 +735,100 @@ bool FSTPVideoModuleWrapper::SubmitFrameToTexture(const std::shared_ptr<AVFrame>
     //               << ", refcount=" << frame.use_count() << std::endl;
     // }
 
+    std::shared_ptr<AVFrame> frame_to_submit = frame;
+    AVPixelFormat src_format = static_cast<AVPixelFormat>(frame->format);
+    bool supported_format = (src_format == AV_PIX_FMT_YUV420P ||
+                             src_format == AV_PIX_FMT_YUVJ420P ||
+                             src_format == AV_PIX_FMT_NV12);
+
+    if (!supported_format) {
+        SwsContext* convert_ctx = sws_getContext(
+            frame->width,
+            frame->height,
+            src_format,
+            frame->width,
+            frame->height,
+            AV_PIX_FMT_YUV420P,
+            SWS_BILINEAR,
+            nullptr,
+            nullptr,
+            nullptr);
+
+        if (convert_ctx) {
+            AVFrame* converted = av_frame_alloc();
+            if (converted) {
+                converted->format = AV_PIX_FMT_YUV420P;
+                converted->width = frame->width;
+                converted->height = frame->height;
+
+                if (av_frame_get_buffer(converted, 32) >= 0) {
+                    int conv = sws_scale(
+                        convert_ctx,
+                        frame->data,
+                        frame->linesize,
+                        0,
+                        frame->height,
+                        converted->data,
+                        converted->linesize);
+
+                    if (conv > 0) {
+                        av_frame_copy_props(converted, frame.get());
+                        converted->pts = frame->pts;
+                        converted->colorspace = frame->colorspace;
+                        converted->color_primaries = frame->color_primaries;
+                        converted->color_trc = frame->color_trc;
+                        converted->color_range = frame->color_range;
+                        frame_to_submit.reset(converted, [](AVFrame* f){ av_frame_free(&f); });
+                        src_format = AV_PIX_FMT_YUV420P;
+                        supported_format = true;
+                    } else {
+                        av_frame_free(&converted);
+                    }
+                } else {
+                    av_frame_free(&converted);
+                }
+            }
+            sws_freeContext(convert_ctx);
+        }
+
+        if (!supported_format) {
+            std::cerr << "❌ [VIDEO] Unsupported frame format: " << frame->format << std::endl;
+            return false;
+        }
+    }
+
     // Support YUV420P and NV12 formats (zero-copy!)
-    if (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P ||
-        frame->format == AV_PIX_FMT_NV12) {
+    if (src_format == AV_PIX_FMT_YUV420P || src_format == AV_PIX_FMT_YUVJ420P ||
+        src_format == AV_PIX_FMT_NV12) {
         // Pass color metadata of current frame (1:1)
         auto norm = [](int v, int unspecified_code) { return (v == unspecified_code) ? -1 : v; };
-        int cs = norm(frame->colorspace, 2);        // AVCOL_SPC_UNSPECIFIED == 2
-        int pr = norm(frame->color_primaries, 2);   // AVCOL_PRI_UNSPECIFIED == 2
-        int tr = norm(frame->color_trc, 2);         // AVCOL_TRC_UNSPECIFIED == 2
-        int rg = (frame->color_range == 0 /* AVCOL_RANGE_UNSPECIFIED */) ? -1 : frame->color_range;
+        int cs = norm(frame_to_submit->colorspace, 2);        // AVCOL_SPC_UNSPECIFIED == 2
+        int pr = norm(frame_to_submit->color_primaries, 2);   // AVCOL_PRI_UNSPECIFIED == 2
+        int tr = norm(frame_to_submit->color_trc, 2);         // AVCOL_TRC_UNSPECIFIED == 2
+        int rg = (frame_to_submit->color_range == 0 /* AVCOL_RANGE_UNSPECIFIED */) ? -1 : frame_to_submit->color_range;
 
         FSTP_UpdatePlayerColorMetadata(m_instance_id, cs, rg, pr, tr);
 
         // ZERO-COPY: Send shared_ptr directly to pixel buffer manager
         // No memcpy! Only increment refcount on AVFrame
-        SubmitAVFrame(m_instance_id, frame, timestamp, frame_number);
+        SubmitAVFrame(m_instance_id, frame_to_submit, timestamp, frame_number);
 
         if (ENABLE_VIDEO_DEBUG) {
             static int zero_copy_log = 0;
             if (++zero_copy_log % 100 == 1) {
-                const char* format_name = av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame->format));
+                const char* format_name = av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame_to_submit->format));
                 std::cout << "🚀 [ZERO-COPY] Submitted AVFrame " << frame_number
                           << " format=" << (format_name ? format_name : "UNKNOWN")
-                          << " (" << frame->width << "x" << frame->height << ")"
-                          << ", Y_linesize=" << frame->linesize[0]
-                          << ", UV_linesize=" << frame->linesize[1]
-                          << ", refcount=" << frame.use_count() << std::endl;
+                          << " (" << frame_to_submit->width << "x" << frame_to_submit->height << ")"
+                          << ", Y_linesize=" << frame_to_submit->linesize[0]
+                          << ", UV_linesize=" << frame_to_submit->linesize[1]
+                          << ", refcount=" << frame_to_submit.use_count() << std::endl;
             }
         }
 
         return true;
     }
 
-    // For other formats return false
-    std::cerr << "❌ [VIDEO] Unsupported frame format: " << frame->format << std::endl;
     return false;
 }
 
@@ -1443,4 +1508,3 @@ double FSTPVideoModuleWrapper::GetPosition() const {
 }
 
 // Progressive scan functions removed
-

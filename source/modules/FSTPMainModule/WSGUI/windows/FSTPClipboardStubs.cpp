@@ -1,4 +1,6 @@
-#include "../FSTPScreenshotClipboard.h"
+#include <cstdint>
+
+#ifdef _WIN32
 #include <windows.h>
 
 bool FSTPCopyScreenshotToClipboard(const uint8_t* rgbaData, int width, int height) {
@@ -79,3 +81,12 @@ bool FSTPGetScreenshotFromClipboard(uint8_t** rgbaData, int* width, int* height)
     CloseClipboard();
     return true;
 }
+#else
+bool FSTPCopyScreenshotToClipboard(const uint8_t* /*rgbaData*/, int /*width*/, int /*height*/) {
+    return false;
+}
+
+bool FSTPGetScreenshotFromClipboard(uint8_t** /*rgbaData*/, int* /*width*/, int* /*height*/) {
+    return false;
+}
+#endif

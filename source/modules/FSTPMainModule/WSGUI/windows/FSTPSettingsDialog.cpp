@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "FSTPSettingsDialog.h"
 #include <commctrl.h>
 #pragma comment(lib, "comctl32.lib")
@@ -80,3 +81,6 @@ INT_PTR CALLBACK FSTPSettingsDialog::DialogProc(HWND hwnd, UINT message, WPARAM 
     }
     return FALSE;
 }
+#else
+// Stub translation unit for non-Windows builds.
+#endif

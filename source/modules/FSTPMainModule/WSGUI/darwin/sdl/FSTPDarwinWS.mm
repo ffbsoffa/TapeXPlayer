@@ -13,6 +13,7 @@
 #include <iostream>
 #include <condition_variable>
 #include <mutex>
+#include <string>
 #include "FSTPDarwinWS.h"
 #include "FSTPOSDSystem.h"
 #include "FSTPSettings.h"
@@ -35,6 +36,102 @@
 
 // Flag to prevent multiple dialog invocations
 static bool g_dialog_open = false;
+
+static void BeginLoadingFileAtPath(NSString* path, int target_player_id) {
+    if (!path || [path length] == 0) {
+        NSLog(@"Error: File path is empty");
+        return;
+    }
+
+    int active_player_id = target_player_id;
+    if (active_player_id < 0) {
+        RestoreFocusToMainWindow();
+        active_player_id = GetActivePlayerID();
+        NSLog(@"Opening file for active player: %d", active_player_id);
+    } else {
+        NSLog(@"Opening file for specific player instance: %d", target_player_id);
+    }
+
+    if (active_player_id < 0) {
+        NSLog(@"Error: No active player available for loading");
+        NSAlert* alert = [[NSAlert alloc] init];
+        [alert setMessageText:@"No active player"];
+        [alert setInformativeText:@"Open a player window before loading media."];
+        [alert addButtonWithTitle:@"OK"];
+        [alert runModal];
+        return;
+    }
+
+    const char* file_path = [path UTF8String];
+    if (!file_path || std::strlen(file_path) == 0) {
+        NSLog(@"Error: File path is empty!");
+        return;
+    }
+
+    UpdateOSDPosition(active_player_id, 0.0, 0.0);
+    UpdateOSDPlayState(active_player_id, false, false, false);
+
+    SetPlayerLoadingState(active_player_id, true);
+    UpdateOSDDisplayMode(active_player_id, OSD_MODE_LOADING);
+    SetPlayerLoadingProgress(active_player_id, 0);
+    SetPlayerLoadingStatus(active_player_id, "threading");
+
+    FSTPPixelBufferManager* pixel_mgr = GetPixelBufferManager();
+    if (pixel_mgr) {
+        pixel_mgr->ClearPlayerBuffers(active_player_id);
+    }
+
+    NSString* filePathString = [path copy];
+    int saved_player_id = active_player_id;
+    int saved_target_player_id = target_player_id;
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        const char* file_path_cstr = [filePathString UTF8String];
+        NSLog(@"Loading file with path: '%s'", file_path_cstr);
+
+        int instance_id = -1;
+        if (saved_player_id >= 0 && IsPlayerInstanceActive(saved_player_id)) {
+            NSLog(@"Loading file into existing player instance %d", saved_player_id);
+            instance_id = LoadFileIntoPlayerInstance(file_path_cstr, saved_player_id);
+        } else {
+            NSLog(@"Creating new player instance for player %d", saved_player_id);
+            instance_id = CreatePlayerInstance(file_path_cstr, saved_player_id);
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (instance_id >= 0) {
+                NSLog(@"File successfully loaded into player instance %d", instance_id);
+
+                int window_index = -1;
+                for (int i = 0; i < MAX_WINDOWS; i++) {
+                    FSTPWindow* window = GetWindowByIndex(i);
+                    if (window && window->player_instance_id == saved_player_id) {
+                        window_index = i;
+                        break;
+                    }
+                }
+
+                if (window_index >= 0) {
+                    double duration = GetInstanceDuration(instance_id);
+                    UpdateWindowOSD(window_index, 0.0, duration, false, 1.0, false);
+                    NSLog(@"OSD updated for window %d (player %d), duration: %.2f sec", window_index, instance_id, duration);
+
+                    if (saved_target_player_id >= 0) {
+                        FSTPWindow* window = GetWindowByIndex(window_index);
+                        if (window && window->window) {
+                            SDL_RaiseWindow(window->window);
+                            NSLog(@"Focus switched to window %d after file loading", window_index);
+                        }
+                    }
+                }
+            } else {
+                NSLog(@"File loading error: %d", instance_id);
+                SetPlayerLoadingState(saved_player_id, false);
+                UpdateOSDDisplayMode(saved_player_id, OSD_MODE_NO_FILE);
+            }
+        });
+    });
+}
 
 void ShowNativeFileDialog(int target_player_id) {
     // Prevent multiple dialog invocations
@@ -75,120 +172,7 @@ void ShowNativeFileDialog(int target_player_id) {
         NSURL* url = [[openPanel URLs] objectAtIndex:0];
         NSString* path = [url path];
 
-        // FIX: Determine player_id based on parameter
-        int active_player_id;
-        if (target_player_id >= 0) {
-            // Open for specific instance (don't return focus to main window!)
-            active_player_id = target_player_id;
-            NSLog(@"Opening file for specific player instance: %d", target_player_id);
-        } else {
-            // Auto-detect: return focus to main window and get active player
-            RestoreFocusToMainWindow();
-            active_player_id = GetActivePlayerID();
-            NSLog(@"Opening file for active player: %d", active_player_id);
-        }
-
-        const char* file_path = [path UTF8String];
-
-        NSLog(@"Loading file '%@' into player %d", path, active_player_id);
-        NSLog(@"File path C string: '%s'", file_path);
-        NSLog(@"Active player ID: %d", active_player_id);
-
-        // Check that path is not empty
-        if (!file_path || strlen(file_path) == 0) {
-            NSLog(@"Error: File path is empty!");
-            return;
-        }
-
-        // FIX: Set initial loading state IMMEDIATELY (synchronously)
-        // so user sees feedback before async loading starts
-        // Detailed progress (0-100%) will be updated from FSTPVideoModule_wrapper.cpp
-
-        // Reset OSD data (timecode, duration) to clear previous file
-        UpdateOSDPosition(active_player_id, 0.0, 0.0);
-        UpdateOSDPlayState(active_player_id, false, false, false);
-
-        // CRITICAL: Set loading flag BEFORE mode!
-        // This is needed so IsPlayerLoading() returns true and render skips old video texture
-        SetPlayerLoadingState(active_player_id, true);
-        UpdateOSDDisplayMode(active_player_id, OSD_MODE_LOADING);
-        SetPlayerLoadingProgress(active_player_id, 0);
-        SetPlayerLoadingStatus(active_player_id, "threading");
-
-        // FIX: Clear old video texture to show black screen
-        FSTPPixelBufferManager* pixel_mgr = GetPixelBufferManager();
-        if (pixel_mgr) {
-            pixel_mgr->ClearPlayerBuffers(active_player_id);
-        }
-
-        // Save file path and player ID for passing to async block
-        NSString* filePathString = [path copy];
-        int saved_player_id = active_player_id; // Save player ID
-        int saved_target_player_id = target_player_id; // Save target to determine if focus is needed
-
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            // Load file into player
-            const char* file_path_cstr = [filePathString UTF8String];
-            NSLog(@"Loading file with path: '%s'", file_path_cstr);
-
-            // Use saved player ID
-            int player_id = saved_player_id;
-
-            int instance_id = -1;
-
-            // Check if player instance is already active
-            if (player_id >= 0 && IsPlayerInstanceActive(player_id)) {
-                // Load file into existing instance
-                NSLog(@"Loading file into existing player instance %d", player_id);
-                instance_id = LoadFileIntoPlayerInstance(file_path_cstr, player_id);
-            } else {
-                // Create new player instance
-                NSLog(@"Creating new player instance for player %d", player_id);
-                instance_id = CreatePlayerInstance(file_path_cstr, player_id);
-            }
-
-            // Return to main thread for completion
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (instance_id >= 0) {
-                    NSLog(@"File successfully loaded into player instance %d", instance_id);
-
-                    // Find window index for OSD update
-                    int window_index = -1;
-                    for (int i = 0; i < MAX_WINDOWS; i++) {
-                        FSTPWindow* window = GetWindowByIndex(i);
-                        if (window && window->player_instance_id == player_id) {
-                            window_index = i;
-                            break;
-                        }
-                    }
-
-                    if (window_index >= 0) {
-                        // Get file info and update OSD for specific window
-                        double duration = GetInstanceDuration(instance_id);
-                        UpdateWindowOSD(window_index, 0.0, duration, false, 1.0, false);
-
-                        NSLog(@"OSD updated for window %d (player %d), duration: %.2f sec", window_index, instance_id, duration);
-
-                        // FIX: If file was loaded for specific instance (not auto-detect),
-                        // switch focus to that window after loading completes
-                        if (saved_target_player_id >= 0) {
-                            FSTPWindow* window = GetWindowByIndex(window_index);
-                            if (window && window->window) {
-                                SDL_RaiseWindow(window->window);
-                                NSLog(@"Focus switched to window %d after file loading", window_index);
-                            }
-                        }
-                    }
-                } else {
-                    NSLog(@"File loading error: %d", instance_id);
-                    // On error return OSD to normal mode
-                    SetPlayerLoadingState(saved_player_id, false);
-                    UpdateOSDDisplayMode(saved_player_id, OSD_MODE_NO_FILE);
-                }
-                // FIX: Successful loading completion is handled in FSTPVideoModule_wrapper.cpp (lines 251-252)
-                // Don't do anything here to avoid overwriting state
-            });
-        });
+        BeginLoadingFileAtPath(path, target_player_id);
     } else {
         // User cancelled file selection - also return focus
         RestoreFocusToMainWindow();
@@ -212,6 +196,8 @@ static NSTextField* g_volumeValueLabel = nil;
 static NSStepper* g_frameOffsetStepper = nil;
 static NSTextField* g_frameOffsetTextField = nil;
 static NSButton* g_autoFreezeCheckbox = nil;
+static NSButton* g_betacamCheckbox = nil;
+static NSButton* g_ytDlpCheckbox = nil;
 
 // UI elements for MIDI settings
 static NSButton* g_midiEnabledCheckbox = nil;
@@ -236,6 +222,8 @@ static NSPopUpButton* g_midiOutputPopup = nil;
     g_frameOffsetStepper = nil;
     g_frameOffsetTextField = nil;
     g_autoFreezeCheckbox = nil;
+    g_betacamCheckbox = nil;
+    g_ytDlpCheckbox = nil;
     g_midiEnabledCheckbox = nil;
     g_midiInputPopup = nil;
     g_midiOutputPopup = nil;
@@ -386,8 +374,45 @@ static void CreateSettingsWindow() {
     [videoView addSubview:CreateLabel(@"(prevents forgotten players from consuming resources)",
                                       NSMakeRect(20, 140, 400, 16))];
 
+    g_betacamCheckbox = CreateCheckbox(@"Enable Betacam tape artefact emulation", NSMakeRect(20, 110, 380, 24));
+    [g_betacamCheckbox setState:(GetBetacamEffectEnabled() ? NSControlStateValueOn : NSControlStateValueOff)];
+    [videoView addSubview:g_betacamCheckbox];
+
+    [videoView addSubview:CreateLabel(@"Adds rewind/fast-forward jitter. Slightly increases GPU load.",
+                                      NSMakeRect(20, 90, 400, 16))];
+
     [videoTab setView:videoView];
     [g_settingsTabView addTabViewItem:videoTab];
+
+    // === "Extensions" Tab ===
+    NSTabViewItem* extensionsTab = [[NSTabViewItem alloc] initWithIdentifier:@"extensions"];
+    [extensionsTab setLabel:@"Extensions"];
+    NSView* extensionsView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 440, 260)];
+
+    NSString* languageString = [NSString stringWithUTF8String:GetExtensionLanguage()];
+    NSString* extensionsHeadline = [NSString stringWithFormat:@"Extensions (%@)", languageString];
+    [extensionsView addSubview:CreateLabel(extensionsHeadline, NSMakeRect(20, 220, 300, 20))];
+
+    g_ytDlpCheckbox = CreateCheckbox(@"Enable yt-dlp network downloader", NSMakeRect(20, 190, 360, 24));
+    [g_ytDlpCheckbox setState:(GetYTDLPExtensionEnabled() ? NSControlStateValueOn : NSControlStateValueOff)];
+    [extensionsView addSubview:g_ytDlpCheckbox];
+
+    NSString* descriptionText = [NSString stringWithFormat:@"TapeXPlayer extensions are scripted using %@ (.lua) files. Drop your automation into the extensions directory to augment playback.", languageString];
+    NSTextField* descriptionLabel = CreateLabel(descriptionText,
+                                                NSMakeRect(20, 160, 400, 60));
+    [descriptionLabel setLineBreakMode:NSLineBreakByWordWrapping];
+    [descriptionLabel setPreferredMaxLayoutWidth:380];
+    [extensionsView addSubview:descriptionLabel];
+
+    NSTextField* roadmapLabel = CreateLabel(@"Extension management tools are coming soon. This panel will evolve as the Lua pipeline matures.",
+                                            NSMakeRect(20, 110, 400, 40));
+    [roadmapLabel setLineBreakMode:NSLineBreakByWordWrapping];
+    [roadmapLabel setPreferredMaxLayoutWidth:380];
+    [roadmapLabel setTextColor:[NSColor secondaryLabelColor]];
+    [extensionsView addSubview:roadmapLabel];
+
+    [extensionsTab setView:extensionsView];
+    [g_settingsTabView addTabViewItem:extensionsTab];
 
     // === "MIDI" Tab ===
     NSTabViewItem* midiTab = [[NSTabViewItem alloc] initWithIdentifier:@"midi"];
@@ -654,6 +679,7 @@ void HandleNativeAppEvents() {
 - (IBAction)copyScreenshotAction:(id)sender;
 - (IBAction)showMemoryLocationsAction:(id)sender;
 - (IBAction)showInspectorAction:(id)sender;
+- (IBAction)downloadFromNetworkAction:(id)sender;
 @end
 
 @implementation AppDelegate
@@ -771,6 +797,21 @@ void HandleNativeAppEvents() {
         NSLog(@"Auto-freeze inactive set to: %d", autoFreeze);
     }
 
+    if (g_betacamCheckbox) {
+        int betacam = ([g_betacamCheckbox state] == NSControlStateValueOn) ? 1 : 0;
+        FSTPSettings* settings = GetSettings();
+        settings->betacam_effect_enabled = betacam;
+        NSLog(@"Betacam effect enabled set to: %d", betacam);
+        SetBetacamEffectEnabled(betacam);
+    }
+
+    if (g_ytDlpCheckbox) {
+        int ytDlpEnabled = ([g_ytDlpCheckbox state] == NSControlStateValueOn) ? 1 : 0;
+        FSTPSettings* settings = GetSettings();
+        settings->yt_dlp_extension_enabled = ytDlpEnabled;
+        NSLog(@"yt-dlp extension enabled set to: %d", ytDlpEnabled);
+    }
+
     // Save MIDI settings
     if (g_midiEnabledCheckbox) {
         int midiEnabled = ([g_midiEnabledCheckbox state] == NSControlStateValueOn) ? 1 : 0;
@@ -813,6 +854,8 @@ void HandleNativeAppEvents() {
 
     // Apply MIDI settings
     ApplyMIDISettings();
+
+    InitToolsMenu();
 
     // Show restart dialog if buffer size changed
     if (bufferSizeChanged) {
@@ -868,6 +911,12 @@ void HandleNativeAppEvents() {
         if (g_autoFreezeCheckbox) {
             [g_autoFreezeCheckbox setState:NSControlStateValueOn]; // Enabled by default
         }
+        if (g_betacamCheckbox) {
+            [g_betacamCheckbox setState:NSControlStateValueOff]; // Disabled by default
+        }
+        if (g_ytDlpCheckbox) {
+            [g_ytDlpCheckbox setState:NSControlStateValueOff];
+        }
 
         // Update UI elements - MIDI
         if (g_midiEnabledCheckbox) {
@@ -879,6 +928,8 @@ void HandleNativeAppEvents() {
         if (g_midiOutputPopup) {
             [g_midiOutputPopup selectItemAtIndex:0]; // "(None)" by default
         }
+
+        InitToolsMenu();
     }
 }
 
@@ -921,6 +972,93 @@ void HandleNativeAppEvents() {
 
 - (IBAction)showInspectorAction:(id)sender {
     ToggleInspector();
+}
+
+- (IBAction)downloadFromNetworkAction:(id)sender {
+    if (!GetYTDLPExtensionEnabled()) {
+        NSAlert* alert = [[NSAlert alloc] init];
+        [alert setMessageText:@"Extensions disabled"];
+        [alert setInformativeText:@"Enable the yt-dlp extension in Settings → Extensions before using this feature."];
+        [alert addButtonWithTitle:@"OK"];
+        [alert runModal];
+        return;
+    }
+
+    if (!FSTP_YTDLP_IsAvailable()) {
+        NSAlert* alert = [[NSAlert alloc] init];
+        [alert setMessageText:@"yt-dlp not found"];
+        [alert setInformativeText:@"Install yt-dlp (e.g. via Homebrew: brew install yt-dlp) and make sure it is available in PATH."];
+        [alert addButtonWithTitle:@"OK"];
+        [alert runModal];
+        return;
+    }
+
+    NSAlert* prompt = [[NSAlert alloc] init];
+    [prompt setMessageText:@"Download via yt-dlp"];
+    [prompt setInformativeText:@"Enter a video URL. TapeXPlayer will invoke yt-dlp to download the media and load it into the active player."];
+    NSTextField* urlField = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 320, 24)];
+    [urlField setPlaceholderString:@"https://..."];
+    [prompt setAccessoryView:urlField];
+    [prompt addButtonWithTitle:@"Download"];
+    [prompt addButtonWithTitle:@"Cancel"];
+
+    NSModalResponse response = [prompt runModal];
+    if (response != NSAlertFirstButtonReturn) {
+        return;
+    }
+
+    NSString* urlString = [[urlField stringValue] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([urlString length] == 0) {
+        return;
+    }
+
+    int preloadPlayer = GetActivePlayerID();
+    if (preloadPlayer >= 0) {
+        SetPlayerLoadingState(preloadPlayer, true);
+        SetPlayerLoadingStatus(preloadPlayer, "downloading");
+        SetPlayerLoadingProgress(preloadPlayer, 0);
+    }
+
+    NSWindow* targetWindow = [NSApp keyWindow];
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        char path_buf[4096];
+        char error_buf[2048];
+        path_buf[0] = '\0';
+        error_buf[0] = '\0';
+
+        int success = FSTP_YTDLP_Download([urlString UTF8String], path_buf, sizeof(path_buf), error_buf, sizeof(error_buf));
+        std::string downloadedPathStd;
+        std::string errorStd;
+        if (success) {
+            downloadedPathStd.assign(path_buf);
+        } else if (error_buf[0] != '\0') {
+            errorStd.assign(error_buf);
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (success) {
+                NSString* downloadedPath = [NSString stringWithUTF8String:downloadedPathStd.c_str()];
+                BeginLoadingFileAtPath(downloadedPath, -1);
+            } else {
+                if (preloadPlayer >= 0) {
+                    SetPlayerLoadingState(preloadPlayer, false);
+                    UpdateOSDDisplayMode(preloadPlayer, OSD_MODE_NO_FILE);
+                }
+
+                NSString* message = errorStd.empty() ? @"yt-dlp failed to download the media." : [NSString stringWithUTF8String:errorStd.c_str()];
+                NSAlert* errorAlert = [[NSAlert alloc] init];
+                [errorAlert setMessageText:@"Download failed"];
+                [errorAlert setInformativeText:message];
+                [errorAlert addButtonWithTitle:@"OK"];
+                if (targetWindow) {
+                    [errorAlert beginSheetModalForWindow:targetWindow completionHandler:nil];
+                } else {
+                    [errorAlert runModal];
+                }
+            }
+        });
+    });
 }
 
 @end

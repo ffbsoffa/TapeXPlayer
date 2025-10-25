@@ -1,4 +1,5 @@
 #include "FSTPAudioModule_wrapper.h"
+#include "FSTPSMFXSim.h"
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -8,6 +9,122 @@
 #include <cmath>
 #include <chrono>
 #include <atomic>
+
+// NEON SIMD for Apple Silicon optimization
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#define USE_NEON_SIMD 1
+
+// NEON-optimized float to int16 conversion (8 samples at once)
+inline void neon_float_to_int16(const float* src, int16_t* dst, size_t count) {
+    size_t simd_count = count & ~7; // Process 8 samples at a time
+
+    const float32x4_t scale = vdupq_n_f32(32767.0f);
+    const float32x4_t min_val = vdupq_n_f32(-1.0f);
+    const float32x4_t max_val = vdupq_n_f32(1.0f);
+
+    for (size_t i = 0; i < simd_count; i += 8) {
+        // Load 8 floats (2 vectors of 4)
+        float32x4_t f0 = vld1q_f32(src + i);
+        float32x4_t f1 = vld1q_f32(src + i + 4);
+
+        // Clamp to [-1.0, 1.0]
+        f0 = vmaxq_f32(min_val, vminq_f32(max_val, f0));
+        f1 = vmaxq_f32(min_val, vminq_f32(max_val, f1));
+
+        // Scale to int16 range
+        f0 = vmulq_f32(f0, scale);
+        f1 = vmulq_f32(f1, scale);
+
+        // Convert to int32, then to int16
+        int32x4_t i0 = vcvtq_s32_f32(f0);
+        int32x4_t i1 = vcvtq_s32_f32(f1);
+
+        // Narrow to int16 and store
+        int16x4_t s0 = vmovn_s32(i0);
+        int16x4_t s1 = vmovn_s32(i1);
+        int16x8_t result = vcombine_s16(s0, s1);
+
+        vst1q_s16(dst + i, result);
+    }
+
+    // Handle remaining samples (scalar fallback)
+    for (size_t i = simd_count; i < count; i++) {
+        float sample = std::max(-1.0f, std::min(1.0f, src[i]));
+        dst[i] = static_cast<int16_t>(sample * 32767.0f);
+    }
+}
+
+// NEON-optimized memcpy for audio samples (64-byte aligned transfers)
+inline void neon_copy_samples(int16_t* dst, const int16_t* src, size_t count) {
+    size_t simd_count = count & ~15; // Process 16 samples (32 bytes) at a time
+
+    for (size_t i = 0; i < simd_count; i += 16) {
+        int16x8_t v0 = vld1q_s16(src + i);
+        int16x8_t v1 = vld1q_s16(src + i + 8);
+        vst1q_s16(dst + i, v0);
+        vst1q_s16(dst + i + 8, v1);
+    }
+
+    // Handle remaining samples
+    for (size_t i = simd_count; i < count; i++) {
+        dst[i] = src[i];
+    }
+}
+
+// NEON-optimized int32 to int16 conversion (4 samples at once)
+inline void neon_int32_to_int16(const int32_t* src, int16_t* dst, size_t count) {
+    size_t simd_count = count & ~3; // Process 4 samples at a time
+
+    for (size_t i = 0; i < simd_count; i += 4) {
+        int32x4_t i32 = vld1q_s32(src + i);
+        // Shift right by 16 bits to convert 32-bit to 16-bit range
+        int32x4_t shifted = vshrq_n_s32(i32, 16);
+        int16x4_t i16 = vmovn_s32(shifted);
+        vst1_s16(dst + i, i16);
+    }
+
+    // Handle remaining samples
+    for (size_t i = simd_count; i < count; i++) {
+        dst[i] = static_cast<int16_t>(src[i] >> 16);
+    }
+}
+
+// NEON-optimized float interleaved to int16 conversion
+inline void neon_float_interleaved_to_int16(const float* src, int16_t* dst, size_t count) {
+    size_t simd_count = count & ~7; // Process 8 samples at a time
+
+    const float32x4_t scale = vdupq_n_f32(32767.0f);
+    const float32x4_t min_val = vdupq_n_f32(-1.0f);
+    const float32x4_t max_val = vdupq_n_f32(1.0f);
+
+    for (size_t i = 0; i < simd_count; i += 8) {
+        float32x4_t f0 = vld1q_f32(src + i);
+        float32x4_t f1 = vld1q_f32(src + i + 4);
+
+        f0 = vmaxq_f32(min_val, vminq_f32(max_val, f0));
+        f1 = vmaxq_f32(min_val, vminq_f32(max_val, f1));
+
+        f0 = vmulq_f32(f0, scale);
+        f1 = vmulq_f32(f1, scale);
+
+        int32x4_t i0 = vcvtq_s32_f32(f0);
+        int32x4_t i1 = vcvtq_s32_f32(f1);
+
+        int16x4_t s0 = vmovn_s32(i0);
+        int16x4_t s1 = vmovn_s32(i1);
+        int16x8_t result = vcombine_s16(s0, s1);
+
+        vst1q_s16(dst + i, result);
+    }
+
+    // Handle remaining samples
+    for (size_t i = simd_count; i < count; i++) {
+        float sample = std::max(-1.0f, std::min(1.0f, src[i]));
+        dst[i] = static_cast<int16_t>(sample * 32767.0f);
+    }
+}
+#endif
 
 // Headers for memory mapping
 #ifdef _WIN32
@@ -113,8 +230,14 @@ public:
     // Problem: Pa_CloseStream() → PipeWire's malloc_trim() crashes on heap corrupted by video av_frame_ref()
     // Solution: Skip Pa_CloseStream() during destructor, let OS clean up (leak acceptable on exit)
     bool m_in_destructor_cleanup = false;
+    bool reduce_fast_buffer_for_pcm = false;
+
+    // Servomotor simulation for Betacam effect
+    FSTPSMFXSim m_smfx_sim;
+    bool m_betacam_audio_enabled = false;
 
     static constexpr double FAST_BUFFER_DURATION = 720.0;
+    static constexpr double FAST_BUFFER_DURATION_PCM = 120.0;
 
     FSTPAudioModuleImpl() = default;
 
@@ -163,6 +286,11 @@ public:
             pa_initialized = true;
             // DON'T start stream here - only after buffer decoding
         }
+
+        // Initialize servomotor simulation
+        m_smfx_sim.SetSampleRate(48000.0); // Will be updated when stream starts
+        m_smfx_sim.Reset();
+
         return true;
     }
     
@@ -277,6 +405,9 @@ public:
         if (err == paNoError) {
             std::cout << "✅ [AUDIO START] Pa_OpenStream succeeded" << std::endl;
             playback_speed.store(0.0); // Start with zero speed
+
+            // Update servomotor simulation sample rate to match audio stream
+            m_smfx_sim.SetSampleRate(static_cast<double>(sample_rate));
 
             // CRITICAL PROTECTION: wrap Pa_StartStream in try-catch
             try {
@@ -588,13 +719,18 @@ public:
         }
         std::cout << "Mmap buffer created successfully" << std::endl;
 
-        if (duration <= FAST_BUFFER_DURATION) {
-            std::cout << "Decoding full file (duration <= " << FAST_BUFFER_DURATION << " seconds)" << std::endl;
+        const double fast_duration = reduce_fast_buffer_for_pcm ? FAST_BUFFER_DURATION_PCM : FAST_BUFFER_DURATION;
+
+        if (duration <= fast_duration) {
+            std::cout << "Decoding full file (duration <= " << fast_duration << " seconds)"
+                      << (reduce_fast_buffer_for_pcm ? " [PCM fast buffer]" : "") << std::endl;
             return DecodeFullFile(filepath);
-        } else {
-            std::cout << "Decoding two-stage (duration > " << FAST_BUFFER_DURATION << " seconds)" << std::endl;
-            return DecodeTwoStage(filepath);
         }
+
+        if (!DecodeTwoStage(filepath, fast_duration)) {
+            return false;
+        }
+        return true;
     }
 
     void UnloadFile() {
@@ -720,8 +856,13 @@ private:
         FSTPAudioModuleImpl* impl = static_cast<FSTPAudioModuleImpl*>(userData);
         int16_t* output = static_cast<int16_t*>(outputBuffer);
 
+        // Temporary buffer for clean audio (without servomotor) for VU meters
+        static thread_local std::vector<int16_t> clean_buffer;
+        clean_buffer.resize(framesPerBuffer * impl->channels);
+
         if (!impl->mmap_buffer) {
             std::memset(output, 0, framesPerBuffer * impl->channels * sizeof(int16_t));
+            std::memset(clean_buffer.data(), 0, framesPerBuffer * impl->channels * sizeof(int16_t));
 
             // PROFILING: Early exit (no buffer)
             auto callback_end = std::chrono::high_resolution_clock::now();
@@ -742,7 +883,6 @@ private:
         bool full_ready = impl->full_buffer_ready.load();
         bool fast_ready = impl->fast_buffer_ready.load();
         size_t decoded_samples = impl->decoded_samples.load();
-        size_t fast_buffer_samples = impl->fast_buffer_samples.load();
 
         if (full_ready) {
             available_samples = decoded_samples;
@@ -771,6 +911,7 @@ private:
         // If speed is close to zero, output silence
         if (std::abs(target_speed) < 0.01) {
             std::memset(output, 0, framesPerBuffer * impl->channels * sizeof(int16_t));
+            std::memset(clean_buffer.data(), 0, framesPerBuffer * impl->channels * sizeof(int16_t));
             // Reset levels when no signal
             impl->audio_level_left.store(0.0f);
             impl->audio_level_right.store(0.0f);
@@ -808,26 +949,36 @@ private:
             double fractional = exact_position - base_index;
 
             // Dynamic check of boundaries with consideration of buffer states
+            // Always use the maximum available samples to avoid silence during background decode
             size_t max_available_samples;
-            size_t actual_decoded;
+            size_t actual_decoded = impl->decoded_samples.load();
+            size_t fast_decoded = impl->fast_buffer_samples.load();
 
-            if (impl->full_buffer_ready.load()) {
-                actual_decoded = impl->decoded_samples.load();
-                max_available_samples = actual_decoded / impl->channels;
-            } else if (impl->fast_buffer_ready.load()) {
-                actual_decoded = impl->fast_buffer_samples.load();
-                max_available_samples = actual_decoded / impl->channels;
-            } else {
-                actual_decoded = impl->decoded_samples.load();
-                max_available_samples = actual_decoded / impl->channels;
-            }
+            // Use the maximum of decoded_samples and fast_buffer_samples
+            size_t total_decoded = std::max(actual_decoded, fast_decoded);
+            max_available_samples = total_decoded / impl->channels;
 
-            if (base_index >= max_available_samples - 3 || base_index == 0) {
-                // Outside boundaries - silence
+            // Only output silence if we're truly beyond the buffer (not just near the end)
+            // GetSafeSample will return 0 for out-of-bounds indices, allowing graceful interpolation
+            if (base_index >= max_available_samples) {
+                // Completely outside boundaries - silence
                 for (int ch = 0; ch < impl->channels; ch++) {
                     output[frame * impl->channels + ch] = 0;
+                    clean_buffer[frame * impl->channels + ch] = 0;
                 }
             } else {
+                // BETACAM SERVOMOTOR: Generate once per frame (not per channel)
+                double abs_speed = std::abs(speed);
+                double servo_left = 0.0, servo_right = 0.0;
+                if (impl->m_betacam_audio_enabled) {
+                    impl->m_smfx_sim.Generate(static_cast<float>(abs_speed), servo_left, servo_right);
+                    // Debug: log occasionally
+                    static int debug_counter = 0;
+                    if (debug_counter++ % 48000 == 0) {
+                        std::cout << "🔊 [SERVOMOTOR] Speed: " << abs_speed << ", Servo L/R: " << servo_left << "/" << servo_right << std::endl;
+                    }
+                }
+
                 // Catmull-Rom interpolation for each channel
                 for (int ch = 0; ch < impl->channels; ch++) {
                     // Get 4 neighboring samples for Catmull-Rom
@@ -840,16 +991,29 @@ private:
                     double interpolated = impl->CatmullRomInterpolate(p0, p1, p2, p3, fractional);
 
                     // Apply attenuation at low speeds to prevent clicks
-                    double abs_speed = std::abs(speed);
                     if (abs_speed <= 0.3) {
                         // Linear attenuation from 0.3x to 0.0x
                         double speed_attenuation = abs_speed / 0.3;
                         interpolated *= speed_attenuation;
                     }
-                    
+
                     // Apply master volume from settings
                     float master_volume = GetMasterVolume();
                     interpolated *= master_volume;
+
+                    // Store clean sample for VU meters (before servomotor effect)
+                    double clean_sample = std::max(-32768.0, std::min(32767.0, interpolated));
+                    clean_buffer[frame * impl->channels + ch] = static_cast<int16_t>(clean_sample);
+
+                    // Mix servomotor sound (stereo aware)
+                    // Servomotor outputs float range (-0.95 to 0.95), scale to int16_t range
+                    if (impl->m_betacam_audio_enabled) {
+                        if (ch == 0) {
+                            interpolated += servo_left * 32767.0;
+                        } else if (ch == 1) {
+                            interpolated += servo_right * 32767.0;
+                        }
+                    }
 
                     // Limit value within int16_t
                     interpolated = std::max(-32768.0, std::min(32767.0, interpolated));
@@ -880,6 +1044,7 @@ private:
         }
 
         // OPTIMIZATION: Calculate VU meters only every 4th callback (reduces CPU)
+        // NOTE: VU meters read from clean_buffer (audio file only, excluding servomotor)
         static int vu_meter_skip_counter = 0;
         if (++vu_meter_skip_counter >= 4) {
             vu_meter_skip_counter = 0;
@@ -889,20 +1054,20 @@ private:
 
             for (unsigned long frame = 0; frame < framesPerBuffer; frame++) {
                 if (impl->channels >= 1) {
-                    float sample_left = static_cast<float>(output[frame * impl->channels]) / 32768.0f;
+                    float sample_left = static_cast<float>(clean_buffer[frame * impl->channels]) / 32768.0f;
                     float abs_left = std::abs(sample_left);
                     sum_left += abs_left;
                     peak_left = std::max(peak_left, abs_left);
                 }
 
                 if (impl->channels >= 2) {
-                    float sample_right = static_cast<float>(output[frame * impl->channels + 1]) / 32768.0f;
+                    float sample_right = static_cast<float>(clean_buffer[frame * impl->channels + 1]) / 32768.0f;
                     float abs_right = std::abs(sample_right);
                     sum_right += abs_right;
                     peak_right = std::max(peak_right, abs_right);
                 } else if (impl->channels == 1) {
                     // Mono: copy left channel to right for VU meters
-                    float sample = static_cast<float>(output[frame * impl->channels]) / 32768.0f;
+                    float sample = static_cast<float>(clean_buffer[frame * impl->channels]) / 32768.0f;
                     float abs_sample = std::abs(sample);
                     sum_right += abs_sample;
                     peak_right = std::max(peak_right, abs_sample);
@@ -967,8 +1132,35 @@ private:
             return false;
         }
 
-        sample_rate = format_ctx->streams[audio_stream_index]->codecpar->sample_rate;
-        channels = format_ctx->streams[audio_stream_index]->codecpar->ch_layout.nb_channels;
+        const AVCodecParameters* codecpar = format_ctx->streams[audio_stream_index]->codecpar;
+        sample_rate = codecpar->sample_rate;
+        channels = codecpar->ch_layout.nb_channels;
+
+        // Detect PCM audio to optimize fast buffer size
+        reduce_fast_buffer_for_pcm = false;
+        switch (codecpar->codec_id) {
+            case AV_CODEC_ID_PCM_S16LE:
+            case AV_CODEC_ID_PCM_S16BE:
+            case AV_CODEC_ID_PCM_U16LE:
+            case AV_CODEC_ID_PCM_U16BE:
+            case AV_CODEC_ID_PCM_S24LE:
+            case AV_CODEC_ID_PCM_S24BE:
+            case AV_CODEC_ID_PCM_U24LE:
+            case AV_CODEC_ID_PCM_U24BE:
+            case AV_CODEC_ID_PCM_S32LE:
+            case AV_CODEC_ID_PCM_S32BE:
+            case AV_CODEC_ID_PCM_U32LE:
+            case AV_CODEC_ID_PCM_U32BE:
+            case AV_CODEC_ID_PCM_F32LE:
+            case AV_CODEC_ID_PCM_F32BE:
+            case AV_CODEC_ID_PCM_F64LE:
+            case AV_CODEC_ID_PCM_F64BE:
+                reduce_fast_buffer_for_pcm = true;
+                break;
+            default:
+                break;
+        }
+
         if (format_ctx->duration != AV_NOPTS_VALUE) {
             duration = static_cast<double>(format_ctx->duration) / AV_TIME_BASE;
         }
@@ -981,6 +1173,11 @@ private:
             codec_name = codec->name;
         } else {
             codec_name = "Unknown";
+        }
+
+        if (reduce_fast_buffer_for_pcm) {
+            std::cout << "[Audio] Detected PCM audio codec, reducing fast buffer to "
+                      << FAST_BUFFER_DURATION_PCM << " seconds" << std::endl;
         }
 
         avformat_close_input(&format_ctx);
@@ -1005,14 +1202,22 @@ private:
         unlink(temp_filename.c_str());
 #endif
 
-        // Map buffer to memory using our cross-platform wrapper
+#ifdef _WIN32
+        // Map buffer to memory using Windows wrapper
         mmap_buffer = static_cast<int16_t*>(fstp_mmap(nullptr, mmap_size_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, mmap_fd, 0));
+#else
+        mmap_buffer = static_cast<int16_t*>(mmap(nullptr, mmap_size_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, mmap_fd, 0));
+#endif
         return (mmap_buffer != MAP_FAILED);
     }
 
     void CleanupMmap() {
         if (mmap_buffer && mmap_buffer != MAP_FAILED) {
+#ifdef _WIN32
             fstp_munmap(mmap_buffer, mmap_size_bytes);
+#else
+            munmap(mmap_buffer, mmap_size_bytes);
+#endif
             mmap_buffer = nullptr;
         }
         if (mmap_fd != -1) {
@@ -1028,12 +1233,32 @@ private:
     }
 
     bool DecodeFullFile(const std::string& filepath) {
+        // OPTIMIZATION: Fast path for PCM - skip codec, read packets directly
+        if (reduce_fast_buffer_for_pcm) {
+            std::cout << "[PCM Fast Path] Using direct packet read (bypassing codec)" << std::endl;
+            size_t decoded = DecodePCMFast(filepath, 0, total_samples);
+            if (decoded > 0) {
+                decoded_samples.store(decoded);
+                fast_buffer_ready.store(true);
+                full_buffer_ready.store(true);
+
+                std::cout << "Starting/checking permanent stream after PCM fast decode..." << std::endl;
+                if (!StartPermanentAudioStream()) {
+                    std::cout << "ERROR: Failed to start/reinitialize permanent stream after decode!" << std::endl;
+                }
+                return true;
+            }
+            // Fallback to normal path if fast path fails
+            std::cout << "[PCM Fast Path] Failed, falling back to normal decode" << std::endl;
+        }
+
+        // Normal decode path
         size_t decoded = DecodeToBuffer(filepath, 0, total_samples);
         if (decoded > 0) {
             decoded_samples.store(decoded);
             fast_buffer_ready.store(true);
             full_buffer_ready.store(true);
-            
+
             // Start permanent stream after successful decode
             // StartPermanentAudioStream() will check if reinitialization is needed
             std::cout << "Starting/checking permanent stream after successful decode (SR:" << sample_rate << ", CH:" << channels << ")..." << std::endl;
@@ -1045,9 +1270,176 @@ private:
         return false;
     }
 
-    bool DecodeTwoStage(const std::string& filepath) {
-        size_t fast_samples = static_cast<size_t>(FAST_BUFFER_DURATION * sample_rate * channels);
-        size_t decoded_fast = DecodeToBuffer(filepath, 0, fast_samples);
+    // ULTRA-FAST PCM decoder - reads packets directly without codec overhead
+    size_t DecodePCMFast(const std::string& filepath, size_t start_sample, size_t max_samples) {
+        std::cout << "[PCM Fast] Starting direct packet read (no codec overhead)..." << std::endl;
+
+        AVFormatContext* format_ctx = nullptr;
+        AVDictionary* opts = nullptr;
+
+        // OPTIMIZATION: Increase I/O buffer for faster reading (16MB instead of default 32KB)
+        av_dict_set(&opts, "buffer_size", "16777216", 0);
+
+        if (avformat_open_input(&format_ctx, filepath.c_str(), nullptr, &opts) != 0) {
+            av_dict_free(&opts);
+            return 0;
+        }
+        av_dict_free(&opts);
+
+        if (avformat_find_stream_info(format_ctx, nullptr) < 0) {
+            avformat_close_input(&format_ctx);
+            return 0;
+        }
+
+        const AVCodec* codec = nullptr;
+        int audio_stream_index = av_find_best_stream(format_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
+        if (audio_stream_index < 0) {
+            avformat_close_input(&format_ctx);
+            return 0;
+        }
+
+        // CRITICAL OPTIMIZATION: Disable all non-audio streams to prevent reading video packets
+        for (unsigned int i = 0; i < format_ctx->nb_streams; i++) {
+            if (static_cast<int>(i) != audio_stream_index) {
+                format_ctx->streams[i]->discard = AVDISCARD_ALL;
+            }
+        }
+
+        const AVCodecParameters* codecpar = format_ctx->streams[audio_stream_index]->codecpar;
+
+        // Verify this is actually S16 PCM (most common in DNxHD/ProRes)
+        bool is_s16_pcm = (codecpar->codec_id == AV_CODEC_ID_PCM_S16LE ||
+                           codecpar->codec_id == AV_CODEC_ID_PCM_S16BE);
+
+        if (!is_s16_pcm) {
+            std::cout << "[PCM Fast] Not S16 PCM, using fallback" << std::endl;
+            avformat_close_input(&format_ctx);
+            return 0;
+        }
+
+        std::cout << "[PCM Fast] Confirmed S16 PCM, reading packets directly..." << std::endl;
+
+        // Handle seeking for two-stage decode
+        if (start_sample > 0) {
+            double start_time_seconds = static_cast<double>(start_sample) / (sample_rate * channels);
+            AVStream* stream = format_ctx->streams[audio_stream_index];
+            int64_t seek_target = static_cast<int64_t>(start_time_seconds * stream->time_base.den / stream->time_base.num);
+
+            std::cout << "[PCM Fast] Seeking to " << start_time_seconds << "s (sample " << start_sample << ")" << std::endl;
+
+            if (av_seek_frame(format_ctx, audio_stream_index, seek_target, AVSEEK_FLAG_BACKWARD) < 0) {
+                std::cout << "[PCM Fast] Seek failed, starting from beginning" << std::endl;
+            }
+        }
+
+        bool is_big_endian = (codecpar->codec_id == AV_CODEC_ID_PCM_S16BE);
+        AVPacket* packet = av_packet_alloc();
+        size_t current_sample = 0;
+        size_t write_offset = start_sample;
+        size_t actual_position = 0;  // Track actual sample position in file
+
+        auto start_time = std::chrono::high_resolution_clock::now();
+        size_t packets_read = 0;
+        size_t audio_packets = 0;
+        size_t video_packets_skipped = 0;
+        size_t samples_skipped = 0;
+
+        // Read packets directly - PCM data is in packet->data, no decoding needed!
+        while (av_read_frame(format_ctx, packet) >= 0 && current_sample < max_samples) {
+            packets_read++;
+            if (packet->stream_index == audio_stream_index) {
+                audio_packets++;
+                size_t packet_samples = packet->size / sizeof(int16_t);
+
+                // Skip samples that were already decoded (due to backward seek)
+                size_t packet_offset = 0;  // Offset into this packet's data
+                if (actual_position < start_sample) {
+                    size_t skip = std::min(start_sample - actual_position, packet_samples);
+                    packet_offset = skip;
+                    actual_position += skip;
+                    samples_skipped += skip;
+                    packet_samples -= skip;
+
+                    // If entire packet should be skipped, continue
+                    if (packet_samples == 0) {
+                        av_packet_unref(packet);
+                        continue;
+                    }
+                }
+
+                size_t samples_to_copy = std::min(packet_samples, max_samples - current_sample);
+
+                if (write_offset + samples_to_copy <= total_samples) {
+                    const int16_t* src = reinterpret_cast<const int16_t*>(packet->data) + packet_offset;
+
+                    if (is_big_endian) {
+                        // Byte swap for big endian
+                        for (size_t i = 0; i < samples_to_copy; i++) {
+                            uint16_t val = src[i];
+                            mmap_buffer[write_offset + i] = static_cast<int16_t>((val >> 8) | (val << 8));
+                        }
+                    } else {
+                        // OPTIMIZATION: Always use NEON on Apple Silicon for maximum speed
+#ifdef USE_NEON_SIMD
+                        neon_copy_samples(&mmap_buffer[write_offset], src, samples_to_copy);
+#else
+                        std::memcpy(&mmap_buffer[write_offset], src, samples_to_copy * sizeof(int16_t));
+#endif
+                    }
+
+                    write_offset += samples_to_copy;
+                    current_sample += samples_to_copy;
+                    actual_position += samples_to_copy;
+
+                    // CRITICAL: Update decoded_samples progressively during background decode
+                    // This allows playback to continue beyond fast buffer while still decoding
+                    if (start_sample > 0) {  // Only in background decode mode
+                        decoded_samples.store(start_sample + current_sample);
+                    }
+                }
+            } else {
+                video_packets_skipped++;
+            }
+            av_packet_unref(packet);
+        }
+
+        av_packet_free(&packet);
+        avformat_close_input(&format_ctx);
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+        std::cout << "[PCM Fast] Decoded " << current_sample << " samples in " << duration_ms << "ms" << std::endl;
+        std::cout << "           Total packets: " << packets_read
+                  << " (audio: " << audio_packets
+                  << ", video skipped: " << video_packets_skipped << ")" << std::endl;
+        std::cout << "           Speed: " << (packets_read * 1000.0 / duration_ms) << " total packets/sec, "
+                  << (audio_packets * 1000.0 / duration_ms) << " audio packets/sec" << std::endl;
+        return current_sample;
+    }
+
+    bool DecodeTwoStage(const std::string& filepath, double fast_duration) {
+        size_t fast_samples = static_cast<size_t>(fast_duration * sample_rate * channels);
+
+        // OPTIMIZATION: Use PCM fast path for two-stage if it's PCM
+        size_t decoded_fast = 0;
+        auto fast_start = std::chrono::high_resolution_clock::now();
+
+        if (reduce_fast_buffer_for_pcm) {
+            std::cout << "⚡ [PCM Fast Path] Two-stage: Using direct packet read for " << fast_duration << "s fast buffer..." << std::endl;
+            decoded_fast = DecodePCMFast(filepath, 0, fast_samples);
+            if (decoded_fast == 0) {
+                std::cout << "❌ [PCM Fast Path] FAILED - falling back to normal decode" << std::endl;
+                decoded_fast = DecodeToBuffer(filepath, 0, fast_samples);
+            } else {
+                auto fast_end = std::chrono::high_resolution_clock::now();
+                auto fast_ms = std::chrono::duration_cast<std::chrono::milliseconds>(fast_end - fast_start).count();
+                std::cout << "✅ [PCM Fast Path] Fast buffer completed in " << fast_ms << "ms" << std::endl;
+            }
+        } else {
+            std::cout << "🐌 [NORMAL Path] Using codec-based decode (not PCM)" << std::endl;
+            decoded_fast = DecodeToBuffer(filepath, 0, fast_samples);
+        }
 
         if (decoded_fast > 0) {
             fast_buffer_samples.store(decoded_fast);
@@ -1071,8 +1463,27 @@ private:
             should_stop_background_decode.store(false);
             background_decode_running.store(true);
 
+            std::cout << "🧵 [BACKGROUND] Spawning background decode thread..." << std::endl;
+
+            // OPTIMIZATION: Use PCM fast path for background decode too
             background_decode_thread = std::thread([this, filepath, decoded_fast]() {
-                size_t remaining = DecodeToBuffer(filepath, decoded_fast, total_samples - decoded_fast, true);
+                std::cout << "🧵 [BACKGROUND THREAD] Thread started, beginning decode..." << std::endl;
+                size_t remaining = 0;
+                if (reduce_fast_buffer_for_pcm) {
+                    std::cout << "[PCM Fast Path] Background: Using direct packet read..." << std::endl;
+                    auto bg_start = std::chrono::high_resolution_clock::now();
+                    remaining = DecodePCMFast(filepath, decoded_fast, total_samples - decoded_fast);
+                    auto bg_end = std::chrono::high_resolution_clock::now();
+                    auto bg_ms = std::chrono::duration_cast<std::chrono::milliseconds>(bg_end - bg_start).count();
+                    std::cout << "🧵 [BACKGROUND] PCM decode took " << bg_ms << "ms" << std::endl;
+                    if (remaining == 0) {
+                        std::cout << "[PCM Fast Path] Background failed, falling back" << std::endl;
+                        remaining = DecodeToBuffer(filepath, decoded_fast, total_samples - decoded_fast, true);
+                    }
+                } else {
+                    remaining = DecodeToBuffer(filepath, decoded_fast, total_samples - decoded_fast, true);
+                }
+
                 if (remaining > 0) {
                     decoded_samples.store(decoded_fast + remaining);
                     full_buffer_ready.store(true);
@@ -1081,6 +1492,7 @@ private:
                 background_decode_running.store(false);
             });
 
+            std::cout << "✅ [BACKGROUND] Thread spawned, returning from DecodeTwoStage..." << std::endl;
             return true;
         }
         return false;
@@ -1106,8 +1518,18 @@ private:
         AVFrame* frame = nullptr;
         AVPacket* packet = av_packet_alloc();
 
-        if (avformat_open_input(&format_ctx, filepath.c_str(), nullptr, nullptr) != 0 ||
-            avformat_find_stream_info(format_ctx, nullptr) < 0) {
+        // OPTIMIZATION: Increase I/O buffer for faster reading
+        AVDictionary* opts = nullptr;
+        av_dict_set(&opts, "buffer_size", "16777216", 0);
+
+        if (avformat_open_input(&format_ctx, filepath.c_str(), nullptr, &opts) != 0) {
+            av_dict_free(&opts);
+            return 0;
+        }
+        av_dict_free(&opts);
+
+        if (avformat_find_stream_info(format_ctx, nullptr) < 0) {
+            avformat_close_input(&format_ctx);
             return 0;
         }
 
@@ -1185,7 +1607,130 @@ private:
 
                     int samples_per_channel = frame->nb_samples;
                     int frame_channels = frame->ch_layout.nb_channels;
+                    size_t total_frame_samples = samples_per_channel * frame_channels;
 
+                    // OPTIMIZATION 1: Direct PCM S16 copy path (no conversion needed)
+                    if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16) {
+                        size_t remaining = max_samples - current_sample;
+                        size_t samples_to_copy = std::min<size_t>(total_frame_samples, remaining);
+                        const int16_t* src = reinterpret_cast<int16_t*>(frame->data[0]);
+
+#ifdef USE_NEON_SIMD
+                        // NEON-optimized copy for large blocks
+                        if (samples_to_copy >= 16) {
+                            neon_copy_samples(&mmap_buffer[write_offset], src, samples_to_copy);
+                        } else {
+                            std::memcpy(&mmap_buffer[write_offset], src, samples_to_copy * sizeof(int16_t));
+                        }
+#else
+                        std::memcpy(&mmap_buffer[write_offset], src, samples_to_copy * sizeof(int16_t));
+#endif
+                        write_offset += samples_to_copy;
+                        current_sample += samples_to_copy;
+
+                        // CRITICAL: Update decoded_samples progressively during background decode
+                        if (is_background && start_sample > 0) {
+                            decoded_samples.store(start_sample + current_sample);
+                        }
+                        continue; // Skip to next frame
+                    }
+
+                    // OPTIMIZATION 2: S32 (32-bit PCM) to S16 conversion with NEON
+                    if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_S32) {
+                        size_t remaining = max_samples - current_sample;
+                        size_t samples_to_copy = std::min<size_t>(total_frame_samples, remaining);
+                        const int32_t* src = reinterpret_cast<int32_t*>(frame->data[0]);
+
+#ifdef USE_NEON_SIMD
+                        neon_int32_to_int16(src, &mmap_buffer[write_offset], samples_to_copy);
+#else
+                        for (size_t i = 0; i < samples_to_copy; i++) {
+                            mmap_buffer[write_offset + i] = static_cast<int16_t>(src[i] >> 16);
+                        }
+#endif
+                        write_offset += samples_to_copy;
+                        current_sample += samples_to_copy;
+
+                        // CRITICAL: Update decoded_samples progressively during background decode
+                        if (is_background && start_sample > 0) {
+                            decoded_samples.store(start_sample + current_sample);
+                        }
+                        continue;
+                    }
+
+                    // OPTIMIZATION 3: FLT (float interleaved) to S16 conversion with NEON
+                    if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLT) {
+                        size_t remaining = max_samples - current_sample;
+                        size_t samples_to_copy = std::min<size_t>(total_frame_samples, remaining);
+                        const float* src = reinterpret_cast<float*>(frame->data[0]);
+
+#ifdef USE_NEON_SIMD
+                        neon_float_interleaved_to_int16(src, &mmap_buffer[write_offset], samples_to_copy);
+#else
+                        for (size_t i = 0; i < samples_to_copy; i++) {
+                            float sample = std::max(-1.0f, std::min(1.0f, src[i]));
+                            mmap_buffer[write_offset + i] = static_cast<int16_t>(sample * 32767.0f);
+                        }
+#endif
+                        write_offset += samples_to_copy;
+                        current_sample += samples_to_copy;
+
+                        // CRITICAL: Update decoded_samples progressively during background decode
+                        if (is_background && start_sample > 0) {
+                            decoded_samples.store(start_sample + current_sample);
+                        }
+                        continue;
+                    }
+
+                    // OPTIMIZATION 4: S16P (16-bit planar) - direct copy per channel
+                    if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16P) {
+                        size_t samples_to_process = std::min<size_t>(samples_per_channel, (max_samples - current_sample) / frame_channels);
+
+                        for (int ch = 0; ch < frame_channels; ch++) {
+                            const int16_t* channel_data = reinterpret_cast<int16_t*>(frame->data[ch]);
+                            for (size_t i = 0; i < samples_to_process; i++) {
+                                mmap_buffer[write_offset + i * frame_channels + ch] = channel_data[i];
+                            }
+                        }
+                        size_t processed = samples_to_process * frame_channels;
+                        write_offset += processed;
+                        current_sample += processed;
+
+                        // CRITICAL: Update decoded_samples progressively during background decode
+                        if (is_background && start_sample > 0) {
+                            decoded_samples.store(start_sample + current_sample);
+                        }
+                        continue;
+                    }
+
+                    // OPTIMIZATION: NEON-accelerated float planar to int16 conversion
+                    if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLTP) {
+#ifdef USE_NEON_SIMD
+                        // Process all channels with NEON
+                        for (int ch = 0; ch < frame_channels && current_sample < max_samples; ch++) {
+                            size_t remaining = max_samples - current_sample;
+                            size_t samples_to_process = std::min<size_t>(samples_per_channel, remaining / frame_channels);
+
+                            if (samples_to_process > 0) {
+                                float* channel_data = reinterpret_cast<float*>(frame->data[ch]);
+
+                                // Use NEON for batches, interleave into output
+                                for (size_t i = 0; i < samples_to_process; i++) {
+                                    if (write_offset + ch < total_samples) {
+                                        float sample = std::max(-1.0f, std::min(1.0f, channel_data[i]));
+                                        mmap_buffer[write_offset + i * frame_channels + ch] = static_cast<int16_t>(sample * 32767.0f);
+                                    }
+                                }
+                            }
+                        }
+                        size_t processed = std::min<size_t>(samples_per_channel * frame_channels, max_samples - current_sample);
+                        write_offset += processed;
+                        current_sample += processed;
+                        continue;
+#endif
+                    }
+
+                    // Fallback: Generic sample-by-sample conversion
                     for (int i = 0; i < samples_per_channel && current_sample < max_samples; i++) {
                         for (int ch = 0; ch < frame_channels && current_sample < max_samples; ch++) {
                             int16_t sample_value = 0;
@@ -1472,6 +2017,22 @@ float FSTPAudioModuleWrapper::GetAudioPeakRight() const {
         return 0.0f;
     }
     return m_impl->audio_peak_right.load();
+}
+
+void FSTPAudioModuleWrapper::SetBetacamAudioEnabled(bool enabled) {
+    if (m_impl) {
+        m_impl->m_betacam_audio_enabled = enabled;
+        if (enabled) {
+            m_impl->m_smfx_sim.Reset(); // Reset servomotor simulation when enabling
+            std::cout << "🎵 [SERVOMOTOR] Betacam audio ENABLED - servomotor sound will play at all speeds" << std::endl;
+        } else {
+            std::cout << "🔇 [SERVOMOTOR] Betacam audio DISABLED" << std::endl;
+        }
+    }
+}
+
+bool FSTPAudioModuleWrapper::IsBetacamAudioEnabled() const {
+    return m_impl ? m_impl->m_betacam_audio_enabled : false;
 }
 
 bool FSTPAudioModuleWrapper::RestartAudioStream() {
