@@ -80,7 +80,8 @@ check_deps() {
 
 # ── Fetch latest release URL ──────────────────────────────────────────────────
 get_download_url() {
-    info "Fetching latest release from GitHub..."
+    # All informational output goes to stderr so stdout carries only the URL
+    info "Fetching latest release from GitHub..." >&2
 
     local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
     local response
