@@ -1,295 +1,275 @@
 #!/bin/bash
-
-# TapeXPlayer 2026 - Installation Script
-# Supports: macOS (arm64/x86_64), Linux (x86_64)
+# install.sh — TapeXPlayer macOS Installer
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/main/source/install.sh | bash
+#   curl -fsSL ... | bash -s -- --quiet
+#   curl -fsSL ... | bash -s -- --force
+#
+# Flags:
+#   --quiet   Non-interactive mode (no prompts, auto-overwrite)
+#   --force   Force reinstall even if same version is detected
 
 set -e
 
-INSTALL_VERSION="2026.01"
-DOWNLOAD_BASE_URL="https://example.com/releases"  # TODO: Replace with actual URL
+# ── Configuration ─────────────────────────────────────────────────────────────
+GITHUB_REPO="ffbsoffa/TapeXPlayer"
+APP_NAME="TapeXPlayer"
+MIN_MACOS_MAJOR=13   # macOS 13.0 Ventura
+INSTALL_DIR="/Applications"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-echo ""
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║         TapeXPlayer 2026 - Installation Script          ║"
-echo "║                    Version ${INSTALL_VERSION}                      ║"
-echo "╚══════════════════════════════════════════════════════════╝"
-echo ""
-
-# Detect platform
-detect_platform() {
-    OS=$(uname -s)
-    ARCH=$(uname -m)
-
-    case "$OS" in
-        Darwin)
-            PLATFORM="macos"
-            case "$ARCH" in
-                arm64)
-                    BINARY_NAME="TapeXPlayer_macos_arm64.app.tar.gz"
-                    ;;
-                x86_64)
-                    BINARY_NAME="TapeXPlayer_macos_x86_64.app.tar.gz"
-                    ;;
-                *)
-                    echo -e "${RED}Error: Unsupported macOS architecture: $ARCH${NC}"
-                    exit 1
-                    ;;
-            esac
-            ;;
-        Linux)
-            PLATFORM="linux"
-            case "$ARCH" in
-                x86_64)
-                    BINARY_NAME="TapeXPlayer_linux_x86_64.tar.gz"
-                    ;;
-                *)
-                    echo -e "${RED}Error: Unsupported Linux architecture: $ARCH${NC}"
-                    exit 1
-                    ;;
-            esac
-            ;;
-        *)
-            echo -e "${RED}Error: Unsupported operating system: $OS${NC}"
-            exit 1
-            ;;
+# ── Flags ─────────────────────────────────────────────────────────────────────
+QUIET=0
+FORCE=0
+for arg in "$@"; do
+    case "$arg" in
+        --quiet) QUIET=1 ;;
+        --force) FORCE=1 ;;
     esac
+done
 
-    echo -e "${GREEN}✓${NC} Detected platform: ${BLUE}$PLATFORM ($ARCH)${NC}"
+# ── Helpers ───────────────────────────────────────────────────────────────────
+print_header() {
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "           TapeXPlayer Installer for macOS"
+    echo "════════════════════════════════════════════════════════════════"
+    echo ""
 }
 
-# Check for download tool (curl or wget)
-check_download_tool() {
-    if command -v curl &> /dev/null; then
-        DOWNLOADER="curl"
-        DOWNLOAD_CMD="curl -fL -o"
-        echo -e "${GREEN}✓${NC} Found download tool: ${BLUE}curl${NC}"
-    elif command -v wget &> /dev/null; then
-        DOWNLOADER="wget"
-        DOWNLOAD_CMD="wget -O"
-        echo -e "${GREEN}✓${NC} Found download tool: ${BLUE}wget${NC}"
-    else
-        echo -e "${RED}✗ Error: Neither curl nor wget found${NC}"
-        echo "  Please install curl or wget first:"
-        echo "    macOS:  brew install curl"
-        echo "    Linux:  sudo apt install curl  (or yum/dnf install curl)"
-        exit 1
-    fi
+info()    { echo "   $*"; }
+success() { echo "   ✅ $*"; }
+warn()    { echo "   ⚠️  $*"; }
+fail()    {
+    echo ""
+    echo "   ❌ $*"
+    echo ""
+    exit 1
 }
 
-# Download and install for macOS
-install_macos() {
-    echo ""
-    echo -e "${YELLOW}Installing TapeXPlayer for macOS...${NC}"
-    echo ""
-
-    # Create temporary directory
-    TMP_DIR=$(mktemp -d)
-    trap "rm -rf $TMP_DIR" EXIT
-
-    cd "$TMP_DIR"
-
-    # Download
-    DOWNLOAD_URL="${DOWNLOAD_BASE_URL}/${BINARY_NAME}"
-    echo -e "${BLUE}→${NC} Downloading from: $DOWNLOAD_URL"
-
-    if ! $DOWNLOAD_CMD "$BINARY_NAME" "$DOWNLOAD_URL"; then
-        echo -e "${RED}✗ Download failed${NC}"
-        echo ""
-        echo "Manual installation:"
-        echo "  1. Download from: $DOWNLOAD_URL"
-        echo "  2. Extract: tar -xzf $BINARY_NAME"
-        echo "  3. Move to Applications: mv TapeXPlayer.app /Applications/"
-        echo "  4. Remove quarantine: xattr -dr com.apple.quarantine /Applications/TapeXPlayer.app"
-        exit 1
-    fi
-
-    echo -e "${GREEN}✓${NC} Download complete"
-
-    # Extract
-    echo -e "${BLUE}→${NC} Extracting archive..."
-    tar -xzf "$BINARY_NAME"
-
-    # Determine installation directory
-    if [ -w "/Applications" ]; then
-        INSTALL_DIR="/Applications"
-    else
-        INSTALL_DIR="$HOME/Applications"
-        mkdir -p "$INSTALL_DIR"
-    fi
-
-    # Remove old version if exists
-    if [ -d "$INSTALL_DIR/TapeXPlayer.app" ]; then
-        echo -e "${YELLOW}→${NC} Removing old version..."
-        rm -rf "$INSTALL_DIR/TapeXPlayer.app"
-    fi
-
-    # Install
-    echo -e "${BLUE}→${NC} Installing to: $INSTALL_DIR"
-    mv TapeXPlayer.app "$INSTALL_DIR/"
-
-    # CRITICAL: Remove quarantine attribute to bypass GateKeeper
-    # This is the key difference from browser downloads
-    echo -e "${BLUE}→${NC} Removing quarantine attribute (bypass GateKeeper)..."
-    xattr -dr com.apple.quarantine "$INSTALL_DIR/TapeXPlayer.app" 2>/dev/null || true
-
-    # Make executable
-    chmod +x "$INSTALL_DIR/TapeXPlayer.app/Contents/MacOS/TapeXPlayer"
-
-    echo ""
-    echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║           ✓ Installation Complete (macOS)               ║${NC}"
-    echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    echo -e "${BLUE}Location:${NC} $INSTALL_DIR/TapeXPlayer.app"
-    echo ""
-    echo -e "${GREEN}You can now launch TapeXPlayer from:${NC}"
-    echo "  • Finder → Applications → TapeXPlayer"
-    echo "  • Spotlight (⌘+Space) → TapeXPlayer"
-    echo ""
-    echo -e "${YELLOW}Note:${NC} GateKeeper bypass enabled - app will run without warnings"
+ask() {
+    # ask <prompt> → returns 0 for yes, 1 for no
+    # In quiet mode always returns 0 (yes)
+    if [ "$QUIET" -eq 1 ]; then return 0; fi
+    local reply
+    read -r -p "   $1 (y/n): " reply
+    [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-# Download and install for Linux
-install_linux() {
-    echo ""
-    echo -e "${YELLOW}Installing TapeXPlayer for Linux...${NC}"
-    echo ""
+# ── macOS version check ───────────────────────────────────────────────────────
+check_macos_version() {
+    local version
+    version=$(sw_vers -productVersion 2>/dev/null || echo "0.0")
+    local major
+    major=$(echo "$version" | cut -d. -f1)
 
-    # Create temporary directory
-    TMP_DIR=$(mktemp -d)
-    trap "rm -rf $TMP_DIR" EXIT
-
-    cd "$TMP_DIR"
-
-    # Download
-    DOWNLOAD_URL="${DOWNLOAD_BASE_URL}/${BINARY_NAME}"
-    echo -e "${BLUE}→${NC} Downloading from: $DOWNLOAD_URL"
-
-    if ! $DOWNLOAD_CMD "$BINARY_NAME" "$DOWNLOAD_URL"; then
-        echo -e "${RED}✗ Download failed${NC}"
-        echo ""
-        echo "Manual installation:"
-        echo "  1. Download from: $DOWNLOAD_URL"
-        echo "  2. Extract: tar -xzf $BINARY_NAME"
-        echo "  3. Move binary: sudo mv TapeXPlayer_linux /usr/local/bin/tapexplayer"
-        exit 1
+    if [ "$major" -lt "$MIN_MACOS_MAJOR" ] 2>/dev/null; then
+        fail "macOS $MIN_MACOS_MAJOR.0 (Ventura) or later required. Found: $version"
     fi
 
-    echo -e "${GREEN}✓${NC} Download complete"
+    local arch
+    arch=$(uname -m)
+    info "macOS $version detected ($arch)"
+}
 
-    # Extract
-    echo -e "${BLUE}→${NC} Extracting archive..."
-    tar -xzf "$BINARY_NAME"
-
-    # Determine installation directory
-    if [ -w "/usr/local/bin" ]; then
-        INSTALL_DIR="/usr/local/bin"
-        DESKTOP_DIR="/usr/share/applications"
-        NEED_SUDO=false
-    else
-        INSTALL_DIR="$HOME/.local/bin"
-        DESKTOP_DIR="$HOME/.local/share/applications"
-        NEED_SUDO=false
-        mkdir -p "$INSTALL_DIR"
-        mkdir -p "$DESKTOP_DIR"
-    fi
-
-    # Install binary
-    echo -e "${BLUE}→${NC} Installing to: $INSTALL_DIR"
-
-    if [ "$NEED_SUDO" = true ] && [ -w "/usr/local/bin" ]; then
-        sudo mv TapeXPlayer_linux "$INSTALL_DIR/tapexplayer"
-        sudo chmod +x "$INSTALL_DIR/tapexplayer"
-    elif [ ! -w "/usr/local/bin" ] && command -v sudo &> /dev/null; then
-        echo -e "${YELLOW}→${NC} Need sudo permission for system-wide installation..."
-        sudo mv TapeXPlayer_linux "$INSTALL_DIR/tapexplayer"
-        sudo chmod +x "$INSTALL_DIR/tapexplayer"
-    else
-        mv TapeXPlayer_linux "$INSTALL_DIR/tapexplayer"
-        chmod +x "$INSTALL_DIR/tapexplayer"
-    fi
-
-    # Create desktop entry
-    echo -e "${BLUE}→${NC} Creating desktop entry..."
-
-    DESKTOP_FILE="$DESKTOP_DIR/tapexplayer.desktop"
-
-    cat > tapexplayer.desktop << 'EOF'
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=TapeXPlayer 2026
-GenericName=Video Player
-Comment=Professional video player with frame-accurate control
-Exec=tapexplayer %F
-Icon=tapexplayer
-Terminal=false
-Categories=AudioVideo;Player;
-MimeType=video/mp4;video/x-matroska;video/quicktime;video/x-msvideo;
-Keywords=video;player;playback;
-EOF
-
-    if [ "$NEED_SUDO" = true ] || [ ! -w "$DESKTOP_DIR" ]; then
-        sudo mv tapexplayer.desktop "$DESKTOP_FILE"
-        sudo chmod 644 "$DESKTOP_FILE"
-    else
-        mv tapexplayer.desktop "$DESKTOP_FILE"
-        chmod 644 "$DESKTOP_FILE"
-    fi
-
-    # Update desktop database
-    if command -v update-desktop-database &> /dev/null; then
-        if [ -w "$DESKTOP_DIR" ]; then
-            update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
-        else
-            sudo update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+# ── Dependency check ──────────────────────────────────────────────────────────
+check_deps() {
+    for cmd in curl unzip; do
+        if ! command -v "$cmd" &>/dev/null; then
+            fail "Required tool not found: $cmd"
         fi
+    done
+}
+
+# ── Fetch latest release URL ──────────────────────────────────────────────────
+get_download_url() {
+    info "Fetching latest release from GitHub..."
+
+    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    local response
+    response=$(curl -fsSL "$api_url" 2>/dev/null) || \
+        fail "Cannot reach GitHub API. Check your internet connection."
+
+    # Extract browser_download_url for macOS ZIP (matches *-mac.zip or TapeXPlayer-*.zip without -win/-linux)
+    local url
+    url=$(printf '%s' "$response" \
+        | grep '"browser_download_url"' \
+        | grep -i '\-mac\.zip\|TapeXPlayer.*\.zip' \
+        | grep -iv '\-win\|\-linux' \
+        | head -1 \
+        | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')
+
+    if [ -z "$url" ]; then
+        # Fallback: any .zip in the release
+        url=$(printf '%s' "$response" \
+            | grep '"browser_download_url"' \
+            | grep '\.zip' \
+            | grep -iv '\-win\|\-linux' \
+            | head -1 \
+            | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')
     fi
 
-    echo ""
-    echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║           ✓ Installation Complete (Linux)               ║${NC}"
-    echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    echo -e "${BLUE}Location:${NC} $INSTALL_DIR/tapexplayer"
-    echo ""
-    echo -e "${GREEN}You can now launch TapeXPlayer from:${NC}"
-    echo "  • Command line: tapexplayer"
-    echo "  • Application menu (GNOME/KDE/etc.)"
-    echo ""
+    if [ -z "$url" ]; then
+        fail "No macOS ZIP found in the latest GitHub release.\nCheck: https://github.com/${GITHUB_REPO}/releases"
+    fi
 
-    # Add to PATH reminder
-    if [ "$INSTALL_DIR" = "$HOME/.local/bin" ]; then
-        if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-            echo -e "${YELLOW}Note:${NC} Add ~/.local/bin to your PATH:"
-            echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
-            echo "  source ~/.bashrc"
+    echo "$url"
+}
+
+# ── Optional SHA256 verification ─────────────────────────────────────────────
+verify_sha256() {
+    local file="$1"
+    local sha_url="$2"
+
+    local expected
+    expected=$(curl -fsSL "$sha_url" 2>/dev/null | awk '{print $1}') || return 0
+
+    if [ -z "$expected" ]; then return 0; fi   # no checksum file — skip
+
+    local actual
+    actual=$(shasum -a 256 "$file" | awk '{print $1}')
+
+    if [ "$actual" != "$expected" ]; then
+        fail "SHA256 mismatch!\n   Expected: $expected\n   Actual:   $actual\n   The download may be corrupted."
+    fi
+
+    success "SHA256 verified"
+}
+
+# ── Validate bundle is self-contained ────────────────────────────────────────
+validate_bundle() {
+    local app="$1"
+    local exe="$app/Contents/MacOS/${APP_NAME}"
+
+    # 1. Check Frameworks dir has embedded libavcodec
+    if ! ls "$app/Contents/Frameworks/libavcodec"*.dylib 1>/dev/null 2>&1; then
+        fail "Broken archive: embedded libavcodec not found in Frameworks/\n   The download may be incomplete or corrupted."
+    fi
+
+    # 2. Check that ALL FFmpeg/SDL2 libs in the binary point to @executable_path,
+    #    NOT to /opt/homebrew, /usr/local, or any absolute external path.
+    #    This is the critical check: even one unpatched reference means the app
+    #    will try to load the user's system library instead of the bundled one.
+    local bad_refs
+    bad_refs=$(otool -L "$exe" 2>/dev/null \
+        | grep -E "libavcodec|libavformat|libavutil|libswscale|libswresample|libSDL2|libportaudio|librtmidi|libssl|libcrypto" \
+        | grep -v "@executable_path" \
+        | awk '{print $1}')
+
+    if [ -n "$bad_refs" ]; then
+        fail "Binary is NOT self-contained — these libs still reference external paths:\n\n${bad_refs}\n\n   This means the app will fail to launch on machines without Homebrew\n   or with a different FFmpeg version. The release was built incorrectly\n   (bundle_libs.sh was not run, or install_name_tool patching failed).\n\n   Please report this at: https://github.com/${GITHUB_REPO}/issues"
+    fi
+
+    # 3. Verify the bundled Frameworks libs themselves don't reference external paths
+    #    (transitive deps must also be patched)
+    local fw_dir="$app/Contents/Frameworks"
+    local fw_bad=""
+    for dylib in "$fw_dir"/lib{avcodec,avformat,avutil,swscale,swresample}*.dylib; do
+        [ -f "$dylib" ] || continue
+        local ext_refs
+        ext_refs=$(otool -L "$dylib" 2>/dev/null \
+            | tail -n +2 \
+            | grep -v "@executable_path\|/System/\|/usr/lib/" \
+            | grep -v "$(basename "$dylib")" \
+            | awk '{print $1}')
+        if [ -n "$ext_refs" ]; then
+            fw_bad="$fw_bad\n  $(basename "$dylib"): $ext_refs"
+        fi
+    done
+
+    if [ -n "$fw_bad" ]; then
+        warn "Some bundled FFmpeg libs have unpatched transitive deps:${fw_bad}"
+        warn "The app may fail if those deps are missing on the target system."
+        warn "Consider rebuilding with 'make bundle-universal' and re-releasing."
+        # Not fatal — warn only, because the main exe paths are correct
+    fi
+
+    success "Bundle is self-contained (all primary libs embedded and patched)"
+}
+
+# ── Main install logic ────────────────────────────────────────────────────────
+print_header
+check_macos_version
+check_deps
+
+DOWNLOAD_URL=$(get_download_url)
+FILENAME=$(basename "$DOWNLOAD_URL")
+info "Latest release: $FILENAME"
+
+# Create temp directory
+TMPDIR_INSTALL=$(mktemp -d)
+trap 'rm -rf "$TMPDIR_INSTALL"' EXIT
+
+ZIP_PATH="$TMPDIR_INSTALL/$FILENAME"
+
+echo ""
+echo "1️⃣   Downloading..."
+info "URL: $DOWNLOAD_URL"
+curl -fL --progress-bar "$DOWNLOAD_URL" -o "$ZIP_PATH" || \
+    fail "Download failed."
+
+# Optional SHA256 check
+SHA_URL="${DOWNLOAD_URL%.zip}.sha256"
+verify_sha256 "$ZIP_PATH" "$SHA_URL"
+
+echo ""
+echo "2️⃣   Extracting..."
+unzip -q "$ZIP_PATH" -d "$TMPDIR_INSTALL/"
+
+# Find the .app bundle
+APP_FOUND=$(find "$TMPDIR_INSTALL" -maxdepth 3 -name "${APP_NAME}.app" -type d | head -1)
+if [ -z "$APP_FOUND" ]; then
+    fail "${APP_NAME}.app not found in the downloaded archive."
+fi
+success "Found: $(basename "$APP_FOUND")"
+
+echo ""
+echo "3️⃣   Removing Gatekeeper quarantine..."
+xattr -cr "$APP_FOUND" 2>/dev/null || true
+success "Quarantine removed"
+
+echo ""
+echo "4️⃣   Validating bundle integrity..."
+validate_bundle "$APP_FOUND"
+
+echo ""
+echo "5️⃣   Installing to $INSTALL_DIR..."
+DEST="$INSTALL_DIR/${APP_NAME}.app"
+
+if [ -d "$DEST" ]; then
+    if [ "$FORCE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+        warn "${APP_NAME} is already installed."
+        if ! ask "Replace existing version?"; then
             echo ""
+            info "Installation cancelled."
+            info "Existing version untouched at: $DEST"
+            exit 0
         fi
     fi
-}
+    info "Removing old version..."
+    rm -rf "$DEST"
+fi
 
-# Main installation flow
-main() {
-    detect_platform
-    check_download_tool
+# Try copying without sudo first; fall back to sudo if needed
+if cp -R "$APP_FOUND" "$DEST" 2>/dev/null; then
+    success "Installed to $DEST"
+else
+    info "Requesting administrator access to write to $INSTALL_DIR..."
+    sudo cp -R "$APP_FOUND" "$DEST" && success "Installed to $DEST (with sudo)" || \
+        fail "Installation failed. Try copying manually:\n   cp -R \"$APP_FOUND\" \"$DEST\""
+fi
 
-    case "$PLATFORM" in
-        macos)
-            install_macos
-            ;;
-        linux)
-            install_linux
-            ;;
-    esac
-}
+echo ""
+echo "════════════════════════════════════════════════════════════════"
+success "Installation complete!"
+echo "════════════════════════════════════════════════════════════════"
+echo ""
+info "TapeXPlayer installed to: $DEST"
+echo ""
 
-# Run installation
-main
+if [ "$QUIET" -eq 0 ]; then
+    if ask "Launch TapeXPlayer now?"; then
+        open -a "${APP_NAME}"
+    fi
+fi
+
+echo ""
