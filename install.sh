@@ -165,7 +165,7 @@ ${bad_refs}
         local ext_refs
         ext_refs=$(otool -L "$dylib" 2>/dev/null \
             | tail -n +2 \
-            | grep -v "@executable_path\|/System/\|/usr/lib/" \
+            | grep -v "@executable_path\|@rpath\|/System/\|/usr/lib/" \
             | grep -v "$(basename "$dylib")" \
             | awk '{print $1}') || true
         if [ -n "$ext_refs" ]; then
