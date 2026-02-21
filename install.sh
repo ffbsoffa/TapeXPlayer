@@ -93,7 +93,7 @@ fetch_release_url() {
         | grep -i '\-mac\.zip' \
         | head -1 \
         | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' \
-        | tr -d '\r\n')
+        | tr -d '\r\n') || true
 
     if [ -z "$DOWNLOAD_URL" ]; then
         # Fallback: any .zip not tagged -win or -linux
@@ -103,7 +103,7 @@ fetch_release_url() {
             | grep -iv '\-win\|\-linux' \
             | head -1 \
             | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' \
-            | tr -d '\r\n')
+            | tr -d '\r\n') || true
     fi
 
     [ -z "$DOWNLOAD_URL" ] && \
