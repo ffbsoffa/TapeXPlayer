@@ -106,8 +106,9 @@ fetch_release_url() {
             | tr -d '\r\n') || true
     fi
 
-    [ -z "$DOWNLOAD_URL" ] && \
+    if [ -z "$DOWNLOAD_URL" ]; then
         fail "No macOS ZIP found in the latest release. Check: https://github.com/${GITHUB_REPO}/releases"
+    fi
 }
 
 # ── Optional SHA256 verification ─────────────────────────────────────────────
@@ -145,7 +146,7 @@ validate_bundle() {
     bad_refs=$(otool -L "$exe" 2>/dev/null \
         | grep -E "libavcodec|libavformat|libavutil|libswscale|libswresample|libSDL2|libportaudio|librtmidi|libssl|libcrypto" \
         | grep -v "@executable_path" \
-        | awk '{print $1}')
+        | awk '{print $1}') || true
 
     if [ -n "$bad_refs" ]; then
         fail "Binary is not self-contained. These libs reference external paths:
@@ -166,7 +167,7 @@ ${bad_refs}
             | tail -n +2 \
             | grep -v "@executable_path\|/System/\|/usr/lib/" \
             | grep -v "$(basename "$dylib")" \
-            | awk '{print $1}')
+            | awk '{print $1}') || true
         if [ -n "$ext_refs" ]; then
             fw_bad="$fw_bad  $(basename "$dylib")"
         fi
