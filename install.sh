@@ -79,26 +79,25 @@ check_deps() {
 }
 
 # ── Fetch latest release URL ──────────────────────────────────────────────────
-get_download_url() {
-    # All informational output goes to stderr so stdout carries only the URL
-    info "Fetching latest release from GitHub..." >&2
+# Note: URL is fetched inline (not via a function) to avoid stdout capture
+# swallowing info/fail messages when using $(...) substitution.
+fetch_release_url() {
+    info "Fetching latest release from GitHub..."
 
     local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    local response
-    response=$(curl -fsSL "$api_url" 2>/dev/null) || \
+    _API_RESPONSE=$(curl -fsSL "$api_url" 2>/dev/null) || \
         fail "Cannot reach GitHub API. Check your internet connection."
 
-    local url
-    url=$(printf '%s' "$response" \
+    DOWNLOAD_URL=$(printf '%s' "$_API_RESPONSE" \
         | grep '"browser_download_url"' \
         | grep -i '\-mac\.zip' \
         | head -1 \
         | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' \
         | tr -d '\r\n')
 
-    if [ -z "$url" ]; then
+    if [ -z "$DOWNLOAD_URL" ]; then
         # Fallback: any .zip not tagged -win or -linux
-        url=$(printf '%s' "$response" \
+        DOWNLOAD_URL=$(printf '%s' "$_API_RESPONSE" \
             | grep '"browser_download_url"' \
             | grep '\.zip' \
             | grep -iv '\-win\|\-linux' \
@@ -107,11 +106,8 @@ get_download_url() {
             | tr -d '\r\n')
     fi
 
-    if [ -z "$url" ]; then
+    [ -z "$DOWNLOAD_URL" ] && \
         fail "No macOS ZIP found in the latest release. Check: https://github.com/${GITHUB_REPO}/releases"
-    fi
-
-    echo "$url"
 }
 
 # ── Optional SHA256 verification ─────────────────────────────────────────────
@@ -189,7 +185,7 @@ print_header
 check_macos_version
 check_deps
 
-DOWNLOAD_URL=$(get_download_url)
+fetch_release_url   # sets $DOWNLOAD_URL directly, no $() capture
 FILENAME=$(basename "$DOWNLOAD_URL")
 info "Latest release: $FILENAME"
 
