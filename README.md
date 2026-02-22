@@ -151,20 +151,14 @@ All trademarks are property of their respective owners.
 
 ---
 
-## 🔗 Links
+## Links
 
 - **Website**: [ffbsoffa.org](https://ffbsoffa.org)
 - **GitHub**: [github.com/ffbsoffa/TapeXPlayer](https://github.com/ffbsoffa/TapeXPlayer)
 - **Issues**: [Report a bug](https://github.com/ffbsoffa/TapeXPlayer/issues)
 - **Releases**: [Download latest version](https://github.com/ffbsoffa/TapeXPlayer/releases)
 
----
 
-## 👨‍💻 Author
-
-**Maksim Maloletkin (FFB_soffa)**
-
-© 2025 Maksim Maloletkin. Licensed under GPL v3.0.
 ---
 ## 🙏 Acknowledgments
 
@@ -180,3 +174,8 @@ Special thanks to:
 [⭐ Star this project](https://github.com/ffbsoffa/TapeXPlayer) if you find it useful!
 
 </div>
+
+
+---
+
+© 2025 Maksim Maloletkin. Licensed under GPL v3.0.
