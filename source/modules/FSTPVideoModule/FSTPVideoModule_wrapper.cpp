@@ -5,9 +5,10 @@
 #include "../FSTPMainModule/WSGUI/FSTPPixelBufferManager.h"
 #include "../FSTPAudioModule/FSTPAudioModule_API.h"
 #include "../FSTPAudioModule/FSTPAudioModule_wrapper.h"
-#include "../FSTPMainModule/WSGUI/FSTPToolsMenu.h"
+#include "../FSTPMainModule/WSGUI/darwin/sdl/FSTPToolsMenu.h"
 #include "FSTPPerformanceProfiler.h"
 #include "FSTPCallCounter.h"
+#include "FSTPHardwareDetection.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,10 +20,28 @@
 #include <vector>
 #include <cstring>
 #include <utility>
+#include <map>
+#include <mutex>
 
 extern "C" {
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
+}
+
+// External hardware detection
+extern FSTPHardwareDetection* g_hardware_detection;
+
+// Global registry for video module instances (for frame update notifications)
+static std::map<int, FSTPVideoModuleWrapper*> g_video_instances;
+static std::mutex g_instances_mutex;
+
+// Global function to notify video module about frame update
+void NotifyVideoFrameUpdate(int instance_id) {
+    std::lock_guard<std::mutex> lock(g_instances_mutex);
+    auto it = g_video_instances.find(instance_id);
+    if (it != g_video_instances.end() && it->second) {
+        it->second->RequestFrameUpdate();
+    }
 }
 
 // Platform-specific memory headers
@@ -40,6 +59,9 @@ static constexpr bool ENABLE_VIDEO_DEBUG = false;
 // Export from WindowManager for updating color metadata renderer
 extern "C" void FSTP_UpdatePlayerColorMetadata(int player_id, int colorspace, int color_range, int color_primaries, int color_trc);
 
+// Request force render from window system
+extern "C" void RequestForceRender();
+
 FSTPVideoModuleWrapper::FSTPVideoModuleWrapper()
     : m_audio_module(nullptr)
     , m_frame_converter(std::make_unique<FSTPFrameConverter>())
@@ -48,6 +70,12 @@ FSTPVideoModuleWrapper::FSTPVideoModuleWrapper()
 }
 
 FSTPVideoModuleWrapper::~FSTPVideoModuleWrapper() {
+    // Unregister from global instance map
+    if (m_instance_id >= 0) {
+        std::lock_guard<std::mutex> lock(g_instances_mutex);
+        g_video_instances.erase(m_instance_id);
+    }
+
     if (m_initialized) {
         Shutdown();
     }
@@ -133,7 +161,7 @@ bool FSTPVideoModuleWrapper::EnsureProxy(const std::string& filepath, const std:
     fs::path cacheDir = fs::path(FSTP::LowResDecoder::getCachePath()) / "proxy";
     fs::create_directories(cacheDir);
 
-    m_proxy_path = cacheDir / (FSTP::LowResDecoder::generateFileId(filepath) + "_lowres.mp4");
+    m_proxy_path = (cacheDir / (FSTP::LowResDecoder::generateFileId(filepath) + "_lowres.mp4")).string();
 
     // If using original - create symlink or copy
     if (use_original_as_proxy) {
@@ -198,7 +226,7 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
     SetPlayerLoadingState(osdPlayerId, true);
     SetPlayerLoadingProgress(osdPlayerId, 0);
     UpdateOSDDisplayMode(osdPlayerId, OSD_MODE_LOADING);
-    SetPlayerLoadingStatus(osdPlayerId, "threading");
+    // REMOVED: SetPlayerLoadingStatus("threading") - moved to Phase 3 where it actually happens
 
     if (m_loaded) {
         UnloadFile();
@@ -207,7 +235,9 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
     m_current_file = filepath;
 
     // Phase 1: Proxy conversion (0-50%)
-    SetPlayerLoadingStatus(osdPlayerId, "proxy");  // FIX: Set status "proxy"
+    SetPlayerLoadingStatus(osdPlayerId, "proxy");
+    SetPlayerLoadingProgress(osdPlayerId, 0);  // Ensure 0% at start
+    UpdateOSDLoadingProgress(osdPlayerId, 0);
 
     auto proxyProgress = [playerId = osdPlayerId](int percent) {
         int scaledPercent = percent / 2;  // 0-100 -> 0-50
@@ -243,6 +273,37 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
     SetPlayerLoadingProgress(osdPlayerId, 75);
     UpdateOSDLoadingProgress(osdPlayerId, 75);
 
+    // HALF-FPS PROXY DETECTION: Check if proxy is 30fps from 60fps original
+    // Compare original FPS (from m_frame_index) with proxy FPS (from m_proxy_path)
+    double original_fps = m_frame_index->GetFrameRate();
+    m_is_half_fps_proxy = false;
+
+    if (!m_use_original_as_proxy && !m_proxy_path.empty()) {
+        // Open proxy file to check its FPS
+        AVFormatContext* proxy_fmt = nullptr;
+        if (avformat_open_input(&proxy_fmt, m_proxy_path.c_str(), nullptr, nullptr) == 0) {
+            if (avformat_find_stream_info(proxy_fmt, nullptr) >= 0) {
+                int video_stream_idx = av_find_best_stream(proxy_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                if (video_stream_idx >= 0) {
+                    AVStream* stream = proxy_fmt->streams[video_stream_idx];
+                    if (stream->r_frame_rate.den > 0) {
+                        double proxy_fps = static_cast<double>(stream->r_frame_rate.num) / stream->r_frame_rate.den;
+
+                        // Detect half-FPS: original 55-65fps, proxy 25-35fps (accounting for variations)
+                        if (original_fps >= 55.0 && original_fps <= 65.0 &&
+                            proxy_fps >= 25.0 && proxy_fps <= 35.0) {
+                            m_is_half_fps_proxy = true;
+                            std::cout << "🎯 [HALF-FPS PROXY] Detected: original " << std::fixed << std::setprecision(2)
+                                      << original_fps << " fps, proxy " << proxy_fps << " fps" << std::endl;
+                            std::cout << "                     Creating separate half-size index to avoid EMPTY slots" << std::endl;
+                        }
+                    }
+                }
+            }
+            avformat_close_input(&proxy_fmt);
+        }
+    }
+
     // CRITICAL: Initialize m_frames pointer if needed (leak on exit acceptable)
     if (!m_frames) {
         m_frames = new std::vector<FSTP::FrameInfo>();
@@ -250,6 +311,18 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
 
     m_frames->clear();
     m_frames->resize(m_frame_index->GetTotalFrames());
+
+    // HALF-FPS PROXY: Create separate index with half size
+    if (m_is_half_fps_proxy) {
+        if (!m_half_fps_frames) {
+            m_half_fps_frames = new std::vector<FSTP::FrameInfo>();
+        }
+        size_t half_size = (m_frame_index->GetTotalFrames() + 1) / 2; // Round up
+        m_half_fps_frames->clear();
+        m_half_fps_frames->resize(half_size);
+        std::cout << "🎯 [HALF-FPS INDEX] Created " << half_size << " slots (main index: "
+                  << m_frames->size() << " slots)" << std::endl;
+    }
     
     // Initialize time_ms and keyframe info from original video index for seeking reference
     // LowResDecoder will update time_ms with actual proxy file timing during decode
@@ -275,7 +348,32 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
             (*m_frames)[i].is_keyframe = false;
         }
     }
-    
+
+    // HALF-FPS PROXY: Initialize half-fps index with every second frame's metadata
+    if (m_is_half_fps_proxy && m_half_fps_frames) {
+        for (size_t i = 0; i < m_half_fps_frames->size(); ++i) {
+            // Map half-fps index to original: i → 2*i
+            size_t orig_idx = i * 2;
+            if (orig_idx < m_frames->size()) {
+                const SimpleFrameInfo* frame_info = m_frame_index->GetFrameInfo(static_cast<int>(orig_idx));
+                if (frame_info) {
+                    (*m_half_fps_frames)[i].time_ms = static_cast<int64_t>(std::round(frame_info->time_seconds * 1000.0));
+                    (*m_half_fps_frames)[i].is_keyframe = frame_info->is_keyframe;
+
+                    static int half_debug = 0;
+                    if (half_debug++ < 5) {
+                        std::cout << "🎯 [HALF-FPS INIT] Slot " << i << " (from orig " << orig_idx << "): time_ms="
+                                  << (*m_half_fps_frames)[i].time_ms
+                                  << (frame_info->is_keyframe ? " [KEYFRAME]" : "") << std::endl;
+                    }
+                } else {
+                    (*m_half_fps_frames)[i].time_ms = -1;
+                    (*m_half_fps_frames)[i].is_keyframe = false;
+                }
+            }
+        }
+    }
+
     m_current_index.store(0);
 
     m_duration.store(m_frame_index->GetDuration());
@@ -284,7 +382,11 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
     m_video_width = m_frame_index->GetWidth();
     m_video_height = m_frame_index->GetHeight();
 
-    // Phase 3: Initialize decoders (75-100%)
+    // Phase 3: Initialize decoders (75-100%) - THREADING
+    SetPlayerLoadingStatus(osdPlayerId, "threading");
+    SetPlayerLoadingProgress(osdPlayerId, 75);
+    UpdateOSDLoadingProgress(osdPlayerId, 75);
+
     if (!InitializeDecoders()) {
         SetPlayerLoadingState(osdPlayerId, false);
         SetPlayerLoadingProgress(osdPlayerId, 0);
@@ -294,6 +396,11 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
     }
 
     m_loaded = true;
+
+    // Notify audio module of video frame rate for frame alignment feature
+    if (m_audio_module && m_frame_rate > 0.0) {
+        m_audio_module->SetVideoFrameRate(m_frame_rate);
+    }
 
     SetPlayerLoadingProgress(osdPlayerId, 100);
     UpdateOSDLoadingProgress(osdPlayerId, 100);
@@ -314,6 +421,18 @@ void FSTPVideoModuleWrapper::UnloadFile() {
     if (!m_loaded) {
         return;
     }
+
+    const int osdPlayerId = (m_instance_id >= 0 ? m_instance_id : 0);
+
+    // Show "unthreading" progress during unload
+    // If reloading, LOADING mode is already set by LoadFile
+    if (!m_file_reloading.load()) {
+        SetPlayerLoadingState(osdPlayerId, true);
+        UpdateOSDDisplayMode(osdPlayerId, OSD_MODE_LOADING);
+    }
+    SetPlayerLoadingStatus(osdPlayerId, "unthreading");
+    SetPlayerLoadingProgress(osdPlayerId, 0);
+    UpdateOSDLoadingProgress(osdPlayerId, 0);
 
     // CRITICAL FIX: CORRECT cleanup order to prevent heap corruption!
     // AVFrames have internal references to decoder contexts.
@@ -362,6 +481,14 @@ void FSTPVideoModuleWrapper::UnloadFile() {
 
             cleaned += (batch_end - i);
 
+            // Update OSD progress (0-80% for frame cleanup)
+            int progress = static_cast<int>((cleaned * 80) / frame_count);
+            SetPlayerLoadingProgress(osdPlayerId, progress);
+            UpdateOSDLoadingProgress(osdPlayerId, progress);
+
+            // NOTE: Don't call RenderAllWindows() here - causes race condition!
+            // Render thread will automatically pick up OSD updates on next VSync
+
             // Progress report every 1000 frames
             if (cleaned % 1000 == 0 || cleaned == frame_count) {
                 auto now = std::chrono::steady_clock::now();
@@ -386,49 +513,98 @@ void FSTPVideoModuleWrapper::UnloadFile() {
                   << " frames in " << total_ms << "ms" << std::endl;
     }
 
-    // STEP 2: Now safe to shutdown decoders (all AVFrames freed)
+    // HALF-FPS PROXY: Clear half-fps index if it exists
+    if (m_half_fps_frames && !m_half_fps_frames->empty()) {
+        std::cout << "🎯 [HALF-FPS] Clearing half-fps index (" << m_half_fps_frames->size() << " slots)" << std::endl;
+        m_half_fps_frames->clear();
+    }
+
+    // STEP 2: Now safe to shutdown decoders (all AVFrames freed) - 80-100%
+    SetPlayerLoadingProgress(osdPlayerId, 85);
+    UpdateOSDLoadingProgress(osdPlayerId, 85);
+
     std::cout << "[VIDEO] All frames freed, now shutting down decoder contexts..." << std::endl;
     ShutdownDecoders();
     std::cout << "[VIDEO] Decoder contexts shutdown complete" << std::endl;
+
+    SetPlayerLoadingProgress(osdPlayerId, 95);
+    UpdateOSDLoadingProgress(osdPlayerId, 95);
 
     if (m_frame_index) {
         m_frame_index->Clear();
     }
 
+    SetPlayerLoadingProgress(osdPlayerId, 98);
+    UpdateOSDLoadingProgress(osdPlayerId, 98);
+
     m_current_file.clear();
     m_proxy_path.clear();
     m_use_original_as_proxy = false; // Reset flag
+    m_is_half_fps_proxy = false; // Reset half-fps flag
     m_duration.store(0.0);
     m_frame_rate = 0.0;
     m_total_frames = 0;
     m_last_displayed_frame = -1; // Reset for forced rendering of first frame
+    m_last_good_frame_number = -1; // Reset to prevent stale frame reference on reload
     m_loaded = false;
 
-    // DON'T switch OSD to NO_FILE mode here - it causes visual glitch during exit
-    // When closing window: UnloadFile() is called → NO_FILE screen briefly appears
-    // UpdateWindowOSD() will handle NO_FILE mode if needed when user explicitly unloads file
-    // During exit/close, window closes immediately after this anyway
+    // Complete unthreading process
+    SetPlayerLoadingProgress(osdPlayerId, 100);
+    UpdateOSDLoadingProgress(osdPlayerId, 100);
+
+    // NOTE: Don't call RenderAllWindows() - render thread handles it
+    // Small delay to allow render thread to show 100% completion
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    // If reloading, keep LOADING mode (LoadFile will continue with "proxy")
+    // If just unloading, keep LOADING state with "unthreading 100%" until window closes
+    if (m_file_reloading.load()) {
+        std::cout << "[VIDEO] File unloaded, continuing with reload..." << std::endl;
+    } else {
+        // DON'T call SetPlayerLoadingState(false) - keep "unthreading 100%" visible
+        // until window actually closes (prevents NO_FILE flash)
+        std::cout << "[VIDEO] File unloaded (unthreading complete, keeping LOADING state)" << std::endl;
+    }
 }
 
 bool FSTPVideoModuleWrapper::InitializeDecoders() {
     std::cout << "[VIDEO] InitializeDecoders: Using LowCachedDecoderManager (the proven solution)" << std::endl;
 
+    const int osdPlayerId = (m_instance_id >= 0 ? m_instance_id : 0);
+
+    // Progress: 75% → 85% (Low-res decoder setup)
+    SetPlayerLoadingProgress(osdPlayerId, 78);
+    UpdateOSDLoadingProgress(osdPlayerId, 78);
+
     // Use the working LowCachedDecoderManager from old code
+    // HALF-FPS PROXY: Use separate index if available
     try {
+        std::vector<FSTP::FrameInfo>& frame_index_ref = m_is_half_fps_proxy ? *m_half_fps_frames : *m_frames;
+
+        if (m_is_half_fps_proxy) {
+            std::cout << "🎯 [HALF-FPS] Using half-fps index (" << m_half_fps_frames->size()
+                      << " slots) for LowCachedDecoderManager" << std::endl;
+        }
+
         m_low_cached_manager = std::make_unique<FSTP::LowCachedDecoderManager>(
             m_proxy_path,
-            *m_frames,  // Dereference pointer to get reference
+            frame_index_ref,  // Use half-fps index if available, otherwise main index
             m_current_index,
             m_low_res_range,
             m_high_res_window,
             m_playing,
             m_speed,
-            m_reverse
+            m_reverse,
+            m_instance_id,  // Pass instance ID for frame update notifications
+            m_is_half_fps_proxy  // HALF-FPS: Tell manager to map frame indices /2
         );
     } catch (const std::exception& ex) {
         std::cerr << "[VIDEO] Failed to create low cached decoder manager: " << ex.what() << std::endl;
         return false;
     }
+
+    SetPlayerLoadingProgress(osdPlayerId, 82);
+    UpdateOSDLoadingProgress(osdPlayerId, 82);
 
     // ADAPTIVE SEGMENT SIZING: Use GOP information from index
     // This optimizes performance for videos with different GOP structures (GOP 25, GOP 300, etc.)
@@ -447,10 +623,24 @@ bool FSTPVideoModuleWrapper::InitializeDecoders() {
         m_low_cached_manager->run();
     }
 
+    SetPlayerLoadingProgress(osdPlayerId, 88);
+    UpdateOSDLoadingProgress(osdPlayerId, 88);
+
     // V2: Streaming full-res decoder (only if video > 480p or not h264)
     // For ≤480p h264 video we use only proxy - save resources!
-    if (!m_use_original_as_proxy) {
+    // PENTIUM GOLD 7505 OPTIMIZATION: Always disable Full-Res decoder on this CPU
+    bool skip_fullres = m_use_original_as_proxy;
+    if (g_hardware_detection && g_hardware_detection->GetCPUInfo().is_pentium_gold_7505) {
+        skip_fullres = true;
+        std::cout << "[VIDEO] 🎯 Pentium Gold 7505: Full-Res decoder DISABLED (always use optimized proxy)" << std::endl;
+    }
+
+    if (!skip_fullres) {
         std::cout << "[VIDEO] InitializeDecoders: Creating FSTPFullResDecoderV2 (streaming mode)" << std::endl;
+
+        SetPlayerLoadingProgress(osdPlayerId, 92);
+        UpdateOSDLoadingProgress(osdPlayerId, 92);
+
         try {
             m_full_res_decoder = std::make_unique<FSTPFullResDecoderV2>(m_current_file);
 
@@ -469,10 +659,17 @@ bool FSTPVideoModuleWrapper::InitializeDecoders() {
             m_full_res_decoder.reset();
         }
     } else {
-        std::cout << "[VIDEO] ⚡ Skipping Full-Res decoder (using original ≤480p h264 as proxy - resource optimization)" << std::endl;
+        std::cout << "[VIDEO] ⚡ Skipping Full-Res decoder (resource optimization)" << std::endl;
+        // Still update progress for consistency
+        SetPlayerLoadingProgress(osdPlayerId, 92);
+        UpdateOSDLoadingProgress(osdPlayerId, 92);
     }
 
     // Progressive scan functionality removed
+
+    // Final progress before completion
+    SetPlayerLoadingProgress(osdPlayerId, 98);
+    UpdateOSDLoadingProgress(osdPlayerId, 98);
 
     m_decoders_active.store(true);
     return true;
@@ -523,6 +720,31 @@ bool FSTPVideoModuleWrapper::Stop() {
 
 void FSTPVideoModuleWrapper::SetSpeed(double speed) {
     m_speed.store(speed);
+
+    // PENTIUM 7505 OPTIMIZATION: Disable Full-Res decoder at speeds >= 2x
+    // At any speed > 1x, only low-res preview is shown, so full-res wastes CPU/memory
+    // Freeing these resources allows low-res decoder to keep up at 24x
+    if (m_full_res_decoder) {
+        static bool full_res_stopped = false;
+        double abs_speed = std::abs(speed);
+
+        if (abs_speed >= 2.0) {
+            // Fast playback: stop full-res decoder to free resources
+            if (!full_res_stopped) {
+                std::cout << "⚡ [SPEED OPT] Speed >= 2x (" << abs_speed << "x), stopping Full-Res decoder to free resources" << std::endl;
+                m_full_res_decoder->RequestStop();
+                full_res_stopped = true;
+            }
+        } else {
+            // Normal playback: resume full-res decoder
+            if (full_res_stopped) {
+                std::cout << "✅ [SPEED OPT] Speed < 2x (" << abs_speed << "x), resuming Full-Res decoder" << std::endl;
+                m_full_res_decoder->ClearStopRequest();
+                full_res_stopped = false;
+            }
+        }
+    }
+
     NotifyDecodersOfFrameChange(m_current_index.load());
 }
 
@@ -620,6 +842,11 @@ bool FSTPVideoModuleWrapper::IsFullBufferReady() const {
 
 void FSTPVideoModuleWrapper::SetAudioModule(FSTPAudioModuleWrapper* audio_module) {
     m_audio_module = audio_module;
+
+    // Notify audio module of video frame rate for frame alignment feature
+    if (m_audio_module && m_frame_rate > 0.0) {
+        m_audio_module->SetVideoFrameRate(m_frame_rate);
+    }
 }
 
 int FSTPVideoModuleWrapper::GetCurrentAudioFrame() const {
@@ -704,15 +931,30 @@ int FSTPVideoModuleWrapper::GetCurrentAudioFrame() const {
 
 void FSTPVideoModuleWrapper::SetInstanceID(int instance_id) {
     m_instance_id = instance_id;
+
+    // Register in global instance map for frame update notifications
+    if (instance_id >= 0) {
+        std::lock_guard<std::mutex> lock(g_instances_mutex);
+        g_video_instances[instance_id] = this;
+    }
 }
 
 int FSTPVideoModuleWrapper::GetInstanceID() const {
     return m_instance_id;
 }
 
+void FSTPVideoModuleWrapper::RequestFrameUpdate() {
+    m_force_frame_update.store(true);
+    m_last_displayed_frame = -1; // Invalidate cache to force re-render
+    // Also trigger render update
+    RequestForceRender();
+}
+
 bool FSTPVideoModuleWrapper::SubmitFrameToTexture(const std::shared_ptr<AVFrame>& frame,
                                                    int frame_number,
-                                                   double timestamp) {
+                                                   double timestamp,
+                                                   const std::shared_ptr<AVFrame>& prev_frame,
+                                                   const std::shared_ptr<AVFrame>& next_frame) {
     // ZERO-COPY: No profiling memcpy - it's gone!
 
     if (!frame) {
@@ -811,7 +1053,8 @@ bool FSTPVideoModuleWrapper::SubmitFrameToTexture(const std::shared_ptr<AVFrame>
 
         // ZERO-COPY: Send shared_ptr directly to pixel buffer manager
         // No memcpy! Only increment refcount on AVFrame
-        SubmitAVFrame(m_instance_id, frame_to_submit, timestamp, frame_number);
+        // Also pass adjacent frames for Betacam slow-motion compositing
+        SubmitAVFrame(m_instance_id, frame_to_submit, timestamp, frame_number, prev_frame, next_frame);
 
         if (ENABLE_VIDEO_DEBUG) {
             static int zero_copy_log = 0;
@@ -896,16 +1139,33 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         }
         return;
     }
+
+    // HALF-FPS PROXY: Map original frame index to half-fps index
+    // Example: original frames 0,1,2,3,4,5... → half-fps frames 0,0,1,1,2,2...
+    int actual_index = clamped;
+    std::vector<FSTP::FrameInfo>* frame_vector = m_frames;
+
+    if (m_is_half_fps_proxy && m_half_fps_frames) {
+        actual_index = clamped / 2; // Integer division maps pairs to same index
+        frame_vector = m_half_fps_frames;
+
+        static int mapping_log = 0;
+        if (mapping_log++ < 10) {
+            std::cout << "🎯 [HALF-FPS MAPPING] Original frame " << clamped
+                      << " → half-fps index " << actual_index << std::endl;
+        }
+    }
+
     // Use frames decoded by LowCachedDecoderManager (the proven solution)
-    if (clamped >= static_cast<int>(m_frames->size())) {
+    if (actual_index >= static_cast<int>(frame_vector->size())) {
         if (debug_call_count <= 3) {
-            std::cout << "[VIDEO] Frame index " << clamped << " out of range (size=" << m_frames->size() << ")" << std::endl;
+            std::cout << "[VIDEO] Frame index " << actual_index << " out of range (size=" << frame_vector->size() << ")" << std::endl;
         }
         return;
     }
 
-    // SAFE CHECK: make sure m_frames was not cleared between checks
-    if (!m_loaded || clamped >= static_cast<int>(m_frames->size())) {
+    // SAFE CHECK: make sure frame vector was not cleared between checks
+    if (!m_loaded || actual_index >= static_cast<int>(frame_vector->size())) {
         if (debug_call_count <= 3) {
             std::cout << "[VIDEO] Race condition detected: frames cleared during DisplayFrame" << std::endl;
         }
@@ -915,7 +1175,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     auto t_after_checks = std::chrono::high_resolution_clock::now();
     total_checks_us += std::chrono::duration_cast<std::chrono::microseconds>(t_after_checks - t_df_start).count();
 
-    FSTP::FrameInfo& info = (*m_frames)[clamped];
+    FSTP::FrameInfo& info = (*frame_vector)[actual_index];
     std::shared_ptr<AVFrame> frame;
 
     // CRITICAL: Use DECODED time (info.time_ms) if available,
@@ -1017,9 +1277,18 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     total_v2_get_us += std::chrono::duration_cast<std::chrono::microseconds>(t_after_v2_get - t_before_v2_get).count();
 
     // SAFE MUTEX: check that object is still valid
+    // Use try_lock to avoid deadlock with UnloadFile during file reload
     // auto t_before_mutex = std::chrono::high_resolution_clock::now();  // Unused - performance timing disabled
     try {
-        std::lock_guard<std::mutex> lock(info.mutex);
+        std::unique_lock<std::mutex> lock(info.mutex, std::try_to_lock);
+
+        // If we couldn't get the lock, skip this frame (UnloadFile might be cleaning it)
+        if (!lock.owns_lock()) {
+            if (debug_call_count <= 5) {
+                std::cout << "⚠️  [MUTEX] Couldn't lock frame " << clamped << " - skipping (file may be reloading)" << std::endl;
+            }
+            return;
+        }
 
         // DEBUG: Check frame state at mutex entry
         static int mutex_entry_counter = 0;
@@ -1109,48 +1378,55 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             fallback_search_counter++;
 
             // CRITICAL: Detect seek (large jump in time)
-            // If jump > 30 frames, this is explicit seek - need freeze frame
+            // If jump > 30 frames, this is explicit seek - wake up background decoder
             bool is_seek = false;
             int frame_distance = abs(clamped - m_last_good_frame_number);
             if (m_last_good_frame_number >= 0 && frame_distance > 30) {
                 is_seek = true;
-                if (debug_call_count <= 3 || fallback_search_counter % 30 == 1) {
-                    std::cout << "🔍 [SEEK DETECTED] Jump from frame " << m_last_good_frame_number
-                              << " to " << clamped << " (distance: " << frame_distance << " frames)" << std::endl;
+                // Wake up background thread to prioritize this segment
+                if (m_low_cached_manager) {
+                    m_low_cached_manager->notifyFrameChange();
                 }
             }
 
-            if (debug_call_count <= 3 || fallback_search_counter % 30 == 1) {
+            // Fallback search for nearest available frame (silent during seek)
+            if (!is_seek && (debug_call_count <= 3 || fallback_search_counter % 30 == 1)) {
                 std::cout << "⚠️  [FALLBACK SEARCH #" << fallback_search_counter << "] No decoded frame available for frame " << clamped
                           << " (is_decoding=" << info.is_decoding.load()
                           << ", is_ready=" << info.is_ready.load()
-                          << ", is_seek=" << is_seek << "), searching for nearest (SLOW!)" << std::endl;
+                          << "), searching for nearest..." << std::endl;
             }
 
             // FAST EXPONENTIAL SEARCH: Check frames at exponentially increasing distances
             // Instead of checking 1,2,3,4,5... (linear O(n) with n mutex locks)
             // Check 1,2,4,8,16,32... (logarithmic O(log n) with much fewer mutex locks)
             //
-            // IMPORTANT: When seeking, do not use fallback search - instead use freeze frame
+            // IMPROVED: Allow wider search even when seeking to avoid freeze frame
+            // HALF-FPS AWARE: Search in actual_index space (half-fps if applicable)
             std::shared_ptr<AVFrame> nearest_frame = nullptr;
             int found_idx = -1;
-            int search_radius = is_seek ? 0 : 64; // Disable search when seeking!
+            int search_radius = is_seek ? 256 : 64; // Allow wider search when seeking to find ANY frame
 
             // Exponential backward search (prefer backward - more likely to be decoded)
             // Try: -1, -2, -4, -8, -16, -32, -64
+            // CRITICAL: Use try_lock to avoid deadlock with UnloadFile during file reload
             for (int step = 1; step <= search_radius; step *= 2) {
-                int idx = clamped - step;
-                if (idx >= 0 && idx < static_cast<int>(m_frames->size())) {
-                    // Quick check without lock first (peek at atomic state)
-                    // This avoids expensive mutex locks on empty frames
-                    std::lock_guard<std::mutex> search_lock((*m_frames)[idx].mutex);
-                    if ((*m_frames)[idx].low_res_frame &&
-                        (*m_frames)[idx].low_res_frame->data[0]) {
-                        nearest_frame = (*m_frames)[idx].low_res_frame;
-                        found_idx = idx;
+                // Check file_reloading before each lock attempt to avoid race with UnloadFile
+                if (m_file_reloading.load()) break;
+
+                int search_idx = actual_index - step;
+                if (search_idx >= 0 && search_idx < static_cast<int>(frame_vector->size())) {
+                    // Use try_lock to avoid blocking if UnloadFile is clearing this frame
+                    std::unique_lock<std::mutex> search_lock((*frame_vector)[search_idx].mutex, std::try_to_lock);
+                    if (!search_lock.owns_lock()) continue;  // Skip if can't get lock
+
+                    if ((*frame_vector)[search_idx].low_res_frame &&
+                        (*frame_vector)[search_idx].low_res_frame->data[0]) {
+                        nearest_frame = (*frame_vector)[search_idx].low_res_frame;
+                        found_idx = search_idx;
                         if (debug_call_count <= 3) {
-                            std::cout << "⚡ [FAST SEARCH] Found backward frame " << idx
-                                      << " (offset -" << step << ") for " << clamped << std::endl;
+                            std::cout << "⚡ [FAST SEARCH] Found backward frame " << search_idx
+                                      << " (offset -" << step << ") for " << actual_index << std::endl;
                         }
                         break;
                     }
@@ -1159,18 +1435,24 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
 
             // If not found backward, try exponential forward search
             // Try: +1, +2, +4, +8, +16, +32, +64
-            if (!nearest_frame) {
+            // CRITICAL: Use try_lock to avoid deadlock with UnloadFile during file reload
+            if (!nearest_frame && !m_file_reloading.load()) {
                 for (int step = 1; step <= search_radius; step *= 2) {
-                    int idx = clamped + step;
-                    if (idx >= 0 && idx < static_cast<int>(m_frames->size())) {
-                        std::lock_guard<std::mutex> search_lock((*m_frames)[idx].mutex);
-                        if ((*m_frames)[idx].low_res_frame &&
-                            (*m_frames)[idx].low_res_frame->data[0]) {
-                            nearest_frame = (*m_frames)[idx].low_res_frame;
-                            found_idx = idx;
+                    // Check file_reloading before each lock attempt
+                    if (m_file_reloading.load()) break;
+
+                    int search_idx = actual_index + step;
+                    if (search_idx >= 0 && search_idx < static_cast<int>(frame_vector->size())) {
+                        std::unique_lock<std::mutex> search_lock((*frame_vector)[search_idx].mutex, std::try_to_lock);
+                        if (!search_lock.owns_lock()) continue;  // Skip if can't get lock
+
+                        if ((*frame_vector)[search_idx].low_res_frame &&
+                            (*frame_vector)[search_idx].low_res_frame->data[0]) {
+                            nearest_frame = (*frame_vector)[search_idx].low_res_frame;
+                            found_idx = search_idx;
                             if (debug_call_count <= 3) {
-                                std::cout << "⚡ [FAST SEARCH] Found forward frame " << idx
-                                          << " (offset +" << step << ") for " << clamped << std::endl;
+                                std::cout << "⚡ [FAST SEARCH] Found forward frame " << search_idx
+                                          << " (offset +" << step << ") for " << actual_index << std::endl;
                             }
                             break;
                         }
@@ -1180,18 +1462,25 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
 
             // If exponential search found nothing, try immediate neighbors (linear search within small range)
             // This catches frames that were skipped by exponential steps (e.g., -3, -5, -6, -7)
-            if (!nearest_frame) {
-                for (int offset = 1; offset <= 8 && (clamped - offset) >= 0; offset++) {
-                    int idx = clamped - offset;
-                    if (idx < static_cast<int>(m_frames->size())) {
-                        std::lock_guard<std::mutex> search_lock((*m_frames)[idx].mutex);
-                        if ((*m_frames)[idx].low_res_frame &&
-                            (*m_frames)[idx].low_res_frame->data[0]) {
-                            nearest_frame = (*m_frames)[idx].low_res_frame;
-                            found_idx = idx;
+            // HALF-FPS AWARE: Search in actual_index space
+            // CRITICAL: Use try_lock to avoid deadlock with UnloadFile during file reload
+            if (!nearest_frame && !m_file_reloading.load()) {
+                for (int offset = 1; offset <= 8 && (actual_index - offset) >= 0; offset++) {
+                    // Check file_reloading before each lock attempt
+                    if (m_file_reloading.load()) break;
+
+                    int search_idx = actual_index - offset;
+                    if (search_idx < static_cast<int>(frame_vector->size())) {
+                        std::unique_lock<std::mutex> search_lock((*frame_vector)[search_idx].mutex, std::try_to_lock);
+                        if (!search_lock.owns_lock()) continue;  // Skip if can't get lock
+
+                        if ((*frame_vector)[search_idx].low_res_frame &&
+                            (*frame_vector)[search_idx].low_res_frame->data[0]) {
+                            nearest_frame = (*frame_vector)[search_idx].low_res_frame;
+                            found_idx = search_idx;
                             if (debug_call_count <= 3) {
-                                std::cout << "⚡ [NEIGHBOR SEARCH] Found nearby backward frame " << idx
-                                          << " for " << clamped << std::endl;
+                                std::cout << "⚡ [NEIGHBOR SEARCH] Found nearby backward frame " << search_idx
+                                          << " for " << actual_index << std::endl;
                             }
                             break;
                         }
@@ -1211,8 +1500,8 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                 // CRITICAL: use time_base from FrameInfo, not from AVFrame!
                 double found_frame_time = -1.0;
 
-                // Get FrameInfo for found frame
-                const FSTP::FrameInfo& found_info = (*m_frames)[found_idx];
+                // Get FrameInfo for found frame (use correct vector)
+                const FSTP::FrameInfo& found_info = (*frame_vector)[found_idx];
 
                 // Try best_effort_timestamp (most accurate)
                 if (nearest_frame->best_effort_timestamp != AV_NOPTS_VALUE) {
@@ -1283,46 +1572,41 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             }
 
             // If no suitable frame found or seek detected, use freeze frame
-            if (!nearest_frame) {
+            // CRITICAL: Check file_reloading to avoid race with UnloadFile
+            if (!nearest_frame && !m_file_reloading.load()) {
                 // FREEZE FRAME: Hold last good frame while needed segment is being decoded
                 static int freeze_frame_counter = 0;
                 freeze_frame_counter++;
 
-                if (is_seek) {
-                    // When seeking - this is expected behavior
-                    if (freeze_frame_counter % 10 == 1 || debug_call_count <= 3) {
-                        std::cout << "🧊 [FREEZE FRAME] Seek detected, holding last good frame "
-                                  << m_last_good_frame_number
-                                  << " while decoding segment for frame " << clamped << std::endl;
-                    }
-                } else {
-                    // If not seek but frame unavailable - decoder is lagging
-                    if (freeze_frame_counter % 10 == 1 || debug_call_count <= 3) {
-                        std::cout << "🧊 [FREEZE FRAME #" << freeze_frame_counter
-                                  << "] No suitable frame for " << clamped
-                                  << ", holding last good frame " << m_last_good_frame_number
-                                  << " (decoder catching up...)" << std::endl;
-                    }
+                // Silently hold last good frame while decoder loads the segment
+                // (freeze frame is expected during seek, logging disabled to reduce noise)
+
+                // HALF-FPS AWARE: Calculate last good frame index in current coordinate space
+                int last_good_idx = m_last_good_frame_number;
+                if (m_is_half_fps_proxy && m_half_fps_frames) {
+                    last_good_idx = m_last_good_frame_number / 2;
                 }
 
                 // Try to use the last good frame if available
-                if (m_last_good_frame_number >= 0 && m_last_good_frame_number < static_cast<int>(m_frames->size())) {
-                    std::lock_guard<std::mutex> last_lock((*m_frames)[m_last_good_frame_number].mutex);
-                    if ((*m_frames)[m_last_good_frame_number].low_res_frame) {
-                        frame = (*m_frames)[m_last_good_frame_number].low_res_frame;
+                // Use try_lock to avoid deadlock with UnloadFile during file reload
+                if (!m_file_reloading.load() && last_good_idx >= 0 && last_good_idx < static_cast<int>(frame_vector->size())) {
+                    std::unique_lock<std::mutex> last_lock((*frame_vector)[last_good_idx].mutex, std::try_to_lock);
+                    if (last_lock.owns_lock() && (*frame_vector)[last_good_idx].low_res_frame) {
+                        frame = (*frame_vector)[last_good_idx].low_res_frame;
                     }
                 }
 
                 // If still no frame, keep showing last good frame (sticky frame for pause)
-                if (!frame && m_last_good_frame_number >= 0 && m_last_good_frame_number < static_cast<int>(m_frames->size())) {
+                // Use try_lock to avoid deadlock with UnloadFile during file reload
+                if (!frame && !m_file_reloading.load() && last_good_idx >= 0 && last_good_idx < static_cast<int>(frame_vector->size())) {
                     // Force re-submit last good frame to prevent black screen during pause
-                    std::lock_guard<std::mutex> last_lock((*m_frames)[m_last_good_frame_number].mutex);
-                    if ((*m_frames)[m_last_good_frame_number].low_res_frame) {
-                        if (SubmitFrameToTexture((*m_frames)[m_last_good_frame_number].low_res_frame,
+                    std::unique_lock<std::mutex> last_lock((*frame_vector)[last_good_idx].mutex, std::try_to_lock);
+                    if (last_lock.owns_lock() && (*frame_vector)[last_good_idx].low_res_frame) {
+                        if (SubmitFrameToTexture((*frame_vector)[last_good_idx].low_res_frame,
                                                m_last_good_frame_number, timestamp)) {
                             if (debug_call_count <= 3) {
                                 std::cout << "[VIDEO] Re-submitted sticky frame " << m_last_good_frame_number
-                                          << " to prevent black screen" << std::endl;
+                                          << " (mapped to idx " << last_good_idx << ") to prevent black screen" << std::endl;
                             }
                         }
                     }
@@ -1361,12 +1645,102 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
 
     auto t_before_submit = std::chrono::high_resolution_clock::now();
 
-    // Submit real decoded frame to texture interface
-    if (SubmitFrameToTexture(frame, clamped, timestamp)) {
+    // Get adjacent frames for Betacam slow-motion compositing
+    // These are frames at index N-1 (prev) and N+1 (next)
+    std::shared_ptr<AVFrame> prev_frame = nullptr;
+    std::shared_ptr<AVFrame> next_frame = nullptr;
+
+    // Only fetch adjacent frames when at slow speed (compositing is needed)
+    // NOTE: Uses try_lock to avoid deadlock with UnloadFile during file reload
+    double actual_speed_for_adjacent = 0.0;
+    if (m_audio_module) {
+        actual_speed_for_adjacent = m_audio_module->GetActualSpeed();
+    }
+
+    if (actual_speed_for_adjacent <= 1.0 && !m_file_reloading.load()) {
+        // Calculate frame duration for adjacent timestamp calculation
+        double fps = (m_frame_rate > 0) ? m_frame_rate : 25.0;
+        double frame_duration = 1.0 / fps;
+
+        // Check if current frame came from full-res decoder (high resolution)
+        bool using_full_res = frame && (frame->height > 480);
+
+        if (using_full_res && m_full_res_decoder && !m_file_reloading.load()) {
+            // FULL-RES MODE: Get adjacent frames from full-res decoder
+            // Use GetFrameForTime with adjacent timestamps
+            // Skip if file is reloading to avoid potential blocking
+            try {
+                double prev_time = timestamp - frame_duration;
+                double next_time = timestamp + frame_duration;
+
+                if (prev_time >= 0 && !m_file_reloading.load()) {
+                    prev_frame = m_full_res_decoder->GetFrameForTime(prev_time);
+                }
+                if (!m_file_reloading.load()) {
+                    next_frame = m_full_res_decoder->GetFrameForTime(next_time);
+                }
+
+                // Validate: adjacent frames must be different from current
+                if (prev_frame && frame) {
+                    // Check if it's actually a different frame (compare PTS or data ptr)
+                    if (prev_frame.get() == frame.get() || prev_frame->data[0] == frame->data[0]) {
+                        prev_frame = nullptr;  // Same frame, not useful for compositing
+                    }
+                }
+                if (next_frame && frame) {
+                    if (next_frame.get() == frame.get() || next_frame->data[0] == frame->data[0]) {
+                        next_frame = nullptr;
+                    }
+                }
+            } catch (...) {
+                prev_frame = nullptr;
+                next_frame = nullptr;
+            }
+        } else if (frame_vector && actual_index >= 0 && !m_file_reloading.load()) {
+            // PROXY MODE: Get adjacent frames from frame_vector
+            // CRITICAL: Use try_lock to avoid deadlock with UnloadFile
+            // If mutex is held by UnloadFile, we just skip the adjacent frame
+            try {
+                // Get previous frame (N-1)
+                int prev_idx = actual_index - 1;
+                if (prev_idx >= 0 && prev_idx < static_cast<int>(frame_vector->size()) && !m_file_reloading.load()) {
+                    std::unique_lock<std::mutex> prev_lock((*frame_vector)[prev_idx].mutex, std::try_to_lock);
+                    if (prev_lock.owns_lock()) {
+                        if ((*frame_vector)[prev_idx].low_res_frame &&
+                            (*frame_vector)[prev_idx].low_res_frame->data[0]) {
+                            prev_frame = (*frame_vector)[prev_idx].low_res_frame;
+                        }
+                    }
+                    // If lock failed, skip this frame (UnloadFile might be holding it)
+                }
+
+                // Get next frame (N+1) - use try_lock to avoid blocking
+                int next_idx = actual_index + 1;
+                if (next_idx >= 0 && next_idx < static_cast<int>(frame_vector->size()) && !m_file_reloading.load()) {
+                    std::unique_lock<std::mutex> next_lock((*frame_vector)[next_idx].mutex, std::try_to_lock);
+                    if (next_lock.owns_lock()) {
+                        if ((*frame_vector)[next_idx].low_res_frame &&
+                            (*frame_vector)[next_idx].low_res_frame->data[0]) {
+                            next_frame = (*frame_vector)[next_idx].low_res_frame;
+                        }
+                    }
+                    // If lock failed, skip this frame
+                }
+            } catch (...) {
+                prev_frame = nullptr;
+                next_frame = nullptr;
+            }
+        }
+    }
+
+    // Submit real decoded frame to texture interface (with adjacent frames for compositing)
+    if (SubmitFrameToTexture(frame, clamped, timestamp, prev_frame, next_frame)) {
         m_last_good_frame_number = clamped;
         if (debug_call_count <= 3) {
             std::cout << "[VIDEO] Submitted real decoded frame " << clamped
-                      << " (time=" << std::fixed << std::setprecision(3) << timestamp << "s)" << std::endl;
+                      << " (time=" << std::fixed << std::setprecision(3) << timestamp << "s)"
+                      << ", prev=" << (prev_frame ? "YES" : "NO")
+                      << ", next=" << (next_frame ? "YES" : "NO") << std::endl;
         }
     }
 
@@ -1443,8 +1817,24 @@ void FSTPVideoModuleWrapper::UpdateVideoFrame() {
     }
 
     // OPTIMIZATION: SKIP RENDERING IDENTICAL FRAMES
-    // If frame hasn't changed since last render - skip
-    if (audioFrame == m_last_displayed_frame) {
+    // If frame hasn't changed since last render - skip (unless forced update)
+    bool force_update = m_force_frame_update.exchange(false); // Reset flag atomically
+
+    // BETACAM EFFECT: Don't skip frames at pause/slow motion or shuttle speeds
+    // The Betacam effect needs continuous rendering to show the noise stripe
+    // even when the video frame itself doesn't change
+    // Use ACTUAL speed from audio module, not target speed (m_speed)
+    double actual_speed = 0.0;
+    if (m_audio_module) {
+        actual_speed = m_audio_module->GetActualSpeed();
+    }
+    double abs_speed = std::abs(actual_speed);
+    bool betacam_speed_range = (abs_speed < 0.9 || abs_speed > 1.1);
+    if (betacam_speed_range) {
+        force_update = true;
+    }
+
+    if (audioFrame == m_last_displayed_frame && !force_update) {
         // Frame unchanged - skip all rendering and notifications
         return;
     }
@@ -1467,6 +1857,9 @@ void FSTPVideoModuleWrapper::UpdateVideoFrame() {
     // The inspector updates automatically via its own timer (FSTPInspectorView.swift)
     // No need to push updates from here anymore
 
+    // Update OSD decoded frames indicator (top bar)
+    UpdateOSDDecodedFramesMap();
+
     perf_samples++;
 
     // Progressive scan removed
@@ -1476,6 +1869,33 @@ void FSTPVideoModuleWrapper::UpdateVideoFrame() const {
     // Don't add FSTP_COUNT_CALL here, as this function just delegates to non-const version
     // which already has the counter. Otherwise we get double counting!
     const_cast<FSTPVideoModuleWrapper*>(this)->UpdateVideoFrame();
+}
+
+void FSTPVideoModuleWrapper::UpdateOSDDecodedFramesMap() const {
+    if (!m_loaded || !m_frames) {
+        return;
+    }
+
+    // Throttle updates to once per 100ms
+    static auto last_update = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_update);
+    if (elapsed.count() < 100) {
+        return;
+    }
+    last_update = now;
+
+    // Build decoded frames map
+    int total_frames = static_cast<int>(m_frames->size());
+    std::vector<bool> decoded_map(total_frames, false);
+
+    for (int i = 0; i < total_frames; ++i) {
+        const auto& frame_info = (*m_frames)[i];
+        decoded_map[i] = (frame_info.low_res_frame != nullptr);
+    }
+
+    // Update OSD
+    UpdateOSDDecodedFrames(m_instance_id, decoded_map, total_frames);
 }
 
 bool FSTPVideoModuleWrapper::GetCurrentFrame(uint8_t** frame_data, int& width, int& height) const {

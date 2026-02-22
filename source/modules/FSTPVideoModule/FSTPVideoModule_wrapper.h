@@ -45,12 +45,21 @@ private:
 
     // Optimization: track last rendered frame to skip identical ones
     mutable int m_last_displayed_frame = -1;
+    mutable std::atomic<bool> m_force_frame_update{false}; // Force update after segment decode
 
     std::unique_ptr<FSTPSimpleVideoIndex> m_frame_index;
     // CRITICAL FIX: Use raw pointer to prevent destructor cleanup
     // Problem: vector destructor calls shared_ptr destructors → heap corruption
     // Solution: Allocate dynamically and NEVER free (leak on exit acceptable)
     std::vector<FSTP::FrameInfo>* m_frames = nullptr;
+
+    // HALF-FPS PROXY OPTIMIZATION: Separate index for 30fps proxy from 60fps original
+    // When proxy is 30fps from 60fps source, create dedicated half-size index
+    // This avoids 50% EMPTY slots in main index which trigger expensive fallback search
+    // Mapping: original_frame_idx → half_fps_idx = original_frame_idx / 2
+    std::vector<FSTP::FrameInfo>* m_half_fps_frames = nullptr;
+    bool m_is_half_fps_proxy = false; // Flag: proxy is 30fps from 60fps original
+
     std::atomic<int> m_current_index{0};
     std::atomic<bool> m_decoders_active{false};
     std::atomic<bool> m_file_reloading{false}; // Protection from race condition when changing file
@@ -75,7 +84,9 @@ private:
     void NotifyDecodersOfFrameChange(int frame_number);
     bool SubmitFrameToTexture(const std::shared_ptr<AVFrame>& frame,
                               int frame_number,
-                              double timestamp);
+                              double timestamp,
+                              const std::shared_ptr<AVFrame>& prev_frame = nullptr,
+                              const std::shared_ptr<AVFrame>& next_frame = nullptr);
 
 public:
     FSTPVideoModuleWrapper();
@@ -126,9 +137,14 @@ public:
     int GetCurrentAudioFrame() const;
 
     void SetInstanceID(int instance_id);
+
+    // Force frame update after segment decode (for seek responsiveness)
+    void RequestFrameUpdate();
     int GetInstanceID() const;
 
     void DisplayFrame(int frame_number);
     void UpdateVideoFrame();
     void UpdateVideoFrame() const;
+
+    void UpdateOSDDecodedFramesMap() const;
 };

@@ -129,7 +129,7 @@ bool FSTPRemote::CreateSharedMemory() {
         PAGE_READWRITE,
         0,
         sizeof(RemoteCommand),
-        L"Local\\\\TapeXPlayerControl"
+        "Local\\TapeXPlayerControl"
     );
 
     if (m_mapping_handle == NULL) {
@@ -240,7 +240,7 @@ void FSTPRemote::StartProcessingThread() {
     m_thread_running = true;
     m_processing_thread = std::thread(&FSTPRemote::CommandProcessingThread, this);
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(__MINGW32__)
     SetThreadPriority(m_processing_thread.native_handle(), THREAD_PRIORITY_HIGHEST);
 #else
     struct sched_param param;

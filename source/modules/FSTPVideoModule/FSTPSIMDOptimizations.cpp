@@ -1,9 +1,9 @@
 #include "FSTPSIMDOptimizations.h"
+#include "FSTPHardwareDetection.h"  // NEW: Use unified hardware detection
 #include <iostream>
 #include <algorithm>
 
 extern "C" {
-#include <libavutil/cpu.h>
 #include <libavutil/opt.h>
 }
 
@@ -20,55 +20,66 @@ bool SIMDOptimizations::features_detected = false;
 void SIMDOptimizations::DetectCPUFeatures() {
     if (features_detected) return;
 
+    // ========================================
+    // UNIFIED HARDWARE DETECTION (NEW!)
+    // ========================================
+    // Use centralized FSTPHardwareDetection instead of FFmpeg av_get_cpu_flags()
+
+    if (g_hardware_detection) {
+        const FSTPCPUInfo& cpu_info = g_hardware_detection->GetCPUInfo();
+
+        // Map CPU info to SIMD flags
+        sse2_available = cpu_info.has_sse2;
+        sse41_available = cpu_info.has_sse4_2;  // Note: SSE4.2 includes SSE4.1
+        avx_available = cpu_info.has_avx;
+        avx2_available = cpu_info.has_avx2;
+
+        // FORCE DISABLE AVX-512 due to heap corruption on Intel CPUs
+        // AVX-512 requires 64-byte alignment which causes issues with AVFrame allocation
+        avx512_available = false;
+
+        features_detected = true;
+
+        // Log detected features for debugging
+        if (cpu_info.is_apple_silicon) {
+            // Apple Silicon - uses NEON
+            std::cout << "🔧 [SIMD] CPU Features detected (Apple Silicon ARM64):" << std::endl;
+            std::cout << "   ARM NEON: ✅ (always available)" << std::endl;
+            std::cout << "   Optimal SIMD Level: NEON" << std::endl;
+        } else if (cpu_info.architecture == "x86_64") {
+            // x86_64 Intel/AMD
+            std::cout << "🔧 [SIMD] CPU Features detected (x86_64):" << std::endl;
+            std::cout << "   SSE2: " << (sse2_available ? "✅" : "❌") << std::endl;
+            std::cout << "   SSE4.1: " << (sse41_available ? "✅" : "❌") << std::endl;
+            std::cout << "   AVX: " << (avx_available ? "✅" : "❌") << std::endl;
+            std::cout << "   AVX2: " << (avx2_available ? "✅" : "❌") << std::endl;
+            std::cout << "   AVX-512: ❌ (DISABLED - stability)" << std::endl;
+            std::cout << "   Optimal SIMD Level: " << GetOptimalSIMDLevel() << std::endl;
+        } else {
+            // Other architectures
+            std::cout << "🔧 [SIMD] CPU Features detected (" << cpu_info.architecture << "):" << std::endl;
+            std::cout << "   Optimal SIMD Level: " << GetOptimalSIMDLevel() << std::endl;
+        }
+    } else {
+        // Fallback: g_hardware_detection not initialized
+        std::cerr << "⚠️  [SIMD] g_hardware_detection not initialized - using defaults" << std::endl;
+
+        // Defaults: assume basic SIMD support on x86_64
 #ifdef FSTP_SIMD_X86
-    // x86/x64 - Use FFmpeg's CPU detection
-    int cpu_flags = av_get_cpu_flags();
-
-    sse2_available = (cpu_flags & AV_CPU_FLAG_SSE2) != 0;
-    sse41_available = (cpu_flags & AV_CPU_FLAG_SSE4) != 0;
-    avx_available = (cpu_flags & AV_CPU_FLAG_AVX) != 0;
-    avx2_available = (cpu_flags & AV_CPU_FLAG_AVX2) != 0;
-
-    // FORCE DISABLE AVX-512 due to heap corruption on Intel CPUs
-    // AVX-512 requires 64-byte alignment which causes issues with AVFrame allocation
-    avx512_available = false;
-
-    features_detected = true;
-
-    // Log detected features for debugging
-    std::cout << "🔧 [SIMD] CPU Features detected (x86/x64):" << std::endl;
-    std::cout << "   SSE2: " << (sse2_available ? "✅" : "❌") << std::endl;
-    std::cout << "   SSE4.1: " << (sse41_available ? "✅" : "❌") << std::endl;
-    std::cout << "   AVX: " << (avx_available ? "✅" : "❌") << std::endl;
-    std::cout << "   AVX2: " << (avx2_available ? "✅" : "❌") << std::endl;
-    std::cout << "   AVX-512: ❌ (DISABLED - stability)" << std::endl;
-    std::cout << "   Optimal SIMD Level: " << GetOptimalSIMDLevel() << std::endl;
-#elif defined(FSTP_SIMD_ARM_NEON)
-    // ARM64 - NEON is always available on ARM64
-    sse2_available = false;
-    sse41_available = false;
-    avx_available = false;
-    avx2_available = false;
-    avx512_available = false;
-
-    features_detected = true;
-
-    // Log detected features for debugging
-    std::cout << "🔧 [SIMD] CPU Features detected (ARM64):" << std::endl;
-    std::cout << "   ARM NEON: ✅ (always available on ARM64)" << std::endl;
-    std::cout << "   Optimal SIMD Level: ARM NEON" << std::endl;
+        sse2_available = true;   // SSE2 is baseline for x86_64
+        sse41_available = false;
+        avx_available = false;
+        avx2_available = false;
+        avx512_available = false;
 #else
-    // No SIMD support
-    sse2_available = false;
-    sse41_available = false;
-    avx_available = false;
-    avx2_available = false;
-    avx512_available = false;
-
-    features_detected = true;
-
-    std::cout << "⚠️  [SIMD] No SIMD support detected" << std::endl;
+        sse2_available = false;
+        sse41_available = false;
+        avx_available = false;
+        avx2_available = false;
+        avx512_available = false;
 #endif
+        features_detected = true;
+    }
 }
 
 void SIMDOptimizations::OptimizeFrameAlignment(AVFrame* frame) {

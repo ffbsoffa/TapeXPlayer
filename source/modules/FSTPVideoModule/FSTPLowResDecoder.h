@@ -10,6 +10,7 @@
 #include <mutex>
 #include <thread>
 #include "FSTPVideoFrame.h"
+#include "FSTPAVFramePool.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -65,6 +66,7 @@ private:
         bool initialized = false;
         bool hw_accel_enabled = false;
         AVBufferRef* hw_device_ctx = nullptr;
+        AVRational sar = {1, 1};  // Sample Aspect Ratio from stream
 
         void cleanup() {
             if (codecCtx) {
@@ -97,8 +99,10 @@ private:
     int width_ = 0;
     int height_ = 0;
     AVPixelFormat pixFmt_ = AV_PIX_FMT_NONE;
+    AVRational sar_ = {1, 1};  // Sample Aspect Ratio from stream (for anamorphic content)
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> is_decoding_{false};
+    std::atomic<bool> cleanup_called_{false};  // Protection from double cleanup
     AVBufferRef* global_hw_device_ctx_ = nullptr;
     bool hw_accel_available_ = false;
 
@@ -117,6 +121,16 @@ private:
     // race condition in av_buffer_unref() leading to double-free corruption
     // This mutex serializes cleanup to prevent the race
     static std::mutex frameCleanupMutex_;
+
+    // OPTIMIZATION: Frame pool for buffer reuse (avoid av_frame_clone overhead)
+    // Per-file pool (each LowResDecoder instance gets its own pool)
+    // 480x360 YUV420P = ~259 KB per frame (after anamorphic optimization)
+    // Pool saves 155 MB copying per 600-frame segment!
+    //
+    // NOTE: Only CPU frames (YUV420P) use pool.
+    // HW frames (NV12) can't use pool because av_frame_copy() fails with NV12.
+    // av_frame_clone() for HW frames is already efficient (zero-copy via refcounting).
+    std::unique_ptr<AVFramePool> frame_pool_;
 };
 
 } // namespace FSTP

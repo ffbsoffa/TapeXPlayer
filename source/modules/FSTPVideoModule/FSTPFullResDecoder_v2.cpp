@@ -1,6 +1,7 @@
 #include "FSTPFullResDecoder_v2.h"
 #include "FSTPPerformanceProfiler.h"
 #include "FSTPVideoOptimizations.h"
+#include "FSTPHardwareDetection.h"  // NEW: Unified hardware detection
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
@@ -8,7 +9,9 @@
 #include <atomic>
 #include <thread>
 #include <pthread.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -19,6 +22,7 @@
 
 // Debug control: set to true to enable verbose logging
 static constexpr bool ENABLE_FULLRES_V2_DEBUG = false;
+static constexpr bool ENABLE_FULLRES_V2_PROFILING = false;  // CPU/Buffer statistics every 100 iterations
 
 // Global counter of active V2 decoders (for multi-instance adaptation)
 static std::atomic<int> g_active_decoder_count{0};
@@ -242,42 +246,79 @@ bool FSTPFullResDecoderV2::Initialize() {
 }
 
 bool FSTPFullResDecoderV2::InitializeHardwareAcceleration(const AVCodec* codec) {
-    // Hardware acceleration: VideoToolbox (macOS) or VA-API (Linux)
+    // ========================================
+    // UNIFIED HARDWARE DETECTION (NEW!)
+    // ========================================
+    // Use centralized FSTPHardwareDetection instead of inline detection
+
     if (codec_params_->codec_id != AV_CODEC_ID_H264 && codec_params_->codec_id != AV_CODEC_ID_HEVC) {
         std::cout << "ℹ️  [FULL-RES V2] Codec doesn't support hardware acceleration, using software" << std::endl;
         return false;
     }
 
+    if (!g_hardware_detection) {
+        std::cerr << "⚠️  [FULL-RES V2] g_hardware_detection not initialized, using software" << std::endl;
+        return false;
+    }
+
+    // Get decoder strategy from unified detection
+    FSTPDecoderStrategy strategy = g_hardware_detection->GetDecoderStrategy(
+        codec_params_->width,
+        codec_params_->height,
+        codec_params_->codec_id,
+        1.0  // Normal playback speed
+    );
+
+    std::cout << "🎯 [FULL-RES V2] Strategy: " << strategy.strategy_reason << std::endl;
+
+    if (!strategy.use_hw_accel) {
+        std::cout << "ℹ️  [FULL-RES V2] Strategy recommends software decode" << std::endl;
+        return false;
+    }
+
+    // Initialize hardware acceleration based on strategy
     int ret = -1;
 
-#ifdef __APPLE__
-    // macOS: Use VideoToolbox
-    ret = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0);
+    if (strategy.hw_accel_type == FSTPHWAccelType::VIDEOTOOLBOX) {
+        // macOS VideoToolbox
+        ret = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nullptr, nullptr, 0);
+        if (ret >= 0) {
+            hw_pix_fmt_ = AV_PIX_FMT_VIDEOTOOLBOX;
+            std::cout << "✅ [FULL-RES V2] VideoToolbox hardware acceleration enabled" << std::endl;
+        }
+    } else if (strategy.hw_accel_type == FSTPHWAccelType::VAAPI) {
+        // Linux VA-API
+        const char* device = strategy.hw_device_path.empty() ? "/dev/dri/renderD128" : strategy.hw_device_path.c_str();
+        ret = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VAAPI, device, nullptr, 0);
+        if (ret >= 0) {
+            hw_pix_fmt_ = AV_PIX_FMT_VAAPI;
+            std::cout << "✅ [FULL-RES V2] VA-API hardware acceleration enabled (" << device << ")" << std::endl;
+        }
+    } else if (strategy.hw_accel_type == FSTPHWAccelType::D3D11VA ||
+               strategy.hw_accel_type == FSTPHWAccelType::DXVA2) {
+        // Windows Direct3D 11 Video Acceleration
+        ret = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
+        if (ret >= 0) {
+            hw_pix_fmt_ = AV_PIX_FMT_D3D11;
+            std::cout << "✅ [FULL-RES V2] D3D11VA hardware acceleration enabled" << std::endl;
+        }
+    }
+
     if (ret < 0) {
-        std::cerr << "⚠️  [FULL-RES V2] Failed to create VideoToolbox device" << std::endl;
+        std::cerr << "⚠️  [FULL-RES V2] Hardware acceleration init failed, using software" << std::endl;
+        char av_errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_make_error_string(av_errbuf, AV_ERROR_MAX_STRING_SIZE, ret);
+        std::cerr << "      Error code: " << ret << " (" << av_errbuf << ")" << std::endl;
         return false;
     }
-    hw_pix_fmt_ = AV_PIX_FMT_VIDEOTOOLBOX;
-    std::cout << "✅ [FULL-RES V2] VideoToolbox hardware acceleration enabled" << std::endl;
 
-#elif defined(__linux__)
-    // Linux: Use VA-API (modern Intel GPU driver, Tiger Lake and newer)
-    ret = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128", nullptr, 0);
-    if (ret < 0) {
-        std::cerr << "⚠️  [FULL-RES V2] VA-API init failed, falling back to software decode" << std::endl;
-        std::cerr << "      Error code: " << ret << " (" << av_err2str(ret) << ")" << std::endl;
-        return false;
-    }
-    hw_pix_fmt_ = AV_PIX_FMT_VAAPI;
-    std::cout << "✅ [FULL-RES V2] VA-API hardware acceleration enabled (Intel GPU)" << std::endl;
-
-#else
-    std::cerr << "⚠️  [FULL-RES V2] Hardware acceleration not supported on this platform" << std::endl;
-    return false;
-#endif
-
+    // Apply decoder strategy settings
     codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
     codec_ctx_->get_format = FSTPFullResDecoderV2::GetHWFormat;
+    codec_ctx_->thread_count = strategy.thread_count;
+    codec_ctx_->thread_type = strategy.thread_type;
+    codec_ctx_->flags |= strategy.codec_flags;
+    codec_ctx_->flags2 |= strategy.codec_flags2;
 
     return true;
 }
@@ -285,13 +326,11 @@ bool FSTPFullResDecoderV2::InitializeHardwareAcceleration(const AVCodec* codec) 
 AVPixelFormat FSTPFullResDecoderV2::GetHWFormat(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
     for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
 #ifdef __APPLE__
-        if (*p == AV_PIX_FMT_VIDEOTOOLBOX) {
-            return *p;
-        }
+        if (*p == AV_PIX_FMT_VIDEOTOOLBOX) return *p;
 #elif defined(__linux__)
-        if (*p == AV_PIX_FMT_VAAPI) {
-            return *p;
-        }
+        if (*p == AV_PIX_FMT_VAAPI)         return *p;
+#elif defined(_WIN32)
+        if (*p == AV_PIX_FMT_D3D11)         return *p;
 #endif
     }
     return AV_PIX_FMT_NONE;
@@ -610,7 +649,8 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
                 AVFrame* temp_hw_frame = nullptr;
 
                 bool is_hw_frame = (decoded_frame->format == AV_PIX_FMT_VIDEOTOOLBOX) ||
-                                   (decoded_frame->format == AV_PIX_FMT_VAAPI);
+                                   (decoded_frame->format == AV_PIX_FMT_VAAPI) ||
+                                   (decoded_frame->format == AV_PIX_FMT_D3D11);
 
                 if (is_hw_frame) {
                     // PROFILING: Measurement of av_frame_alloc
@@ -903,7 +943,13 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
         auto buffer_check_end = std::chrono::high_resolution_clock::now();
         total_buffer_check_us += std::chrono::duration_cast<std::chrono::microseconds>(buffer_check_end - buffer_check_start).count();
 
-        if (needs_update && !stop_requested_.load()) {
+        // PENTIUM 7505 OPTIMIZATION: Sleep when stopped to free CPU
+        if (stop_requested_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;  // Skip decoding, check again after sleep
+        }
+
+        if (needs_update) {
             // Decode frames to fill buffer
             double minTime = playback_time - buffer_window_behind_;
             double maxTime = playback_time + buffer_window_ahead_;
@@ -924,12 +970,23 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                     bufferMinTime = stream_buffer_.front().time_seconds;
                     bufferMaxTime = stream_buffer_.back().time_seconds;
 
-                    // Seek needed ONLY if playback jumped BACK (user rewound)
+                    // Seek needed if:
+                    // 1. Playback jumped BACK (user rewound)
+                    // 2. Playback is VERY FAR ahead (shuttle/scrub forward)
                     if (playback_time < bufferMinTime - 0.5) {
                         need_seek = true;
                     }
-                    // If playback is ahead of buffer - DO NOT seek!
-                    // Decoder is already in the correct position (after last buffer frame)
+                    // SHUTTLE FIX: Seek forward if playback is >10s ahead of buffer
+                    // Without this, decoder gets stuck decoding from wrong position during shuttle
+                    else if (playback_time > bufferMaxTime + 10.0) {
+                        need_seek = true;
+                        static int shuttle_seek_log = 0;
+                        if (++shuttle_seek_log % 10 == 1) {
+                            std::cout << "🔄 [V2 SHUTTLE] Seek forward: buffer=[" << bufferMinTime
+                                      << ".." << bufferMaxTime << "]s, playback=" << playback_time
+                                      << "s (diff=" << (playback_time - bufferMaxTime) << "s)" << std::endl;
+                        }
+                    }
                 }
             }
 
@@ -1189,7 +1246,7 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
 
         // PROFILING: Output statistics thread loop every 100 iterations
         profile_iterations++;
-        if (profile_iterations >= 100) {
+        if (ENABLE_FULLRES_V2_PROFILING && profile_iterations >= 100) {
             auto profile_end_time = std::chrono::high_resolution_clock::now();
             uint64_t wall_clock_us = std::chrono::duration_cast<std::chrono::microseconds>(profile_end_time - profile_start_time).count();
             uint64_t profile_end_cpu_us = GetThreadCPUTimeMicroseconds();

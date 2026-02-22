@@ -7,6 +7,12 @@
 #include <limits>
 #include <cmath>
 
+// Request force render from window system (defined in platform-specific WS)
+extern "C" void RequestForceRender();
+
+// Request frame update from video module (defined in FSTPVideoModule_wrapper.cpp)
+extern void NotifyVideoFrameUpdate(int instance_id);
+
 // Debug control: set to true to enable verbose logging
 static constexpr bool ENABLE_LOWCACHED_DEBUG = false;
 
@@ -25,7 +31,9 @@ LowCachedDecoderManager::LowCachedDecoderManager(const std::string& lowResFilena
                                                  int highResWindowSize,
                                                  std::atomic<bool>& isPlaying,
                                                  std::atomic<double>& playbackRate,
-                                                 std::atomic<bool>& isReverseRef)
+                                                 std::atomic<bool>& isReverseRef,
+                                                 int instanceId,
+                                                 bool isHalfFps)
     : decoder_(std::make_unique<LowResDecoder>(lowResFilename))
     , frameIndex_(frameIndex)
     , currentFrame_(currentFrame)
@@ -34,12 +42,24 @@ LowCachedDecoderManager::LowCachedDecoderManager(const std::string& lowResFilena
     , isReverse_(isReverseRef)
     , ringBufferCapacity_(ringBufferCapacity)
     , highResWindowSize_(highResWindowSize)
-    , segmentSize_(600) {  // Default 600 frames, will be updated from GOP
+    , segmentSize_(2400)  // Large window for 32x reverse support (3 seconds @ 800 fps)
+    , instanceId_(instanceId)
+    , isHalfFps_(isHalfFps) {
     if (!decoder_ || !decoder_->isInitialized()) {
         throw std::runtime_error("Failed to initialize LowResDecoder in LowCachedDecoderManager");
     }
 
-    int initialSegment = currentFrame_.load() / segmentSize_;
+    if (isHalfFps_) {
+        std::cout << "🎯 [HALF-FPS MANAGER] Initialized with half-fps mode (will map frame indices /2)" << std::endl;
+    }
+
+    // HALF-FPS: Convert currentFrame to half-fps coordinates if needed
+    int current = currentFrame_.load();
+    if (isHalfFps_) {
+        current = current / 2;
+    }
+
+    int initialSegment = current / segmentSize_;
     int startFrame = initialSegment * segmentSize_;
     int endFrame = std::min(startFrame + segmentSize_ - 1, static_cast<int>(frameIndex_.size()) - 1);
     if (!frameIndex_.empty() && startFrame <= endFrame) {
@@ -111,6 +131,12 @@ void LowCachedDecoderManager::decodingLoop() {
         }
 
         int current = currentFrame_.load();
+
+        // HALF-FPS: Convert to half-fps coordinates if needed
+        if (isHalfFps_) {
+            current = current / 2;
+        }
+
         double currentRate = std::abs(playbackRate_.load());
         double rateDiff = std::abs(currentRate - previousPlaybackRate_);
         const double rateThreshold = 0.5;
@@ -138,6 +164,10 @@ void LowCachedDecoderManager::decodingLoop() {
                     if (stopRequested_.load()) return true;
 
                     int newFrame = currentFrame_.load();
+                    // HALF-FPS: Convert to half-fps coordinates
+                    if (isHalfFps_) {
+                        newFrame = newFrame / 2;
+                    }
                     int newSegment = newFrame / segmentSize_;
                     int lastSegment = lastNotifiedFrame_ / segmentSize_;
 
@@ -153,6 +183,10 @@ void LowCachedDecoderManager::decodingLoop() {
                 })) {
                 // Timeout - check periodically even if segment didn't change
                 current = currentFrame_.load();
+                // HALF-FPS: Convert to half-fps coordinates
+                if (isHalfFps_) {
+                    current = current / 2;
+                }
                 int currentSegment = current / segmentSize_;
                 int lastSegment = lastNotifiedFrame_ / segmentSize_;
 
@@ -166,6 +200,10 @@ void LowCachedDecoderManager::decodingLoop() {
             }
 
             current = currentFrame_.load();
+            // HALF-FPS: Convert to half-fps coordinates
+            if (isHalfFps_) {
+                current = current / 2;
+            }
             if (current != lastNotifiedFrame_) {
                 needsUpdate = true;
                 lastNotifiedFrame_ = current;
@@ -209,96 +247,24 @@ void LowCachedDecoderManager::decodingLoop() {
         bool directionChanged = (isReverse_.load() != previousIsReverse_);
 
         if (segmentChanged || directionChanged) {
+            // SIMPLE SLIDING WINDOW APPROACH
+            // Decode segments around current position regardless of direction
+            // Window size: ±1 segment (total 3 segments: before, current, after)
+
             std::set<int> targetSegments;
+
+            // Always keep current segment + neighbors
             targetSegments.insert(currentSegment);
+            if (currentSegment > 0) {
+                targetSegments.insert(currentSegment - 1);  // Previous segment
+            }
+            if (currentSegment < numSegmentsTotal - 1) {
+                targetSegments.insert(currentSegment + 1);  // Next segment
+            }
 
-            if (isReverse_.load()) {
-                // REVERSE PRELOAD: ALWAYS backward (to smaller segment numbers)
-                // When reverse head moves: frame N → N-1 → N-2 → 0 (DECREASE!)
-                // So segments also decrease: segment 10 → 9 → 8 → 0
-
-                // REVERSE-SPECIFIC OPTIMIZATION for Intel Celeron + PowerSaver
-                // Problem: Reverse playback needs different segment loading strategy
-                // Forward: Load segments ahead of current position
-                // Reverse: Load segments BEHIND current position (already passed)
-                
-                // CRITICAL: For reverse, we need to preload segments that we've ALREADY passed
-                // This prevents dropouts when playback head moves backward faster than decoder
-                
-                // OPTIMIZED PRELOADING for 24x max speed (500 frame segments)
-                // Test results: 500 frames = 1221 fps throughput (enough for 24x)
-                // With 500 frame segments: fewer segments needed, less memory
-                // Segment = 500 frames = 20 seconds @ 25fps
-                int preloadCount;
-                if (currentRate >= 16.0) {
-                    preloadCount = 8;   // 16x+: 8 segments (160 seconds = 2.7 minutes)
-                } else if (currentRate >= 8.0) {
-                    preloadCount = 6;   // 8-16x: 6 segments (120 seconds = 2 minutes)
-                } else if (currentRate >= 4.0) {
-                    preloadCount = 5;   // 4-8x: 5 segments (100 seconds = 1.7 minutes)
-                } else if (currentRate >= 2.0) {
-                    preloadCount = 4;   // 2-4x: 4 segments (80 seconds = 1.3 minutes)
-                } else {
-                    preloadCount = 3;   // 1-2x: 3 segments (60 seconds = 1 minute)
-                }
-                
-                // ADDITIONAL: Current frame position adaptation
-                // If we're near the beginning, reduce preloading to avoid waste
-                int currentFrame = currentFrame_.load();
-                int totalFrames = frameIndex_.size();
-                if (currentFrame < totalFrames * 0.1) {  // First 10% of video
-                    preloadCount = std::min(preloadCount, 30);  // Limit preloading
-                } else if (currentFrame > totalFrames * 0.9) {  // Last 10% of video
-                    preloadCount = std::min(preloadCount, 20);  // Limit preloading
-                }
-
-                // REVERSE STRATEGY: Load segments BEHIND current position
-                // This ensures smooth reverse playback without dropouts
-                for (int i = 1; i <= preloadCount; i++) {
-                    if (currentSegment - i >= 0) {
-                        targetSegments.insert(currentSegment - i);
-                    }
-                }
-                
-                // ADDITIONAL: Also preload some segments AHEAD for direction changes
-                // This helps when user switches from reverse to forward
-                int forwardBuffer = std::min(5, preloadCount / 4);
-                for (int i = 1; i <= forwardBuffer; i++) {
-                    targetSegments.insert(currentSegment + i);
-                }
-
-                if (directionChanged) {
-                    int minSegment = std::max(0, currentSegment - preloadCount);
-                    std::cout << "⏪ [REVERSE PRELOAD] Direction changed to REVERSE at segment " << currentSegment
-                              << " (speed=" << currentRate << "x) → preloading " << preloadCount
-                              << " segments BACKWARD [" << minSegment
-                              << " to " << (currentSegment - 1) << "]" << std::endl;
-                }
-                
-                // REALTIME MONITORING for Intel Celeron + PowerSaver
-                // Log performance metrics for 32x reverse optimization
-                static auto lastLogTime = std::chrono::steady_clock::now();
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLogTime).count() >= 2) {
-                    int currentFrame = currentFrame_.load();
-                    int totalFrames = frameIndex_.size();
-                    double progress = totalFrames > 0 ? (double)currentFrame / totalFrames * 100.0 : 0.0;
-                    
-                    std::cout << "📊 [REALTIME] Speed: " << currentRate << "x | Frame: " << currentFrame 
-                              << "/" << totalFrames << " (" << std::fixed << std::setprecision(1) << progress << "%)"
-                              << " | Segment: " << currentSegment << " | Preload: " << preloadCount << " segments" << std::endl;
-                    
-                    lastLogTime = now;
-                }
-            } else {
-                // Forward preloading (leave as is - works perfectly)
-                if (currentSegment < numSegmentsTotal - 1) targetSegments.insert(currentSegment + 1);
-                if (currentRate >= 1.8 && currentSegment < numSegmentsTotal - 2) targetSegments.insert(currentSegment + 2);
-                if (directionChanged && currentSegment < numSegmentsTotal - 3) {
-                    targetSegments.insert(currentSegment + 3);
-                    std::cout << "[LowCachedManager] Direction changed to FORWARD: preloading segment "
-                              << (currentSegment + 3) << std::endl;
-                }
+            if (directionChanged) {
+                std::cout << "🔄 [DIRECTION CHANGE] " << (isReverse_.load() ? "REVERSE" : "FORWARD")
+                          << " at segment " << currentSegment << std::endl;
             }
 
             std::set<int> segmentsToLoad;
@@ -312,19 +278,7 @@ void LowCachedDecoderManager::decodingLoop() {
                 }
             }
 
-            // OPTIMIZED BUFFER: With 500-frame segments, need fewer segments in memory
-            // 500 frames/segment × 17MB/segment = reasonable memory usage
-            // Tests show: 8 segments sufficient for 24x reverse (160 seconds buffer)
-            // Safety margin keeps segments longer to avoid re-decode
-            int safetyMargin = 10;  // Keep 10 segments on each side (±10 = 21 total = ~7 minutes)
-            for (int offset = -safetyMargin; offset <= safetyMargin; offset++) {
-                int protectedSegment = currentSegment + offset;
-                if (protectedSegment >= 0 && protectedSegment < numSegmentsTotal) {
-                    segmentsToUnload.erase(protectedSegment);
-                }
-            }
-
-            // Unload only segments that are far from current position
+            // Unload segments not in target window
             for (int segIdx : segmentsToUnload) {
                 int startFrame = segIdx * segmentSize_;
                 int endFrame = startFrame + segmentSize_ - 1;
@@ -332,129 +286,22 @@ void LowCachedDecoderManager::decodingLoop() {
                 loadedSegments_.erase(segIdx);
             }
 
-            // REVERSE-SPECIFIC PRIORITY LOADING for Intel Pentium Gold 7505
-            if (isReverse_.load()) {
-                // REVERSE: Load segments in reverse order of priority
-                // Current segment is most critical, then segments immediately behind it
-                std::vector<int> prioritySegments;
-
-                // EMERGENCY CHECK: Is currentFrame in undecoded zone?
-                // If YES - IMMEDIATE decoding to prevent dropout
-                int current = currentFrame_.load();
-                int frameSegment = current / segmentSize_;
-                bool currentFrameHasLowRes = false;
-
-                if (frameSegment >= 0 && frameSegment < numSegmentsTotal) {
-                    int frameInSegment = current % segmentSize_;
-                    int absoluteFrameIndex = frameSegment * segmentSize_ + frameInSegment;
-
-                    if (absoluteFrameIndex < static_cast<int>(frameIndex_.size())) {
-                        std::lock_guard<std::mutex> lock(frameIndex_[absoluteFrameIndex].mutex);
-                        currentFrameHasLowRes = (frameIndex_[absoluteFrameIndex].low_res_frame != nullptr);
-                    }
-                }
-
-                // CRITICAL: If current frame has NO low_res_frame - EMERGENCY DECODE!
-                if (!currentFrameHasLowRes && frameSegment >= 0 && frameSegment < numSegmentsTotal) {
-                    std::cout << "🚨 [EMERGENCY] Frame " << current << " in segment " << frameSegment
-                              << " has no low_res - IMMEDIATE decode!" << std::endl;
-                    // Load current segment IMMEDIATELY (synchronously)
-                    loadSegment(frameSegment);
-                    // Also preload segments behind (for reverse playback continuity)
-                    for (int i = 1; i <= 3; i++) {
-                        if (frameSegment - i >= 0) {
-                            loadSegment(frameSegment - i);
-                        }
-                    }
-                }
-
-                // 1. Current segment (highest priority)
-                if (segmentsToLoad.count(currentSegment)) {
-                    prioritySegments.push_back(currentSegment);
-                    segmentsToLoad.erase(currentSegment);
-                } else if (loadedSegments_.find(currentSegment) == loadedSegments_.end()) {
-                    // EMERGENCY: Load current segment immediately if not already loaded
-                    loadSegment(currentSegment);
-                }
-                
-                // 2. Segments immediately behind current (for reverse playback)
-                for (int i = 1; i <= 3; i++) {
-                    int behindSegment = currentSegment - i;
-                    if (behindSegment >= 0 && segmentsToLoad.count(behindSegment)) {
-                        prioritySegments.push_back(behindSegment);
-                        segmentsToLoad.erase(behindSegment);
-                    }
-                }
-                
-                // 3. Load priority segments first
-                for (int segIdx : prioritySegments) {
-                    loadSegment(segIdx);
-                }
-                
-                // 4. Load remaining segments in background
-                for (int segIdx : segmentsToLoad) {
-                    loadSegment(segIdx);
-                }
-            } else {
-                // FORWARD: Normal priority loading
-                if (segmentsToLoad.count(currentSegment)) {
-                    loadSegment(currentSegment);
-                    segmentsToLoad.erase(currentSegment);
-                } else {
-                    loadSegment(currentSegment);
-                }
-                
-                for (int segIdx : segmentsToLoad) {
-                    loadSegment(segIdx);
-                }
+            // Simple loading - no priority, no emergency checks
+            for (int segIdx : segmentsToLoad) {
+                loadSegment(segIdx);
             }
 
             lastLowResUpdateTime_ = now;
             previousSegment_ = currentSegment;
         } else if (needsUpdate) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLowResUpdateTime_);
-            // DYNAMIC INTERVALS for Intel Celeron + PowerSaver
-            // Goal: 32x smooth reverse - ultra-aggressive updates
-            auto intervalForRate = [](double rate) {
-                if (rate < 0.9) return std::numeric_limits<int>::max();
-                if (rate <= 1.0) return 2000;     // 1x: 2s
-                if (rate <= 2.0) return 1000;     // 1-2x: 1s
-                if (rate <= 4.0) return 500;      // 2-4x: 500ms
-                if (rate <= 8.0) return 250;      // 4-8x: 250ms
-                if (rate <= 16.0) return 125;     // 8-16x: 125ms
-                if (rate <= 32.0) return 50;      // 16-32x: 50ms - CRITICAL for PowerSaver
-                return 25;                        // 32x+: 25ms - ULTRA CRITICAL
-            };
-            std::chrono::milliseconds updateInterval(intervalForRate(currentRate));
-            bool forceUpdate = (rateDiff > rateThreshold);
-
+            // Same simple window logic as segment change
             std::set<int> targetSegments;
             targetSegments.insert(currentSegment);
-
-            if (isReverse_.load()) {
-                // REVERSE: EXTREME preload for Intel Celeron + PowerSaver (for needsUpdate)
-                // PowerSaver + VA-API needs MASSIVE preloading even for regular updates
-                // Segment=300 frames (~12 seconds each), PowerSaver + VA-API needs huge buffer
-                int preloadCount = 12; // Increased from 8 to 12 for PowerSaver
-                if (currentRate >= 9.0) {
-                    preloadCount = 18;  // Increased from 12 to 18
-                } else if (currentRate >= 4.0) {
-                    preloadCount = 15;  // Increased from 10 to 15
-                } else if (currentRate >= 2.0) {
-                    preloadCount = 13;  // Increased from 9 to 13
-                } else {
-                    preloadCount = 12;  // Increased from 8 to 12 for smooth 1x
-                }
-
-                for (int i = 1; i <= preloadCount; i++) {
-                    if (currentSegment - i >= 0) {
-                        targetSegments.insert(currentSegment - i);
-                    }
-                }
-            } else {
-                // Forward playback (leave as is - works perfectly)
-                if (currentSegment < numSegmentsTotal - 1) targetSegments.insert(currentSegment + 1);
-                if (currentRate >= 1.8 && currentSegment < numSegmentsTotal - 2) targetSegments.insert(currentSegment + 2);
+            if (currentSegment > 0) {
+                targetSegments.insert(currentSegment - 1);
+            }
+            if (currentSegment < numSegmentsTotal - 1) {
+                targetSegments.insert(currentSegment + 1);
             }
 
             std::set<int> segmentsToLoad;
@@ -466,24 +313,11 @@ void LowCachedDecoderManager::decodingLoop() {
                 }
             }
 
-            if (!segmentsToLoad.empty() && (elapsed >= updateInterval || forceUpdate)) {
-                // EMERGENCY BUFFER: Load current segment FIRST for immediate playback
-                if (segmentsToLoad.count(currentSegment)) {
-                    loadSegment(currentSegment);
-                    segmentsToLoad.erase(currentSegment);
-                } else {
-                    // EMERGENCY: Current segment not in load list - load it immediately!
-                    // This prevents dropout when PowerSaver + VA-API is too slow
-                    loadSegment(currentSegment);
-                }
-                
-                // Then load other segments in background
-                for (int segIdx : segmentsToLoad) {
-                    loadSegment(segIdx);
-                }
-                lastLowResUpdateTime_ = now;
+            for (int segIdx : segmentsToLoad) {
+                loadSegment(segIdx);
             }
 
+            lastLowResUpdateTime_ = now;
             previousSegment_ = currentSegment;
         }
 
@@ -521,6 +355,12 @@ void LowCachedDecoderManager::loadSegment(int segmentIndex) {
 
     int highResHalf = highResWindowSize_ / 2;
     int current = currentFrame_.load();
+
+    // HALF-FPS: Convert to half-fps coordinates for highRes window
+    if (isHalfFps_) {
+        current = current / 2;
+    }
+
     int highResStart = std::max(0, current - highResHalf);
     int highResEnd = std::min(static_cast<int>(frameIndex_.size()) - 1, current + highResHalf);
 
@@ -530,6 +370,12 @@ void LowCachedDecoderManager::loadSegment(int segmentIndex) {
     if (ok) {
         std::lock_guard<std::mutex> lock(mtx_);
         loadedSegments_.insert(segmentIndex);
+
+        // Force immediate frame update for seek responsiveness
+        if (instanceId_ >= 0) {
+            NotifyVideoFrameUpdate(instanceId_);
+        }
+        RequestForceRender();
     }
 }
 
@@ -553,8 +399,8 @@ void LowCachedDecoderManager::unloadSegment(int segmentIndex) {
 }
 
 int LowCachedDecoderManager::calculateOptimalSegmentSize(int gopSize) {
-    // ADAPTIVE SEGMENT SIZING based on video GOP structure
-    // Goal: Align segments with GOP boundaries for minimal seek overhead
+    // ADAPTIVE SEGMENT SIZING based on video GOP structure + playback speed
+    // Goal: Large segments for high-speed playback to reduce decoding frequency
 
     if (gopSize <= 0) {
         // Unknown or invalid GOP - use safe default
@@ -562,31 +408,27 @@ int LowCachedDecoderManager::calculateOptimalSegmentSize(int gopSize) {
         return 600;
     }
 
-    // Based on real tests with Pentium Gold 7505:
-    // - 300 frames (GOP 300): 1220 fps, 1.0% seek overhead
-    // - 600 frames (2×GOP 300): 1411 fps, 0.5% seek overhead
-    // - 900 frames (3×GOP 300): 1473 fps, 0.4% seek overhead (best)
+    // Strategy: Use larger multiples of GOP for 32x support
+    // Old: 2× GOP (600 frames max) - too small for 32x reverse
+    // New: 8× GOP (2400 frames) - provides 3 second buffer @ 32x
 
-    // Strategy: Use 2× GOP size for optimal balance
-    // This gives good performance while keeping memory reasonable
+    int targetSize = gopSize * 8;  // 8× GOP for 32x reverse support
 
-    int targetSize = gopSize * 2;
-
-    // Clamp to reasonable range: 300-1200 frames
-    // Too small (<300): Excessive seek overhead
-    // Too large (>1200): Excessive memory usage
+    // Clamp to reasonable range: 300-2400 frames
+    // Minimum 300 to avoid excessive seek overhead
+    // Maximum 2400 for 32x reverse (3 seconds buffer @ 800 fps consumption)
     if (targetSize < 300) {
         targetSize = 300;
-    } else if (targetSize > 1200) {
-        targetSize = 1200;
+    } else if (targetSize > 2400) {
+        targetSize = 2400;
     }
 
-    std::cout << "[LowCachedManager] 🎯 Adaptive segment size: " << targetSize
+    std::cout << "[LowCachedManager] 🎯 Fixed large segment size: " << targetSize
               << " frames (GOP=" << gopSize << ", " << (targetSize / gopSize) << "× GOP)"
               << std::endl;
     std::cout << "                    Memory per segment: ~"
-              << std::fixed << std::setprecision(1) << (targetSize * 35.0 / 1024.0)
-              << " MB" << std::endl;
+              << std::fixed << std::setprecision(1) << (targetSize * 0.345)
+              << " MB (640×360 YUV420P/NV12)" << std::endl;
 
     return targetSize;
 }

@@ -25,13 +25,15 @@ public:
     
     LowCachedDecoderManager(
         const std::string& lowResFilename,
-        std::vector<FSTP::FrameInfo>& frameIndex, 
+        std::vector<FSTP::FrameInfo>& frameIndex,
         std::atomic<int>& currentFrame,
         int ringBufferCapacity,      // How many low-res frames to keep around the current frame
         int highResWindowSize,       // Size of the high-res window (to potentially skip decoding low-res)
         std::atomic<bool>& isPlaying, // Shared playback status
         std::atomic<double>& playbackRate, // Added
-        std::atomic<bool>& isReverseRef // Added
+        std::atomic<bool>& isReverseRef, // Added
+        int instanceId = -1, // Instance ID for frame update notification
+        bool isHalfFps = false // HALF-FPS: true if currentFrame is in original coords but frameIndex is half-size
     );
 
     ~LowCachedDecoderManager();
@@ -71,6 +73,8 @@ private:
     int ringBufferCapacity_;
     int highResWindowSize_;
     int segmentSize_ = 750;    // Golden middle: balance between CPU and responsiveness reverse
+    int instanceId_ = -1;      // Instance ID for frame update notifications
+    bool isHalfFps_ = false;   // HALF-FPS: currentFrame in original coords, frameIndex is half-size
 
     // Thread management
     std::thread managerThread_;

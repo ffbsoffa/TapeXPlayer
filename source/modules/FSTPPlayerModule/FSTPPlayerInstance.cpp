@@ -100,11 +100,6 @@ int FSTPPlayerInstance::LoadFile(const std::string& filepath) {
         return -3;
     }
 
-    // Enable Betacam audio servomotor if Betacam effect is enabled in settings
-    if (GetBetacamEffectEnabled()) {
-        m_audio_module->SetBetacamAudioEnabled(true);
-    }
-
     if (m_video_module && !m_video_module->LoadFile(filepath)) {
         std::cerr << "Warning: Failed to load file into video module (continuing audio-only): " << filepath << std::endl;
     } else if (m_video_module) {
@@ -259,6 +254,12 @@ int FSTPPlayerInstance::SetSpeed(double speed) {
     last_logged_speed = speed;
 
     m_audio_module->SetSpeed(speed);
+
+    // CRITICAL: Also notify video module to enable Full-Res decoder optimization
+    if (m_video_module) {
+        m_video_module->SetSpeed(speed);
+    }
+
     if (should_log) {
         std::cout << "Speed changed successfully" << std::endl;
     }
@@ -277,6 +278,12 @@ int FSTPPlayerInstance::SetSpeedInstant(double speed) {
     }
 
     m_audio_module->SetSpeedInstant(speed);
+
+    // CRITICAL: Also notify video module to enable Full-Res decoder optimization
+    if (m_video_module) {
+        m_video_module->SetSpeedInstant(speed);
+    }
+
     return 0;
 }
 
