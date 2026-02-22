@@ -17,7 +17,7 @@ TapeXPlayer is built with **C**,**C++**, **Objective-C**, **Swift** using indust
 
 - **Smooth Shuttle Control**: Forward/backward playback up to 32x speed with minimal CPU usage
 - **Frame-Accurate Seeking**: Timecode-based navigation (HH:MM:SS:FF)
-- **MIDI Controller Support**: Full integration with Mackie HUI protocol (tested with Behringer X-Touch One)
+- **MIDI Controller Support**: Supports integration with Mackie HUI protocol (tested with Behringer X-Touch One)
 - **Memory Locations**: Quick navigation to important points with zoom recall
 - **Real-Time Zoom & Pan**: Mouse-based zoom with thumbnail preview
 - **Screenshot Capture**: Export frames with timecode overlay
