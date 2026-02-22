@@ -111,7 +111,6 @@ On first launch, Windows Defender SmartScreen may display a warning. Select "Mor
 - Processor: Intel Pentium Gold 7505 or equivalent with hardware decoding support (Intel QSV, AMD VCE)
 - Memory: 8 GB RAM
 - Video card with built-in hardware video decoder
-- Free disk space: 200 MB for installation
 
 When running on minimum requirements, the application automatically disables the full-resolution decoder and uses only the lightweight low-resolution decoder designed for shuttle mode. This preserves interface responsiveness but limits playback of material in original quality.
 
