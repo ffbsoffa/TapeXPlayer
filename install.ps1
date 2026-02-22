@@ -1,6 +1,6 @@
 # install.ps1 — TapeXPlayer Windows Installer
 # Usage:
-#   iwr -useb https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/stable/source/install.ps1 | iex
+#   iwr -useb https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/refs/heads/stable/install.ps1 | iex
 #
 # Flags (pass via $env: variables before piping, or use file mode):
 #   $env:TAPEX_QUIET = "1"   — non-interactive (auto-confirm all prompts)
@@ -325,16 +325,24 @@ Write-Step "5." "Installing to: $installDir"
 # Handle existing installation
 if (Test-Path $installDir) {
     if (-not $Force) {
-        if (-not (Ask-YesNo "TapeXPlayer is already installed. Replace?")) {
+        if (-not (Ask-YesNo "TapeXPlayer is already installed. Update?")) {
             Write-Host "   Installation cancelled." -ForegroundColor Yellow
             exit 0
         }
     }
-    Write-Host "   Removing old version..." -ForegroundColor Gray
-    Remove-Item -Recurse -Force $installDir
+    # Stop any running instance so the exe is not locked during overwrite
+    $running = Get-Process -Name $APP_NAME -ErrorAction SilentlyContinue
+    if ($running) {
+        Write-Host "   Stopping running instance..." -ForegroundColor Gray
+        $running | Stop-Process -Force
+        Start-Sleep -Milliseconds 800
+    }
+    Write-Host "   Updating existing installation..." -ForegroundColor Gray
+} else {
+    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 }
 
-New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+# Overwrite files in place — no full directory removal, preserves user data
 Copy-Item -Path "$sourceDir\*" -Destination $installDir -Recurse -Force
 Write-OK "Files copied to $installDir"
 
