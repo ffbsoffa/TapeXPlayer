@@ -107,7 +107,7 @@ On first launch, Windows Defender SmartScreen may display a warning. Select "Mor
 ## System Requirements
 
 **Minimum requirements:**
-- Operating system: Windows 10/11, macOS 10.14+, Linux (Ubuntu 20.04+, Fedora 34+)
+- Operating system: Windows 10/11, macOS 10.14+, Linux (Ubuntu 20.04+ or Debian - at now)
 - Processor: Intel Pentium Gold 7505 or equivalent with hardware decoding support (Intel QSV, AMD VCE)
 - Memory: 8 GB RAM
 - Video card with built-in hardware video decoder
