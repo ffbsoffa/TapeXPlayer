@@ -11,8 +11,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#ifndef _WIN32
 #include <unistd.h>
 #include <sys/wait.h>
+#endif
 
 #ifdef __APPLE__
 #include <portaudio.h>
@@ -59,6 +61,7 @@ void ResetSettingsToDefault() {
     g_settings.audio_device_index = -1;        // -1 means use Pa_GetDefaultOutputDevice()
     g_settings.audio_master_volume = 1.0f;     // 100%
     g_settings.audio_buffer_size = 1024;       // 1024 samples
+    g_settings.audio_volume_ducking_enabled = 1; // ENABLED BY DEFAULT (ear protection at high shuttle speeds)
 
     // A/V sync settings
     g_settings.frame_offset = 0;              // No offset by default
@@ -72,6 +75,9 @@ void ResetSettingsToDefault() {
     g_settings.midi_enabled = 0;              // Disabled by default
     g_settings.midi_input_port = -1;          // Not selected
     g_settings.midi_output_port = -1;         // Not selected
+
+    // Developer/Debug settings
+    g_settings.show_decoder_status = 0;       // Hidden by default (debug feature)
 }
 
 // Initialize settings system
@@ -120,6 +126,13 @@ int SaveSettings() {
         return -1;
     }
 
+    // Ensure parent directory exists
+    std::filesystem::path settings_dir = std::filesystem::path(g_settings_path).parent_path();
+    if (!settings_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(settings_dir, ec);
+    }
+
     std::ofstream file(g_settings_path);
     if (!file.is_open()) {
         std::cerr << "Failed to open settings file for writing: " << g_settings_path << std::endl;
@@ -134,6 +147,7 @@ int SaveSettings() {
     file << "device_index=" << g_settings.audio_device_index << "\n";
     file << "master_volume=" << g_settings.audio_master_volume << "\n";
     file << "buffer_size=" << g_settings.audio_buffer_size << "\n";
+    file << "volume_ducking_enabled=" << g_settings.audio_volume_ducking_enabled << "\n";
     file << "\n";
 
     // Sync settings
@@ -159,6 +173,11 @@ int SaveSettings() {
     file << "enabled=" << g_settings.midi_enabled << "\n";
     file << "input_port=" << g_settings.midi_input_port << "\n";
     file << "output_port=" << g_settings.midi_output_port << "\n";
+    file << "\n";
+
+    // Developer/Debug settings
+    file << "[Debug]\n";
+    file << "show_decoder_status=" << g_settings.show_decoder_status << "\n";
 
     file.close();
     std::cout << "Settings saved to: " << g_settings_path << std::endl;
@@ -201,6 +220,7 @@ int LoadSettings() {
             if (key == "device_index") g_settings.audio_device_index = std::stoi(value);
             else if (key == "master_volume") g_settings.audio_master_volume = std::stof(value);
             else if (key == "buffer_size") g_settings.audio_buffer_size = std::stoi(value);
+            else if (key == "volume_ducking_enabled") g_settings.audio_volume_ducking_enabled = std::stoi(value);
         }
         else if (current_section == "Sync") {
             if (key == "frame_offset") g_settings.frame_offset = std::stoi(value);
@@ -218,6 +238,9 @@ int LoadSettings() {
             if (key == "enabled") g_settings.midi_enabled = std::stoi(value);
             else if (key == "input_port") g_settings.midi_input_port = std::stoi(value);
             else if (key == "output_port") g_settings.midi_output_port = std::stoi(value);
+        }
+        else if (current_section == "Debug") {
+            if (key == "show_decoder_status") g_settings.show_decoder_status = std::stoi(value);
         }
     }
 
@@ -277,6 +300,13 @@ int GetAudioBufferSize() {
         InitSettings();
     }
     return g_settings.audio_buffer_size;
+}
+
+int GetAudioVolumeDuckingEnabled() {
+    if (!g_settings_initialized) {
+        InitSettings();
+    }
+    return g_settings.audio_volume_ducking_enabled;
 }
 
 int GetFrameOffset() {
@@ -340,6 +370,13 @@ int GetMIDIOutputPort() {
 
 const char* GetExtensionLanguage() {
     return FSTP_EXTENSION_SCRIPT_LANGUAGE;
+}
+
+int GetShowDecoderStatus() {
+    if (!g_settings_initialized) {
+        InitSettings();
+    }
+    return g_settings.show_decoder_status;
 }
 
 namespace {
@@ -427,12 +464,19 @@ static bool LocateYTDLPBinary(std::string& binary_path) {
         fs::path candidate = fs::path(dir) / "yt-dlp";
         std::error_code ec;
         if (fs::exists(candidate, ec) && fs::is_regular_file(candidate, ec)) {
+#ifdef _WIN32
+            cached_path = candidate.string();
+            cached_result = true;
+            binary_path = cached_path;
+            return true;
+#else
             if (::access(candidate.c_str(), X_OK) == 0) {
                 cached_path = candidate.string();
                 cached_result = true;
                 binary_path = cached_path;
                 return true;
             }
+#endif
         }
     }
 
@@ -540,10 +584,14 @@ int FSTP_YTDLP_Download(const char* url,
     }
 
     int status = pclose(pipe);
+#ifdef _WIN32
+    int exit_code = status; // pclose returns exit code directly on Windows
+#else
     int exit_code = -1;
     if (WIFEXITED(status)) {
         exit_code = WEXITSTATUS(status);
     }
+#endif
 
     if (exit_code != 0) {
         if (output.empty()) {

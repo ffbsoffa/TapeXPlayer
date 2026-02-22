@@ -5,7 +5,7 @@
 #include "FSTPPixelBufferManager.h"
 #include "FSTPZoom.h"
 #include "FSTPScreenshot.h"
-#include "FSTPToolsMenu.h"
+#include "darwin/sdl/FSTPToolsMenu.h"
 #include "FSTPMemoryLocations.h"
 #include "FSTPHardwareDetection.h"
 #include <iostream>
@@ -21,6 +21,10 @@ extern "C" {
 
 #ifdef __linux__
 #include "linux/FSTPWaylandWS.h"
+#endif
+
+#ifdef _WIN32
+#include "windows/FSTPWindowsWS.h"
 #endif
 
 // Mouse Shuttle variables
@@ -461,6 +465,11 @@ bool HandleKeyboardEvents(SDL_Event& event) {
 
                 // === Playback Control ===
                 case SDLK_SPACE:
+                    // IMPORTANT: Ignore Space if Cmd is pressed (Cmd+Space = language switch on macOS)
+                    if (event.key.keysym.mod & (KMOD_GUI | KMOD_CTRL | KMOD_ALT)) {
+                        break; // Ignore Space with any modifier to prevent conflicts
+                    }
+
                     // Space - Play/Pause with smart logic
                     if (active_player_id >= 0) {
                         if (IsInstancePlaying(active_player_id)) {
@@ -701,6 +710,12 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                         std::cout << "⚠️ No Ctrl modifier detected (mod=" << event.key.keysym.mod << ")" << std::endl;
                     }
 #endif
+#ifdef _WIN32
+                    if (event.key.keysym.mod & KMOD_CTRL) { // Ctrl+O on Windows
+                        std::cout << "Ctrl+O pressed, opening file dialog..." << std::endl;
+                        ShowNativeFileDialog(-1);
+                    }
+#endif
                     break;
 
                 case SDLK_COMMA:
@@ -713,6 +728,12 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                     if (event.key.keysym.mod & KMOD_CTRL) { // Ctrl+, on Linux
                         std::cout << "⚙️  Ctrl+, pressed, opening Settings dialog..." << std::endl;
                         ShowGTKSettingsDialog();
+                    }
+#endif
+#ifdef _WIN32
+                    if (event.key.keysym.mod & KMOD_CTRL) { // Ctrl+, on Windows
+                        std::cout << "Ctrl+, pressed, opening Settings dialog..." << std::endl;
+                        ShowWin32SettingsDialog();
                     }
 #endif
                     break;
@@ -778,13 +799,32 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                         CopyScreenshotToClipboard();
                     }
 #endif
+#ifdef _WIN32
+                    if (event.key.keysym.mod & KMOD_CTRL) {
+                        // Ctrl+C = Take Screenshot
+                        CopyScreenshotToClipboard();
+                    }
+#endif
                     break;
 
                 case SDLK_n:
+#ifdef __APPLE__
                     if (event.key.keysym.mod & KMOD_GUI) {
                         // Cmd+N handled through macOS menu, don't duplicate here
                         std::cout << "Cmd+N: handled by macOS menu" << std::endl;
                     }
+#elif defined(_WIN32)
+                    if ((event.key.keysym.mod & KMOD_CTRL) && (event.key.keysym.mod & KMOD_SHIFT)) {
+                        int active_count = 0;
+                        for (int i = 0; i < MAX_WINDOWS; i++) {
+                            FSTPWindow* w = GetWindowByIndex(i);
+                            if (w && w->is_active) active_count++;
+                        }
+                        char title[128];
+                        snprintf(title, sizeof(title), "TapeXPlayer 2026 - Player %d", active_count);
+                        CreateNewWindow(title, 1280, 720);
+                    }
+#endif
                     break;
 
                 // === Memory Locations ===
@@ -799,18 +839,24 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                     if (active_player_id >= 0) {
                         double current_time = GetInstancePosition(active_player_id);
                         std::cout << "📍 Creating Memory Location via hotkey (Linux)..." << std::endl;
-                        ShowGTKMemoryLocationDialog(active_player_id, current_time);
+                        ShowGTKMemoryLocationDialog(active_player_id, -1, current_time);
+                    }
+#endif
+#ifdef _WIN32
+                    if (active_player_id >= 0) {
+                        double current_time = GetInstancePosition(active_player_id);
+                        ShowWin32MemoryLocationDialog(active_player_id, -1, current_time);
                     }
 #endif
                     break;
             }
             break;
 
-        case SDL_MOUSEBUTTONDOWN:
-            if (event.button.button == SDL_BUTTON_LEFT) {
-                // Check if this is a compact device (GPD Pocket, etc.)
-                bool is_compact = (g_hardware_detection && g_hardware_detection->IsCompactDevice());
+        case SDL_MOUSEBUTTONDOWN: {
+            // Check if this is a compact device (GPD Pocket, etc.)
+            bool is_compact = (g_hardware_detection && g_hardware_detection->IsCompactDevice());
 
+            if (event.button.button == SDL_BUTTON_LEFT) {
                 if (is_compact) {
                     // For compact devices: LEFT CLICK starts mouse shuttle after small delay
                     // Store click position and time - will activate shuttle on motion
@@ -834,8 +880,20 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                         }
                     }
                 }
+            } else if (event.button.button == SDL_BUTTON_MIDDLE && is_compact) {
+                // GPD Pocket: Middle Mouse Button = Zoom Panning (no modifiers needed)
+                int active_window = GetActivePlayerID();
+                int window_idx = GetWindowIndexByPlayerID(active_window);
+                if (window_idx >= 0) {
+                    FSTPZoomState* zoom = GetZoomState(window_idx);
+                    if (zoom && zoom->enabled) {
+                        zoom_panning_active = true;
+                        std::cout << "🖱️  Middle button zoom panning activated" << std::endl;
+                    }
+                }
             }
             break;
+        }
 
         case SDL_MOUSEBUTTONUP:
             if (event.button.button == SDL_BUTTON_LEFT) {
@@ -855,12 +913,36 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                     }
                     g_alt_shuttle_active = false;
                 }
+            } else if (event.button.button == SDL_BUTTON_MIDDLE) {
+                // Middle button released - stop zoom panning
+                if (zoom_panning_active) {
+                    zoom_panning_active = false;
+                    std::cout << "🖱️  Middle button zoom panning deactivated" << std::endl;
+                }
             }
             break;
 
         case SDL_MOUSEMOTION:
             if (mouse_shuttle_active) {
                 UpdateMouseShuttle(event.motion.x);
+            } else if (zoom_panning_active) {
+                // Zoom panning active - update zoom center
+                int active_window = GetActivePlayerID();
+                int window_idx = GetWindowIndexByPlayerID(active_window);
+
+                if (window_idx >= 0) {
+                    FSTPWindow* win = GetWindowByIndex(window_idx);
+                    if (win && win->window) {
+                        int win_w, win_h;
+                        SDL_GetWindowSize(win->window, &win_w, &win_h);
+
+                        // Normalize mouse position to 0.0-1.0
+                        float norm_x = (float)event.motion.x / (float)win_w;
+                        float norm_y = (float)event.motion.y / (float)win_h;
+
+                        SetZoomCenter(window_idx, norm_x, norm_y);
+                    }
+                }
             } else if (event.motion.state & SDL_BUTTON_LMASK) {
                 // Left button is pressed
                 bool is_compact = (g_hardware_detection && g_hardware_detection->IsCompactDevice());
@@ -881,26 +963,6 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                         // Also check time: within 500ms to prevent window drag conflict
                         if (elapsed < 500) {
                             StartMouseShuttle(mouse_shuttle_start_x, mouse_shuttle_start_y);
-                        }
-                    }
-                } else if ((SDL_GetModState() & KMOD_SHIFT) &&
-                           (SDL_GetModState() & KMOD_ALT) &&
-                           !(SDL_GetModState() & KMOD_CTRL)) {
-                    // Standard devices: Shift+Alt+Left Mouse Drag = Move zoom center
-                    int active_window = GetActivePlayerID();
-                    int window_idx = GetWindowIndexByPlayerID(active_window);
-
-                    if (window_idx >= 0) {
-                        FSTPWindow* win = GetWindowByIndex(window_idx);
-                        if (win && win->window) {
-                            int win_w, win_h;
-                            SDL_GetWindowSize(win->window, &win_w, &win_h);
-
-                            // Normalize mouse position to 0.0-1.0
-                            float norm_x = (float)event.motion.x / (float)win_w;
-                            float norm_y = (float)event.motion.y / (float)win_h;
-
-                            SetZoomCenter(window_idx, norm_x, norm_y);
                         }
                     }
                 }
@@ -1004,11 +1066,18 @@ void UpdateMouseShuttle(int x) {
         target_reverse = true;
     }
 
-    // Apply CPU-specific speed limit for Mouse Shuttle
-    double max_speed = 32.0;  // Default max
+    // CRITICAL: Apply CPU-specific speed limit for Mouse Shuttle
+    // MUST enforce 32x maximum (or 24x for low-power CPUs)
+    double max_speed = 32.0;  // Default max (HARD LIMIT)
     if (g_hardware_detection) {
-        max_speed = g_hardware_detection->GetMaxRecommendedSpeed();
+        double cpu_limit = g_hardware_detection->GetMaxRecommendedSpeed();
+        // Use CPU limit if it's stricter than default
+        if (cpu_limit > 0.0 && cpu_limit < max_speed) {
+            max_speed = cpu_limit;
+        }
     }
+
+    // ENFORCE MAXIMUM: Never exceed 32x (or CPU limit if lower)
     target_speed = std::min(target_speed, max_speed);
     target_speed = std::max(target_speed, 0.1); // Minimum 0.1x (audio module rejects 0.0)
 

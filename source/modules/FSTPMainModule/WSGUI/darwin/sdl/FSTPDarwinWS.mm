@@ -23,6 +23,7 @@
 #include "FSTPKeyboard.h"
 #include "FSTPOSDInstance.h"
 #include "FSTPToolsMenu.h"
+#include "FSTPMemoryLocations.h"
 
 // Debug control: set to true to enable verbose logging
 [[maybe_unused]] static constexpr bool ENABLE_DARWIN_WS_DEBUG = false;
@@ -678,6 +679,7 @@ void HandleNativeAppEvents() {
 - (IBAction)performZoom:(id)sender;
 - (IBAction)copyScreenshotAction:(id)sender;
 - (IBAction)showMemoryLocationsAction:(id)sender;
+- (IBAction)exportMemoryLocationsAction:(id)sender;
 - (IBAction)showInspectorAction:(id)sender;
 - (IBAction)downloadFromNetworkAction:(id)sender;
 @end
@@ -970,6 +972,35 @@ void HandleNativeAppEvents() {
     ShowMemoryLocations();
 }
 
+- (IBAction)exportMemoryLocationsAction:(id)sender {
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    [panel setTitle:@"Export Memory Locations"];
+    [panel setPrompt:@"Export"];
+    [panel setNameFieldStringValue:@"memory_locations.csv"];
+    [panel setAllowedFileTypes:@[@"csv"]];
+    [panel setAllowsOtherFileTypes:NO];
+
+    [panel beginSheetModalForWindow:[NSApp keyWindow] completionHandler:^(NSInteger result) {
+        if (result == NSModalResponseOK) {
+            NSURL* url = [panel URL];
+            std::string filepath = [[url path] UTF8String];
+
+            // Call C++ export function
+            bool success = FSTP::MemoryLocationsManager::GetInstance().ExportToCSV(filepath);
+
+            // Only show error dialog if export failed
+            if (!success) {
+                NSAlert* alert = [[NSAlert alloc] init];
+                [alert setMessageText:@"Export Failed"];
+                [alert setInformativeText:@"Failed to export Memory Locations to CSV file."];
+                [alert addButtonWithTitle:@"OK"];
+                [alert setAlertStyle:NSAlertStyleWarning];
+                [alert runModal];
+            }
+        }
+    }];
+}
+
 - (IBAction)showInspectorAction:(id)sender {
     ToggleInspector();
 }
@@ -1072,6 +1103,9 @@ static SDL_Renderer* g_renderer = nullptr;
 static bool g_renderingActive = false;
 // macOS live resize flag: skip rendering during it to avoid artifacts
 static std::atomic<bool> g_isLiveResizing{false};
+// Shutdown state: allows UI loop to continue during player instance cleanup
+static std::atomic<bool> g_shutdownRequested{false};
+static std::atomic<bool> g_shutdownComplete{false};
 
 void InitializeNativeApp() {
     @autoreleasepool {
@@ -1332,6 +1366,11 @@ void StopAutonomousRendering() {
     // Wait for render thread to finish
     if (g_renderThread.joinable()) {
         g_renderThread.join();
+
+        // CRITICAL: Give render thread extra time to fully exit RenderAllWindows()
+        // This prevents race condition where thread may still be accessing windows
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        NSLog(@"🎬 [RENDER THREAD] Waited for thread cleanup");
     }
 
     g_renderer = nullptr;
@@ -1348,6 +1387,9 @@ int RunMainUILoop() {
     SDL_SetHint("SDL_MAC_DISABLE_FRAMESYNC", "0");       // Enable macOS FramePacing by default
     SDL_SetHint("SDL_METAL_PREFER_LOW_POWER_DEVICE", "0"); // Disable Metal power saving
 
+    // Allow system screen saver and display sleep to work normally
+    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+
     // VSYNC: Enable to eliminate tearing
     // CVDisplayLink synchronized with VBlank, render constantly at 60 FPS for stability
     SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");
@@ -1360,6 +1402,9 @@ int RunMainUILoop() {
         NSLog(@"SDL initialization error: %s", SDL_GetError());
         return -1;
     }
+
+    // SDL disables the screensaver by default - re-enable it so the display can sleep normally
+    SDL_EnableScreenSaver();
 
     // Initialize native app and menu
     InitializeNativeApp();
@@ -1457,7 +1502,7 @@ int RunMainUILoop() {
                     if (event.user.code == 1) {
                         // Real application termination through menu
                         NSLog(@"Application termination requested via menu");
-                        running = false;
+                        g_shutdownRequested.store(true);
                     }
                     break;
 
@@ -1466,7 +1511,7 @@ int RunMainUILoop() {
                         case SDLK_ESCAPE:
                         case SDLK_q:
                             if (event.key.keysym.mod & KMOD_GUI) {
-                                running = false;
+                                g_shutdownRequested.store(true);
                             }
                             break;
 
@@ -1493,6 +1538,29 @@ int RunMainUILoop() {
         }
         // If SDL_WaitEventTimeout returned false (timeout without events) - just continue loop
         // WaitEventTimeout blocking saves CPU instead of active polling + usleep!
+
+        // CRITICAL: Asynchronous shutdown - destroy player instances while UI loop continues
+        // This allows "unthreading" OSD to be visible during cleanup
+        if (g_shutdownRequested.load() && !g_shutdownComplete.load()) {
+            std::cout << "🛑 [SHUTDOWN] Shutdown requested, destroying player instances asynchronously..." << std::endl;
+
+            // Destroy all player instances while render thread is STILL ACTIVE
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                FSTPWindow* window = GetWindowByIndex(i);
+                if (window && window->is_active) {
+                    int player_id = window->player_instance_id;
+                    if (player_id >= 0 && IsPlayerInstanceActive(player_id)) {
+                        std::cout << "🎬 [SHUTDOWN] Destroying player " << player_id << " (UI loop still rendering)" << std::endl;
+                        DestroyPlayerInstance(player_id);
+                        std::cout << "✅ [SHUTDOWN] Player " << player_id << " destroyed" << std::endl;
+                    }
+                }
+            }
+
+            std::cout << "✅ [SHUTDOWN] All player instances destroyed, exiting UI loop" << std::endl;
+            g_shutdownComplete.store(true);
+            running = false;  // NOW we can exit the loop
+        }
     }
 
     // Stop autonomous rendering
@@ -1516,6 +1584,9 @@ int RunMainUILoop() {
 // Request force render (for UI changes like zoom)
 extern "C" void RequestForceRender() {
     g_forceRender.store(true);
+    // Also trigger immediate render by signaling VSync
+    g_vsyncSignal.store(true);
+    g_vsyncCV.notify_one();
 }
 
 // Initial file to load from command line

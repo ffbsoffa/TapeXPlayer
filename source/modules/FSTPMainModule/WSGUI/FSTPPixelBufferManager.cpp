@@ -1,4 +1,5 @@
 #include "FSTPPixelBufferManager.h"
+#include "FSTPOSDSystem.h"
 #include "../../FSTPVideoModule/FSTPPerformanceProfiler.h"
 #include "../../FSTPVideoModule/FSTPCallCounter.h"
 #include <iostream>
@@ -57,8 +58,11 @@ void FSTPPixelBufferManager::Shutdown() {
 }
 
 // ZERO-COPY method - accepts AVFrame directly
+// Optional: prev_frame (N-1) and next_frame (N+1) for Betacam slow-motion compositing
 bool FSTPPixelBufferManager::SubmitAVFrame(int player_id, std::shared_ptr<AVFrame> av_frame,
-                                           double timestamp, int frame_number) {
+                                           double timestamp, int frame_number,
+                                           std::shared_ptr<AVFrame> prev_frame,
+                                           std::shared_ptr<AVFrame> next_frame) {
     if (!ValidatePlayerID(player_id)) {
         std::cerr << "❌ [ZERO-COPY] Invalid player_id=" << player_id << std::endl;
         return false;
@@ -82,12 +86,32 @@ bool FSTPPixelBufferManager::SubmitAVFrame(int player_id, std::shared_ptr<AVFram
 
         PixelBuffer& buffer = m_pixel_buffers[player_id][write_idx];
 
+        // Track frame number changes for slow motion compositing
+        // (actual pixel data is stored in FSTPBetacamEffect::PlayerState)
+        if (buffer.is_valid && buffer.av_frame && buffer.frame_number != frame_number) {
+            m_prev_frame_number[player_id] = buffer.frame_number;
+        }
+
         // ZERO-COPY: simply save shared_ptr (increment refcount)
         buffer.av_frame = av_frame;
+
+        // Store adjacent frames for Betacam slow-motion compositing
+        buffer.prev_frame = prev_frame;  // Frame N-1 (for forward)
+        buffer.next_frame = next_frame;  // Frame N+1 (for reverse)
 
         // Cache metadata for fast access
         buffer.width = av_frame->width;
         buffer.height = av_frame->height;
+
+        // Extract SAR (Sample Aspect Ratio) for anamorphic content
+        buffer.sar_num = av_frame->sample_aspect_ratio.num;
+        buffer.sar_den = av_frame->sample_aspect_ratio.den;
+
+        // Validate SAR (if invalid, default to 1:1 square pixels)
+        if (buffer.sar_num <= 0 || buffer.sar_den <= 0) {
+            buffer.sar_num = 1;
+            buffer.sar_den = 1;
+        }
 
         // Define SDL format based on AVFrame format
         if (av_frame->format == AV_PIX_FMT_NV12) {
@@ -105,6 +129,11 @@ bool FSTPPixelBufferManager::SubmitAVFrame(int player_id, std::shared_ptr<AVFram
         buffer.frame_number = frame_number;
         buffer.new_frame = true;
         buffer.is_valid = true;
+
+        // Detect full-res mode (resolution > 480p indicates full-resolution decoder)
+        // Update OSD to show "LOCK" at 1× speed with full-res
+        bool is_full_res = (av_frame->height > 480);
+        UpdateOSDFullResMode(player_id, is_full_res);
 
         // Atomic switch buffers
         int old_read_idx = m_read_buffer_index[player_id].load();
@@ -202,6 +231,13 @@ const FSTPPixelBufferManager::PixelBuffer* FSTPPixelBufferManager::GetPixelBuffe
     return buffer.is_valid ? &buffer : nullptr;
 }
 
+const FSTPPixelBufferManager::PixelBuffer* FSTPPixelBufferManager::GetPreviousFrame(int player_id) const {
+    // Previous frame data is now stored internally in FSTPBetacamEffect
+    // This method is kept for API compatibility but returns nullptr
+    (void)player_id;
+    return nullptr;
+}
+
 void FSTPPixelBufferManager::UpdatePlaybackMetrics(int player_id,
                                                    const FSTPBetacamEffect::PlaybackMetrics& metrics) {
     if (!ValidatePlayerID(player_id)) {
@@ -235,9 +271,23 @@ bool FSTPPixelBufferManager::ApplyRenderJitter(int player_id,
     return m_betacam_effect.ApplyRenderJitter(player_id, render_ctx);
 }
 
+bool FSTPPixelBufferManager::RenderWithHsync(int player_id, SDL_Renderer* renderer, SDL_Texture* texture,
+                                              int texture_width, int texture_height, const SDL_Rect& dest_rect) {
+    if (!ValidatePlayerID(player_id)) {
+        return false;
+    }
+    return m_betacam_effect.RenderWithHsync(player_id, renderer, texture, texture_width, texture_height, dest_rect);
+}
+
 SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Renderer* renderer, const PixelBuffer* buffer,
                                                           SDL_Texture* existing_texture) {
     FSTP_COUNT_CALL("CreateOrUpdateTexture");
+
+    // CRITICAL: Validate player_id before accessing any arrays
+    if (!ValidatePlayerID(player_id)) {
+        std::cerr << "❌ [PIXEL BUFFER] CreateOrUpdateTexture: invalid player_id=" << player_id << std::endl;
+        return existing_texture;
+    }
 
     if (!renderer || !buffer || !buffer->is_valid) {
         static int invalid_counter = 0;
@@ -342,7 +392,11 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
 
                 if (m_betacam_effect.IsEnabled() && y_plane && y_pitch > 0) {
                     const auto& metrics = m_playback_metrics[player_id];
-                    bool candidate_effect = (std::abs(metrics.playback_rate) >= 1.2) &&
+                    // Effect active at: slow motion (< 0.9×) OR fast shuttle (>= 1.2×)
+                    // NOT active at normal playback (0.9× - 1.2×)
+                    double abs_rate = std::abs(metrics.playback_rate);
+                    bool speed_in_effect_range = (abs_rate < 0.9 || abs_rate >= 1.2);
+                    bool candidate_effect = speed_in_effect_range &&
                                              (metrics.position_seconds > 0.1) &&
                                              ((metrics.duration_seconds <= 0.0) ||
                                               ((metrics.duration_seconds - metrics.position_seconds) > 0.1)) &&
@@ -411,6 +465,11 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                             frame_ctx.planes[2] = scratch.plane2.empty() ? nullptr : scratch.plane2.data();
                             frame_ctx.linesize[2] = v_pitch;
                             frame_ctx.source_frame = buffer->av_frame.get();
+
+                            // Adjacent frames for Betacam slow-motion compositing
+                            // Provided by decoder: prev_frame (N-1) and next_frame (N+1)
+                            frame_ctx.prev_source_frame = buffer->prev_frame.get();
+                            frame_ctx.next_source_frame = buffer->next_frame.get();
 
                             if (m_betacam_effect.ApplyPixelFX(player_id, frame_ctx)) {
                                 y_plane = scratch.plane0.data();
@@ -511,15 +570,28 @@ void FSTPPixelBufferManager::ClearPlayerBuffers(int player_id) {
     if (!ValidatePlayerID(player_id)) {
         return;
     }
-    
+
     std::lock_guard<std::mutex> lock(m_buffer_mutex[player_id]);
-    
+
+    // CRITICAL: Set buffer_ready to false FIRST (inside lock)
+    // This prevents race condition where GetPixelBuffer returns
+    // a pointer to a buffer that's being cleared
+    m_buffer_ready[player_id].store(false);
+
     for (int i = 0; i < 2; ++i) {
         m_pixel_buffers[player_id][i] = PixelBuffer(); // Reset to default state
     }
-    
-    m_buffer_ready[player_id].store(false);
-    m_effect_scratch[player_id] = EffectScratch();
+
+    // Clear effect scratch buffers safely
+    m_effect_scratch[player_id].plane0.clear();
+    m_effect_scratch[player_id].plane1.clear();
+    m_effect_scratch[player_id].plane2.clear();
+    m_effect_scratch[player_id].width = 0;
+    m_effect_scratch[player_id].height = 0;
+
+    // Reset previous frame tracking
+    m_prev_frame_number[player_id] = -1;
+
     m_last_effect_frame[player_id] = -1;
     m_playback_metrics[player_id] = {};
     m_betacam_effect.ResetPlayer(player_id);

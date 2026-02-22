@@ -2,42 +2,24 @@
 #define FSTP_MEMORY_LOCATIONS_WINDOW_H
 
 #ifdef _WIN32
-#include <windows.h>
-#include <SDL.h>
-#include "../FSTPMemoryLocations.h"
 
-class FSTPMemoryLocationsWindow {
-public:
-    explicit FSTPMemoryLocationsWindow(HWND parentWindow);
-    ~FSTPMemoryLocationsWindow();
-
-    void Show();
-    void Hide();
-    void Update();
-    bool IsVisible() const;
-    
-private:
-    HWND hwndWindow;
-    HWND hwndParent;
-    HWND hwndList;
-    bool isVisible;
-
-    void CreateControls();
-    void PopulateList();
-    static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
-};
-
-#else
-
-class FSTPMemoryLocationsWindow {
-public:
-    explicit FSTPMemoryLocationsWindow(void*) {}
-    void Show() {}
-    void Hide() {}
-    void Update() {}
-    bool IsVisible() const { return false; }
-};
-
+#ifdef __cplusplus
+extern "C" {
 #endif
+
+// Show/Hide Memory Locations Inspector Window
+void ShowWin32MemoryLocationsWindow();
+void HideWin32MemoryLocationsWindow();
+void ToggleWin32MemoryLocationsWindow();
+
+// Show unified Add/Edit dialog for Memory Locations
+// Use location_id = -1 for "Add mode", otherwise "Edit mode"
+void ShowWin32MemoryLocationDialog(int player_id, int location_id, double current_time);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // _WIN32
 
 #endif // FSTP_MEMORY_LOCATIONS_WINDOW_H

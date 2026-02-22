@@ -5,21 +5,50 @@ class MemoryLocationViewModel: ObservableObject {
     @Published var locationNumber: String = ""
     @Published var timecode: String = ""
     @Published var name: String = ""
+    @Published var comments: String = ""
     @Published var recallZoom: Bool = false
 
     let playerId: Int
     let currentTime: Double
+    let editingLocationId: Int?  // If set, we're editing existing location
 
-    init(playerId: Int, currentTime: Double) {
+    init(playerId: Int, currentTime: Double, editingLocationId: Int? = nil) {
         self.playerId = playerId
         self.currentTime = currentTime
+        self.editingLocationId = editingLocationId
 
-        // Automatically fill timecode with current position
-        self.timecode = formatTimecode(seconds: currentTime)
+        // If editing existing location, load its data
+        if let locationId = editingLocationId {
+            var data = FSTP_MemoryLocationData()
+            // Find location index by ID
+            let count = Int(FSTP_GetMemoryLocationsCount())
+            for i in 0..<count {
+                if FSTP_GetMemoryLocationData(Int32(i), &data) {
+                    if data.id == locationId {
+                        self.locationNumber = "\(data.id)"
 
-        // Automatically generate next location number
-        let nextId = Int(FSTP_GetMemoryLocationsCount()) + 1
-        self.locationNumber = "\(nextId)"
+                        // Safe conversion from C fixed-size char arrays
+                        self.name = withUnsafeBytes(of: data.name) { ptr in
+                            String(cString: ptr.bindMemory(to: CChar.self).baseAddress!)
+                        }
+                        self.comments = withUnsafeBytes(of: data.comments) { ptr in
+                            String(cString: ptr.bindMemory(to: CChar.self).baseAddress!)
+                        }
+                        self.timecode = withUnsafeBytes(of: data.timecode_display) { ptr in
+                            String(cString: ptr.bindMemory(to: CChar.self).baseAddress!)
+                        }
+
+                        self.recallZoom = data.recall_zoom
+                        break
+                    }
+                }
+            }
+        } else {
+            // New location: fill with defaults
+            self.timecode = formatTimecode(seconds: currentTime)
+            let nextId = Int(FSTP_GetMemoryLocationsCount()) + 1
+            self.locationNumber = "\(nextId)"
+        }
     }
 
     private func formatTimecode(seconds: Double) -> String {
@@ -56,18 +85,33 @@ class MemoryLocationViewModel: ObservableObject {
             }
         }
 
-        // Add location with zoom parameters
-        let success = FSTP_AddMemoryLocationWithZoom(
-            Int32(playerId),
-            Int32(locationId),
-            name,
-            "",  // comments - not used
-            timecodeSeconds,
-            recallZoom,
-            zoomFactor,
-            zoomCenterX,
-            zoomCenterY
-        )
+        let success: Bool
+        if let _ = editingLocationId {
+            // Update existing location
+            success = FSTP_UpdateMemoryLocationFull(
+                Int32(locationId),
+                name,
+                comments,
+                timecodeSeconds,
+                recallZoom,
+                zoomFactor,
+                zoomCenterX,
+                zoomCenterY
+            )
+        } else {
+            // Add new location
+            success = FSTP_AddMemoryLocationWithZoom(
+                Int32(playerId),
+                Int32(locationId),
+                name,
+                comments,
+                timecodeSeconds,
+                recallZoom,
+                zoomFactor,
+                zoomCenterX,
+                zoomCenterY
+            )
+        }
 
         return success
     }
@@ -96,7 +140,16 @@ class MemoryLocationViewModel: ObservableObject {
 struct MemoryLocationDialog: View {
     @ObservedObject var viewModel: MemoryLocationViewModel
     @Environment(\.presentationMode) var presentationMode
-    @FocusState private var isNameFieldFocused: Bool
+
+    // Focus state for Tab navigation
+    enum Field: Hashable {
+        case number
+        case timecode
+        case name
+        case comments
+    }
+    @FocusState private var focusedField: Field?
+
     var onClose: (() -> Void)?
 
     var body: some View {
@@ -110,7 +163,7 @@ struct MemoryLocationDialog: View {
                         .font(.system(size: 18))
                         .foregroundColor(.accentColor)
 
-                    Text("New Memory Location")
+                    Text(viewModel.editingLocationId != nil ? "Edit Memory Location" : "New Memory Location")
                         .font(.system(size: 16, weight: .semibold))
 
                     Spacer()
@@ -131,6 +184,10 @@ struct MemoryLocationDialog: View {
                         TextField("", text: $viewModel.locationNumber)
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 70)
+                            .focused($focusedField, equals: .number)
+                            .onSubmit {
+                                focusedField = .timecode
+                            }
                     }
 
                     Spacer()
@@ -142,6 +199,10 @@ struct MemoryLocationDialog: View {
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 110)
                             .font(.system(.body, design: .monospaced))
+                            .focused($focusedField, equals: .timecode)
+                            .onSubmit {
+                                focusedField = .name
+                            }
                     }
                 }
 
@@ -152,13 +213,33 @@ struct MemoryLocationDialog: View {
                     TextField("", text: $viewModel.name)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 307)
-                        .focused($isNameFieldFocused)
+                        .focused($focusedField, equals: .name)
+                        .onSubmit {
+                            focusedField = .comments
+                        }
+                }
+
+                // Comments field (multiline)
+                HStack(alignment: .top, spacing: 8) {
+                    Text("Comments:")
+                        .frame(width: 60, alignment: .trailing)
+                        .padding(.top, 8)
+
+                    ZStack(alignment: .topLeading) {
+                        TextEditor(text: $viewModel.comments)
+                            .font(.system(size: 12))
+                            .frame(width: 307, height: 80)
+                            .focused($focusedField, equals: .comments)
+                    }
+                    .border(Color.gray.opacity(0.3), width: 1)
+                    .cornerRadius(4)
                 }
             }
             .padding(.horizontal, 30)
             .padding(.vertical, 24)
             .onAppear {
-                isNameFieldFocused = true
+                // Set initial focus to Name field
+                focusedField = .name
             }
 
             Divider()
@@ -187,16 +268,26 @@ struct MemoryLocationDialog: View {
             }
             .padding(20)
         }
-        .frame(width: 430, height: 222)
+        .frame(width: 430, height: 340)
     }
 }
 
 // MARK: - C Bridge Functions
 @_cdecl("ShowSwiftUIMemoryLocationDialog")
 public func ShowSwiftUIMemoryLocationDialog(_ playerId: Int32, _ currentTime: Double) {
+    ShowSwiftUIMemoryLocationDialogEdit(playerId, currentTime, -1)
+}
+
+@_cdecl("ShowSwiftUIMemoryLocationDialogEdit")
+public func ShowSwiftUIMemoryLocationDialogEdit(_ playerId: Int32, _ currentTime: Double, _ locationId: Int32) {
     if #available(macOS 13.0, *) {
         DispatchQueue.main.async {
-            let viewModel = MemoryLocationViewModel(playerId: Int(playerId), currentTime: currentTime)
+            let editingId = locationId >= 0 ? Int(locationId) : nil
+            let viewModel = MemoryLocationViewModel(
+                playerId: Int(playerId),
+                currentTime: currentTime,
+                editingLocationId: editingId
+            )
 
             var window: NSWindow?
             let onClose: () -> Void = {

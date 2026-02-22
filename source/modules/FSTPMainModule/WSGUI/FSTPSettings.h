@@ -13,6 +13,7 @@ typedef struct {
     int audio_device_index;         // Audio device index
     float audio_master_volume;      // 0.0 - 1.0
     int audio_buffer_size;          // 512, 1024, 2048, 4096
+    int audio_volume_ducking_enabled; // 1 = Auto-reduce volume at high shuttle speeds (ear protection), 0 = disabled
 
     // A/V synchronization settings
     int frame_offset;               // Frame offset for monitor delay compensation (-10 to +10)
@@ -26,6 +27,9 @@ typedef struct {
     int midi_enabled;               // 1 = MIDI controller enabled, 0 = disabled
     int midi_input_port;            // Input MIDI port index (-1 = not selected)
     int midi_output_port;           // Output MIDI port index (-1 = not selected)
+
+    // Developer/Debug settings
+    int show_decoder_status;        // 1 = Show decoder status indicator (OSD), 0 = hidden (default)
 
 } FSTPSettings;
 
@@ -47,6 +51,7 @@ void ApplyAudioSettings();
 int GetAudioDeviceIndex();
 float GetMasterVolume();
 int GetAudioBufferSize();
+int GetAudioVolumeDuckingEnabled(); // Get volume ducking (ear protection) state
 int GetFrameOffset();          // Get frame offset
 int GetAutoFreezeInactive();   // Get auto-freeze setting
 int GetBetacamEffectEnabled(); // Get Betacam effect state
@@ -56,6 +61,7 @@ int GetMIDIEnabled();          // Get MIDI state
 int GetMIDIInputPort();        // Get input MIDI port
 int GetMIDIOutputPort();       // Get output MIDI port
 const char* GetExtensionLanguage(); // Get script language for extensions
+int GetShowDecoderStatus();    // Get decoder status display setting
 
 // yt-dlp integration helpers
 int FSTP_YTDLP_IsAvailable(void);

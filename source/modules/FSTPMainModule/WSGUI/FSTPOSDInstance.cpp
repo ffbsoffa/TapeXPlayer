@@ -253,8 +253,12 @@ void FSTPOSDInstance::RenderTextWithOutline(const char* text, int x, int y, SDL_
 void FSTPOSDInstance::RenderTimecode() {
     if (!m_large_font || !m_normal_font || !m_renderer) return;
 
-    int windowWidth, windowHeight;
-    SDL_GetRendererOutputSize(m_renderer, &windowWidth, &windowHeight);
+    // Use logical window size (NOT renderer output size) to avoid HiDPI scaling issues
+    int windowWidth = 0, windowHeight = 0;
+    SDL_Window* window = SDL_RenderGetWindow(m_renderer);
+    if (window) {
+        SDL_GetWindowSize(window, &windowWidth, &windowHeight);
+    }
 
     // Colors - EXACTLY as in the original
     SDL_Color textColor = {255, 255, 255, 255};

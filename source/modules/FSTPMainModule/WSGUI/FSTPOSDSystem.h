@@ -4,6 +4,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include <string>
+#include <vector>
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,6 +42,7 @@ void ShutdownOSDSystem();
 void UpdateOSDTimecode(int player_id, double currentTime);
 void UpdateOSDSpeed(int player_id, double playbackRate, bool isReverse);
 void UpdateOSDActualSpeed(int player_id, double actualPlaybackRate);
+void UpdateOSDFullResMode(int player_id, bool is_full_res);
 void UpdateOSDPlayState(int player_id, bool isPlaying, bool jog_forward, bool jog_backward);
 void UpdateOSDAudioLevels(int player_id, float left, float right, float leftPeak, float rightPeak);
 void UpdateOSDPosition(int player_id, double currentTime, double totalDuration);
@@ -48,6 +50,7 @@ void UpdateOSDSeekMode(int player_id, bool seeking, const std::string& input_tim
 void UpdateOSDDisplayMode(int player_id, OSDDisplayMode mode);
 void UpdateOSDLoadingProgress(int player_id, int percent);
 void SetOSDFileType(int player_id, bool is_audio);
+void UpdateOSDDecodedFrames(int player_id, const std::vector<bool>& decoded_map, int total_frames);
 
 // Backward compatibility - functions without player_id (use player 0)
 // Declarations are in .cpp file

@@ -81,12 +81,21 @@ bool FSTPGetScreenshotFromClipboard(uint8_t** rgbaData, int* width, int* height)
     CloseClipboard();
     return true;
 }
+// Adapter: FSTPScreenshot.cpp expects CopyImageToClipboard (RGB, 3 bytes/pixel)
+extern "C" bool CopyImageToClipboard(const uint8_t* rgb_data, int width, int height) {
+    return FSTPCopyScreenshotToClipboard(rgb_data, width, height);
+}
+
 #else
 bool FSTPCopyScreenshotToClipboard(const uint8_t* /*rgbaData*/, int /*width*/, int /*height*/) {
     return false;
 }
 
 bool FSTPGetScreenshotFromClipboard(uint8_t** /*rgbaData*/, int* /*width*/, int* /*height*/) {
+    return false;
+}
+
+extern "C" bool CopyImageToClipboard(const uint8_t* /*rgb_data*/, int /*width*/, int /*height*/) {
     return false;
 }
 #endif

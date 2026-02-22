@@ -57,6 +57,7 @@ public:
     // Import/Export
     bool SaveToFile(const std::string& filepath);
     bool LoadFromFile(const std::string& filepath);
+    bool ExportToCSV(const std::string& filepath);  // Export to CSV for scientific analysis
 
     // Utilities
     static std::string SecondsToTimecode(double seconds, double fps = 25.0);
@@ -122,10 +123,14 @@ bool FSTP_GetMemoryLocationData(int index, FSTP_MemoryLocationData* out_data);
 // Location management
 bool FSTP_DeleteMemoryLocation(int id);
 bool FSTP_UpdateMemoryLocation(int id, const char* name, const char* comments);
+bool FSTP_UpdateMemoryLocationFull(int id, const char* name, const char* comments,
+                                    double timecode_seconds, bool recall_zoom,
+                                    float zoom_factor, float zoom_center_x, float zoom_center_y);
 
 // Import/Export
 bool FSTP_SaveMemoryLocations(const char* filepath);
 bool FSTP_LoadMemoryLocations(const char* filepath);
+bool FSTP_ExportMemoryLocationsToCSV(const char* filepath);  // Export to CSV for scientific analysis
 
 // Show UI window (platform-dependent implementation in Swift/Cocoa)
 void FSTP_ShowMemoryLocationsWindow();

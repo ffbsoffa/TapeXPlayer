@@ -3,8 +3,10 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 extern "C" {
 #include <libswscale/swscale.h>
@@ -190,15 +192,20 @@ bool TakeScreenshotFromPixelBuffer(
     const uint8_t* src_u = yuv_data + y_size;
     const uint8_t* src_v = yuv_data + y_size + uv_size;
 
-    // Create RGB output buffer using mmap (avoid malloc heap corruption from GTK)
+    // Create RGB output buffer
     size_t rgb_buffer_size = final_width * final_height * 3;
+#ifdef _WIN32
+    // On Windows there is no GTK, so malloc is safe
+    void* rgb_mmap = malloc(rgb_buffer_size);
+    if (rgb_mmap == nullptr) {
+#else
     void* rgb_mmap = mmap(nullptr, rgb_buffer_size,
                           PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS,
                           -1, 0);
-
     if (rgb_mmap == MAP_FAILED) {
-        std::cerr << "❌ [SCREENSHOT] Failed to allocate RGB buffer via mmap" << std::endl;
+#endif
+        std::cerr << "❌ [SCREENSHOT] Failed to allocate RGB buffer" << std::endl;
         return false;
     }
 
@@ -438,8 +445,12 @@ bool TakeScreenshotFromPixelBuffer(
         std::cerr << "❌ [SCREENSHOT] Failed to copy to clipboard" << std::endl;
     }
 
-    // Free mmap'd RGB buffer
+    // Free RGB buffer
+#ifdef _WIN32
+    free(rgb_mmap);
+#else
     munmap(rgb_mmap, rgb_buffer_size);
+#endif
     std::cout << "📋 [SCREENSHOT] Freed RGB buffer (" << rgb_buffer_size << " bytes)" << std::endl;
 
     return success;

@@ -58,7 +58,24 @@ _Bool FSTP_AddMemoryLocationWithTimecode(int player_id, int id, const char* name
 _Bool FSTP_AddMemoryLocationWithZoom(int player_id, int id, const char* name, const char* comments,
                                       double timecode_seconds, _Bool recall_zoom,
                                       float zoom_factor, float zoom_center_x, float zoom_center_y);
+_Bool FSTP_UpdateMemoryLocationFull(int id, const char* name, const char* comments,
+                                     double timecode_seconds, _Bool recall_zoom,
+                                     float zoom_factor, float zoom_center_x, float zoom_center_y);
+
+typedef struct {
+    int id;
+    char name[256];
+    double timecode_seconds;
+    char timecode_display[32];
+    char comments[512];
+    int zoom_level;
+    _Bool recall_zoom;
+    _Bool is_active;
+} FSTP_MemoryLocationData;
+
+_Bool FSTP_GetMemoryLocationData(int index, FSTP_MemoryLocationData* out_data);
 void OnMemoryLocationDialogClosedCallback(void);
+void ShowSwiftUIMemoryLocationDialogEdit(int player_id, double current_time, int location_id);
 
 // Zoom API
 typedef struct {

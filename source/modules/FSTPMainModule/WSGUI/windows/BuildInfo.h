@@ -1,11 +1,26 @@
-#ifndef FSTP_BUILD_INFO_H
-#define FSTP_BUILD_INFO_H
+#pragma once
 
-// This file is auto-generated during build
-#define FSTP_VERSION "2026.01"
-#define FSTP_BUILD_NUMBER "854"
-#define FSTP_BUILD_DATE "17/10/2025"
-#define FSTP_CODE_NAME "Albatross"
-#define FSTP_BUILD_TYPE "Windows (SDL2/MinGW)"
+// Auto-generated build information for Windows
+// Generated on: Sat Feb 21 10:37:35 PST 2026
 
-#endif // FSTP_BUILD_INFO_H
+#define TAPEXPLAYER_VERSION "2026.01"
+#define TAPEXPLAYER_CODE_NAME "Albatross"
+#define TAPEXPLAYER_BUILD_NUMBER "1488"
+#define TAPEXPLAYER_BUILD_DATE __DATE__
+
+// Helper functions
+inline const char* GetTapeXPlayerVersion() {
+    return TAPEXPLAYER_VERSION;
+}
+
+inline const char* GetTapeXPlayerCodeName() {
+    return TAPEXPLAYER_CODE_NAME;
+}
+
+inline const char* GetTapeXPlayerBuildNumber() {
+    return TAPEXPLAYER_BUILD_NUMBER;
+}
+
+inline const char* GetTapeXPlayerBuildDate() {
+    return TAPEXPLAYER_BUILD_DATE;
+}

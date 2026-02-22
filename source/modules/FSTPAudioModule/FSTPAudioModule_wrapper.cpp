@@ -1,14 +1,19 @@
 #include "FSTPAudioModule_wrapper.h"
-#include "FSTPSMFXSim.h"
 #include <iostream>
 #include <iomanip>
 #include <vector>
 #include <thread>
 #include <mutex>
 #include <cstring>
+#define _USE_MATH_DEFINES
 #include <cmath>
 #include <chrono>
 #include <atomic>
+
+// Ensure M_PI is defined (for elastic ease function)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 // NEON SIMD for Apple Silicon optimization
 #if defined(__aarch64__) || defined(__ARM_NEON)
@@ -212,6 +217,24 @@ public:
     std::atomic<float> audio_peak_left{0.0f};
     std::atomic<float> audio_peak_right{0.0f};
 
+    // === FRAME ALIGNMENT ON PAUSE ===
+    // After 10 seconds of pause, gradually align audio time to nearest frame boundary
+    // This removes the visible "stripe" artifact from Betacam effect
+    std::chrono::steady_clock::time_point pause_start_time;
+    std::atomic<bool> pause_time_tracking{false};
+    std::atomic<bool> frame_alignment_done{false};
+    std::atomic<double> video_frame_rate{25.0};  // Set by video module
+
+    // CRITICAL FIX: Per-instance VU meter skip counter (was static - caused race condition!)
+    // Problem: Static counter shared between all player instances caused race condition
+    // Solution: Make it per-instance to eliminate thread conflicts
+    int vu_meter_skip_counter{0};
+
+    // Elastic ease-out for first play and periodic playbacks
+    std::atomic<bool> first_play_after_load{true};  // Track first play after file load
+    std::atomic<int> play_count{0};                 // Count Play() calls for periodic elastic effect
+    std::atomic<bool> use_elastic_ease{false};      // Flag to trigger elastic ease in smooth_speed_change
+
     // Decoding progress
     std::atomic<size_t> decoded_samples{0};
     std::atomic<size_t> fast_buffer_samples{0}; // Fast buffer size
@@ -231,10 +254,6 @@ public:
     // Solution: Skip Pa_CloseStream() during destructor, let OS clean up (leak acceptable on exit)
     bool m_in_destructor_cleanup = false;
     bool reduce_fast_buffer_for_pcm = false;
-
-    // Servomotor simulation for Betacam effect
-    FSTPSMFXSim m_smfx_sim;
-    bool m_betacam_audio_enabled = false;
 
     static constexpr double FAST_BUFFER_DURATION = 720.0;
     static constexpr double FAST_BUFFER_DURATION_PCM = 120.0;
@@ -287,10 +306,6 @@ public:
             // DON'T start stream here - only after buffer decoding
         }
 
-        // Initialize servomotor simulation
-        m_smfx_sim.SetSampleRate(48000.0); // Will be updated when stream starts
-        m_smfx_sim.Reset();
-
         return true;
     }
     
@@ -328,48 +343,19 @@ public:
 
         int buffer_size = GetAudioBufferSize();
 
-        // CRITICAL FIX: Direct ALSA hardware access to bypass PipeWire malloc_trim() crash
-        // PipeWire's pw_impl_node_destroy() calls malloc_trim() which crashes on heap corrupted by video
-        // Solution: Use ALSA host API directly (hw:0,0) instead of PipeWire/PulseAudio
-        PaDeviceIndex selected_device = paNoDevice;
-
-        // Try to find ALSA host API
-        PaHostApiIndex alsa_api = Pa_HostApiTypeIdToHostApiIndex(paALSA);
-        if (alsa_api >= 0) {
-            const PaHostApiInfo* alsa_info = Pa_GetHostApiInfo(alsa_api);
-            if (alsa_info && alsa_info->deviceCount > 0) {
-                std::cout << "🎵 [AUDIO] Found ALSA host API with " << alsa_info->deviceCount << " devices" << std::endl;
-
-                // Try to find first working ALSA output device
-                for (int i = 0; i < alsa_info->deviceCount; i++) {
-                    PaDeviceIndex dev_idx = Pa_HostApiDeviceIndexToDeviceIndex(alsa_api, i);
-                    const PaDeviceInfo* dev_info = Pa_GetDeviceInfo(dev_idx);
-
-                    if (dev_info && dev_info->maxOutputChannels > 0) {
-                        std::cout << "🎵 [ALSA] Device " << i << ": " << dev_info->name
-                                  << " (channels: " << dev_info->maxOutputChannels << ")" << std::endl;
-
-                        // Use first available ALSA device with output channels
-                        if (selected_device == paNoDevice) {
-                            selected_device = dev_idx;
-                            std::cout << "✅ [ALSA] Selected direct hardware device: " << dev_info->name << std::endl;
-                        }
-                    }
-                }
-            }
-        } else {
-            std::cout << "⚠️  [AUDIO] ALSA host API not found, trying default device" << std::endl;
-        }
-
-        // Fallback to default if ALSA not found
-        if (selected_device == paNoDevice) {
-            selected_device = Pa_GetDefaultOutputDevice();
-            std::cout << "⚠️  [AUDIO] Using default device as fallback" << std::endl;
-        }
+        // Use PipeWire via PortAudio default device
+        // On modern Linux systems with PipeWire, Pa_GetDefaultOutputDevice() returns PipeWire backend
+        PaDeviceIndex selected_device = Pa_GetDefaultOutputDevice();
 
         if (selected_device == paNoDevice) {
             std::cout << "❌ [AUDIO] No output device available" << std::endl;
             return false;
+        }
+
+        const PaDeviceInfo* default_dev_info = Pa_GetDeviceInfo(selected_device);
+        if (default_dev_info) {
+            std::cout << "🎵 [AUDIO] Using default device: " << default_dev_info->name << std::endl;
+            std::cout << "🎵 [AUDIO] Host API: " << Pa_GetHostApiInfo(default_dev_info->hostApi)->name << std::endl;
         }
 
         outputParameters.device = selected_device;
@@ -405,9 +391,6 @@ public:
         if (err == paNoError) {
             std::cout << "✅ [AUDIO START] Pa_OpenStream succeeded" << std::endl;
             playback_speed.store(0.0); // Start with zero speed
-
-            // Update servomotor simulation sample rate to match audio stream
-            m_smfx_sim.SetSampleRate(static_cast<double>(sample_rate));
 
             // CRITICAL PROTECTION: wrap Pa_StartStream in try-catch
             try {
@@ -477,29 +460,30 @@ public:
                 // Step 1: Stop stream if active
                 PaError is_active = Pa_IsStreamActive(pa_stream);
                 if (is_active == 1) {
-                    std::cout << "[AUDIO] Stream is active, stopping..." << std::endl;
-                    PaError stop_err = Pa_StopStream(pa_stream);
+                    std::cout << "[AUDIO] Stream is active, aborting..." << std::endl;
+                    // Use Pa_AbortStream instead of Pa_StopStream for immediate shutdown
+                    // This prevents PipeWire from waiting for buffer drain (which can crash)
+                    PaError stop_err = Pa_AbortStream(pa_stream);
                     if (stop_err != paNoError && stop_err != paStreamIsStopped) {
-                        std::cout << "[AUDIO] Pa_StopStream warning: " << Pa_GetErrorText(stop_err) << std::endl;
+                        std::cout << "[AUDIO] Pa_AbortStream warning: " << Pa_GetErrorText(stop_err) << std::endl;
                     }
-
-                    // CRITICAL: Wait longer for PipeWire to fully drain buffers
-                    // PipeWire needs time to communicate with daemon
-                    std::cout << "[AUDIO] Waiting 200ms for PipeWire buffer drain..." << std::endl;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                } else {
+                    std::cout << "[AUDIO] Stream already stopped" << std::endl;
                 }
 
-                // Step 2: Close stream (this is where PipeWire crashes during destructor)
-                std::cout << "[AUDIO] Closing stream..." << std::endl;
-                PaError close_err = Pa_CloseStream(pa_stream);
-                if (close_err != paNoError) {
-                    std::cout << "[AUDIO] Pa_CloseStream warning: " << Pa_GetErrorText(close_err) << std::endl;
-                }
+                // WORKAROUND: PipeWire/ALSA has critical bug in pw_stream_destroy()
+                // Calling Pa_CloseStream() causes malloc corruption in libpipewire
+                // This is a known bug: https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/
+                // Solution: Just abort the stream and DON'T close it
+                // The OS will clean up resources when process exits anyway
 
+                std::cout << "[AUDIO] Skipping Pa_CloseStream to avoid PipeWire crash..." << std::endl;
+                std::cout << "[AUDIO] Stream resources will be cleaned up by OS on exit" << std::endl;
+
+                // Mark stream as null so we don't try to use it
                 pa_stream = nullptr;
                 pa_stream_sample_rate = 0;
                 pa_stream_channels = 0;
-                std::cout << "[AUDIO] Stream closed successfully" << std::endl;
 
             } catch (const std::exception& e) {
                 std::cout << "[AUDIO] Exception during cleanup: " << e.what() << std::endl;
@@ -539,6 +523,18 @@ public:
     }
 
 
+    // Ease Out Elastic function (CSS/animation standard)
+    // Returns value from 0.0 to 1.0 based on time progress t (0 to 1)
+    // Creates "bouncy" overshoot effect at the end
+    double EaseOutElastic(double t) {
+        const double c4 = (2.0 * M_PI) / 3.0;
+
+        if (t == 0.0) return 0.0;
+        if (t == 1.0) return 1.0;
+
+        return pow(2.0, -10.0 * t) * sin((t * 10.0 - 0.75) * c4) + 1.0;
+    }
+
     void StartSmoothSpeedChange() {
         if (smooth_speed_running.load()) {
             return; // Already running
@@ -570,30 +566,81 @@ public:
         // --- Lambda for Stateless Volume Calculation (defined locally) ---
         auto calculate_and_set_volume = [&](double current_rate) {
             float new_volume = 1.0f; // Default to full volume
-            if (current_rate <= 0.3) { // Start fading below 0.3x
-                new_volume = static_cast<float>(current_rate / 0.3); // Linear fade from 0.3x down to 0 (cast needed)
-            } else if (current_rate >= 7.0) {
-                if (current_rate < 10.0) { // Fade from 7x to 10x
-                    float t = static_cast<float>((current_rate - 7.0) / (10.0 - 7.0)); // Range is now 3.0
-                    new_volume = 1.0f - (t * 0.85f);
-                } else { // Fade further from 10x to 24x
-                    const float start_speed = 10.0f;
-                    const float end_speed = 24.0f;
-                    const float start_volume = 0.15f;
-                    const float end_volume = 0.05f;
-                    // Clamp speed to the fade range [10, 24]
-                    float clamped_rate = std::min(static_cast<float>(current_rate), end_speed);
-                    // Calculate progress within the 10-24 range
-                    float t = (clamped_rate - start_speed) / (end_speed - start_speed);
-                    // Linear interpolation between start_volume and end_volume
-                    new_volume = start_volume + (end_volume - start_volume) * t;
+
+            // Check if volume ducking is enabled in settings
+            extern int GetAudioVolumeDuckingEnabled();
+            bool ducking_enabled = GetAudioVolumeDuckingEnabled();
+
+            // Low speed fade (slow motion)
+            if (current_rate <= 0.3) {
+                // Start fading below 0.3x
+                new_volume = static_cast<float>(current_rate / 0.3);
+            }
+            // High speed fade (shuttle) - IMPROVED CURVE for ear protection
+            // 6x: start fade, 12x: -24dB, 32x: -40dB
+            else if (ducking_enabled && current_rate >= 6.0) {
+                // Speed breakpoints and corresponding volumes (linear scale)
+                const float speed_6x = 6.0f;
+                const float speed_12x = 12.0f;
+                const float speed_32x = 32.0f;
+
+                const float vol_full = 1.0f;           // 0 dB at 6x
+                const float vol_12x = 0.0631f;         // -24 dB at 12x (10^(-24/20))
+                const float vol_32x = 0.01f;           // -40 dB at 32x (10^(-40/20))
+
+                if (current_rate < speed_12x) {
+                    // Fade from 6x to 12x: 0dB → -24dB
+                    float t = (static_cast<float>(current_rate) - speed_6x) / (speed_12x - speed_6x);
+                    // Use exponential fade for more natural volume reduction
+                    t = t * t;  // Square for faster initial drop
+                    new_volume = vol_full + (vol_12x - vol_full) * t;
+                } else if (current_rate < speed_32x) {
+                    // Fade from 12x to 32x: -24dB → -40dB
+                    float t = (static_cast<float>(current_rate) - speed_12x) / (speed_32x - speed_12x);
+                    new_volume = vol_12x + (vol_32x - vol_12x) * t;
+                } else {
+                    // Above 32x: stay at -40dB
+                    new_volume = vol_32x;
                 }
             }
+
             volume.store(new_volume);
         };
         // --- End Lambda ---
 
         while (!should_exit_smooth_speed.load()) {
+            // ELASTIC EASE: Apply elastic ease-out for first play (0 → 1.0x)
+            if (use_elastic_ease.load()) {
+                double start_rate = playback_speed.load(); // Should be 0.0 or very low
+                double snap_target = target_playback_speed.load(); // Should be 1.0
+
+                // Duration: 300-500ms (user requested 0.3-0.5s)
+                const int elastic_duration_ms = 250;  // 0.4 seconds
+                const int step_ms = 2;               // 2ms interval for smooth animation
+                const int steps = elastic_duration_ms / step_ms;
+
+               // std::cout << "🎵 [ELASTIC EASE] Starting elastic ease-out from " << start_rate
+               //           << "x to " << snap_target << "x over " << elastic_duration_ms << "ms" << std::endl;
+
+                for (int s = 1; s <= steps; ++s) {
+                    double t = static_cast<double>(s) / steps;  // Progress from 0.0 to 1.0
+                    double eased_t = EaseOutElastic(t);         // Apply elastic curve
+                    double rate = start_rate + (snap_target - start_rate) * eased_t;
+                    playback_speed.store(rate);
+                    calculate_and_set_volume(rate);
+                    if (should_exit_smooth_speed.load()) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+                }
+
+                // Ensure exact target hit (1.0x)
+                playback_speed.store(snap_target);
+                calculate_and_set_volume(snap_target);
+
+                use_elastic_ease.store(false);  // Reset flag
+                // std::cout << "🎵 [ELASTIC EASE] Completed, now at " << snap_target << "x" << std::endl;
+                continue;
+            }
+
             // Instant speed request (mouse shuttle) with micro-smoothing
             if (instant_speed_requested.load()) {
                 double start_rate = playback_speed.load();
@@ -698,13 +745,99 @@ public:
             // --- No Change Needed ---
             // else { /* current == target and not jogging/resuming */ }
 
+            // === FRAME ALIGNMENT ON PROLONGED PAUSE ===
+            // After 10 seconds of pause, gradually align audio time to nearest frame boundary
+            // This removes the visible "stripe" artifact from Betacam effect
+            {
+                bool is_paused = (current == 0.0 && target == 0.0 && !is_jogging);
+
+                if (is_paused) {
+                    // Start tracking pause time if not already
+                    if (!pause_time_tracking.load()) {
+                        pause_start_time = std::chrono::steady_clock::now();
+                        pause_time_tracking.store(true);
+                        frame_alignment_done.store(false);
+                    }
+
+                    // Check if 10 seconds have passed and alignment not done yet
+                    if (pause_time_tracking.load() && !frame_alignment_done.load()) {
+                        auto now = std::chrono::steady_clock::now();
+                        auto pause_duration = std::chrono::duration_cast<std::chrono::seconds>(
+                            now - pause_start_time).count();
+
+                        if (pause_duration >= 10) {
+                            // Calculate current time in seconds
+                            double current_pos_samples = playback_position.load();
+                            double current_time_sec = current_pos_samples / (sample_rate * channels);
+
+                            // Get frame rate (set by video module)
+                            double fps = video_frame_rate.load();
+                            if (fps < 1.0) fps = 25.0;  // Default fallback
+
+                            // Calculate nearest frame boundary
+                            double frame_duration = 1.0 / fps;
+                            double frame_index = current_time_sec / frame_duration;
+                            double nearest_frame = std::round(frame_index);
+                            double target_time_sec = nearest_frame * frame_duration;
+
+                            // Calculate offset
+                            double offset_sec = target_time_sec - current_time_sec;
+
+                            // Only align if offset is significant (> 1ms) but not too large (< half frame)
+                            if (std::abs(offset_sec) > 0.001 && std::abs(offset_sec) < frame_duration * 0.5) {
+                                // Gradually align over 500ms for smooth transition
+                                const int align_duration_ms = 500;
+                                const int align_step_ms = 10;
+                                const int align_steps = align_duration_ms / align_step_ms;
+
+                                double start_samples = current_pos_samples;
+                                double target_samples = target_time_sec * sample_rate * channels;
+
+                                for (int s = 1; s <= align_steps; ++s) {
+                                    // Check if still paused
+                                    if (target_playback_speed.load() != 0.0 || should_exit_smooth_speed.load()) {
+                                        break;  // User started playback, abort alignment
+                                    }
+
+                                    double t = static_cast<double>(s) / align_steps;
+                                    // Ease-out for smooth finish
+                                    double eased_t = 1.0 - (1.0 - t) * (1.0 - t);
+                                    double new_samples = start_samples + (target_samples - start_samples) * eased_t;
+                                    playback_position.store(new_samples);
+
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(align_step_ms));
+                                }
+
+                                // Ensure exact target
+                                if (target_playback_speed.load() == 0.0) {
+                                    playback_position.store(target_samples);
+                                }
+                            }
+
+                            frame_alignment_done.store(true);
+                        }
+                    }
+                } else {
+                    // Not paused - reset tracking
+                    if (pause_time_tracking.load()) {
+                        pause_time_tracking.store(false);
+                        frame_alignment_done.store(false);
+                    }
+                }
+            }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(interval));
         }
     }
 
     bool LoadFile(const std::string& filepath) {
         std::cout << "FSTPAudioModuleImpl::LoadFile called with: " << filepath << std::endl;
-        
+
+        // Reset elastic ease flags for new file
+        first_play_after_load.store(true);
+        play_count.store(0);
+        use_elastic_ease.store(false);
+
         std::cout << "Analyzing file..." << std::endl;
         if (!AnalyzeFile(filepath)) {
             std::cerr << "AnalyzeFile failed" << std::endl;
@@ -967,19 +1100,8 @@ private:
                     clean_buffer[frame * impl->channels + ch] = 0;
                 }
             } else {
-                // BETACAM SERVOMOTOR: Generate once per frame (not per channel)
-                double abs_speed = std::abs(speed);
-                double servo_left = 0.0, servo_right = 0.0;
-                if (impl->m_betacam_audio_enabled) {
-                    impl->m_smfx_sim.Generate(static_cast<float>(abs_speed), servo_left, servo_right);
-                    // Debug: log occasionally
-                    static int debug_counter = 0;
-                    if (debug_counter++ % 48000 == 0) {
-                        std::cout << "🔊 [SERVOMOTOR] Speed: " << abs_speed << ", Servo L/R: " << servo_left << "/" << servo_right << std::endl;
-                    }
-                }
-
                 // Catmull-Rom interpolation for each channel
+                double abs_speed = std::abs(speed);
                 for (int ch = 0; ch < impl->channels; ch++) {
                     // Get 4 neighboring samples for Catmull-Rom
                     double p0 = impl->GetSafeSample(base_index - 1, ch, max_available_samples);
@@ -1001,19 +1123,13 @@ private:
                     float master_volume = GetMasterVolume();
                     interpolated *= master_volume;
 
-                    // Store clean sample for VU meters (before servomotor effect)
+                    // Apply volume ducking for high speeds (ear protection)
+                    float ducking_volume = impl->volume.load();
+                    interpolated *= ducking_volume;
+
+                    // Store clean sample for VU meters
                     double clean_sample = std::max(-32768.0, std::min(32767.0, interpolated));
                     clean_buffer[frame * impl->channels + ch] = static_cast<int16_t>(clean_sample);
-
-                    // Mix servomotor sound (stereo aware)
-                    // Servomotor outputs float range (-0.95 to 0.95), scale to int16_t range
-                    if (impl->m_betacam_audio_enabled) {
-                        if (ch == 0) {
-                            interpolated += servo_left * 32767.0;
-                        } else if (ch == 1) {
-                            interpolated += servo_right * 32767.0;
-                        }
-                    }
 
                     // Limit value within int16_t
                     interpolated = std::max(-32768.0, std::min(32767.0, interpolated));
@@ -1043,12 +1159,9 @@ private:
             }
         }
 
-        // OPTIMIZATION: Calculate VU meters only every 4th callback (reduces CPU)
+        // Peak Program Meter (PPM) calculation - quasi-peak behavior like Pro Tools/iZotope
         // NOTE: VU meters read from clean_buffer (audio file only, excluding servomotor)
-        static int vu_meter_skip_counter = 0;
-        if (++vu_meter_skip_counter >= 4) {
-            vu_meter_skip_counter = 0;
-
+        {
             float sum_left = 0.0f, sum_right = 0.0f;
             float peak_left = 0.0f, peak_right = 0.0f;
 
@@ -1056,6 +1169,7 @@ private:
                 if (impl->channels >= 1) {
                     float sample_left = static_cast<float>(clean_buffer[frame * impl->channels]) / 32768.0f;
                     float abs_left = std::abs(sample_left);
+                    // Quasi-peak: accumulate absolute values (not RMS!)
                     sum_left += abs_left;
                     peak_left = std::max(peak_left, abs_left);
                 }
@@ -1063,24 +1177,36 @@ private:
                 if (impl->channels >= 2) {
                     float sample_right = static_cast<float>(clean_buffer[frame * impl->channels + 1]) / 32768.0f;
                     float abs_right = std::abs(sample_right);
+                    // Quasi-peak: accumulate absolute values (not RMS!)
                     sum_right += abs_right;
                     peak_right = std::max(peak_right, abs_right);
                 } else if (impl->channels == 1) {
                     // Mono: copy left channel to right for VU meters
                     float sample = static_cast<float>(clean_buffer[frame * impl->channels]) / 32768.0f;
                     float abs_sample = std::abs(sample);
+                    // Quasi-peak: accumulate absolute values (not RMS!)
                     sum_right += abs_sample;
                     peak_right = std::max(peak_right, abs_sample);
                 }
             }
 
-            // Average levels (RMS-like value)
-            float rms_left = sum_left / static_cast<float>(framesPerBuffer);
-            float rms_right = sum_right / static_cast<float>(framesPerBuffer);
+            // Quasi-peak (PPM-style): average of absolute values scaled to be closer to peak
+            // This matches iZotope/Pro Tools behavior better than true RMS
+            float avg_left = sum_left / static_cast<float>(framesPerBuffer);
+            float avg_right = sum_right / static_cast<float>(framesPerBuffer);
 
-            // Save raw data without smoothing (smoothing will be in OSD)
-            impl->audio_level_left.store(rms_left);
-            impl->audio_level_right.store(rms_right);
+            // Scale average absolute value to approximate quasi-peak (closer to true peak)
+            // Factor of 1.5 brings it closer to peak for typical audio material
+            float quasi_peak_left = avg_left * 1.5f;
+            float quasi_peak_right = avg_right * 1.5f;
+
+            // Clamp to not exceed true peak
+            quasi_peak_left = std::min(quasi_peak_left, peak_left);
+            quasi_peak_right = std::min(quasi_peak_right, peak_right);
+
+            // Save quasi-peak as "level" and true peak as "peak"
+            impl->audio_level_left.store(quasi_peak_left);
+            impl->audio_level_right.store(quasi_peak_right);
             impl->audio_peak_left.store(peak_left);
             impl->audio_peak_right.store(peak_right);
         }
@@ -1539,6 +1665,22 @@ private:
             return 0;
         }
 
+        // CRITICAL FIX: On macOS, prefer AudioToolbox AAC decoder for AAC files
+        // Native FFmpeg AAC decoder fails on some AAC-ELD profiles
+#ifdef __APPLE__
+        const AVCodecParameters* codecpar = format_ctx->streams[audio_stream_index]->codecpar;
+        if (codecpar->codec_id == AV_CODEC_ID_AAC) {
+            // Try to use AudioToolbox AAC decoder (aac_at) on macOS
+            const AVCodec* aac_at_codec = avcodec_find_decoder_by_name("aac_at");
+            if (aac_at_codec) {
+                std::cout << "DecodeToBuffer: Using AudioToolbox AAC decoder (aac_at) on macOS" << std::endl;
+                codec = aac_at_codec;
+            } else {
+                std::cout << "DecodeToBuffer: AudioToolbox AAC decoder not available, using native" << std::endl;
+            }
+        }
+#endif
+
         codec_ctx = avcodec_alloc_context3(codec);
         if (avcodec_parameters_to_context(codec_ctx, format_ctx->streams[audio_stream_index]->codecpar) < 0 ||
             avcodec_open2(codec_ctx, codec, nullptr) < 0) {
@@ -1854,7 +1996,31 @@ bool FSTPAudioModuleWrapper::Play() {
 
         // Set target speed 1.0 for start
         m_impl->target_playback_speed.store(1.0);
-        std::cout << "Play(): starting legacy smooth_speed_change system" << std::endl;
+
+        // Check if we should use elastic ease-out effect
+        bool should_use_elastic = false;
+
+        if (m_impl->first_play_after_load.load()) {
+            // First play after file load - always use elastic ease
+            should_use_elastic = true;
+            m_impl->first_play_after_load.store(false);
+            std::cout << "Play(): FIRST play after load - using elastic ease-out" << std::endl;
+        } else {
+            // Increment play counter and check if we should trigger periodic elastic
+            int current_count = m_impl->play_count.fetch_add(1) + 1;
+            // Trigger elastic every 7-10 plays (not too frequent, user requested "not often")
+            if (current_count % 8 == 0) {
+                should_use_elastic = true;
+                std::cout << "Play(): Periodic elastic ease-out (play #" << current_count << ")" << std::endl;
+            }
+        }
+
+        if (should_use_elastic) {
+            // Activate elastic ease-out in smooth_speed_change thread
+            m_impl->use_elastic_ease.store(true);
+        } else {
+            std::cout << "Play(): starting legacy smooth_speed_change system (normal)" << std::endl;
+        }
     }
 
     bool result = m_impl->StartPlayback();
@@ -1962,6 +2128,12 @@ bool FSTPAudioModuleWrapper::IsReverse() const {
     return m_reverse.load();
 }
 
+void FSTPAudioModuleWrapper::SetVideoFrameRate(double fps) {
+    if (m_impl && fps > 0.0) {
+        m_impl->video_frame_rate.store(fps);
+    }
+}
+
 bool FSTPAudioModuleWrapper::IsFastBufferReady() const {
     return m_impl && m_impl->fast_buffer_ready.load();
 }
@@ -2017,22 +2189,6 @@ float FSTPAudioModuleWrapper::GetAudioPeakRight() const {
         return 0.0f;
     }
     return m_impl->audio_peak_right.load();
-}
-
-void FSTPAudioModuleWrapper::SetBetacamAudioEnabled(bool enabled) {
-    if (m_impl) {
-        m_impl->m_betacam_audio_enabled = enabled;
-        if (enabled) {
-            m_impl->m_smfx_sim.Reset(); // Reset servomotor simulation when enabling
-            std::cout << "🎵 [SERVOMOTOR] Betacam audio ENABLED - servomotor sound will play at all speeds" << std::endl;
-        } else {
-            std::cout << "🔇 [SERVOMOTOR] Betacam audio DISABLED" << std::endl;
-        }
-    }
-}
-
-bool FSTPAudioModuleWrapper::IsBetacamAudioEnabled() const {
-    return m_impl ? m_impl->m_betacam_audio_enabled : false;
 }
 
 bool FSTPAudioModuleWrapper::RestartAudioStream() {

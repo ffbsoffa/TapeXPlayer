@@ -1,4 +1,5 @@
 #include "FSTPOSDSystem.h"
+#include "FSTPSettings.h"
 #include "fontdata.h"
 #include "FSTPKeyboard.h"
 #include "../FSTPPlayerModule/FSTPPlayerManager.h"
@@ -46,6 +47,9 @@ struct PlayerOSDData {
     float audio_left_peak = 0.0f;
     float audio_right_peak = 0.0f;
 
+    // Full-resolution mode indicator (for "LOCK" display)
+    bool is_full_res = false;
+
     // Position
     double total_duration = 100.0;
 
@@ -70,6 +74,10 @@ struct PlayerOSDData {
 
     // Full-res decoder status (for "lock" indicator)
     bool is_fullres_active = false;
+
+    // Decoded frames visualization
+    int total_frames = 0;
+    std::vector<bool> decoded_frames_map;  // Map of which frames are decoded (low-res)
 
     // Optimization: last render time for throttling
     std::chrono::steady_clock::time_point last_render_time;
@@ -221,6 +229,10 @@ void UpdateOSDActualSpeed(int player_id, double actualPlaybackRate) {
     GetPlayerOSDData(player_id).actual_playback_rate = actualPlaybackRate;
 }
 
+void UpdateOSDFullResMode(int player_id, bool is_full_res) {
+    GetPlayerOSDData(player_id).is_full_res = is_full_res;
+}
+
 void UpdateOSDPlayState(int player_id, bool isPlaying, bool jog_forward, bool jog_backward) {
     GetPlayerOSDData(player_id).is_playing = isPlaying;
     GetPlayerOSDData(player_id).jog_forward = jog_forward;
@@ -286,6 +298,12 @@ void SetOSDFileType(int player_id, bool is_audio) {
     data.is_audio_file = is_audio;
     std::cout << "OSD Player " << player_id << " file type set to: "
               << (is_audio ? "audio" : "video") << std::endl;
+}
+
+void UpdateOSDDecodedFrames(int player_id, const std::vector<bool>& decoded_map, int total_frames) {
+    auto& data = GetPlayerOSDData(player_id);
+    data.decoded_frames_map = decoded_map;
+    data.total_frames = total_frames;
 }
 
 // Backward compatibility - functions without player_id (use player 0)
@@ -921,15 +939,23 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
         int statusY = timecodeY + text_height;
         RenderCachedText(renderer, statusText, timecodeX, statusY, statusColor, shadowColor, g_normal_font);
 
-        // Speed right under timecode
-        char speedBuffer[10];
-        snprintf(speedBuffer, sizeof(speedBuffer), "%.1f", std::abs(data.actual_playback_rate));
+        // Speed right under timecode - show "LOCK" for 1.0× full-res (Betacam SP tribute)
+        std::string speedText;
+        double abs_speed = std::abs(data.actual_playback_rate);
+
+        if (data.is_full_res && abs_speed >= 0.95 && abs_speed <= 1.05) {
+            speedText = "lock";  // Locked 1:1 speed with full-res decoder
+        } else {
+            char speedBuffer[10];
+            snprintf(speedBuffer, sizeof(speedBuffer), "%.1f", abs_speed);
+            speedText = speedBuffer;
+        }
 
         int speed_width, speed_height;
-        TTF_SizeText(g_normal_font, speedBuffer, &speed_width, &speed_height);
+        TTF_SizeText(g_normal_font, speedText.c_str(), &speed_width, &speed_height);
         int speedX = timecodeX + text_width - speed_width;
         int speedY = timecodeY + text_height;
-        RenderCachedText(renderer, std::string(speedBuffer), speedX, speedY, textColor, shadowColor, g_normal_font);
+        RenderCachedText(renderer, speedText, speedX, speedY, textColor, shadowColor, g_normal_font);
 
         // auto status_end = std::chrono::high_resolution_clock::now();
         // total_status_us += std::chrono::duration_cast<std::chrono::microseconds>(status_end - status_start).count();
@@ -940,15 +966,30 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
         bool is_player_active = IsPlayerInstanceActive(player_id);
         bool is_playing = is_player_active && data.is_playing;
 
-        const float LEVEL_INTERPOLATION = 0.15f;
-        const float PEAK_ATTACK = 0.7f;
-        const float PEAK_DECAY = 0.02f;
+        // PPM (Peak Program Meter) ballistics - matching professional broadcast standards
+        // Both bar and line jump to peaks INSTANTLY, but fall at different rates
+        // At 60 FPS: 1.0 = instant, 0.4 = ~5 frames (~80ms), 0.03 = ~33 frames (~550ms)
+        const float LEVEL_ATTACK = 1.0f;          // Quasi-peak: INSTANT attack (same as true peak)
+        const float LEVEL_DECAY = 0.4f;           // Quasi-peak: moderate decay for readability
+        const float PEAK_ATTACK = 1.0f;           // True peak: instant capture
+        const float PEAK_DECAY = 0.03f;           // True peak: slow decay (~2s hold)
         const float STOP_DECAY = 0.05f;
 
         if (is_playing) {
-            data.smooth_left += (data.audio_left - data.smooth_left) * LEVEL_INTERPOLATION;
-            data.smooth_right += (data.audio_right - data.smooth_right) * LEVEL_INTERPOLATION;
+            // Asymmetric ballistics for quasi-peak (PPM bar): fast attack, slower decay
+            if (data.audio_left > data.smooth_left) {
+                data.smooth_left += (data.audio_left - data.smooth_left) * LEVEL_ATTACK;
+            } else {
+                data.smooth_left += (data.audio_left - data.smooth_left) * LEVEL_DECAY;
+            }
 
+            if (data.audio_right > data.smooth_right) {
+                data.smooth_right += (data.audio_right - data.smooth_right) * LEVEL_ATTACK;
+            } else {
+                data.smooth_right += (data.audio_right - data.smooth_right) * LEVEL_DECAY;
+            }
+
+            // True peak line: instant attack, slow decay (hold behavior)
             if (data.audio_left_peak > data.smooth_left_peak) {
                 data.smooth_left_peak += (data.audio_left_peak - data.smooth_left_peak) * PEAK_ATTACK;
             } else {
@@ -1093,6 +1134,56 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
 
         // auto other_end = std::chrono::high_resolution_clock::now();
         // total_other_us += std::chrono::duration_cast<std::chrono::microseconds>(other_end - other_start).count();
+
+        // ========== DECODED FRAMES INDICATOR (TOP OF SCREEN) ==========
+        // Only show if enabled in settings (developer/debug feature)
+        if (GetShowDecoderStatus() && !data.decoded_frames_map.empty() && data.total_frames > 0) {
+            const int BAR_HEIGHT = 8;
+            const int BAR_MARGIN = 10;
+            const int BAR_Y = BAR_MARGIN;
+            const int BAR_WIDTH = windowWidth - (BAR_MARGIN * 2);
+
+            // Background (dark gray)
+            SDL_SetRenderDrawColor(renderer, 40, 40, 40, 200);
+            SDL_Rect bgRect = {BAR_MARGIN, BAR_Y, BAR_WIDTH, BAR_HEIGHT};
+            SDL_RenderFillRect(renderer, &bgRect);
+
+            // Decoded segments (green)
+            SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255);
+
+            // Sample decoded frames map to fit screen width
+            int samplesPerPixel = std::max(1, data.total_frames / BAR_WIDTH);
+
+            for (int x = 0; x < BAR_WIDTH; ++x) {
+                int frameStart = (x * data.total_frames) / BAR_WIDTH;
+                int frameEnd = std::min(frameStart + samplesPerPixel, data.total_frames);
+
+                // Check if any frame in this pixel range is decoded
+                bool hasDecoded = false;
+                for (int f = frameStart; f < frameEnd; ++f) {
+                    if (f < static_cast<int>(data.decoded_frames_map.size()) && data.decoded_frames_map[f]) {
+                        hasDecoded = true;
+                        break;
+                    }
+                }
+
+                if (hasDecoded) {
+                    SDL_RenderDrawLine(renderer, BAR_MARGIN + x, BAR_Y, BAR_MARGIN + x, BAR_Y + BAR_HEIGHT - 1);
+                }
+            }
+
+            // Current position indicator (white vertical line)
+            if (data.total_duration > 0.0 && data.current_time >= 0.0) {
+                double position = data.current_time / data.total_duration;
+                int posX = BAR_MARGIN + static_cast<int>(BAR_WIDTH * position);
+                SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+                SDL_RenderDrawLine(renderer, posX, BAR_Y, posX, BAR_Y + BAR_HEIGHT - 1);
+            }
+
+            // Border
+            SDL_SetRenderDrawColor(renderer, 100, 100, 100, 255);
+            SDL_RenderDrawRect(renderer, &bgRect);
+        }
     }
 
     // Output profiling OSD once per second (DISABLED)
@@ -1137,37 +1228,37 @@ void RenderOSDWithRenderer(SDL_Renderer* renderer) {
 
 // Set loading state for specific player
 void SetPlayerLoadingState(int player_id, bool is_loading) {
-    if (player_id >= 1 && player_id <= MAX_PLAYERS) {
-        int index = player_id - 1;  // player_id starts with 1
-        g_player_loading_states[index] = is_loading;
+    // FIXED: Use 0-based indexing to match GetPlayerOSDData and other OSD functions
+    if (player_id >= 0 && player_id < MAX_PLAYERS) {
+        g_player_loading_states[player_id] = is_loading;
         if (!is_loading) {
-            g_player_loading_progress[index] = 0;  // Reset progress when loading is finished
+            g_player_loading_progress[player_id] = 0;  // Reset progress when loading is finished
         }
     }
 }
 
     // Check player loading state
 bool IsPlayerLoading(int player_id) {
-    if (player_id >= 1 && player_id <= MAX_PLAYERS) {
-        int index = player_id - 1;  // player_id starts with 1
-        return g_player_loading_states[index];
+    // FIXED: Use 0-based indexing to match GetPlayerOSDData and other OSD functions
+    if (player_id >= 0 && player_id < MAX_PLAYERS) {
+        return g_player_loading_states[player_id];
     }
     return false;
 }
 
 // Set loading progress for specific player
 void SetPlayerLoadingProgress(int player_id, int progress) {
-    if (player_id >= 1 && player_id <= MAX_PLAYERS) {
-        int index = player_id - 1;  // player_id starts with 1
-        g_player_loading_progress[index] = std::max(0, std::min(100, progress));
+    // FIXED: Use 0-based indexing to match GetPlayerOSDData and other OSD functions
+    if (player_id >= 0 && player_id < MAX_PLAYERS) {
+        g_player_loading_progress[player_id] = std::max(0, std::min(100, progress));
     }
 }
 
 // Get loading progress for specific player
 int GetPlayerLoadingProgress(int player_id) {
-    if (player_id >= 1 && player_id <= MAX_PLAYERS) {
-        int index = player_id - 1;  // player_id starts with 1
-        return g_player_loading_progress[index];
+    // FIXED: Use 0-based indexing to match GetPlayerOSDData and other OSD functions
+    if (player_id >= 0 && player_id < MAX_PLAYERS) {
+        return g_player_loading_progress[player_id];
     }
     return 0;
 }

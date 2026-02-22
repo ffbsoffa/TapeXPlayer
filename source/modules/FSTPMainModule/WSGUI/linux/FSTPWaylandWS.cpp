@@ -47,6 +47,11 @@ static bool g_renderingActive = false;
 static std::atomic<bool> g_renderThreadRunning{false};
 static std::thread g_renderThread;
 
+// Asynchronous shutdown variables (like macOS)
+static std::atomic<bool> g_shutdownRequested{false};
+static std::atomic<bool> g_shutdownComplete{false};
+static std::atomic<bool> g_cleanupThreadStarted{false};
+
 // Autonomous rendering function - works independently of events (like macOS)
 void AutoRenderFrame() {
     if (!g_renderingActive) return;
@@ -413,7 +418,7 @@ extern "C" void OnMemoryLocationDialogClosedCallback() {
     }
 }
 
-// GTK3 Memory Location Dialog for Linux
+// GTK3 Memory Location Dialog for Linux (wrapper for backwards compatibility)
 void ShowMemoryLocationDialog(int player_id, double current_time) {
     std::cout << "🔵 ShowMemoryLocationDialog called for player " << player_id
               << " at time " << current_time << std::endl;
@@ -432,148 +437,8 @@ void ShowMemoryLocationDialog(int player_id, double current_time) {
         g_gtk_initialized = true;
     }
 
-    // Format timecode from current time
-    double fps = GetInstanceVideoFPS(player_id);
-    if (fps <= 0) fps = 25.0;  // fallback
-
-    int hours = static_cast<int>(current_time) / 3600;
-    int minutes = (static_cast<int>(current_time) % 3600) / 60;
-    int seconds = static_cast<int>(current_time) % 60;
-    int frames = static_cast<int>((current_time - floor(current_time)) * fps);
-
-    char timecode_str[32];
-    snprintf(timecode_str, sizeof(timecode_str), "%02d:%02d:%02d:%02d",
-             hours, minutes, seconds, frames);
-
-    // Get next location number
-    int next_id = FSTP_GetMemoryLocationsCount() + 1;
-    char number_str[16];
-    snprintf(number_str, sizeof(number_str), "%d", next_id);
-
-    // Create dialog
-    GtkWidget* dialog = gtk_dialog_new_with_buttons(
-        "New Memory Location",
-        nullptr,
-        GTK_DIALOG_MODAL,
-        "_Cancel", GTK_RESPONSE_CANCEL,
-        "_OK", GTK_RESPONSE_ACCEPT,
-        nullptr
-    );
-
-    gtk_window_set_default_size(GTK_WINDOW(dialog), 430, 200);
-    gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
-
-    // Content area
-    GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    gtk_container_set_border_width(GTK_CONTAINER(content), 20);
-
-    // Grid for layout
-    GtkWidget* grid = gtk_grid_new();
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 12);
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 12);
-    gtk_container_add(GTK_CONTAINER(content), grid);
-
-    // Number field
-    GtkWidget* number_label = gtk_label_new("Number:");
-    gtk_widget_set_halign(number_label, GTK_ALIGN_END);
-    GtkWidget* number_entry = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(number_entry), number_str);
-    gtk_entry_set_width_chars(GTK_ENTRY(number_entry), 10);
-
-    gtk_grid_attach(GTK_GRID(grid), number_label, 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), number_entry, 1, 0, 1, 1);
-
-    // Timecode field
-    GtkWidget* timecode_label = gtk_label_new("Timecode:");
-    gtk_widget_set_halign(timecode_label, GTK_ALIGN_END);
-    GtkWidget* timecode_entry = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(timecode_entry), timecode_str);
-    gtk_entry_set_width_chars(GTK_ENTRY(timecode_entry), 15);
-
-    gtk_grid_attach(GTK_GRID(grid), timecode_label, 2, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), timecode_entry, 3, 0, 1, 1);
-
-    // Name field (spans full width)
-    GtkWidget* name_label = gtk_label_new("Name:");
-    gtk_widget_set_halign(name_label, GTK_ALIGN_END);
-    GtkWidget* name_entry = gtk_entry_new();
-    gtk_entry_set_width_chars(GTK_ENTRY(name_entry), 40);
-    gtk_entry_set_activates_default(GTK_ENTRY(name_entry), TRUE);
-
-    gtk_grid_attach(GTK_GRID(grid), name_label, 0, 1, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid), name_entry, 1, 1, 3, 1);
-
-    // Recall zoom checkbox
-    GtkWidget* recall_zoom_check = gtk_check_button_new_with_label("Recall zoom settings");
-    gtk_grid_attach(GTK_GRID(grid), recall_zoom_check, 0, 2, 4, 1);
-
-    // Show all widgets
-    gtk_widget_show_all(dialog);
-
-    // Focus name field
-    gtk_widget_grab_focus(name_entry);
-
-    // Set OK as default button
-    GtkWidget* ok_button = gtk_dialog_get_widget_for_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
-    if (ok_button) {
-        gtk_widget_set_can_default(ok_button, TRUE);
-        gtk_widget_grab_default(ok_button);
-    }
-
-    // Run dialog
-    gint result = gtk_dialog_run(GTK_DIALOG(dialog));
-
-    if (result == GTK_RESPONSE_ACCEPT) {
-        // Get values
-        const char* name = gtk_entry_get_text(GTK_ENTRY(name_entry));
-        const char* timecode = gtk_entry_get_text(GTK_ENTRY(timecode_entry));
-        const char* number = gtk_entry_get_text(GTK_ENTRY(number_entry));
-        gboolean recall_zoom = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(recall_zoom_check));
-
-        if (name && strlen(name) > 0) {
-            // Parse location number
-            int location_id = atoi(number);
-            if (location_id <= 0) location_id = next_id;
-
-            // Parse timecode back to seconds
-            int tc_hours = 0, tc_minutes = 0, tc_seconds = 0, tc_frames = 0;
-            if (sscanf(timecode, "%d:%d:%d:%d", &tc_hours, &tc_minutes, &tc_seconds, &tc_frames) == 4) {
-                double timecode_seconds = tc_hours * 3600.0 + tc_minutes * 60.0 + tc_seconds;
-                timecode_seconds += tc_frames / fps;
-
-                // Get zoom state if requested
-                float zoom_factor = 1.0f;
-                float zoom_center_x = 0.5f;
-                float zoom_center_y = 0.5f;
-
-                if (recall_zoom) {
-                    // Get zoom state from player (simplified - would need proper API)
-                    // For now, just use defaults
-                }
-
-                // Add location
-                bool success = FSTP_AddMemoryLocationWithZoom(
-                    player_id,
-                    location_id,
-                    name,
-                    "",  // comments
-                    timecode_seconds,
-                    recall_zoom,
-                    zoom_factor,
-                    zoom_center_x,
-                    zoom_center_y
-                );
-
-                if (success) {
-                    std::cout << "✅ Memory Location added: " << name << " at " << timecode << std::endl;
-                } else {
-                    std::cout << "❌ Failed to add Memory Location" << std::endl;
-                }
-            }
-        }
-    }
-
-    gtk_widget_destroy(dialog);
+    // Call unified dialog in add mode (location_id = -1)
+    ShowGTKMemoryLocationDialog(player_id, -1, current_time);
 
     // Process events
     while (gtk_events_pending()) {
@@ -584,11 +449,6 @@ void ShowMemoryLocationDialog(int player_id, double current_time) {
     OnMemoryLocationDialogClosedCallback();
 
     std::cout << "🗑️  Memory Location dialog closed" << std::endl;
-}
-
-// C API bridge
-extern "C" void ShowGTKMemoryLocationDialog(int player_id, double current_time) {
-    ShowMemoryLocationDialog(player_id, current_time);
 }
 
 // Settings dialog is now in FSTPSettingsDialog.cpp (separate file)
@@ -906,11 +766,17 @@ int RunMainUILoop() {
     SDL_SetHint("SDL_APP_ID", "TapeXPlayer");
     std::cout << "[GNOME] Set SDL_APP_ID=TapeXPlayer for dock integration" << std::endl;
 
+    // Allow system screen saver and display sleep to work normally
+    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+
     // Initialize SDL
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) < 0) {
         std::cerr << "SDL initialization error: " << SDL_GetError() << std::endl;
         return -1;
     }
+
+    // SDL disables the screensaver by default - re-enable it so the display can sleep normally
+    SDL_EnableScreenSaver();
 
     std::cout << "SDL2 initialized successfully" << std::endl;
 
@@ -958,10 +824,11 @@ int RunMainUILoop() {
 
     std::cout << "OSD system initialized" << std::endl;
 
-    // CRITICAL FIX: On Linux, render from MAIN thread, not separate thread
+    // CRITICAL: On Linux with SSH/X11, render from MAIN thread (SDL/OpenGL context requirement)
+    // Instead, we'll make CLEANUP asynchronous to keep rendering active
     // StartAutonomousRendering(main_window->renderer);
-    g_renderingActive = true;  // ENABLE rendering from main loop
-    std::cout << "🔧 [LINUX FIX] Rendering from main thread (not separate thread)" << std::endl;
+    g_renderingActive = true;
+    std::cout << "🔧 [LINUX] Rendering from main thread (SDL context requirement)" << std::endl;
 
     std::cout << "Ready! Press ESC or Ctrl+Q to exit, Ctrl+O to open file" << std::endl;
 
@@ -974,43 +841,85 @@ int RunMainUILoop() {
     // Main event loop - similar to macOS version
     bool running = true;
     SDL_Event event;
+    std::thread cleanup_thread;
 
     while (running) {
-        // TESTING: Call AutoRenderFrame directly from main thread
+        // Render frame from main thread (SDL context requirement)
         AutoRenderFrame();
+
+        // CRITICAL: Asynchronous shutdown - destroy player instances in SEPARATE THREAD
+        // This allows main thread to continue rendering "unthreading" OSD
+        if (g_shutdownRequested.load() && !g_cleanupThreadStarted.load()) {
+            std::cout << "🛑 [SHUTDOWN] Shutdown requested, starting async cleanup thread..." << std::endl;
+            g_cleanupThreadStarted.store(true);
+
+            // Launch cleanup in separate thread while main loop continues rendering
+            cleanup_thread = std::thread([&]() {
+                std::cout << "🧵 [CLEANUP THREAD] Started cleanup while main thread renders..." << std::endl;
+
+                // Destroy all player instances while main thread CONTINUES RENDERING
+                for (int i = 0; i < MAX_WINDOWS; i++) {
+                    FSTPWindow* window = GetWindowByIndex(i);
+                    if (window && window->is_active) {
+                        int player_id = window->player_instance_id;
+                        if (player_id >= 0 && IsPlayerInstanceActive(player_id)) {
+                            std::cout << "🎬 [CLEANUP] Destroying player " << player_id << " (main thread rendering)" << std::endl;
+                            DestroyPlayerInstance(player_id);
+                            std::cout << "✅ [CLEANUP] Player " << player_id << " destroyed" << std::endl;
+                        }
+                    }
+                }
+
+                std::cout << "✅ [CLEANUP THREAD] All player instances destroyed" << std::endl;
+
+                // WORKAROUND: PipeWire has corrupted heap during normal operation
+                // Calling exit() or returning to main would trigger PipeWire thread cleanup
+                // which crashes in tcache_thread_shutdown due to malloc corruption
+                // Solution: Use _exit() to terminate immediately without library cleanup
+                std::cout << "🚀 [CLEANUP] Exiting immediately to avoid PipeWire cleanup crash..." << std::endl;
+                _exit(0);  // Exit without calling atexit handlers or thread cleanup
+            });
+        }
+
+        // Exit when cleanup is complete
+        if (g_shutdownComplete.load()) {
+            std::cout << "🛑 [MAIN] Cleanup complete, exiting UI loop" << std::endl;
+            running = false;
+            break;
+        }
 
         // Process events with PollEvent (non-blocking)
         while (SDL_PollEvent(&event)) {
             // Intercept exit events and trigger graceful shutdown
             if (event.type == SDL_QUIT) {
-                std::cout << "[EXIT] SDL_QUIT received - initiating graceful shutdown" << std::endl;
-                running = false;
+                std::cout << "[EXIT] SDL_QUIT received - requesting asynchronous shutdown" << std::endl;
+                g_shutdownRequested.store(true);
                 break;
             }
 
             // Check for window close event
             if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) {
-                std::cout << "[EXIT] Window close requested - initiating graceful shutdown" << std::endl;
-                running = false;
+                std::cout << "[EXIT] Window close requested - requesting asynchronous shutdown" << std::endl;
+                g_shutdownRequested.store(true);
                 break;
             }
 
             // Check for ESC and Ctrl+Q BEFORE keyboard handler
             if (event.type == SDL_KEYDOWN) {
                 if (event.key.keysym.sym == SDLK_ESCAPE) {
-                    std::cout << "[EXIT] ESC pressed - initiating graceful shutdown" << std::endl;
-                    running = false;
+                    std::cout << "[EXIT] ESC pressed - requesting asynchronous shutdown" << std::endl;
+                    g_shutdownRequested.store(true);
                     break;
                 }
                 if (event.key.keysym.sym == SDLK_q && (event.key.keysym.mod & KMOD_CTRL)) {
-                    std::cout << "[EXIT] Ctrl+Q pressed - initiating graceful shutdown" << std::endl;
-                    running = false;
+                    std::cout << "[EXIT] Ctrl+Q pressed - requesting asynchronous shutdown" << std::endl;
+                    g_shutdownRequested.store(true);
                     break;
                 }
             }
 
-            // Skip other event handling if we're exiting
-            if (!running) break;
+            // Skip other event handling if we're shutting down
+            if (g_shutdownRequested.load()) break;
 
             // Handle mouse events
             if (event.type == SDL_MOUSEBUTTONDOWN) {
@@ -1030,9 +939,6 @@ int RunMainUILoop() {
             HandleKeyboardEvents(event);
         }
 
-        // Exit immediately if shutdown was triggered
-        if (!running) break;
-
         // Process pending GTK events (needed for context menu and dialogs)
         if (g_gtk_initialized) {
             while (gtk_events_pending()) {
@@ -1046,27 +952,29 @@ int RunMainUILoop() {
 
     std::cout << "🛑 Shutting down gracefully..." << std::endl;
 
-    // Step 1: Stop rendering
+    // Step 1: Wait for cleanup thread to finish
+    if (cleanup_thread.joinable()) {
+        cleanup_thread.join();
+        std::cout << "✅ Cleanup thread joined" << std::endl;
+    }
+
+    // Step 2: Stop rendering
     g_renderingActive = false;
     std::cout << "✅ Rendering stopped" << std::endl;
 
-    // Step 2: Wait for render loop to finish current frame
-    SDL_Delay(50);
-
-    // Step 3: CRITICAL - Clear PixelBufferManager BEFORE shutting down player instances!
+    // Step 3: CRITICAL - Clear PixelBufferManager
     // PixelBufferManager holds shared_ptr<AVFrame> that reference decoder contexts.
-    // Must free these AVFrames WHILE decoder contexts are still valid!
     std::cout << "🖼️  Clearing pixel buffer manager..." << std::endl;
     FSTPPixelBufferManager* pixel_mgr = GetPixelBufferManager();
     if (pixel_mgr) {
-        // Clear all player buffers (frees AVFrames while decoder contexts are valid)
+        // Clear all player buffers (frees AVFrames)
         for (int i = 0; i < 16; i++) {  // MAX_PLAYERS
             pixel_mgr->ClearPlayerBuffers(i);
         }
         std::cout << "✅ Pixel buffer manager cleared" << std::endl;
     }
 
-    // Step 4: Now safe to shutdown player instances (decoder contexts)
+    // Step 4: Shutdown player manager (instances already destroyed in async shutdown)
     std::cout << "🎬 Shutting down player manager..." << std::endl;
     ShutdownPlayerManager();
     std::cout << "✅ Player manager shutdown complete" << std::endl;

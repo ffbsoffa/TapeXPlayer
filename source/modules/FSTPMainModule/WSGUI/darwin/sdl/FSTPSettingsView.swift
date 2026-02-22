@@ -8,6 +8,7 @@ class SettingsViewModel: ObservableObject {
     @Published var audioDeviceIndex: Int = -1
     @Published var masterVolume: Double = 1.0
     @Published var bufferSize: Int = 1024
+    @Published var volumeDuckingEnabled: Bool = true
 
     // Video & Sync Settings
     @Published var frameOffset: Int = 0
@@ -19,6 +20,9 @@ class SettingsViewModel: ObservableObject {
     @Published var midiEnabled: Bool = false
     @Published var midiInputPort: Int = -1
     @Published var midiOutputPort: Int = -1
+
+    // Developer/Debug Settings
+    @Published var showDecoderStatus: Bool = false
 
     // Available devices
     @Published var audioDevices: [(index: Int, name: String)] = []
@@ -40,6 +44,7 @@ class SettingsViewModel: ObservableObject {
             audioDeviceIndex = Int(s.pointee.audio_device_index)
             masterVolume = Double(s.pointee.audio_master_volume)
             bufferSize = Int(s.pointee.audio_buffer_size)
+            volumeDuckingEnabled = s.pointee.audio_volume_ducking_enabled != 0
             frameOffset = Int(s.pointee.frame_offset)
             autoFreezeInactive = s.pointee.auto_freeze_inactive != 0
             betacamEffectEnabled = s.pointee.betacam_effect_enabled != 0
@@ -47,6 +52,7 @@ class SettingsViewModel: ObservableObject {
             midiEnabled = s.pointee.midi_enabled != 0
             midiInputPort = Int(s.pointee.midi_input_port)
             midiOutputPort = Int(s.pointee.midi_output_port)
+            showDecoderStatus = s.pointee.show_decoder_status != 0
         }
 
         if !ytDlpAvailable {
@@ -103,6 +109,7 @@ class SettingsViewModel: ObservableObject {
         settings.pointee.audio_device_index = Int32(audioDeviceIndex)
         settings.pointee.audio_master_volume = Float(masterVolume)
         settings.pointee.audio_buffer_size = Int32(bufferSize)
+        settings.pointee.audio_volume_ducking_enabled = volumeDuckingEnabled ? 1 : 0
         settings.pointee.frame_offset = Int32(frameOffset)
         settings.pointee.auto_freeze_inactive = autoFreezeInactive ? 1 : 0
         settings.pointee.betacam_effect_enabled = betacamEffectEnabled ? 1 : 0
@@ -110,6 +117,7 @@ class SettingsViewModel: ObservableObject {
         settings.pointee.midi_enabled = midiEnabled ? 1 : 0
         settings.pointee.midi_input_port = Int32(midiInputPort)
         settings.pointee.midi_output_port = Int32(midiOutputPort)
+        settings.pointee.show_decoder_status = showDecoderStatus ? 1 : 0
 
         // Save to file
         SaveSettings()
@@ -157,6 +165,16 @@ struct AudioSettingsView: View {
                             .monospacedDigit()
                     }
                     Slider(value: $viewModel.masterVolume, in: 0...1)
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Auto-Reduce Volume at High Speeds", isOn: $viewModel.volumeDuckingEnabled)
+
+                    Text("Protects your ears during shuttle (6x: fade starts, 12x: -24dB, 32x: -40dB)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
             }
 
@@ -242,6 +260,15 @@ struct VideoSyncSettingsView: View {
                 Toggle("Enable Betacam tape artefact emulation", isOn: $viewModel.betacamEffectEnabled)
 
                 Text("Adds rewind/fast-forward tape jitter. May impact performance on slower GPUs.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section(header: Text("Developer/Debug").font(.headline)) {
+                Toggle("Show Decoder Status", isOn: $viewModel.showDecoderStatus)
+
+                Text("Displays decoded frames indicator at the top of the screen. Useful for debugging decoder performance.")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

@@ -67,7 +67,7 @@ void ShutdownWindowManager();
 int CreateNewWindow(const char* title, int width, int height);
 
 // Close window by ID
-void CloseWindow(int window_index);
+void FSTPCloseWindow(int window_index);
 
 // Get player ID for window (hard binding)
 int GetPlayerIDForWindow(int window_index);
@@ -94,7 +94,7 @@ int GetActiveWindowCount();
 FSTPWindow* GetMainWindow();
 
 // Get active (focused) window
-FSTPWindow* GetActiveWindow();
+FSTPWindow* FSTPGetActiveWindow();
 
 // Get active window's player ID
 int GetActivePlayerID();
@@ -139,8 +139,11 @@ void UpdateWindowTitle(int window_index, int instance_id, const char* filename);
 // C++ ONLY functions (use std::shared_ptr) - MOVED OUTSIDE extern "C"
 #ifdef __cplusplus
 // ZERO-COPY method - pass shared_ptr<AVFrame> directly (RECOMMENDED)
+// Optional: prev_frame (N-1) and next_frame (N+1) for Betacam slow-motion compositing
 void SubmitAVFrame(int player_id, std::shared_ptr<AVFrame> av_frame,
-                  double timestamp, int frame_number);
+                  double timestamp, int frame_number,
+                  std::shared_ptr<AVFrame> prev_frame = nullptr,
+                  std::shared_ptr<AVFrame> next_frame = nullptr);
 #endif
 
 #endif // FSTP_WINDOW_MANAGER_H

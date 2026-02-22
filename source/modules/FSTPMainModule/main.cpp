@@ -45,6 +45,7 @@
 #include "../FSTPVideoModule/FSTPHardwareDetection.h"
 
 int main(int argc, char* argv[]) {
+    #ifndef _WIN32
     // CRITICAL: Set malloc arena limit BEFORE any allocations
     // Fixes glibc malloc arena corruption in PipeWire/PortAudio cleanup
     // Must be set at program start, cannot be changed later
@@ -55,6 +56,17 @@ int main(int argc, char* argv[]) {
     // When PipeWire/PortAudio later calls malloc_trim(), heap metadata is already corrupted
     // Solution: Disable trim by setting threshold to max value (memory leak on exit acceptable)
     setenv("MALLOC_TRIM_THRESHOLD_", "9999999999", 1);
+    #endif
+
+    #ifdef __linux__
+    // CRITICAL FIX: Force native Wayland backend for correct scaling on GNOME
+    // Without this, SDL may choose wrong backend and apply incorrect fractional scaling
+    // This matches the working run_tapexplayer.sh script
+    if (getenv("SDL_VIDEODRIVER") == nullptr) {
+        setenv("SDL_VIDEODRIVER", "wayland", 1);
+        setenv("GDK_BACKEND", "wayland", 1);
+    }
+    #endif
 
     std::cout << "=== TapeXPlayer 2026 - Initialization ===" << std::endl;
 

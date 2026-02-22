@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
 #include <filesystem>
 #include <set>
 
@@ -237,6 +238,50 @@ bool MemoryLocationsManager::LoadFromFile(const std::string& filepath) {
     return loaded_count > 0;
 }
 
+// Export to CSV for scientific analysis
+bool MemoryLocationsManager::ExportToCSV(const std::string& filepath) {
+    std::ofstream file(filepath);
+    if (!file.is_open()) {
+        std::cerr << "Failed to export Memory Locations to CSV: " << filepath << std::endl;
+        return false;
+    }
+
+    // CSV Header
+    file << "ID,Name,Timecode,Seconds,Comments,Active\n";
+
+    // Export each location
+    for (const auto& loc : locations_) {
+        // Escape quotes in name and comments for CSV
+        std::string name = loc.name;
+        std::string comments = loc.comments;
+
+        // Replace quotes with double quotes (CSV standard)
+        size_t pos = 0;
+        while ((pos = name.find('"', pos)) != std::string::npos) {
+            name.replace(pos, 1, "\"\"");
+            pos += 2;
+        }
+
+        pos = 0;
+        while ((pos = comments.find('"', pos)) != std::string::npos) {
+            comments.replace(pos, 1, "\"\"");
+            pos += 2;
+        }
+
+        // Write CSV line
+        file << loc.id << ","
+             << "\"" << name << "\","
+             << "\"" << loc.timecode_display << "\","
+             << std::fixed << std::setprecision(3) << loc.timecode_seconds << ","
+             << "\"" << comments << "\","
+             << (loc.is_active ? "Yes" : "No") << "\n";
+    }
+
+    file.close();
+    std::cout << "📊 Exported " << locations_.size() << " Memory Locations to CSV: " << filepath << std::endl;
+    return true;
+}
+
 // Convert seconds to timecode
 std::string MemoryLocationsManager::SecondsToTimecode(double seconds, double fps) {
     int hours = static_cast<int>(seconds / 3600);
@@ -409,12 +454,59 @@ bool FSTP_UpdateMemoryLocation(int id, const char* name, const char* comments) {
     return true;
 }
 
+bool FSTP_UpdateMemoryLocationFull(int id, const char* name, const char* comments,
+                                    double timecode_seconds, bool recall_zoom,
+                                    float zoom_factor, float zoom_center_x, float zoom_center_y) {
+    auto* loc = FSTP::MemoryLocationsManager::GetInstance().GetLocation(id);
+    if (!loc) return false;
+
+    if (name) loc->name = name;
+    if (comments) loc->comments = comments;
+
+    // Update timecode
+    loc->timecode_seconds = timecode_seconds;
+    loc->timecode_display = FSTP::MemoryLocationsManager::SecondsToTimecode(timecode_seconds, 25.0);
+
+    // Update zoom parameters
+    loc->recall_zoom = recall_zoom;
+    loc->zoom_factor = zoom_factor;
+    loc->zoom_center_x = zoom_center_x;
+    loc->zoom_center_y = zoom_center_y;
+
+    std::cout << "📝 Updated Memory Location #" << id << ": \"" << loc->name
+              << "\" @ " << loc->timecode_display << std::endl;
+
+    return true;
+}
+
 bool FSTP_SaveMemoryLocations(const char* filepath) {
     return FSTP::MemoryLocationsManager::GetInstance().SaveToFile(filepath);
 }
 
 bool FSTP_LoadMemoryLocations(const char* filepath) {
     return FSTP::MemoryLocationsManager::GetInstance().LoadFromFile(filepath);
+}
+
+bool FSTP_ExportMemoryLocationsToCSV(const char* filepath) {
+    return FSTP::MemoryLocationsManager::GetInstance().ExportToCSV(filepath);
+}
+
+// ── Platform-specific app data base path ─────────────────────────────────────
+// Returns the root folder for TapeXPlayer user data:
+//   Windows  → %APPDATA%\TapeXPlayer   (C:\Users\<user>\AppData\Roaming\TapeXPlayer)
+//   macOS    → $HOME/.fstp
+//   Linux    → $HOME/.fstp
+static fs::path getFstpBasePath() {
+#ifdef _WIN32
+    const char* appData = std::getenv("APPDATA");
+    if (appData) return fs::path(appData) / "TapeXPlayer";
+    const char* localAppData = std::getenv("LOCALAPPDATA");
+    if (localAppData) return fs::path(localAppData) / "TapeXPlayer";
+    return fs::path("C:/TapeXPlayer");
+#else
+    const char* homeDir = std::getenv("HOME");
+    return fs::path(homeDir ? homeDir : "/tmp") / ".fstp";
+#endif
 }
 
 // Cache Management API
@@ -425,10 +517,8 @@ const char* FSTP_GetProxyCachePath() {
 }
 
 const char* FSTP_GetMemoryLocationsCachePath() {
-    const char* homeDir = std::getenv("HOME");
-    if (!homeDir) homeDir = "/tmp";
     static std::string locations_path;
-    locations_path = std::string(homeDir) + "/.fstp";
+    locations_path = getFstpBasePath().string();
     return locations_path.c_str();
 }
 
@@ -530,11 +620,7 @@ static std::vector<std::string> g_memory_locations_files;
 int FSTP_GetMemoryLocationsFilesCount() {
     g_memory_locations_files.clear();
 
-    // Get memory locations directory path
-    const char* homeDir = std::getenv("HOME");
-    if (!homeDir) return 0;
-
-    fs::path locations_dir = fs::path(homeDir) / ".fstp" / "memory_locations";
+    fs::path locations_dir = getFstpBasePath() / "memory_locations";
 
     if (!fs::exists(locations_dir) || !fs::is_directory(locations_dir)) {
         return 0;
@@ -580,10 +666,7 @@ const char* FSTP_GetMemoryLocationsFileName(int index) {
 }
 
 bool FSTP_ClearAllMemoryLocations() {
-    const char* homeDir = std::getenv("HOME");
-    if (!homeDir) return false;
-
-    fs::path locations_dir = fs::path(homeDir) / ".fstp" / "memory_locations";
+    fs::path locations_dir = getFstpBasePath() / "memory_locations";
 
     if (!fs::exists(locations_dir)) {
         return true; // Nothing to clear

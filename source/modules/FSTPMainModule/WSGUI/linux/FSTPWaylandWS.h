@@ -12,8 +12,8 @@ void RequestForceRender();  // Request forced render on UI changes
 // Screenshot
 void CopyScreenshotToClipboard();
 
-// Memory Location Dialog
-void ShowGTKMemoryLocationDialog(int player_id, double current_time);
+// Memory Location Dialog (unified for add/edit: location_id = -1 for add mode)
+void ShowGTKMemoryLocationDialog(int player_id, int location_id, double current_time);
 void OnMemoryLocationDialogClosedCallback();
 
 // Settings Dialog

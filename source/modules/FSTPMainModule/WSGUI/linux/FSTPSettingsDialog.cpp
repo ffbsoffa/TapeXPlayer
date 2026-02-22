@@ -212,6 +212,20 @@ void ShowGTKSettingsDialog() {
     gtk_range_set_value(GTK_RANGE(volume_scale), settings->audio_master_volume);
     gtk_scale_set_value_pos(GTK_SCALE(volume_scale), GTK_POS_RIGHT);
     gtk_box_pack_start(GTK_BOX(volume_box), volume_scale, FALSE, FALSE, 0);
+
+    // Volume ducking (ear protection) checkbox
+    GtkWidget* ducking_check = gtk_check_button_new_with_label("Auto-Reduce Volume at High Speeds");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(ducking_check), settings->audio_volume_ducking_enabled);
+    gtk_box_pack_start(GTK_BOX(volume_box), ducking_check, FALSE, FALSE, 0);
+
+    GtkWidget* ducking_note = gtk_label_new("Protects your ears during shuttle (6x: fade starts, 12x: -24dB, 32x: -40dB)");
+    gtk_widget_set_halign(ducking_note, GTK_ALIGN_START);
+    PangoAttrList* ducking_attrs = pango_attr_list_new();
+    pango_attr_list_insert(ducking_attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
+    gtk_label_set_attributes(GTK_LABEL(ducking_note), ducking_attrs);
+    pango_attr_list_unref(ducking_attrs);
+    gtk_box_pack_start(GTK_BOX(volume_box), ducking_note, FALSE, FALSE, 0);
+
     gtk_box_pack_start(GTK_BOX(audio_page), volume_box, FALSE, FALSE, 0);
 
     // Buffer size
@@ -319,6 +333,29 @@ void ShowGTKSettingsDialog() {
     gtk_box_pack_start(GTK_BOX(betacam_box), betacam_note, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(video_page), betacam_box, FALSE, FALSE, 0);
+
+    // Developer/Debug settings
+    GtkWidget* debug_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    GtkWidget* debug_title = gtk_label_new(nullptr);
+    gtk_label_set_markup(GTK_LABEL(debug_title), "<b>Developer/Debug</b>");
+    gtk_widget_set_halign(debug_title, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(debug_box), debug_title, FALSE, FALSE, 0);
+
+    GtkWidget* decoder_status_check = gtk_check_button_new_with_label("Show Decoder Status");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(decoder_status_check), settings->show_decoder_status);
+    gtk_box_pack_start(GTK_BOX(debug_box), decoder_status_check, FALSE, FALSE, 0);
+
+    GtkWidget* decoder_note = gtk_label_new("Displays decoded frames indicator at the top of the screen. Useful for debugging decoder performance.");
+    gtk_widget_set_halign(decoder_note, GTK_ALIGN_START);
+    gtk_label_set_line_wrap(GTK_LABEL(decoder_note), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(decoder_note), 0.0f);
+    attrs = pango_attr_list_new();
+    pango_attr_list_insert(attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
+    gtk_label_set_attributes(GTK_LABEL(decoder_note), attrs);
+    pango_attr_list_unref(attrs);
+    gtk_box_pack_start(GTK_BOX(debug_box), decoder_note, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(video_page), debug_box, FALSE, FALSE, 0);
 
     gtk_stack_add_named(GTK_STACK(stack), video_page, "video");
 
@@ -448,11 +485,42 @@ void ShowGTKSettingsDialog() {
     GtkWidget* proxy_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     if (FSTP_IsAnyPlayerActive()) {
         GtkWidget* clear_inactive_btn = gtk_button_new_with_label("Clear Inactive");
+        g_signal_connect(clear_inactive_btn, "clicked", G_CALLBACK(+[](GtkButton*, gpointer) {
+            FSTP_ClearProxyCache(true);  // Keep active files
+            std::cout << "✅ Inactive proxy cache cleared" << std::endl;
+        }), nullptr);
         gtk_box_pack_end(GTK_BOX(proxy_buttons), clear_inactive_btn, FALSE, FALSE, 0);
     }
-    GtkWidget* clear_all_btn = gtk_button_new_with_label("Clear All");
-    gtk_widget_set_sensitive(clear_all_btn, proxy_count > 0);
-    gtk_box_pack_end(GTK_BOX(proxy_buttons), clear_all_btn, FALSE, FALSE, 0);
+    GtkWidget* clear_all_proxy_btn = gtk_button_new_with_label("Clear All");
+    gtk_widget_set_sensitive(clear_all_proxy_btn, proxy_count > 0);
+    g_signal_connect(clear_all_proxy_btn, "clicked", G_CALLBACK(+[](GtkButton* button, gpointer user_data) {
+        GtkWidget* dialog_widget = GTK_WIDGET(user_data);
+
+        GtkWidget* confirm_dialog = gtk_message_dialog_new(
+            GTK_WINDOW(gtk_widget_get_toplevel(dialog_widget)),
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_WARNING,
+            GTK_BUTTONS_YES_NO,
+            "Clear All Proxy Cache?"
+        );
+
+        int proxy_count = FSTP_GetProxyFilesCount();
+        int proxy_size = FSTP_GetProxyCacheSize();
+        char message[256];
+        snprintf(message, sizeof(message),
+                 "This will delete all proxy video files (%d files, %d MB). This cannot be undone.",
+                 proxy_count, proxy_size);
+        gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(confirm_dialog), "%s", message);
+
+        gint response = gtk_dialog_run(GTK_DIALOG(confirm_dialog));
+        gtk_widget_destroy(confirm_dialog);
+
+        if (response == GTK_RESPONSE_YES) {
+            FSTP_ClearProxyCache(false);  // Clear all
+            std::cout << "✅ All proxy cache cleared" << std::endl;
+        }
+    }), dialog);
+    gtk_box_pack_end(GTK_BOX(proxy_buttons), clear_all_proxy_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(proxy_cache_box), proxy_buttons, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(cache_page), proxy_cache_box, FALSE, FALSE, 0);
@@ -480,6 +548,46 @@ void ShowGTKSettingsDialog() {
     pango_attr_list_unref(attrs);
     gtk_box_pack_start(GTK_BOX(memory_box), memory_info_label, FALSE, FALSE, 0);
 
+    // Show list of files with Memory Locations if any exist
+    if (memory_count > 0) {
+        GtkWidget* separator = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+        gtk_box_pack_start(GTK_BOX(memory_box), separator, FALSE, FALSE, 4);
+
+        GtkWidget* files_label = gtk_label_new("Files with Memory Locations:");
+        gtk_widget_set_halign(files_label, GTK_ALIGN_START);
+        attrs = pango_attr_list_new();
+        pango_attr_list_insert(attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
+        gtk_label_set_attributes(GTK_LABEL(files_label), attrs);
+        pango_attr_list_unref(attrs);
+        gtk_box_pack_start(GTK_BOX(memory_box), files_label, FALSE, FALSE, 0);
+
+        // Scrolled window for file list
+        GtkWidget* scrolled = gtk_scrolled_window_new(nullptr, nullptr);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
+                                       GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+        gtk_widget_set_size_request(scrolled, -1, 120);
+
+        GtkWidget* files_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+        for (int i = 0; i < memory_count; i++) {
+            const char* filename = FSTP_GetMemoryLocationsFileName(i);
+            if (filename) {
+                char bullet_text[512];
+                snprintf(bullet_text, sizeof(bullet_text), "• %s", filename);
+                GtkWidget* file_label = gtk_label_new(bullet_text);
+                gtk_widget_set_halign(file_label, GTK_ALIGN_START);
+                attrs = pango_attr_list_new();
+                pango_attr_list_insert(attrs, pango_attr_scale_new(PANGO_SCALE_SMALL));
+                pango_attr_list_insert(attrs, pango_attr_family_new("monospace"));
+                gtk_label_set_attributes(GTK_LABEL(file_label), attrs);
+                pango_attr_list_unref(attrs);
+                gtk_box_pack_start(GTK_BOX(files_vbox), file_label, FALSE, FALSE, 0);
+            }
+        }
+
+        gtk_container_add(GTK_CONTAINER(scrolled), files_vbox);
+        gtk_box_pack_start(GTK_BOX(memory_box), scrolled, FALSE, FALSE, 0);
+    }
+
     GtkWidget* memory_note = gtk_label_new("Memory Locations are saved per-video like browser cookies");
     gtk_widget_set_halign(memory_note, GTK_ALIGN_START);
     attrs = pango_attr_list_new();
@@ -491,6 +599,33 @@ void ShowGTKSettingsDialog() {
     GtkWidget* memory_buttons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     GtkWidget* clear_memory_btn = gtk_button_new_with_label("Clear All");
     gtk_widget_set_sensitive(clear_memory_btn, memory_count > 0);
+    g_signal_connect(clear_memory_btn, "clicked", G_CALLBACK(+[](GtkButton* button, gpointer user_data) {
+        GtkWidget* dialog_widget = GTK_WIDGET(user_data);
+
+        int memory_count = FSTP_GetMemoryLocationsFilesCount();
+
+        GtkWidget* confirm_dialog = gtk_message_dialog_new(
+            GTK_WINDOW(gtk_widget_get_toplevel(dialog_widget)),
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_WARNING,
+            GTK_BUTTONS_YES_NO,
+            "Clear All Memory Locations?"
+        );
+
+        char message[256];
+        snprintf(message, sizeof(message),
+                 "This will delete all saved Memory Locations for %d video files. This cannot be undone.",
+                 memory_count);
+        gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(confirm_dialog), "%s", message);
+
+        gint response = gtk_dialog_run(GTK_DIALOG(confirm_dialog));
+        gtk_widget_destroy(confirm_dialog);
+
+        if (response == GTK_RESPONSE_YES) {
+            FSTP_ClearAllMemoryLocations();
+            std::cout << "✅ All Memory Locations cleared" << std::endl;
+        }
+    }), dialog);
     gtk_box_pack_end(GTK_BOX(memory_buttons), clear_memory_btn, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(memory_box), memory_buttons, FALSE, FALSE, 0);
 
@@ -580,6 +715,9 @@ void ShowGTKSettingsDialog() {
         // Volume
         writable_settings->audio_master_volume = gtk_range_get_value(GTK_RANGE(volume_scale));
 
+        // Volume ducking (ear protection)
+        writable_settings->audio_volume_ducking_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ducking_check));
+
         // Buffer size
         int buffer_sizes[] = {512, 1024, 2048, 4096};
         int new_buffer_index = gtk_combo_box_get_active(GTK_COMBO_BOX(buffer_combo));
@@ -594,6 +732,9 @@ void ShowGTKSettingsDialog() {
         // Betacam effect
         writable_settings->betacam_effect_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(betacam_check));
         SetBetacamEffectEnabled(writable_settings->betacam_effect_enabled);
+
+        // Decoder status display
+        writable_settings->show_decoder_status = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(decoder_status_check));
 
         // yt-dlp extension
         if (yt_dlp_available && yt_dlp_check) {

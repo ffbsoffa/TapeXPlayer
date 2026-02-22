@@ -153,7 +153,7 @@ void ShutdownWindowManager() {
     // Close all active windows
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (g_windows[i].is_active) {
-            CloseWindow(i);
+            FSTPCloseWindow(i);
         }
     }
 
@@ -203,6 +203,14 @@ int CreateNewWindow(const char* title, int width, int height) {
         std::cerr << "Failed to create window: " << SDL_GetError() << std::endl;
         return -3;
     }
+
+    // Set minimum window size to prevent OSD elements from overlapping
+    // Minimum 800x450 (16:9) ensures all OSD elements fit without overlap:
+    // - VU meters (left): 180px
+    // - Timecode (center): ~400px
+    // - Position indicator (right): 112px
+    // - Bottom OSD height: ~100px
+    SDL_SetWindowMinimumSize(window, 800, 450);
 
     // Try creating renderer with fallback strategy
     SDL_Renderer* renderer = nullptr;
@@ -326,12 +334,21 @@ int CreateNewWindow(const char* title, int width, int height) {
     return window_index;
 }
 
-void CloseWindow(int window_index) {
+void FSTPCloseWindow(int window_index) {
     if (window_index < 0 || window_index >= MAX_WINDOWS || !g_windows[window_index].is_active) {
         return;
     }
 
     std::cout << "Closing window " << window_index << " (bound to player " << g_windows[window_index].player_instance_id << ")" << std::endl;
+
+    // CRITICAL: Mark window as closing to prevent rendering thread from accessing textures
+    // This prevents Metal command encoder crash during shutdown
+    g_windows[window_index].is_closing = true;
+
+    // CRITICAL: Give render thread time to see is_closing flag and finish current frame
+    // Render thread runs at 60fps = ~16.7ms per frame, wait 2 frames worth to be safe
+    // This prevents Metal crash: "Command encoder released without endEncoding"
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
 
     // OSD uses original system - nothing to free
     g_windows[window_index].osd_instance = nullptr;
@@ -483,8 +500,8 @@ void HandleWindowEvents(SDL_Event* event) {
                         int player_id = g_windows[i].player_instance_id;
                         std::cout << "Window " << i << " close requested - stopping player " << player_id << std::endl;
 
-                        // Mark window as closing to prevent OSD updates during cleanup
-                        g_windows[i].is_closing = true;
+                        // REMOVED: Don't mark is_closing yet - it blocks OSD during unthreading!
+                        // g_windows[i].is_closing = true;
 
                         // First stop player, then destroy
                         if (player_id >= 0 && IsPlayerInstanceActive(player_id)) {
@@ -496,12 +513,14 @@ void HandleWindowEvents(SDL_Event* event) {
                                 std::cout << "Player " << player_id << " stopped" << std::endl;
                             }
 
-                            // Now destroy instance
+                            // CRITICAL: Destroy instance with OSD visible
+                            // UnloadFile will show "unthreading" progress
                             DestroyPlayerInstance(player_id);
                         }
 
-                        // Close window
-                        CloseWindow(i);
+                        // NOW mark as closing and close window (AFTER player destroyed)
+                        g_windows[i].is_closing = true;
+                        FSTPCloseWindow(i);
                         break;
                     }
                 }
@@ -602,9 +621,18 @@ void RenderAllWindows() {
 
     // CPU OPTIMIZATION: Throttling for static screens (no file/loading)
     for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (g_windows[i].is_active && !g_windows[i].is_minimized && g_windows[i].renderer) {
+        // CRITICAL FIX: Skip windows that are being closed to avoid Metal command encoder crash
+        if (g_windows[i].is_active && !g_windows[i].is_minimized && !g_windows[i].is_closing && g_windows[i].renderer) {
             SDL_Renderer* renderer = g_windows[i].renderer;
             int player_id = g_windows[i].player_instance_id;
+
+            // CRITICAL: Take snapshot of is_closing state at start of render block
+            // This ensures consistent state throughout rendering operations
+            // If window starts closing mid-render, we still need to finish cleanly
+            bool window_closing = g_windows[i].is_closing;
+            if (window_closing) {
+                continue;  // Skip this window entirely
+            }
 
             // REMOVED: Throttling optimization that prevented OSD from showing immediately
             // macOS version doesn't have this check and renders every frame
@@ -677,6 +705,16 @@ void RenderAllWindows() {
                         need_update = true;
                         g_windows[i].betacam_hold_frames--;
                     }
+
+                    // BETACAM EFFECT: Always update at pause/slow motion or shuttle speeds
+                    // This ensures noise bars are rendered even when video frame doesn't change
+                    // Force update regardless of whether Betacam effect is enabled
+                    // (rendering needs to happen for effect to be visible)
+                    bool betacam_speed = (absPlaybackRate < 0.9 || absPlaybackRate > 1.1);
+                    if (betacam_speed) {
+                        need_update = true;
+                    }
+
                     bool is_new_frame = need_update || (pixel_buffer->frame_number != g_windows[i].last_rendered_frame);
 
                     SDL_Texture* new_texture = nullptr;
@@ -702,18 +740,27 @@ void RenderAllWindows() {
                         g_windows[i].texture_buffer_timestamp[current_buf] = pixel_buffer->timestamp;
 
                         // Render video with aspect ratio within window
+                        // Use logical window size (NOT renderer output size) to avoid HiDPI scaling issues
                         int win_w = 0, win_h = 0;
-                        // Prefer renderer output size to account for HiDPI/scaling
-                        if (SDL_GetRendererOutputSize(renderer, &win_w, &win_h) != 0 || win_w <= 0 || win_h <= 0) {
-                            // Fallback: take window size
-                            if (g_windows[i].window) {
-                                SDL_GetWindowSize(g_windows[i].window, &win_w, &win_h);
-                            }
+                        if (g_windows[i].window) {
+                            SDL_GetWindowSize(g_windows[i].window, &win_w, &win_h);
+                        }
+
+                        // Compute display dimensions accounting for SAR (Sample Aspect Ratio)
+                        // For anamorphic content: display_width = pixel_width × (sar_num / sar_den)
+                        int display_width = pixel_buffer->width;
+                        int display_height = pixel_buffer->height;
+
+                        if (pixel_buffer->sar_num > 0 && pixel_buffer->sar_den > 0) {
+                            // Apply SAR correction to width
+                            display_width = static_cast<int>(pixel_buffer->width *
+                                static_cast<double>(pixel_buffer->sar_num) /
+                                static_cast<double>(pixel_buffer->sar_den));
                         }
 
                         SDL_Rect dst_rect = ComputeAspectFitRect(
-                            pixel_buffer->width,
-                            pixel_buffer->height,
+                            display_width,   // Use display width (SAR-corrected)
+                            display_height,  // Height stays the same
                             win_w,
                             win_h
                         );
@@ -723,8 +770,9 @@ void RenderAllWindows() {
                             render_ctx.dest_rect = &dst_rect;
                             render_ctx.window_width = win_w;
                             render_ctx.window_height = win_h;
-                            render_ctx.target_aspect_ratio = (pixel_buffer->height > 0)
-                                ? static_cast<float>(pixel_buffer->width) / static_cast<float>(pixel_buffer->height)
+                            // Compute aspect ratio from display dimensions (SAR-corrected)
+                            render_ctx.target_aspect_ratio = (display_height > 0)
+                                ? static_cast<float>(display_width) / static_cast<float>(display_height)
                                 : 1.0f;
                             render_ctx.frame_number = pixel_buffer->frame_number;
                             render_ctx.new_frame = is_new_frame;
@@ -753,7 +801,20 @@ void RenderAllWindows() {
                             src_rect_ptr = &src_rect_for_zoom;
                         }
 
-                        SDL_RenderCopy(renderer, new_texture, src_rect_ptr, &dst_rect);
+                        // Try HSync loss effect rendering first (only when no zoom active)
+                        bool hsync_rendered = false;
+                        if (g_pixel_buffer_manager && !src_rect_ptr) {
+                            // HSync effect only works with full frame (no zoom)
+                            hsync_rendered = g_pixel_buffer_manager->RenderWithHsync(
+                                player_id, renderer, new_texture,
+                                pixel_buffer->width, pixel_buffer->height, dst_rect
+                            );
+                        }
+
+                        // Fallback to normal rendering if hsync was not applied
+                        if (!hsync_rendered) {
+                            SDL_RenderCopy(renderer, new_texture, src_rect_ptr, &dst_rect);
+                        }
 
                         if (is_new_frame) {
                             g_windows[i].last_rendered_frame = pixel_buffer->frame_number;
@@ -763,7 +824,8 @@ void RenderAllWindows() {
                         if (zoom_state && zoom_state->enabled && zoom_state->show_thumbnail && zoom_state->factor > 1.0f) {
                             // Thumbnail size (15% of window width, max 180px)
                             int thumb_w = std::min(180, static_cast<int>(win_w * 0.15f));
-                            int thumb_h = static_cast<int>(thumb_w * ((float)pixel_buffer->height / (float)pixel_buffer->width));
+                            // Use display dimensions (SAR-corrected) for correct aspect ratio
+                            int thumb_h = static_cast<int>(thumb_w * ((float)display_height / (float)display_width));
 
                             // Thumbnail position (top-right corner with padding)
                             int padding = 10;
@@ -827,7 +889,13 @@ void RenderAllWindows() {
 
             // 4. Final Present
             auto t_before_present = std::chrono::high_resolution_clock::now();
-            SDL_RenderPresent(renderer);
+
+            // CRITICAL: Double-check window is not closing before SDL_RenderPresent
+            // Race condition: window might start closing between loop check and here
+            if (!g_windows[i].is_closing && g_windows[i].is_active) {
+                SDL_RenderPresent(renderer);
+            }
+
             auto t_after_present = std::chrono::high_resolution_clock::now();
             total_render_present_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_present - t_before_present).count());
 
@@ -912,7 +980,7 @@ FSTPWindow* GetMainWindow() {
     return GetWindowByIndex(0);
 }
 
-FSTPWindow* GetActiveWindow() {
+FSTPWindow* FSTPGetActiveWindow() {
     // Find window with focus
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (g_windows[i].is_active && g_windows[i].has_focus) {
@@ -925,7 +993,7 @@ FSTPWindow* GetActiveWindow() {
 }
 
 int GetActivePlayerID() {
-    FSTPWindow* active_window = GetActiveWindow();
+    FSTPWindow* active_window = FSTPGetActiveWindow();
     if (active_window) {
         return active_window->player_instance_id;
     }
@@ -971,10 +1039,14 @@ SDL_Renderer* GetWindowRenderer(int window_index) {
 // === NEW SAFE FUNCTIONS FOR PIXEL DATA ===
 
 // ZERO-COPY method - pass AVFrame directly
+// Optional: prev_frame (N-1) and next_frame (N+1) for Betacam slow-motion compositing
 void SubmitAVFrame(int player_id, std::shared_ptr<AVFrame> av_frame,
-                  double timestamp, int frame_number) {
+                  double timestamp, int frame_number,
+                  std::shared_ptr<AVFrame> prev_frame,
+                  std::shared_ptr<AVFrame> next_frame) {
     if (g_pixel_buffer_manager) {
-        g_pixel_buffer_manager->SubmitAVFrame(player_id, av_frame, timestamp, frame_number);
+        g_pixel_buffer_manager->SubmitAVFrame(player_id, av_frame, timestamp, frame_number,
+                                               prev_frame, next_frame);
     }
 }
 
@@ -1009,14 +1081,6 @@ extern "C" void SetBetacamEffectEnabled(int enabled) {
 
     // Enable visual Betacam effect
     g_pixel_buffer_manager->SetBetacamEffectEnabled(enabled != 0);
-
-    // Enable audio servomotor for all active players
-    for (int player_id = 0; player_id < MAX_PLAYER_INSTANCES; player_id++) {
-        FSTPAudioModuleWrapper* audio_module = GetInstanceAudioModule(player_id);
-        if (audio_module) {
-            audio_module->SetBetacamAudioEnabled(enabled != 0);
-        }
-    }
 }
 
 // Update window title with instance number and filename

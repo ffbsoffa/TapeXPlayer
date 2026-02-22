@@ -44,6 +44,15 @@ public:
         double frame_rate = 25.0;           // Source FPS
         bool new_frame = false;             // True when freshly submitted
 
+        // SAR (Sample Aspect Ratio) for anamorphic content
+        // Used to compute display aspect ratio: DAR = SAR × (width / height)
+        int sar_num = 1;                    // SAR numerator (default 1:1 square pixels)
+        int sar_den = 1;                    // SAR denominator
+
+        // Adjacent frames for Betacam slow-motion compositing
+        std::shared_ptr<AVFrame> prev_frame;  // Frame N-1 (for forward compositing)
+        std::shared_ptr<AVFrame> next_frame;  // Frame N+1 (for reverse compositing)
+
         PixelBuffer() = default;
 
         // shared_ptr manages copying/assignment itself
@@ -62,6 +71,9 @@ private:
 
     // Mutexes for buffer protection
     std::mutex m_buffer_mutex[MAX_PLAYERS];
+
+    // Previous frame number tracking (actual data stored in FSTPBetacamEffect)
+    int64_t m_prev_frame_number[MAX_PLAYERS] = {-1, -1, -1, -1, -1};
 
     // Statistics
     std::atomic<size_t> m_total_bytes_processed{0};
@@ -102,10 +114,14 @@ public:
      * @param av_frame shared_ptr to decoded frame (YUV420P)
      * @param timestamp Timestamp
      * @param frame_number Frame number
+     * @param prev_frame Optional: previous frame (N-1) for forward compositing
+     * @param next_frame Optional: next frame (N+1) for reverse compositing
      * @return true if successful
      */
     bool SubmitAVFrame(int player_id, std::shared_ptr<AVFrame> av_frame,
-                      double timestamp, int frame_number);
+                      double timestamp, int frame_number,
+                      std::shared_ptr<AVFrame> prev_frame = nullptr,
+                      std::shared_ptr<AVFrame> next_frame = nullptr);
 
     /**
      * @brief [LEGACY] Submit pixel data (with copying, deprecated)
@@ -132,6 +148,14 @@ public:
     const PixelBuffer* GetPixelBuffer(int player_id);
 
     /**
+     * @brief Get previous frame for slow motion compositing
+     *
+     * @param player_id Player ID (0-4)
+     * @return Pointer to previous frame buffer or nullptr
+     */
+    const PixelBuffer* GetPreviousFrame(int player_id) const;
+
+    /**
      * @brief Update playback metrics used by Betacam effect.
      */
     void UpdatePlaybackMetrics(int player_id, const FSTPBetacamEffect::PlaybackMetrics& metrics);
@@ -151,6 +175,12 @@ public:
      */
     bool ApplyRenderJitter(int player_id, FSTPBetacamEffect::RenderContext& render_ctx);
 
+    /**
+     * @brief Render texture with HSync loss effect if active.
+     * @return true if hsync effect was applied (caller should skip normal render)
+     */
+    bool RenderWithHsync(int player_id, SDL_Renderer* renderer, SDL_Texture* texture,
+                         int texture_width, int texture_height, const SDL_Rect& dest_rect);
 
     /**
      * @brief Create/update SDL texture from pixel buffer (synchronous)
