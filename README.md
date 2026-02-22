@@ -131,23 +131,90 @@ On the recommended configuration, the application ensures smooth operation of bo
 
 ## 📄 License
 
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
+TapeXPlayer is distributed under the **GNU General Public License version 3.0 (GPL-3.0)**.
 
-### Third-Party Libraries
+The choice of GPL-3.0 is driven by the use of the FFmpeg library with GPL components (libx264 for H.264, specific codecs and filters). Under the terms of the GPL, software that uses GPL libraries must be distributed under the same license.
 
-TapeXPlayer uses the following open-source libraries:
 
-- **[FFmpeg](https://ffmpeg.org)** - LGPL v2.1+ / GPL v2+ - Video/audio codec library
-- **[SDL2](https://www.libsdl.org)** - zlib License - Cross-platform multimedia library
-- **[SDL2_ttf](https://github.com/libsdl-org/SDL_ttf)** - zlib License - TrueType font rendering
-- **[PortAudio](http://www.portaudio.com)** - MIT-like License - Cross-platform audio I/O
-- **[RtMidi](https://github.com/thestk/rtmidi)** - MIT-like License - Cross-platform MIDI I/O
-- **[OpenSSL](https://www.openssl.org)** - Apache License 2.0 - Cryptography toolkit
+### FFmpeg
 
-**macOS Frameworks**:
-- Cocoa, CoreVideo, VideoToolbox, CoreAudio, CoreMIDI, IOKit, QuartzCore, CoreFoundation, UniformTypeIdentifiers
+**License:** LGPL 2.1+ / GPL 2.0+ (depending on configuration)
+**Usage:** Decoding video and audio streams, working with file containers
+**Website:** https://ffmpeg.org/
 
-All trademarks are property of their respective owners.
+Components used:
+- **libavformat**: demultiplexing containers (MP4, MOV, MKV, AVI)
+- **libavcodec**: video decoding (H.264, H.265, ProRes, DNxHD) and audio decoding (AAC, MP3, PCM)
+- **libswscale**: color space conversion (YUV ↔ RGB)
+- **libswresample**: audio resampling
+- **libavutil**: utility functions
+
+Hardware decoding support: VideoToolbox (macOS), VA-API (Linux), DXVA2 (Windows).
+
+### SDL2
+
+**License:** zlib License
+**Usage:** Cross-platform window system, rendering, input event handling
+**Website:** https://www.libsdl.org/
+
+Functionality:
+- Creating and managing application windows
+- Initializing graphics renderers (Metal, OpenGL, Direct3D, Vulkan)
+- Rendering YUV textures
+- Processing keyboard and mouse events
+- Timers and time measurement
+
+### SDL_ttf
+
+**License:** zlib License
+**Usage:** Rendering TrueType fonts for on-screen display (OSD)
+**Website:** https://github.com/libsdl-org/SDL_ttf
+
+Rasterization of timecode, speed indicators, and VU meters. The font is embedded in the binary as a byte array.
+
+### PortAudio
+
+**License:** MIT License
+**Usage:** Audio playback through system APIs
+**Website:** http://www.portaudio.com/
+
+Audio output abstraction for CoreAudio (macOS), ALSA/PulseAudio (Linux), WASAPI/DirectSound (Windows). Registers a callback function to fill the audio buffer.
+
+### RtMidi
+
+**License:** MIT-style License
+**Usage:** Integration with MIDI controllers
+**Website:** https://github.com/thestk/rtmidi
+
+Support for the Mackie Control protocol for controlling playback via physical faders and buttons. Abstraction for CoreMIDI (macOS), ALSA (Linux), WinMM (Windows).
+
+### Platform-Specific APIs
+
+#### macOS
+
+- **Cocoa**: native dialogs (`NSOpenPanel`)
+- **VideoToolbox**: hardware video decoding
+- **CoreAudio**: audio output (via PortAudio)
+- **CoreMIDI**: MIDI devices (via RtMidi)
+- **Metal**: graphics API (via SDL2)
+
+**License:** Proprietary Apple frameworks
+
+#### Linux
+
+- **GTK+ 3** (LGPL 2.1+): native dialogs, context menus
+- **X11/Wayland**: window system (via SDL2)
+- **VA-API**: hardware video decoding
+- **ALSA/PulseAudio**: audio subsystem (via PortAudio)
+
+#### Windows
+
+- **Win32 API**: native dialogs (IFileOpenDialog), window integration
+- **Direct3D 11/12**: graphics API (via SDL2)
+- **DXVA2**: hardware video decoding
+- **WASAPI**: audio subsystem (via PortAudio)
+
+**License:** Proprietary Microsoft APIs
 
 ---
 
@@ -178,4 +245,4 @@ Special thanks to:
 
 ---
 
-© 2025 Maksim Maloletkin. Licensed under GPL v3.0.
+© 2026 Maksim Maloletkin. Licensed under GPL v3.0.
