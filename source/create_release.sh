@@ -22,9 +22,9 @@ fi
 
 # Determine release name
 if [ -n "$CODENAME" ]; then
-    RELEASE_NAME="TapeXPlayer-${CODENAME}-build${BUILD}"
+    RELEASE_NAME="TapeXPlayer-${CODENAME}-build${BUILD}-mac"
 else
-    RELEASE_NAME="TapeXPlayer-build${BUILD}"
+    RELEASE_NAME="TapeXPlayer-build${BUILD}-mac"
 fi
 
 RELEASE_DIR="../builds/release"
@@ -42,6 +42,11 @@ mkdir -p "$RELEASE_CONTENT"
 echo "1️⃣  Copying TapeXPlayer.app..."
 cp -R "$APP_PATH" "$RELEASE_CONTENT/"
 
+# Copy LICENSES file (LGPL compliance)
+if [ -f "LICENSES_THIRD_PARTY.txt" ]; then
+    cp "LICENSES_THIRD_PARTY.txt" "$RELEASE_CONTENT/"
+fi
+
 # Create README
 echo "2️⃣  Generating README.txt..."
 cat > "$RELEASE_CONTENT/README.txt" << EOF
@@ -58,48 +63,33 @@ Universal Binary (Intel + Apple Silicon)
 INSTALLATION / УСТАНОВКА
 ================================================================================
 
-⚠️  ВАЖНО! macOS покажет предупреждение при первом запуске, так как
-    приложение не нотаризовано Apple. Это нормально для open-source
-    проектов распространяемых через GitHub.
+macOS помечает файлы, скачанные с GitHub, атрибутом карантина.
+Перед первым запуском его нужно снять одним из способов ниже.
 
-⚠️  ПОСЛЕ СКАЧИВАНИЯ С GITHUB: macOS помечает скачанные файлы как
-    "небезопасные". Сначала нужно снять это ограничение!
+================================================================================
+СПОСОБ 1 — Terminal
+================================================================================
 
-╔════════════════════════════════════════════════════════════════════════════╗
-║  СПОСОБ 1 (САМЫЙ ПРОСТОЙ) - Одна команда в Terminal:                      ║
-╚════════════════════════════════════════════════════════════════════════════╝
-
-1. Распакуйте ZIP архив (если еще не распаковали)
-2. Откройте Terminal (⌘+Space, наберите "Terminal")
-3. Введите эту команду (замените путь на свой):
+1. Распакуйте ZIP архив
+2. Откройте Terminal (⌘+Space → "Terminal")
+3. Выполните команды:
 
    cd ~/Downloads/TapeXPlayer-${CODENAME}-build${BUILD}
    xattr -cr .
+   cp -R TapeXPlayer.app /Applications/
 
-4. Теперь можно использовать install.command или запустить приложение
+4. Запускайте из Launchpad или /Applications
 
-   ВАЖНО: Команда "xattr -cr ." снимает ограничения со ВСЕХ файлов в папке,
-          включая install.command, поэтому он сможет запуститься.
+================================================================================
+СПОСОБ 2 — System Settings
+================================================================================
 
-╔════════════════════════════════════════════════════════════════════════════╗
-║  СПОСОБ 2 - Используйте install.command (после снятия quarantine):        ║
-╚════════════════════════════════════════════════════════════════════════════╝
-
-1. Сначала выполните команду из СПОСОБА 1
-2. Двойной клик на "install.command"
-3. Приложение автоматически установится в /Applications
-4. Готово! Запускайте из Launchpad или /Applications
-
-╔════════════════════════════════════════════════════════════════════════════╗
-║  СПОСОБ 3 - Через System Settings (долгий способ):                        ║
-╚════════════════════════════════════════════════════════════════════════════╝
-
-1. Попробуйте запустить TapeXPlayer.app двойным кликом
-2. Система покажет: "cannot be opened because the developer cannot be verified"
-3. Откройте: System Settings → Privacy & Security
-4. Прокрутите вниз до раздела Security
+1. Распакуйте ZIP и переместите TapeXPlayer.app в /Applications
+2. Запустите TapeXPlayer.app двойным кликом
+3. macOS покажет: "cannot be opened because the developer cannot be verified"
+4. Откройте: System Settings → Privacy & Security
 5. Нажмите "Open Anyway" рядом с TapeXPlayer
-6. Подтвердите открытие в следующем диалоге
+6. Подтвердите запуск в появившемся диалоге
 
 ================================================================================
 SYSTEM REQUIREMENTS / СИСТЕМНЫЕ ТРЕБОВАНИЯ
@@ -214,7 +204,7 @@ TROUBLESHOOTING / РЕШЕНИЕ ПРОБЛЕМ
 ================================================================================
 
 Q: "TapeXPlayer cannot be opened because the developer cannot be verified"
-A: Используйте install.command или выполните: xattr -cr TapeXPlayer.app
+A: Выполните: cd ~/Downloads/TapeXPlayer-${CODENAME}-build${BUILD} && xattr -cr .
 
 Q: Приложение не запускается после установки
 A: Убедитесь что выполнили xattr -cr перед первым запуском
@@ -266,72 +256,8 @@ Architecture: Universal (x86_64 + arm64)
 
 EOF
 
-# Create install script
-echo "3️⃣  Creating install.command..."
-cat > "$RELEASE_CONTENT/install.command" << 'EOF'
-#!/bin/bash
-# TapeXPlayer Installer
-# Automatic installation with quarantine attribute removal
-
-clear
-echo "════════════════════════════════════════════════════════════════"
-echo "           TapeXPlayer Installer for macOS"
-echo "════════════════════════════════════════════════════════════════"
-echo ""
-
-# Determine script path
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-APP_PATH="$SCRIPT_DIR/TapeXPlayer.app"
-
-if [ ! -d "$APP_PATH" ]; then
-    echo "❌ Error: TapeXPlayer.app not found in current folder"
-    echo ""
-    read -p "Press Enter to exit..."
-    exit 1
-fi
-
-echo "1️⃣  Removing quarantine attributes..."
-xattr -cr "$APP_PATH"
-echo "   ✅ Done"
-echo ""
-
-echo "2️⃣  Installing to /Applications..."
-if [ -d "/Applications/TapeXPlayer.app" ]; then
-    echo "   ⚠️  TapeXPlayer is already installed in /Applications"
-    read -p "   Replace existing version? (y/n): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "   ⏭  Installation cancelled"
-        echo ""
-        echo "Application is ready to use from current folder."
-        read -p "Press Enter to exit..."
-        exit 0
-    fi
-    rm -rf "/Applications/TapeXPlayer.app"
-fi
-
-cp -R "$APP_PATH" "/Applications/"
-echo "   ✅ Done"
-echo ""
-
-echo "════════════════════════════════════════════════════════════════"
-echo "           ✅ Installation completed successfully!"
-echo "════════════════════════════════════════════════════════════════"
-echo ""
-echo "TapeXPlayer installed to /Applications"
-echo ""
-echo "Launch the application:"
-echo "  • From Launchpad"
-echo "  • From Finder → Applications"
-echo "  • Or run: open -a TapeXPlayer"
-echo ""
-read -p "Press Enter to exit..."
-EOF
-
-chmod +x "$RELEASE_CONTENT/install.command"
-
 # Create uninstall script
-echo "4️⃣  Creating uninstall.command..."
+echo "3️⃣  Creating uninstall.command..."
 cat > "$RELEASE_CONTENT/uninstall.command" << 'EOF'
 #!/bin/bash
 # TapeXPlayer Uninstaller
@@ -385,7 +311,7 @@ EOF
 chmod +x "$RELEASE_CONTENT/uninstall.command"
 
 # Create ZIP
-echo "5️⃣  Creating ZIP archive..."
+echo "4️⃣  Creating ZIP archive..."
 rm -f "$RELEASE_ZIP"
 cd "$RELEASE_DIR"
 zip -r -q "../../$(basename "$RELEASE_ZIP")" "$(basename "$RELEASE_CONTENT")"
@@ -404,9 +330,9 @@ echo "Size: $(du -h "$RELEASE_ZIP" | cut -f1)"
 echo ""
 echo "Contents:"
 echo "  • TapeXPlayer.app (Universal Binary)"
-echo "  • README.txt (bilingual instructions)"
-echo "  • install.command (automatic installation)"
+echo "  • README.txt (installation instructions)"
 echo "  • uninstall.command (removal)"
+echo "  • LICENSES_THIRD_PARTY.txt (third-party licenses)"
 echo ""
 echo "Ready to upload to GitHub Releases! 🚀"
 echo ""

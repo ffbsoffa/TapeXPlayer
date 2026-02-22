@@ -25,12 +25,25 @@ CODE_NAME ?= Albatross
 # File for storing build number
 BUILD_NUMBER_FILE = .build_number
 
-# Automatic build number increment on each make invocation
+# Build number: increment only when actually compiling (all / rebuild / default).
+# Non-compile targets (release, bundle, clean, deb, etc.) just read the current value.
+#
+# NOTE: case/in/pattern) inside $(shell ...) is broken — Make counts ALL bare )
+# characters when searching for the closing ) of $(shell), so the ) after each
+# case-pattern closes the function prematurely.  Use $(filter ...) in Make itself
+# to produce a plain "1" or "0" flag, then use a simple if/else in the shell.
+_BUILD_GOALS     := $(or $(MAKECMDGOALS),all)
+_SHOULD_INCREMENT := $(if $(filter all rebuild,$(_BUILD_GOALS)),1,0)
+
 BUILD_NUMBER := $(shell \
 	CURRENT=$$(cat $(BUILD_NUMBER_FILE) 2>/dev/null || echo "852"); \
-	NEXT=$$((CURRENT + 1)); \
-	echo $$NEXT > $(BUILD_NUMBER_FILE); \
-	echo $$NEXT \
+	if [ "$(_SHOULD_INCREMENT)" = "1" ]; then \
+		NEXT=$$((CURRENT + 1)); \
+		echo $$NEXT > $(BUILD_NUMBER_FILE); \
+		echo $$NEXT; \
+	else \
+		echo $$CURRENT; \
+	fi \
 )
 
 # Automatic build date generation
@@ -48,14 +61,14 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Platform detection and configuration
-ifneq (,$(findstring MINGW,$(MSYSTEM)))
-    # Windows (MSYS2/MinGW) configuration
+ifneq (,$(findstring _NT,$(UNAME_S)))
+    # Windows (MSYS2) configuration
     PLATFORM = windows
     BUILD_TYPE = Windows (SDL2/MinGW)
     ARCH_FLAGS =
-    
-    # Windows-specific paths and flags
-    MINGW_PATH = /mingw64
+
+    # Auto-detect MSYS2 prefix (/mingw64, /ucrt64, /clang64, etc.)
+    MINGW_PATH = $(or $(MSYSTEM_PREFIX),/mingw64)
     HOMEBREW_PATH = $(MINGW_PATH)
     
     # Disable macOS-specific settings
@@ -75,20 +88,27 @@ ifneq (,$(findstring MINGW,$(MSYSTEM)))
               -Imodules/FSTPMainModule/WSGUI \
               -Imodules/FSTPPlayerModule \
               -Imodules/FSTPVideoModule \
+              -Imodules/FSTPAudioModule \
               -I$(MINGW_PATH)/include/ffmpeg
-    
+
     # Add includes to CXXFLAGS
     CXXFLAGS += $(INCLUDES)
-    
+
     # Library paths and libs
     LDFLAGS = -L$(MINGW_PATH)/lib
-    LIBS = -lSDL2 -lportaudio -lavformat -lavcodec -lavutil -lswscale \
-           -lwinmm -lole32 -lgdi32
+    LIBS = -lmingw32 -lSDL2main -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavutil -lswscale \
+           -lssl -lcrypto -lrtmidi \
+           -lwinmm -lole32 -lgdi32 -lcomdlg32 -lcomctl32 -lshell32 -lshlwapi -luuid -luxtheme
     
+    # Resource compiler for manifest embedding
+    WINDRES = windres
+    RC_SOURCE = modules/FSTPMainModule/WSGUI/windows/resources.rc
+    RC_OBJECT = ../builds/obj_windows/resources.res.o
+
     # Output directories
     OBJDIR = ../builds/obj_windows
     TARGET = ../builds/binaries/TapeXPlayer.exe
-    
+
     # Use g++ as linker
     LINKER = $(CXX)
 
@@ -114,7 +134,8 @@ endif
 CXXFLAGS_BASE = -std=c++23 -Wall -Wextra $(ARCH_FLAGS)
 OBJCFLAGS = -std=c++23 -Wall -Wextra $(ARCH_FLAGS)
 
-# Platform-specific configuration
+# Platform-specific configuration (skip if Windows — already configured above)
+ifneq ($(PLATFORM),windows)
 ifeq ($(UNAME_S),Linux)
     # Linux configuration
     SWIFT_TARGET =
@@ -172,6 +193,7 @@ else
     OBJDIR = ../builds/obj
     TARGET = ../builds/binaries/TapeXPlayer
 endif
+endif
 LIBS_WITH_ARCH = $(LIBS) $(ARCH_FLAGS)
 # TEMPORARILY REMOVED: -framework Metal -framework MetalKit (causes crashes with software rendering)
 
@@ -196,16 +218,25 @@ CPP_SOURCES_RAW = $(filter-out modules/FSTPPlayerModule/example_usage.cpp, \
                   $(wildcard modules/*/*/*/*/*.cpp))))
 
 # Platform-specific source filtering
-ifeq ($(UNAME_S),Linux)
-    # Exclude macOS-specific files (darwin and windows directories)
+ifeq ($(PLATFORM),windows)
+    # Windows - exclude macOS and Linux specific files
+    CPP_SOURCES = $(filter-out modules/FSTPMainModule/WSGUI/darwin/%, \
+                  $(filter-out modules/FSTPMainModule/WSGUI/linux/%, \
+                  $(CPP_SOURCES_RAW)))
+    MM_SOURCES =
+    SWIFT_SOURCES =
+else ifeq ($(UNAME_S),Linux)
+    # Linux - exclude macOS and Windows specific files
     CPP_SOURCES = $(filter-out modules/FSTPMainModule/WSGUI/darwin/%, \
                   $(filter-out modules/FSTPMainModule/WSGUI/windows/%, \
                   $(CPP_SOURCES_RAW)))
     MM_SOURCES =
     SWIFT_SOURCES =
 else
-    # macOS - include all files
-    CPP_SOURCES = $(CPP_SOURCES_RAW)
+    # macOS - include all files (except linux/windows platform dirs)
+    CPP_SOURCES = $(filter-out modules/FSTPMainModule/WSGUI/linux/%, \
+                  $(filter-out modules/FSTPMainModule/WSGUI/windows/%, \
+                  $(CPP_SOURCES_RAW)))
     MM_SOURCES = $(wildcard modules/*/*.mm) $(wildcard modules/*/*/*.mm) $(wildcard modules/*/*/*/*.mm) $(wildcard modules/*/*/*/*/*.mm)
     # Exclude BuildInfo.swift from scanning (it's auto-generated)
     SWIFT_SOURCES = $(filter-out $(BUILD_INFO_SWIFT), $(wildcard modules/*/*/*/*.swift) $(wildcard modules/*/*/*/*/*.swift))
@@ -232,23 +263,26 @@ platform-info:
 	@echo "================================================"
 	@echo "TapeXPlayer 2026 - Universal Build System"
 	@echo "================================================"
-	@echo "Platform:        $(UNAME_S)"
-	@echo "Architecture:    $(UNAME_M)"
-ifeq ($(UNAME_S),Linux)
-	@echo "Target:          $(TARGET)"
-	@echo "Build Type:      Linux (GTK+/SDL2)"
+ifeq ($(PLATFORM),windows)
+	@echo "Platform:        Windows (MinGW)"
+	@echo "Build Type:      Win32/SDL2"
 	@echo "Compiler:        $(CXX)"
-	@echo "Flags:           $(CXXFLAGS)"
+	@echo "Target:          $(notdir $(TARGET))"
+	@echo "Build Number:    $(BUILD_NUMBER)"
+	@echo "Version:         $(VERSION) \"$(CODE_NAME)\""
+	@echo "------------------------------------------------"
+else ifeq ($(UNAME_S),Linux)
+	@echo "Platform:        Linux ($(UNAME_M))"
+	@echo "Build Type:      GTK+/SDL2"
+	@echo "Compiler:        $(CXX)"
+	@echo "Target:          $(notdir $(TARGET))"
 	@echo "------------------------------------------------"
 else
-	@echo "Target:          $(TARGET)"
-	@echo "Build Type:      macOS (Cocoa/SDL2/Swift)"
-	@echo "Architecture:    $(ARCH_FLAGS)"
-	@echo "Swift Target:    $(SWIFT_TARGET)"
-	@echo "Homebrew Path:   $(HOMEBREW_PATH)"
+	@echo "Platform:        macOS ($(UNAME_M))"
+	@echo "Build Type:      Cocoa/SDL2/Swift"
+	@echo "Target:          $(notdir $(TARGET))"
 	@echo "Build Number:    $(BUILD_NUMBER)"
-	@echo "Version:         $(VERSION)"
-	@echo "Code Name:       $(CODE_NAME)"
+	@echo "Version:         $(VERSION) \"$(CODE_NAME)\""
 	@echo "------------------------------------------------"
 endif
 	@echo ""
@@ -257,7 +291,7 @@ endif
 ifeq ($(USE_SWIFT),yes)
 .PHONY: $(BUILD_INFO_SWIFT)
 $(BUILD_INFO_SWIFT):
-	@echo "Generating BuildInfo.swift (Version: $(VERSION), Build: $(BUILD_NUMBER), Date: $(BUILD_DATE))..."
+	@echo "✅ BuildInfo.h updated: $(VERSION) \"$(CODE_NAME)\" Build $(BUILD_NUMBER)"
 	@mkdir -p $(dir $(BUILD_INFO_SWIFT))
 	@echo "// Auto-generated by Makefile - DO NOT EDIT MANUALLY" > $(BUILD_INFO_SWIFT)
 	@echo "// Generated on: $$(date)" >> $(BUILD_INFO_SWIFT)
@@ -275,13 +309,76 @@ $(BUILD_INFO_SWIFT):
 		echo "    static let codeName: String? = nil" >> $(BUILD_INFO_SWIFT); \
 	fi
 	@echo "}" >> $(BUILD_INFO_SWIFT)
-	@echo "BuildInfo.swift generated."
 
 $(TARGET): $(BUILD_INFO_SWIFT) $(OBJECTS)
-	@echo "Linking $(TARGET)..."
+	@echo "[Link] $(notdir $(TARGET))"
 	@mkdir -p $(dir $(TARGET))
-	$(LINKER) $(LINKER_FLAGS) $(OBJECTS) $(LIBS) -o $(TARGET)
-	@echo "Build complete!"
+	@$(LINKER) $(LINKER_FLAGS) $(OBJECTS) $(LIBS) -o $(TARGET)
+	@echo ""
+	@echo "================================================"
+	@echo "✅ Build complete!"
+	@echo "================================================"
+	@echo "Target:     $(TARGET)"
+	@echo "Platform:   macOS ($(UNAME_M))"
+	@echo "Build:      $(BUILD_NUMBER)"
+	@echo ""
+	@echo "To run: $(TARGET)"
+	@echo "================================================"
+else ifeq ($(PLATFORM),windows)
+# Windows build - update BuildInfo.h before building
+WINDOWS_BUILDINFO_H = modules/FSTPMainModule/WSGUI/windows/BuildInfo.h
+
+.PHONY: update-buildinfo-windows
+update-buildinfo-windows:
+	@echo "#pragma once" > $(WINDOWS_BUILDINFO_H)
+	@echo "" >> $(WINDOWS_BUILDINFO_H)
+	@echo "// Auto-generated build information for Windows" >> $(WINDOWS_BUILDINFO_H)
+	@echo "// Generated on: $$(date)" >> $(WINDOWS_BUILDINFO_H)
+	@echo "" >> $(WINDOWS_BUILDINFO_H)
+	@echo "#define TAPEXPLAYER_VERSION \"$(VERSION)\"" >> $(WINDOWS_BUILDINFO_H)
+	@echo "#define TAPEXPLAYER_CODE_NAME \"$(CODE_NAME)\"" >> $(WINDOWS_BUILDINFO_H)
+	@echo "#define TAPEXPLAYER_BUILD_NUMBER \"$(BUILD_NUMBER)\"" >> $(WINDOWS_BUILDINFO_H)
+	@echo "#define TAPEXPLAYER_BUILD_DATE __DATE__" >> $(WINDOWS_BUILDINFO_H)
+	@echo "" >> $(WINDOWS_BUILDINFO_H)
+	@echo "// Helper functions" >> $(WINDOWS_BUILDINFO_H)
+	@echo "inline const char* GetTapeXPlayerVersion() {" >> $(WINDOWS_BUILDINFO_H)
+	@echo "    return TAPEXPLAYER_VERSION;" >> $(WINDOWS_BUILDINFO_H)
+	@echo "}" >> $(WINDOWS_BUILDINFO_H)
+	@echo "" >> $(WINDOWS_BUILDINFO_H)
+	@echo "inline const char* GetTapeXPlayerCodeName() {" >> $(WINDOWS_BUILDINFO_H)
+	@echo "    return TAPEXPLAYER_CODE_NAME;" >> $(WINDOWS_BUILDINFO_H)
+	@echo "}" >> $(WINDOWS_BUILDINFO_H)
+	@echo "" >> $(WINDOWS_BUILDINFO_H)
+	@echo "inline const char* GetTapeXPlayerBuildNumber() {" >> $(WINDOWS_BUILDINFO_H)
+	@echo "    return TAPEXPLAYER_BUILD_NUMBER;" >> $(WINDOWS_BUILDINFO_H)
+	@echo "}" >> $(WINDOWS_BUILDINFO_H)
+	@echo "" >> $(WINDOWS_BUILDINFO_H)
+	@echo "inline const char* GetTapeXPlayerBuildDate() {" >> $(WINDOWS_BUILDINFO_H)
+	@echo "    return TAPEXPLAYER_BUILD_DATE;" >> $(WINDOWS_BUILDINFO_H)
+	@echo "}" >> $(WINDOWS_BUILDINFO_H)
+	@echo "✅ Windows BuildInfo.h updated: $(VERSION) \"$(CODE_NAME)\" Build $(BUILD_NUMBER)"
+
+$(RC_OBJECT): $(RC_SOURCE)
+	@echo "[RC] $(notdir $(RC_SOURCE))"
+	@mkdir -p $(dir $(RC_OBJECT))
+	@$(WINDRES) -i $(RC_SOURCE) -o $(RC_OBJECT) --include-dir=$(dir $(RC_SOURCE))
+
+$(TARGET): update-buildinfo-windows $(OBJECTS) $(RC_OBJECT)
+	@echo "[Link] $(notdir $(TARGET))"
+	@mkdir -p $(dir $(TARGET))
+	@$(LINKER) $(LDFLAGS) $(OBJECTS) $(RC_OBJECT) $(LIBS) -o $(TARGET)
+	@echo ""
+	@echo "================================================"
+	@echo "✅ Build complete!"
+	@echo "================================================"
+	@echo "Target:     $(TARGET)"
+	@echo "Platform:   Windows (MinGW)"
+	@echo "Files:      $(words $(CPP_SOURCES)) C++ sources"
+	@echo "Build:      $(BUILD_NUMBER)"
+	@echo ""
+	@echo "To run: $(TARGET)"
+	@echo "================================================"
+
 else
 # Linux build - update BuildInfo.h before building
 .PHONY: update-buildinfo
@@ -290,9 +387,9 @@ update-buildinfo:
 	@./update_buildinfo.sh
 
 $(TARGET): update-buildinfo $(OBJECTS)
-	@echo "Linking $(TARGET)..."
+	@echo "[Link] $(notdir $(TARGET))"
 	@mkdir -p $(dir $(TARGET))
-	$(LINKER) $(OBJECTS) $(LIBS) -o $(TARGET)
+	@$(LINKER) $(OBJECTS) $(LIBS) -o $(TARGET)
 	@echo ""
 	@echo "================================================"
 	@echo "✅ Build complete!"
@@ -300,7 +397,7 @@ $(TARGET): update-buildinfo $(OBJECTS)
 	@echo "Target:     $(TARGET)"
 	@echo "Platform:   Linux ($(UNAME_M))"
 	@echo "Files:      $(words $(CPP_SOURCES)) C++ sources"
-	@echo "Version:    $(shell grep 'TAPEXPLAYER_VERSION' modules/FSTPMainModule/WSGUI/linux/BuildInfo.h | cut -d'\"' -f2) Build $(shell grep 'TAPEXPLAYER_BUILD_NUMBER' modules/FSTPMainModule/WSGUI/linux/BuildInfo.h | cut -d'\"' -f2)"
+	@echo "Version:     Build $(shell grep 'TAPEXPLAYER_BUILD_NUMBER' modules/FSTPMainModule/WSGUI/linux/BuildInfo.h 2>/dev/null | grep -o '[0-9]*' || echo 'N/A')"
 	@echo ""
 	@echo "To run: $(TARGET)"
 	@echo "================================================"
@@ -308,24 +405,24 @@ endif
 
 # Compile C++ files
 $(OBJDIR)/%.o: %.cpp
-	@echo "Compiling $<..."
+	@echo "[C++] $<"
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # Compile Objective-C++ files
 $(OBJDIR)/%.o: %.mm
-	@echo "Compiling $<..."
+	@echo "[ObjC++] $<"
 	@mkdir -p $(dir $@)
-	$(CXX) $(OBJCFLAGS) $(INCLUDES) -c $< -o $@
+	@$(CXX) $(OBJCFLAGS) $(INCLUDES) -c $< -o $@
 
 # Compile Swift module (all files together + BuildInfo.swift) - only on macOS
 ifeq ($(USE_SWIFT),yes)
 .PHONY: force_swift_rebuild
 $(SWIFT_MODULE_OBJECT): force_swift_rebuild $(BUILD_INFO_SWIFT) $(SWIFT_SOURCES)
-	@echo "Compiling Swift module (BuildInfo + $(words $(SWIFT_SOURCES)) files)..."
+	@echo "[Swift] Compiling module ($(words $(SWIFT_SOURCES)) files + BuildInfo)"
 	@mkdir -p $(dir $@)
 	@rm -f $@
-	$(SWIFTC) $(SWIFTFLAGS) $(INCLUDES) -whole-module-optimization -emit-object $(BUILD_INFO_SWIFT) $(SWIFT_SOURCES) -o $@
+	@$(SWIFTC) $(SWIFTFLAGS) $(INCLUDES) -whole-module-optimization -emit-object $(BUILD_INFO_SWIFT) $(SWIFT_SOURCES) -o $@
 
 force_swift_rebuild:
 endif
@@ -333,11 +430,12 @@ endif
 # Clean
 clean:
 	@echo "Cleaning build artifacts..."
-ifneq (,$(findstring MSYS_NT,$(UNAME_S)))
+ifeq ($(PLATFORM),windows)
 	@echo "Cleaning Windows build..."
-	rm -rf ../builds/obj_windows
-	rm -f ../builds/binaries/TapeXPlayer.exe
-	rm -f modules/FSTPMainModule/WSGUI/windows/BuildInfo.h
+	find "$(OBJDIR)" -name "*.o" -delete 2>/dev/null || true
+	find "$(OBJDIR)" -name "*.res.o" -delete 2>/dev/null || true
+	rm -rf "$(OBJDIR)"
+	rm -f "$(TARGET)"
 else ifeq ($(UNAME_S),Linux)
 	@echo "Cleaning Linux build..."
 	rm -rf ../builds/obj_linux
@@ -475,7 +573,14 @@ endif
 
 # === GITHUB RELEASE (WITHOUT NOTARIZATION) ===
 
-release: $(APP_BUNDLE)
+release:
+	@if [ ! -d "$(APP_BUNDLE)" ]; then \
+		echo ""; \
+		echo "❌ App bundle not found: $(APP_BUNDLE)"; \
+		echo "   Run 'make bundle' or 'make bundle-universal' first."; \
+		echo ""; \
+		exit 1; \
+	fi
 	@echo "📦 Creating GitHub Release..."
 	@chmod +x create_release.sh
 	@./create_release.sh $(BUILD_NUMBER) $(CODE_NAME)
@@ -499,6 +604,13 @@ release-help:
 	@echo "Result: ../builds/TapeXPlayer-CODENAME-buildXXX.zip"
 	@echo "Ready to upload to GitHub Releases!"
 	@echo "Ready for distribution! 🚀"
+
+# === WINDOWS RELEASE ZIP ===
+
+win-release:
+	@echo "📦 Creating Windows Release ZIP..."
+	@chmod +x create_win_release.sh
+	@./create_win_release.sh $(BUILD_NUMBER) $(CODE_NAME)
 
 # Show source files (useful for debugging makefile)
 .PHONY: show-sources
@@ -588,4 +700,4 @@ uninstall:
 	@echo "✅ TapeXPlayer uninstalled"
 endif
 
-.PHONY: all clean rebuild run test test-run debug config test-render test-render-run app bundle bundle-universal notarize notarize-help release release-help platform-info show-sources help deb install-deb uninstall
+.PHONY: all clean rebuild run test test-run debug config test-render test-render-run app bundle bundle-universal notarize notarize-help release release-help win-release platform-info show-sources help deb install-deb uninstall

@@ -35,10 +35,29 @@ process_lib() {
         return
     fi
 
-    # If @rpath, search in Homebrew
+    # If @rpath, resolve to an actual file.
+    # Homebrew installs many libs as keg-only under /opt/homebrew/opt/<pkg>/lib/
+    # (e.g. /opt/homebrew/opt/ffmpeg/lib/libavcodec.62.dylib) rather than the
+    # top-level /opt/homebrew/lib/.  Search in this order:
+    #   1. $HOMEBREW_PATH/lib/            (standard linked path)
+    #   2. Already-copied Frameworks dir  (another lib already pulled it in)
+    #   3. Recursive search in $HOMEBREW_PATH/opt/  (keg-only packages)
     if [[ "$lib_path" == @rpath/* ]]; then
         lib_name="${lib_path#@rpath/}"
-        lib_path="$HOMEBREW_PATH/lib/$lib_name"
+        if [ -f "$HOMEBREW_PATH/lib/$lib_name" ]; then
+            lib_path="$HOMEBREW_PATH/lib/$lib_name"
+        elif [ -f "$FRAMEWORKS_DIR/$lib_name" ]; then
+            # Already in Frameworks — nothing to copy, just patch the reference
+            return
+        else
+            local keg_found
+            keg_found=$(find "$HOMEBREW_PATH/opt" -name "$lib_name" -type f 2>/dev/null | head -1)
+            if [ -n "$keg_found" ]; then
+                lib_path="$keg_found"
+            else
+                lib_path="$HOMEBREW_PATH/lib/$lib_name"  # will warn as not found below
+            fi
+        fi
     fi
 
     # If @loader_path, search relative to executable
@@ -106,6 +125,33 @@ done
 
 # Add @executable_path/../Frameworks to rpath
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$EXECUTABLE" 2>/dev/null || true
+
+# ── Second pass: patch inter-library references inside Frameworks ─────────────
+# The first pass only patches the main binary's references.
+# But dylibs in Frameworks reference each other using absolute Homebrew paths
+# (e.g. libavformat.61.dylib → /opt/homebrew/Cellar/ffmpeg@7/.../libavcodec.61.dylib).
+# Those absolute paths don't exist on the end user's machine.
+# This pass reads each COPY in Frameworks and patches any remaining absolute refs.
+echo ""
+echo "🔧 Patching inter-library references in Frameworks..."
+PATCHED_COUNT=0
+for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
+    [ -f "$dylib" ] || continue
+    while IFS= read -r dep; do
+        [ -z "$dep" ] && continue
+        dep_name=$(basename "$dep")
+        # Skip @-paths and system libs — only absolute paths need fixing
+        if [[ "$dep" == @* ]] || [[ "$dep" == /System/* ]] || [[ "$dep" == /usr/lib/* ]]; then
+            continue
+        fi
+        # If the referenced lib is in our Frameworks, patch to @loader_path
+        if [ -f "$FRAMEWORKS_DIR/$dep_name" ]; then
+            install_name_tool -change "$dep" "@loader_path/$dep_name" "$dylib" 2>/dev/null && \
+                PATCHED_COUNT=$((PATCHED_COUNT + 1)) || true
+        fi
+    done < <(otool -L "$dylib" 2>/dev/null | tail -n +2 | awk '{print $1}' || true)
+done
+echo "   Inter-library references patched: $PATCHED_COUNT"
 
 # Count copied libraries
 LIB_COUNT=$(find "$FRAMEWORKS_DIR" -name "*.dylib" 2>/dev/null | wc -l | tr -d ' ')
