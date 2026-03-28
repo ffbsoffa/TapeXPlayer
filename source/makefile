@@ -392,6 +392,8 @@ update-buildinfo-windows:
 	@echo "    return TAPEXPLAYER_BUILD_DATE;" >> $(WINDOWS_BUILDINFO_H)
 	@echo "}" >> $(WINDOWS_BUILDINFO_H)
 	@echo "✅ Windows BuildInfo.h updated: $(VERSION) \"$(CODE_NAME)\" Build $(BUILD_NUMBER)"
+	@# Force recompile of About dialog so new build number appears immediately
+	@rm -f $(OBJDIR)/modules/FSTPMainModule/WSGUI/windows/FSTPAboutDialog.o
 
 $(RC_OBJECT): $(RC_SOURCE)
 	@echo "[RC] $(notdir $(RC_SOURCE))"
@@ -420,6 +422,8 @@ else
 update-buildinfo:
 	@chmod +x update_buildinfo.sh
 	@./update_buildinfo.sh
+	@# Force recompile of About dialog so new build number appears immediately
+	@rm -f $(OBJDIR)/modules/FSTPMainModule/WSGUI/linux/FSTPAboutDialog.o
 
 $(TARGET): update-buildinfo $(OBJECTS)
 	@echo "[Link] $(notdir $(TARGET))"
