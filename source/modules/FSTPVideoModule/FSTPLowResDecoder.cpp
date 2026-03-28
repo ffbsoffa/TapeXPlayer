@@ -17,6 +17,9 @@
 #include <cmath>
 #include <limits>
 #include <iomanip>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" {
 #include <libavutil/opt.h>
@@ -60,19 +63,88 @@ static enum AVPixelFormat SelectHWFormat(AVCodecContext* ctx, const AVPixelForma
     return AV_PIX_FMT_NONE;
 }
 
-static double QueryVideoDuration(const std::string& filename) {
-    std::string command = "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"" + filename + "\"";
-    FILE* pipe = popen(command.c_str(), "r");
-    if (!pipe) {
-        return -1.0;
+#ifdef _WIN32
+// Runs a UTF-8 encoded command via CreateProcessW (Unicode-safe, bypasses cmd.exe ANSI).
+// lineCallback is called for each line of combined stdout+stderr output.
+// Returns the process exit code, or -1 on failure to launch.
+static int RunCommandW(const std::string& utf8Command,
+                       const std::function<void(const std::string&)>& lineCallback) {
+    // Convert UTF-8 command to wide string
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8Command.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return -1;
+    std::wstring wcmd(wlen - 1, 0);
+    MultiByteToWideChar(CP_UTF8, 0, utf8Command.c_str(), -1, &wcmd[0], wlen);
+
+    // Create a pipe: child writes stdout+stderr, parent reads
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    HANDLE hRead = nullptr, hWrite = nullptr;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return -1;
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);  // read end not inherited by child
+
+    STARTUPINFOW si{};
+    si.cb          = sizeof(STARTUPINFOW);
+    si.hStdOutput  = hWrite;
+    si.hStdError   = hWrite;  // merge stderr into same pipe
+    si.dwFlags     = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(
+        nullptr, &wcmd[0],        // exe from command line (mutable wide string required)
+        nullptr, nullptr,          // process/thread security attributes
+        TRUE,                      // inherit handles (for the pipe)
+        CREATE_NO_WINDOW,          // no console window popup
+        nullptr, nullptr,          // inherit environment and working directory
+        &si, &pi
+    );
+
+    CloseHandle(hWrite);  // parent must close its copy of the write end
+    if (!ok) {
+        CloseHandle(hRead);
+        return -1;
     }
 
-    char buffer[128];
-    std::string result;
-    while (fgets(buffer, sizeof(buffer), pipe)) {
-        result += buffer;
+    // Read output line by line and forward to callback
+    char buf[4096];
+    DWORD nRead;
+    std::string lineBuffer;
+    while (ReadFile(hRead, buf, sizeof(buf) - 1, &nRead, nullptr) && nRead > 0) {
+        buf[nRead] = '\0';
+        lineBuffer += buf;
+        size_t pos;
+        while ((pos = lineBuffer.find('\n')) != std::string::npos) {
+            lineCallback(lineBuffer.substr(0, pos));
+            lineBuffer.erase(0, pos + 1);
+        }
     }
+    if (!lineBuffer.empty()) lineCallback(lineBuffer);  // flush last partial line
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = static_cast<DWORD>(-1);
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+
+    CloseHandle(hRead);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return static_cast<int>(exitCode);
+}
+#endif
+
+static double QueryVideoDuration(const std::string& filename) {
+    std::string command = "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"" + filename + "\"";
+    std::string result;
+
+#ifdef _WIN32
+    RunCommandW(command, [&](const std::string& line) { result += line; });
+#else
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) return -1.0;
+    char buffer[128];
+    while (fgets(buffer, sizeof(buffer), pipe)) result += buffer;
     pclose(pipe);
+#endif
 
     try {
         return std::stod(result);
@@ -1651,53 +1723,54 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
 
     reportProgress(0);
 
+    // Parse one output line from ffmpeg -progress pipe:1 and update progress bar
+    auto processLine = [&](const std::string& line) {
+        if (!progressCallback) return;
+        size_t timePos = line.find("out_time_ms=");
+        if (timePos == std::string::npos) return;
+        try {
+            int64_t time_us = std::stoll(line.substr(timePos + 12));
+            double currentTime = time_us / 1000000.0;
+            if (totalDuration > 0.0 && currentTime > 0.0) {
+                int percent = static_cast<int>((currentTime / totalDuration) * 100.0);
+                percent = std::max(0, std::min(100, percent));
+                reportProgress(percent);
+            }
+        } catch (...) {}
+    };
+
     auto executeConversion = [&](const std::string& command, const fs::path& destination) -> bool {
+        int status = 0;
+
+#ifdef _WIN32
+        // Use CreateProcessW: handles Unicode paths natively, no cmd.exe ANSI conversion
+        status = RunCommandW(command, processLine);
+        if (status == -1) {
+            std::cerr << "[LowResDecoder] Failed to launch command (CreateProcessW): " << command << std::endl;
+            return false;
+        }
+#else
         FILE* pipe = popen(command.c_str(), "r");
         if (!pipe) {
             std::cerr << "[LowResDecoder] Failed to execute command: " << command << std::endl;
             return false;
         }
-
         char buffer[512];
         std::string lineBuffer;
-
         while (fgets(buffer, sizeof(buffer), pipe)) {
             lineBuffer += buffer;
             size_t pos;
             while ((pos = lineBuffer.find('\n')) != std::string::npos) {
-                std::string line = lineBuffer.substr(0, pos);
+                processLine(lineBuffer.substr(0, pos));
                 lineBuffer.erase(0, pos + 1);
-
-                if (progressCallback) {
-                    // Parse progress from -progress pipe:1 format: "out_time_ms=123456789"
-                    size_t timePos = line.find("out_time_ms=");
-                    if (timePos != std::string::npos) {
-                        std::string timeStr = line.substr(timePos + 12);  // Skip "out_time_ms="
-                        try {
-                            int64_t time_us = std::stoll(timeStr);  // Microseconds
-                            double currentTime = time_us / 1000000.0;  // Convert to seconds
-
-                            if (totalDuration > 0.0 && currentTime > 0.0) {
-                                // Known duration - compute accurate percentage
-                                int percent = static_cast<int>((currentTime / totalDuration) * 100.0);
-                                if (percent < 0) percent = 0;
-                                if (percent > 100) percent = 100;
-                                reportProgress(percent);
-                            }
-                        } catch (...) {
-                            // Ignore parse errors
-                        }
-                    }
-                }
             }
         }
+        status = pclose(pipe);
+#endif
 
-        int status = pclose(pipe);
         if (status != 0) {
             std::cerr << "[LowResDecoder] FFmpeg command failed with status " << status << std::endl;
-            if (fs::exists(destination)) {
-                fs::remove(destination);
-            }
+            if (fs::exists(destination)) fs::remove(destination);
             return false;
         }
 
@@ -1863,12 +1936,23 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
     std::string audio_decoder = "";  // Use default decoder on other platforms
 #endif
 
+#ifdef _WIN32
+    // On Windows: CreateProcessW handles stdout+stderr via pipe — no shell, no "2>&1" needed
+    std::string h264Command = "ffmpeg " + audio_decoder + " -nostdin -y -progress pipe:1 -i \"" + filename +
+                              "\" -vf \"" + vfilter + "\" -colorspace " + cs_flag +
+                              " -color_primaries " + prim_flag + " -color_trc " + trc_flag +
+                              " -color_range " + range_flag +
+                              " -c:v libx264 -profile:v baseline -preset medium -g 25 -b:v 600k -x264-params \"" +
+                              x264_params + "\" -c:a aac -b:a 128k \"" + h264Path.string() + "\"";
+#else
+    // On Mac/Linux: popen() uses a shell, "2>&1" merges stderr into stdout for progress parsing
     std::string h264Command = "ffmpeg " + audio_decoder + " -nostdin -y -progress pipe:1 -i \"" + filename +
                               "\" -vf \"" + vfilter + "\" -colorspace " + cs_flag +
                               " -color_primaries " + prim_flag + " -color_trc " + trc_flag +
                               " -color_range " + range_flag +
                               " -c:v libx264 -profile:v baseline -preset medium -g 25 -b:v 600k -x264-params \"" +
                               x264_params + "\" -c:a aac -b:a 128k \"" + h264Path.string() + "\" 2>&1";
+#endif
 
     std::cout << "🎬 [Proxy] Starting conversion with GOP=25 for responsive scrubbing..." << std::endl;
     std::cout << "    Duration: " << std::fixed << std::setprecision(1) << totalDuration << "s" << std::endl;

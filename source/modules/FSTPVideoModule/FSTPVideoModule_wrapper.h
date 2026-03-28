@@ -46,6 +46,7 @@ private:
     // Optimization: track last rendered frame to skip identical ones
     mutable int m_last_displayed_frame = -1;
     mutable std::atomic<bool> m_force_frame_update{false}; // Force update after segment decode
+    mutable bool m_last_frame_aligned = false; // Previous IsFrameAligned() for transition detection
 
     std::unique_ptr<FSTPSimpleVideoIndex> m_frame_index;
     // CRITICAL FIX: Use raw pointer to prevent destructor cleanup
@@ -66,6 +67,17 @@ private:
 
     std::unique_ptr<FSTP::LowCachedDecoderManager> m_low_cached_manager;
     std::unique_ptr<FSTPFullResDecoderV2> m_full_res_decoder;  // V2: Streaming decoder
+
+    // Pause-frame cache: avoid re-querying decoder when position hasn't changed
+    std::shared_ptr<AVFrame> m_v2_cached_frame;
+    double m_v2_cached_timestamp = -1.0;
+
+    // Adjacent-frame cache for Betacam compositing.
+    // try_to_lock may intermittently fail when decoder threads briefly hold the mutex.
+    // Caching the last valid N-1 / N+1 frames prevents compositing from flickering off.
+    std::shared_ptr<AVFrame> m_cached_next_adjacent;
+    std::shared_ptr<AVFrame> m_cached_prev_adjacent;
+    int m_cached_adjacent_frame_number = -1;
 
 
     mutable FSTP::FrameBuffer m_display_buffer;

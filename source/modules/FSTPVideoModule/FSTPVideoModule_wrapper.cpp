@@ -421,6 +421,9 @@ void FSTPVideoModuleWrapper::UnloadFile() {
     if (!m_loaded) {
         return;
     }
+    // NOTE: V2 caches (m_v2_cached_frame, m_cached_next_adjacent, m_cached_prev_adjacent)
+    // are cleared in DisplayFrame when m_file_reloading=true, from the render thread.
+    // Clearing them here (load thread) while render thread might be reading = data race.
 
     const int osdPlayerId = (m_instance_id >= 0 ? m_instance_id : 0);
 
@@ -1117,6 +1120,16 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         if (debug_call_count <= 3) {
             std::cout << "[VIDEO] DisplayFrame: file is reloading, skipping" << std::endl;
         }
+        // Drop all cached frame references from THIS thread (render thread).
+        // UnloadFile/ShutdownDecoders runs on the load thread — clearing shared_ptrs here
+        // avoids a data race that would occur if UnloadFile reset them directly while
+        // this thread was reading them. After this point, ShutdownDecoders can safely
+        // destroy V2 decoder buffers with no outstanding references.
+        m_v2_cached_frame = nullptr;
+        m_v2_cached_timestamp = -1.0;
+        m_cached_next_adjacent = nullptr;
+        m_cached_prev_adjacent = nullptr;
+        m_cached_adjacent_frame_number = -1;
         return;
     }
 
@@ -1221,13 +1234,51 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     auto t_before_v2_get = std::chrono::high_resolution_clock::now();
 
     // Use full-res decoder when at slow/normal speed (including pause!)
-    if (m_full_res_decoder && slow_or_normal_speed) {
+    // Guard: m_decoders_active is set to false as FIRST action in ShutdownDecoders,
+    // so checking it here prevents accessing a partially-destroyed decoder.
+    if (m_full_res_decoder && slow_or_normal_speed && m_decoders_active.load()) {
         // Inform background thread of current playback time (lightweight operation)
         m_full_res_decoder->SetPlaybackTime(timestamp);
         m_full_res_decoder->ClearStopRequest();
 
-        // Get shared_ptr copy from buffer (safe - extends frame lifetime)
-        frame = m_full_res_decoder->GetFrameForTime(timestamp);
+        // PAUSE CACHE: during pause the same timestamp is requested at render rate (60fps).
+        // Return cached frame immediately — no decoder query, no V2 HIT spam.
+        const double ONE_FRAME_S = (m_frame_rate > 0.0) ? (1.0 / m_frame_rate) : 0.04;
+        bool same_timestamp = (std::abs(timestamp - m_v2_cached_timestamp) < ONE_FRAME_S * 0.5);
+        if (actual_speed < 0.05 && same_timestamp && m_v2_cached_frame) {
+            frame = m_v2_cached_frame;
+        } else {
+            // Get shared_ptr copy from buffer (safe - extends frame lifetime)
+            frame = m_full_res_decoder->GetFrameForTime(timestamp);
+            if (frame) {
+                // SYNC CHECK: Reject V2 frame if too far from requested timestamp.
+                // Prevents visible frame jump (proxy→full-res) after seek/shuttle.
+                // GetFrameForTime tolerates ±3.1 frames, but visual switch must be ≤1 frame.
+                double v2_actual_time = m_full_res_decoder->GetLastFrameTime();
+                if (v2_actual_time >= 0.0) {
+                    // Compare against NOMINAL time (frame_number/fps from SimpleIndex),
+                    // NOT against proxy decoded PTS. Proxy and original can have different
+                    // PTS bases (systematic offset of up to 1 frame), so comparing against
+                    // proxy PTS causes systematic V2 rejection → visible "frame deviation".
+                    double nominal_time = frame_info->time_seconds;
+                    // Tolerance = 0.5 frame: tight enough to reject N+1 for N/fps (1 frame off),
+                    // loose enough to accept V2 during the post-seek buffer fill transient.
+                    // Using nominal_time (N/fps) instead of proxy PTS avoids systematic rejection
+                    // when proxy and original have different PTS bases (offset up to ~0.5 frame).
+                    double half_frame = (m_frame_rate > 0.0) ? (0.5 / m_frame_rate) : 0.02;
+                    if (std::fabs(v2_actual_time - nominal_time) > half_frame) {
+                        // V2 is off by more than 0.5 frame — keep proxy until V2 catches up
+                        frame = nullptr;
+                        m_v2_cached_frame = nullptr;
+                        m_v2_cached_timestamp = -1.0;
+                    }
+                }
+                if (frame) {
+                    m_v2_cached_frame = frame;
+                    m_v2_cached_timestamp = timestamp;
+                }
+            }
+        }
 
         if (frame) {
             if (ENABLE_VIDEO_DEBUG) {
@@ -1665,7 +1716,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         // Check if current frame came from full-res decoder (high resolution)
         bool using_full_res = frame && (frame->height > 480);
 
-        if (using_full_res && m_full_res_decoder && !m_file_reloading.load()) {
+        if (using_full_res && m_full_res_decoder && m_decoders_active.load() && !m_file_reloading.load()) {
             // FULL-RES MODE: Get adjacent frames from full-res decoder
             // Use GetFrameForTime with adjacent timestamps
             // Skip if file is reloading to avoid potential blocking
@@ -1731,6 +1782,29 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                 next_frame = nullptr;
             }
         }
+    }
+
+    // Adjacent-frame sticky cache: prevents compositing flicker when try_to_lock fails.
+    // When the decoder thread briefly holds the frame mutex, try_to_lock returns nullptr.
+    // Keep the last valid N-1/N+1 per frame-number and use them as fallback.
+    // During file reload: always invalidate to avoid using stale frames from previous file.
+    if (m_file_reloading.load()) {
+        m_cached_adjacent_frame_number = -1;
+        m_cached_next_adjacent = nullptr;
+        m_cached_prev_adjacent = nullptr;
+    } else {
+        if (clamped != m_cached_adjacent_frame_number) {
+            // New video frame — reset cache (prev/next will differ)
+            m_cached_adjacent_frame_number = clamped;
+            m_cached_next_adjacent = nullptr;
+            m_cached_prev_adjacent = nullptr;
+        }
+        // Update cache with any freshly obtained frames
+        if (next_frame) m_cached_next_adjacent = next_frame;
+        if (prev_frame) m_cached_prev_adjacent = prev_frame;
+        // Fall back to cache for frames we couldn't obtain this call
+        if (!next_frame) next_frame = m_cached_next_adjacent;
+        if (!prev_frame) prev_frame = m_cached_prev_adjacent;
     }
 
     // Submit real decoded frame to texture interface (with adjacent frames for compositing)
@@ -1831,11 +1905,25 @@ void FSTPVideoModuleWrapper::UpdateVideoFrame() {
     double abs_speed = std::abs(actual_speed);
     bool betacam_speed_range = (abs_speed < 0.9 || abs_speed > 1.1);
     if (betacam_speed_range) {
-        force_update = true;
+        bool is_pure_pause = (abs_speed < 0.05);
+        if (!is_pure_pause) {
+            // Slow motion or shuttle: stripe always active, force every frame
+            force_update = true;
+        } else {
+            // Pure pause: force until audio aligns to frame boundary (stripe disappears).
+            // On the transition frame (false→true): force ONE more DisplayFrame so the
+            // betacam effect renders a clean frame (no prev/next compositing).
+            bool stripe_settled = m_audio_module && m_audio_module->IsFrameAligned();
+            bool just_aligned = stripe_settled && !m_last_frame_aligned;
+            m_last_frame_aligned = stripe_settled;
+            if (!stripe_settled || just_aligned) {
+                force_update = true;
+            }
+        }
     }
 
     if (audioFrame == m_last_displayed_frame && !force_update) {
-        // Frame unchanged - skip all rendering and notifications
+        // Frame unchanged and Betacam stripe settled — skip all rendering and notifications
         return;
     }
 
@@ -1913,6 +2001,9 @@ void FSTPVideoModuleWrapper::SetPosition(double position_seconds) {
     if (!m_loaded || !m_frame_index) {
         return;
     }
+    // Invalidate pause-frame cache — position changed, need a fresh decode
+    m_v2_cached_frame.reset();
+    m_v2_cached_timestamp = -1.0;
 
     int frameNumber = m_frame_index->FindFrameByTime(position_seconds);
     frameNumber = std::max(0, std::min(frameNumber, static_cast<int>(m_frames->size()) - 1));

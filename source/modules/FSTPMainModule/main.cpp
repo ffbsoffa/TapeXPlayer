@@ -68,12 +68,38 @@ int main(int argc, char* argv[]) {
     }
     #endif
 
+    #ifdef _WIN32
+    // On Windows the binary is built with -mwindows (no console by default).
+    // Pass --debug on the command line to open a debug console window that
+    // captures all stdout/stderr output (std::cout, std::cerr, printf).
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug") == 0) {
+            // Try to attach to a parent console first (e.g. launched from MSYS2/cmd).
+            // If there is no parent console, create a new one.
+            if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+                AllocConsole();
+                SetConsoleTitleA("TapeXPlayer - Debug Console");
+            }
+            // Redirect C-runtime stdout/stderr to the console
+            FILE* f = nullptr;
+            freopen_s(&f, "CONOUT$", "w", stdout);
+            freopen_s(&f, "CONOUT$", "w", stderr);
+            // Sync C++ streams with the new C handles
+            std::cout.clear();
+            std::cerr.clear();
+            break;
+        }
+    }
+    #endif
+
     std::cout << "=== TapeXPlayer 2026 - Initialization ===" << std::endl;
 
-    // Check for file argument
-    if (argc > 1) {
-        std::cout << "📂 File argument detected: " << argv[1] << std::endl;
-        SetInitialFileToLoad(argv[1]);
+    // Check for file argument (skip --debug flag)
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug") == 0) continue;
+        std::cout << "📂 File argument detected: " << argv[i] << std::endl;
+        SetInitialFileToLoad(argv[i]);
+        break;
     }
 
     // 1. Hardware acceleration detection (must be first)

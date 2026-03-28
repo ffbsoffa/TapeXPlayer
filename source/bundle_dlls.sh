@@ -103,8 +103,8 @@ echo ""
 
 # ── PortAudio ─────────────────────────────────────────────────────────────────
 echo "3️⃣   PortAudio..."
-# MinGW package may be named portaudio or portaudio_x64
-copy_dll "portaudio*.dll"
+# MinGW names it libportaudio.dll (not portaudio.dll)
+copy_dll "libportaudio*.dll"
 echo ""
 
 # ── OpenSSL ───────────────────────────────────────────────────────────────────
@@ -164,43 +164,58 @@ _is_system_dll() {
         d3d11.dll|d3d9.dll|dxgi.dll|opengl32.dll|glu32.dll)          return 0 ;;
         dwmapi.dll|uxtheme.dll|avrt.dll|hid.dll|winspool.drv)        return 0 ;;
         api-ms-win-*.dll|ext-ms-win-*.dll)                            return 0 ;;
+        # GDI/graphics system DLLs
+        msimg32.dll|gdiplus.dll|d2d1.dll|dwrite.dll)                 return 0 ;;
+        # Network/DNS system DLLs
+        dnsapi.dll|iphlpapi.dll|wsock32.dll|mswsock.dll|winnsi.dll)  return 0 ;;
+        # User/profile/security system DLLs
+        userenv.dll|profapi.dll|wtsapi32.dll|usp10.dll)               return 0 ;;
+        # Video capture / multimedia system DLLs
+        avicap32.dll|msvfw32.dll|quartz.dll)                          return 0 ;;
     esac
     return 1
 }
 
-_copy_transitive() {
-    local pe_file="$1"
-    if ! command -v objdump &>/dev/null; then return; fi
-
+echo "9️⃣   Resolving transitive DLL dependencies..."
+if command -v ldd &>/dev/null; then
+    # ldd uses the Windows loader — resolves ALL transitive deps in one shot,
+    # much faster than walking objdump output recursively on MSYS2.
+    LDD_ADDED=0
+    while IFS= read -r dll_path; do
+        [ -z "$dll_path" ] || [ ! -f "$dll_path" ] && continue
+        dll_name=$(basename "$dll_path")
+        _is_system_dll "$dll_name" && continue
+        if [ ! -f "$OUT_DIR/$dll_name" ]; then
+            cp "$dll_path" "$OUT_DIR/$dll_name"
+            echo "   + transitive: $dll_name"
+            LDD_ADDED=$((LDD_ADDED + 1))
+        fi
+    # Use the original exe (not the copy in OUT_DIR) so ldd searches
+    # MINGW_BIN via PATH rather than the already-populated bundle dir.
+    done < <(ldd "$EXE_PATH" 2>/dev/null \
+             | awk '$3 ~ /\// {print $3}' \
+             | grep -i "mingw" \
+             | sort -u)
+    echo "   Added $LDD_ADDED additional DLLs via ldd"
+elif command -v objdump &>/dev/null; then
+    # Fallback: single objdump pass (no recursion, no find-per-dep)
+    echo "   (ldd not found, using objdump — only direct deps)"
     while IFS= read -r dep; do
         [ -z "$dep" ] && continue
-        if _is_system_dll "$dep"; then continue; fi
-        if [ -f "$OUT_DIR/$dep" ]; then continue; fi   # already bundled
-
-        # Search in MinGW bin (case-insensitive glob)
-        local found
-        found=$(find "$MINGW_BIN" -maxdepth 1 -iname "$dep" 2>/dev/null | head -1)
-        if [ -n "$found" ]; then
-            cp "$found" "$OUT_DIR/$dep"
-            echo "   + transitive: $dep"
-            _copy_transitive "$OUT_DIR/$dep"   # recurse
-        else
-            echo "   !! transitive dep not found in MinGW: $dep"
+        _is_system_dll "$dep" && continue
+        [ -f "$OUT_DIR/$dep" ] && continue
+        src=$(ls "$MINGW_BIN/$dep" 2>/dev/null | head -1)
+        [ -z "$src" ] && src=$(ls "$MINGW_BIN/"*"$dep" 2>/dev/null | head -1)
+        if [ -n "$src" ]; then
+            cp "$src" "$OUT_DIR/$dep"
+            echo "   + $dep"
         fi
-    done < <(objdump -p "$pe_file" 2>/dev/null | grep "DLL Name" | awk '{print $3}' || true)
-}
-
-if command -v objdump &>/dev/null; then
-    echo "9️⃣   Resolving transitive DLL dependencies..."
-    for pe in "$OUT_DIR"/*.dll "$OUT_DIR/TapeXPlayer.exe"; do
-        [ -f "$pe" ] || continue
-        _copy_transitive "$pe"
-    done
-    echo ""
+    done < <(objdump -p "$OUT_DIR/TapeXPlayer.exe" 2>/dev/null \
+             | grep "DLL Name" | awk '{print $3}' || true)
 else
-    echo "9️⃣   (objdump not found — skipping transitive dep check)"
-    echo ""
+    echo "   (neither ldd nor objdump found — skipping)"
 fi
+echo ""
 
 # ── Integrity check ───────────────────────────────────────────────────────────
 if [ "$MISSING_REQUIRED" -ne 0 ]; then
@@ -228,23 +243,25 @@ fi
 
 DLL_COUNT=$(find "$OUT_DIR" -maxdepth 1 -name "*.dll" | wc -l | tr -d ' ')
 
-# ── Final dependency verification ─────────────────────────────────────────────
-if command -v objdump &>/dev/null; then
+# ── Final dependency verification (ldd-based, fast) ──────────────────────────
+# Check that all DLLs needed by TapeXPlayer.exe are present in OUT_DIR.
+# Uses ldd on the ORIGINAL exe so results are not affected by OUT_DIR contents.
+if command -v ldd &>/dev/null; then
     UNSATISFIED=0
-    for pe in "$OUT_DIR"/*.dll "$OUT_DIR/TapeXPlayer.exe"; do
-        [ -f "$pe" ] || continue
-        while IFS= read -r dep; do
-            [ -z "$dep" ] && continue
-            if _is_system_dll "$dep"; then continue; fi
-            if [ ! -f "$OUT_DIR/$dep" ]; then
-                echo "   !! UNSATISFIED: $(basename "$pe") needs $dep"
-                UNSATISFIED=$((UNSATISFIED + 1))
-            fi
-        done < <(objdump -p "$pe" 2>/dev/null | grep "DLL Name" | awk '{print $3}' || true)
-    done
+    while IFS= read -r dep_name; do
+        [ -z "$dep_name" ] && continue
+        _is_system_dll "$dep_name" && continue
+        if [ ! -f "$OUT_DIR/$dep_name" ]; then
+            echo "   !! UNSATISFIED: $dep_name"
+            UNSATISFIED=$((UNSATISFIED + 1))
+        fi
+    done < <(ldd "$EXE_PATH" 2>/dev/null \
+             | awk '{print $1}' \
+             | grep -iv "^ntdll\|^kernel\|^user32\|^msvcrt\|not$" \
+             | grep -i "\.dll$" \
+             | sort -u)
     if [ "$UNSATISFIED" -gt 0 ]; then
-        echo ""
-        echo "   !! $UNSATISFIED unsatisfied DLL dependencies remain."
+        echo "   !! $UNSATISFIED unsatisfied DLL dependencies."
         echo "      Install missing packages via: pacman -S <package>"
     else
         echo "   All DLL imports satisfied."

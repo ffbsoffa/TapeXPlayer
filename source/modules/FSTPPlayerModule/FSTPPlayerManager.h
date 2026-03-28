@@ -53,8 +53,9 @@ int SeekInstance(int instance_id, double position);
 
 // === Speed and Direction Control ===
 int SetInstanceSpeed(int instance_id, double speed);
-int SetInstanceSpeedInstant(int instance_id, double speed);  // For Mouse Shuttle - without animation
-int SetInstanceReverse(int instance_id, bool reverse);
+int SetInstanceSpeedInstant(int instance_id, double speed);    // For Mouse Shuttle - without animation
+int SetInstanceReverse(int instance_id, bool reverse);         // With direction-change sequencer
+int SetInstanceReverseInstant(int instance_id, bool reverse);  // For Mouse Shuttle - instant
 
 // === Instance State Retrieval ===
 double GetInstancePosition(int instance_id);
@@ -69,6 +70,8 @@ float GetInstanceAudioLevelLeft(int instance_id);
 float GetInstanceAudioLevelRight(int instance_id);
 float GetInstanceAudioPeakLeft(int instance_id);
 float GetInstanceAudioPeakRight(int instance_id);
+
+bool GetInstanceFrameAligned(int instance_id);
 
 // Get audio module and video FPS for frame number calculation
 class FSTPAudioModuleWrapper* GetInstanceAudioModule(int instance_id);

@@ -50,6 +50,11 @@ public:
     // Get frame for given time (or nullptr if not in buffer)
     std::shared_ptr<AVFrame> GetFrameForTime(double time_seconds);
 
+    // Get actual timestamp of last frame returned by GetFrameForTime (-1 if none)
+    double GetLastFrameTime() const {
+        return cached_frame_time_.load(std::memory_order_relaxed);
+    }
+
     // Clear buffer
     void ClearBuffer();
 

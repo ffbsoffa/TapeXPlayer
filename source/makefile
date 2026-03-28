@@ -95,10 +95,10 @@ ifneq (,$(findstring _NT,$(UNAME_S)))
     CXXFLAGS += $(INCLUDES)
 
     # Library paths and libs
-    LDFLAGS = -L$(MINGW_PATH)/lib
+    LDFLAGS = -L$(MINGW_PATH)/lib -mwindows
     LIBS = -lmingw32 -lSDL2main -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavutil -lswscale \
            -lssl -lcrypto -lrtmidi \
-           -lwinmm -lole32 -lgdi32 -lcomdlg32 -lcomctl32 -lshell32 -lshlwapi -luuid -luxtheme
+           -lwinmm -lole32 -lgdi32 -lcomdlg32 -lcomctl32 -lshell32 -lshlwapi -luuid -luxtheme -ldwmapi
     
     # Resource compiler for manifest embedding
     WINDRES = windres
@@ -176,8 +176,11 @@ else
     # Swift target determined by architecture (requires macOS 13.0 for modern SwiftUI APIs)
     ifeq ($(UNAME_M),arm64)
         SWIFT_TARGET = arm64-apple-macosx13.0
-        # Apple Silicon - use NEON for SIMD (ARM architecture)
-        CXXFLAGS = $(CXXFLAGS_BASE) -O2 -g -Wno-unused-parameter
+        # Apple Silicon - O1 instead of O2: prevents NEON auto-vectorization
+        # that causes intermittent heap overflow (16-byte NEON stores into
+        # undersized buffers → corrupts malloc freelist metadata).
+        # Bottleneck is FFmpeg decode, not our C++ code, so O1 is sufficient.
+        CXXFLAGS = $(CXXFLAGS_BASE) -O1 -g -Wno-unused-parameter
     else
         SWIFT_TARGET = x86_64-apple-macosx13.0
         # Intel Mac - use AVX2 for SIMD optimizations (same as Linux)

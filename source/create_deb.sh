@@ -37,7 +37,7 @@ ARCH=$(dpkg --print-architecture)
 PACKAGE_NAME="tapexplayer_${PACKAGE_VERSION}_${ARCH}"
 
 # Directories
-BUILD_DIR="../binaries/deb"
+BUILD_DIR="../builds/binaries/deb"
 PACKAGE_DIR="${BUILD_DIR}/${PACKAGE_NAME}"
 DEBIAN_DIR="${PACKAGE_DIR}/DEBIAN"
 BIN_DIR="${PACKAGE_DIR}/usr/bin"
@@ -71,7 +71,7 @@ mkdir -p "${ICON_DIR}/512x512/apps"
 mkdir -p "${ICON_DIR}/1024x1024/apps"
 
 # Check if executable exists
-if [ ! -f "../binaries/TapeXPlayer_linux" ]; then
+if [ ! -f "../builds/binaries/TapeXPlayer_linux" ]; then
     echo "❌ Error: Executable not found!"
     echo "   Please run 'make' first to build the application."
     exit 1
@@ -79,7 +79,7 @@ fi
 
 # Copy executable
 echo "Copying executable..."
-cp ../binaries/TapeXPlayer_linux "${BIN_DIR}/tapexplayer"
+cp ../builds/binaries/TapeXPlayer_linux "${BIN_DIR}/tapexplayer"
 chmod 755 "${BIN_DIR}/tapexplayer"
 
 # Copy desktop file
@@ -125,7 +125,7 @@ tapexplayer (${PACKAGE_VERSION}) unstable; urgency=medium
   * Screenshot functionality
   * Heap corruption fixes for Intel Celeron
 
- -- TapeXPlayer Team <team@tapexplayer.com>  $(date -R)
+ -- FFB_soffa <mail@ffbsoffa.org>  $(date -R)
 EOF
 gzip -9 "${DOC_DIR}/changelog"
 
@@ -158,7 +158,7 @@ Keyboard shortcuts:
 - Ctrl+M:      Add memory location
 - ESC/Ctrl+Q:  Exit
 
-For more information, visit: https://github.com/yourusername/tapexplayer
+For more information, visit: https://github.com/ffbsoffa/tapexplayer
 EOF
 
 # Calculate installed size
@@ -184,7 +184,7 @@ Depends: libsdl2-2.0-0 (>= 2.0.0), libsdl2-ttf-2.0-0, libportaudio2, libavformat
 Recommends: vaapi-driver-all
 Suggests: ffmpeg
 Installed-Size: ${INSTALLED_SIZE}
-Maintainer: TapeXPlayer Team <team@tapexplayer.com>
+Maintainer: FFB_soffa <mail@ffbsoffa.org>
 Homepage: https://github.com/ffbsoffa/TapeXPlayer
 Description: ${SHORT_DESC}
  TapeXPlayer ${VERSION} "${CODE_NAME}" is a professional video player

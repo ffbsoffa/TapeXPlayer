@@ -9,6 +9,7 @@
 #include <cmath>
 #include <chrono>
 #include <atomic>
+#include <random>
 
 // Ensure M_PI is defined (for elastic ease function)
 #ifndef M_PI
@@ -235,6 +236,10 @@ public:
     std::atomic<int> play_count{0};                 // Count Play() calls for periodic elastic effect
     std::atomic<bool> use_elastic_ease{false};      // Flag to trigger elastic ease in smooth_speed_change
 
+    // Direction-change sequencer (ramp down → hold → flip → ramp up)
+    std::atomic<bool> direction_change_pending{false};  // Sequencer requested
+    std::atomic<bool> pending_reverse_value{false};     // Target direction for sequencer
+
     // Decoding progress
     std::atomic<size_t> decoded_samples{0};
     std::atomic<size_t> fast_buffer_samples{0}; // Fast buffer size
@@ -248,6 +253,10 @@ public:
     // CRITICAL: Per-instance cached speed to eliminate race condition between players!
     // Was static - conflicted with multiple players
     double cached_speed = 0.0;
+
+    // Tape-style low-pass filter state (per channel, 1st-order IIR).
+    // Reduces HF harshness at non-1x speeds; bypassed at "lock" (0.95x–1.05x).
+    float lpf_state[8] = {0.0f};  // supports up to 8 channels
 
     // CRITICAL FIX: Flag to detect destructor cleanup vs normal cleanup
     // Problem: Pa_CloseStream() → PipeWire's malloc_trim() crashes on heap corrupted by video av_frame_ref()
@@ -609,6 +618,60 @@ public:
         // --- End Lambda ---
 
         while (!should_exit_smooth_speed.load()) {
+
+            // === DIRECTION CHANGE SEQUENCER ===
+            // Physics: reversing tape requires motor to stop, wait for mechanics, then restart.
+            // Sequence: ramp down → hold 150ms (direction flips midway) → ramp up
+            if (direction_change_pending.load()) {
+                direction_change_pending.store(false);
+                bool new_direction = pending_reverse_value.load();
+                double saved_target = target_playback_speed.load();
+
+                // Phase 1: Soft ramp down (gentle exponential decay, 0.85 factor)
+                while (playback_speed.load() > 0.01 && !should_exit_smooth_speed.load()) {
+                    double spd = playback_speed.load() * 0.85;
+                    if (spd < 0.01) spd = 0.0;
+                    playback_speed.store(spd);
+                    calculate_and_set_volume(spd);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                playback_speed.store(0.0);
+                calculate_and_set_volume(0.0);
+
+                if (should_exit_smooth_speed.load()) continue;
+
+                // Phase 2: Hold at 0 for 150ms, flip direction at midpoint (75ms)
+                const int hold_ms = 150;
+                const int half_ms = hold_ms / 2;
+
+                for (int i = 0; i < half_ms && !should_exit_smooth_speed.load(); i += 5)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+                // Flip direction — visible to all readers via IsReverse()
+                is_reverse.store(new_direction);
+
+                for (int i = 0; i < (hold_ms - half_ms) && !should_exit_smooth_speed.load(); i += 5)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+                if (should_exit_smooth_speed.load()) continue;
+
+                // Phase 3: Ramp up back to saved target (cubic ease-out, ~200ms)
+                target_playback_speed.store(saved_target);
+                const int ramp_steps = 40;  // 40 × 5ms = 200ms
+                for (int s = 1; s <= ramp_steps && !should_exit_smooth_speed.load(); ++s) {
+                    double t = static_cast<double>(s) / ramp_steps;
+                    double eased = 1.0 - std::pow(1.0 - t, 3.0);  // Cubic ease-out
+                    double rate = eased * saved_target;
+                    playback_speed.store(rate);
+                    calculate_and_set_volume(rate);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                playback_speed.store(saved_target);
+                calculate_and_set_volume(saved_target);
+                continue;
+            }
+            // === END DIRECTION CHANGE SEQUENCER ===
+
             // ELASTIC EASE: Apply elastic ease-out for first play (0 → 1.0x)
             if (use_elastic_ease.load()) {
                 double start_rate = playback_speed.load(); // Should be 0.0 or very low
@@ -777,14 +840,20 @@ public:
                             // Calculate nearest frame boundary
                             double frame_duration = 1.0 / fps;
                             double frame_index = current_time_sec / frame_duration;
+                            // Snap to NEAREST frame boundary (round), not always backward.
+                            // scroll_phase = fmod(audio_time * fps, 1.0):
+                            //   < 0.5 → more of frame N visible → snap backward to N
+                            //   > 0.5 → more of frame N+1 visible → snap forward to N+1
+                            // The compositing model handles snap-forward cleanly:
+                            // scroll_phase approaches 1.0, then snaps to 0 on N+1 (no flash).
                             double nearest_frame = std::round(frame_index);
                             double target_time_sec = nearest_frame * frame_duration;
 
-                            // Calculate offset
+                            // Calculate offset (negative = backward, positive = forward)
                             double offset_sec = target_time_sec - current_time_sec;
 
-                            // Only align if offset is significant (> 1ms) but not too large (< half frame)
-                            if (std::abs(offset_sec) > 0.001 && std::abs(offset_sec) < frame_duration * 0.5) {
+                            // Only align if offset is significant (> 1ms) but within one frame
+                            if (std::abs(offset_sec) > 0.001 && std::abs(offset_sec) < frame_duration) {
                                 // Gradually align over 500ms for smooth transition
                                 const int align_duration_ms = 500;
                                 const int align_step_ms = 10;
@@ -1102,6 +1171,26 @@ private:
             } else {
                 // Catmull-Rom interpolation for each channel
                 double abs_speed = std::abs(speed);
+
+                // === TAPE-STYLE LOW-PASS FILTER ===
+                // 1st-order IIR: y[n] = alpha*x[n] + (1-alpha)*y[n-1]
+                // alpha = 1.0  → bypass (full bandwidth, "lock" mode)
+                // alpha < 1.0  → HF rolloff; lower = softer/more muffled
+                //
+                // Cutoff mapping (at 48kHz):
+                //   deviation 0.0 (1.0x)   → alpha=1.00 bypass
+                //   deviation 0.5 (0.5/1.5x)→ alpha≈0.57  fc≈10kHz
+                //   deviation 1.0 (0x/2x)  → alpha≈0.40  fc≈ 6kHz
+                //   deviation 7.0 (8x)     → alpha=0.30  fc≈ 3kHz
+                //
+                // Bypassed when OSD shows "lock" (0.95x–1.05x).
+                bool is_lock_speed = (abs_speed >= 0.95 && abs_speed <= 1.05);
+                float lpf_alpha = 1.0f;
+                if (!is_lock_speed) {
+                    double deviation = std::abs(abs_speed - 1.0);
+                    lpf_alpha = std::max(0.30f, static_cast<float>(1.0 / (1.0 + deviation * 1.5)));
+                }
+
                 for (int ch = 0; ch < impl->channels; ch++) {
                     // Get 4 neighboring samples for Catmull-Rom
                     double p0 = impl->GetSafeSample(base_index - 1, ch, max_available_samples);
@@ -1126,6 +1215,17 @@ private:
                     // Apply volume ducking for high speeds (ear protection)
                     float ducking_volume = impl->volume.load();
                     interpolated *= ducking_volume;
+
+                    // Apply tape-style low-pass filter (HF rolloff at non-lock speeds)
+                    if (lpf_alpha < 0.999f && ch < 8) {
+                        float x = static_cast<float>(interpolated / 32768.0);
+                        float y = lpf_alpha * x + (1.0f - lpf_alpha) * impl->lpf_state[ch];
+                        impl->lpf_state[ch] = y;
+                        interpolated = static_cast<double>(y) * 32768.0;
+                    } else if (ch < 8) {
+                        // Lock speed: update state without filtering to avoid transient on speed change
+                        impl->lpf_state[ch] = static_cast<float>(interpolated / 32768.0);
+                    }
 
                     // Store clean sample for VU meters
                     double clean_sample = std::max(-32768.0, std::min(32767.0, interpolated));
@@ -2080,9 +2180,19 @@ void FSTPAudioModuleWrapper::SetSpeedInstant(double speed) {
 }
 
 void FSTPAudioModuleWrapper::SetReverse(bool reverse) {
+    if (!m_impl) return;
+    if (m_impl->is_reverse.load() == reverse) return;  // No change needed
+    // Queue direction-change sequencer (ramp down → hold → flip → ramp up)
+    m_impl->pending_reverse_value.store(reverse);
+    m_impl->direction_change_pending.store(true);
+}
+
+void FSTPAudioModuleWrapper::SetReverseInstant(bool reverse) {
+    // For Mouse Shuttle: bypass sequencer, change direction immediately
     m_reverse.store(reverse);
     if (m_impl) {
         m_impl->is_reverse.store(reverse);
+        m_impl->direction_change_pending.store(false);  // Cancel any pending sequencer
     }
 }
 
@@ -2125,6 +2235,8 @@ double FSTPAudioModuleWrapper::GetActualSpeed() const {
 }
 
 bool FSTPAudioModuleWrapper::IsReverse() const {
+    // Read actual state from impl (sequencer updates is_reverse at the right moment)
+    if (m_impl) return m_impl->is_reverse.load();
     return m_reverse.load();
 }
 
@@ -2132,6 +2244,10 @@ void FSTPAudioModuleWrapper::SetVideoFrameRate(double fps) {
     if (m_impl && fps > 0.0) {
         m_impl->video_frame_rate.store(fps);
     }
+}
+
+bool FSTPAudioModuleWrapper::IsFrameAligned() const {
+    return m_impl && m_impl->frame_alignment_done.load();
 }
 
 bool FSTPAudioModuleWrapper::IsFastBufferReady() const {

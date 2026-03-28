@@ -619,6 +619,7 @@ void RenderAllWindows() {
 
     total_update_video_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_video - t_start).count());
 
+
     // CPU OPTIMIZATION: Throttling for static screens (no file/loading)
     for (int i = 0; i < MAX_WINDOWS; i++) {
         // CRITICAL FIX: Skip windows that are being closed to avoid Metal command encoder crash
@@ -645,6 +646,29 @@ void RenderAllWindows() {
                 UpdateVideoFrameForPlayer(player_id);
             }
 
+            // SETTLED PAUSE THROTTLE: when frame is aligned, betacam stripe gone,
+            // and zoom is not active — throttle full render cycle to ~5fps.
+            // SDL events and menus are processed independently on all platforms.
+            {
+                FSTPZoomState* zs = GetZoomState(i);
+                bool zoom_active = (zs && zs->enabled && zs->factor > 1.0f) || IsZoomPanningActive();
+                bool settled = player_id >= 0 &&
+                               g_windows[i].last_frame_aligned &&
+                               g_windows[i].betacam_hold_frames == 0;
+
+                if (settled && !zoom_active) {
+                    uint64_t now_ms = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                    if (now_ms - g_windows[i].last_settled_render_ms < 200) {
+                        continue; // Nothing changed — skip Clear/Texture/OSD/Present
+                    }
+                    g_windows[i].last_settled_render_ms = now_ms;
+                } else {
+                    g_windows[i].last_settled_render_ms = 0; // Reset when leaving settled state
+                }
+            }
+
             // ============================================================
             // SINGLE RENDERING LOOP - ALL IN ONE PLACE
             // ============================================================
@@ -669,24 +693,25 @@ void RenderAllWindows() {
                 playback_metrics.position_seconds = GetInstancePosition(player_id);
                 playback_metrics.duration_seconds = GetInstanceDuration(player_id);
                 playback_metrics.frame_rate = GetInstanceVideoFPS(player_id);
-                g_pixel_buffer_manager->UpdatePlaybackMetrics(player_id, playback_metrics);
 
-                const double holdSpeedThreshold = 0.05;
                 double absPlaybackRate = std::fabs(playback_metrics.playback_rate);
-                int holdFramesTarget = 0;
-                if (playback_metrics.frame_rate > 1.0) {
-                    holdFramesTarget = static_cast<int>(std::round(playback_metrics.frame_rate * 0.5));
-                } else {
-                    holdFramesTarget = 30;
-                }
-                holdFramesTarget = std::clamp(holdFramesTarget, 15, 90);
+                bool is_pure_pause = (absPlaybackRate < 0.05);
 
-                if (g_windows[i].last_effect_speed >= holdSpeedThreshold && absPlaybackRate < holdSpeedThreshold) {
-                    g_windows[i].betacam_hold_frames = std::max(g_windows[i].betacam_hold_frames, holdFramesTarget);
-                } else if (absPlaybackRate >= holdSpeedThreshold) {
+                // betacam_hold_frames: short buffer after IsFrameAligned() fires (stripe just disappeared)
+                // Triggered by false→true transition of frame alignment, not by speed change.
+                bool frame_aligned = is_pure_pause && player_id >= 0 && GetInstanceFrameAligned(player_id);
+                if (frame_aligned && !g_windows[i].last_frame_aligned) {
+                    // Alignment just happened — hold a few frames for visual smoothness
+                    g_windows[i].betacam_hold_frames = 30;
+                }
+                if (!is_pure_pause) {
                     g_windows[i].betacam_hold_frames = 0;
                 }
-                g_windows[i].last_effect_speed = absPlaybackRate;
+                g_windows[i].last_frame_aligned = frame_aligned;
+
+                // Pass frame_aligned to betacam effect so it can render clean frame
+                playback_metrics.frame_aligned = frame_aligned;
+                g_pixel_buffer_manager->UpdatePlaybackMetrics(player_id, playback_metrics);
 
                 const FSTPPixelBufferManager::PixelBuffer* pixel_buffer =
                     g_pixel_buffer_manager->GetPixelBuffer(player_id);
@@ -706,12 +731,12 @@ void RenderAllWindows() {
                         g_windows[i].betacam_hold_frames--;
                     }
 
-                    // BETACAM EFFECT: Always update at pause/slow motion or shuttle speeds
-                    // This ensures noise bars are rendered even when video frame doesn't change
-                    // Force update regardless of whether Betacam effect is enabled
-                    // (rendering needs to happen for effect to be visible)
+                    // BETACAM EFFECT: Always update at slow motion or shuttle speeds.
+                    // During pure pause: force until IsFrameAligned fires, then hold 30 frames.
+                    // Once frame_aligned and hold_frames == 0 — stripe gone, allow frame skip.
                     bool betacam_speed = (absPlaybackRate < 0.9 || absPlaybackRate > 1.1);
-                    if (betacam_speed) {
+                    bool pause_settled = is_pure_pause && frame_aligned && g_windows[i].betacam_hold_frames == 0;
+                    if (betacam_speed && !pause_settled) {
                         need_update = true;
                     }
 

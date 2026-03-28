@@ -392,10 +392,11 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
 
                 if (m_betacam_effect.IsEnabled() && y_plane && y_pitch > 0) {
                     const auto& metrics = m_playback_metrics[player_id];
-                    // Effect active at: slow motion (< 0.9×) OR fast shuttle (>= 1.2×)
-                    // NOT active at normal playback (0.9× - 1.2×)
+                    // Effect active at: slow motion (< 0.9×), fast shuttle (>= 1.2×),
+                    // OR 1× reverse (normal speed but backward → tracking artifacts)
                     double abs_rate = std::abs(metrics.playback_rate);
-                    bool speed_in_effect_range = (abs_rate < 0.9 || abs_rate >= 1.2);
+                    bool speed_in_effect_range = (abs_rate < 0.9 || abs_rate >= 1.2) ||
+                                                 (abs_rate >= 0.9 && abs_rate <= 1.1 && metrics.is_reverse);
                     bool candidate_effect = speed_in_effect_range &&
                                              (metrics.position_seconds > 0.1) &&
                                              ((metrics.duration_seconds <= 0.0) ||

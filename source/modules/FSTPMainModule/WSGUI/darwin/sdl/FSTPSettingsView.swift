@@ -24,6 +24,8 @@ class SettingsViewModel: ObservableObject {
     // Developer/Debug Settings
     @Published var showDecoderStatus: Bool = false
 
+    // Power management
+
     // Available devices
     @Published var audioDevices: [(index: Int, name: String)] = []
     @Published var midiInputDevices: [String] = []
@@ -255,6 +257,7 @@ struct VideoSyncSettingsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+
 
             Section(header: Text("Visual Effects").font(.headline)) {
                 Toggle("Enable Betacam tape artefact emulation", isOn: $viewModel.betacamEffectEnabled)

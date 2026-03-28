@@ -78,6 +78,7 @@ void ResetSettingsToDefault() {
 
     // Developer/Debug settings
     g_settings.show_decoder_status = 0;       // Hidden by default (debug feature)
+
 }
 
 // Initialize settings system

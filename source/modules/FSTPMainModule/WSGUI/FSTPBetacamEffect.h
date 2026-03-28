@@ -28,6 +28,7 @@ public:
         double duration_seconds = 0.0;  // Total duration of clip
         double frame_rate = 25.0;       // Source frame rate (used for timing)
         bool   is_reverse = false;      // Convenience flag for consumers
+        bool   frame_aligned = false;   // Audio snapped to frame boundary — stripe gone, render clean frame
     };
 
     struct FrameContext {
@@ -242,6 +243,10 @@ private:
         // Only updates when a new frame actually arrives, not on playback_rate sign change
         bool composite_direction_reverse = false;  // true = reverse compositing mode
         int64_t last_direction_frame = -1;         // frame number when direction was last determined
+
+        // Redundant-compositing guard: during pause the result is identical every render frame.
+        // AVFrame data is modified in-place and persists → skip re-compositing same frame.
+        int last_composited_frame_number = -1;
 
         // Double-buffered frame storage for slow motion compositing
         // stored_frame = last captured frame (current at previous call)

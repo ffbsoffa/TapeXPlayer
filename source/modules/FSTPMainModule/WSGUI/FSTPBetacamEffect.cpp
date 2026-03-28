@@ -150,6 +150,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     const double rawPlaybackRate = std::abs(currentPlaybackRate);
     const double currentTime = metrics.position_seconds;
     const double totalDuration = metrics.duration_seconds;
+    // 1× reverse: tape moves backward at normal speed → helical scan misaligned → tracking artifacts
+    const bool isReverseNormalSpeed = (rawPlaybackRate >= 0.9 && rawPlaybackRate <= 1.1 && metrics.is_reverse);
 
     const bool isNewFrame = frame_ctx.new_frame;
     if (isNewFrame) {
@@ -167,7 +169,7 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     // - Slow motion / pause (< 0.9×) - shows single stripe like real Betacam pause
     // - Fast shuttle (> 1.2×) - shows multiple stripes
     // - Normal playback (0.9× - 1.1×) - NO effect (perfect tracking)
-    bool isSlowMotion = (rawPlaybackRate < 0.9);
+    bool isSlowMotion = (rawPlaybackRate < 0.9) || isReverseNormalSpeed;
     bool isFastShuttle = (rawPlaybackRate >= kEffectThreshold);
     bool shouldShowEffect = isSlowMotion || isFastShuttle;
 
@@ -248,11 +250,24 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     bool have_planes = dst_data[0] && dst_data[1] && (isNV12 || dst_data[2]);
 
     if (isSlowMotion && isYUVFormat && have_planes && textureHeight > 0 && textureWidth > 0) {
+        // OPTIMIZATION: During pure pause (speed≈0) the compositing result is identical
+        // every render frame — AVFrame data persists in-place after first application.
+        // Skip re-compositing when the same video frame is presented again.
+        bool isPurePause = (rawPlaybackRate < 0.05) && !isReverseNormalSpeed;
+        // Frame aligned: audio snapped to boundary, stripe is gone.
+        // Render clean frame (no compositing) and invalidate cache so next
+        // pause cycle re-composites from scratch.
+        if (isPurePause && metrics.frame_aligned) {
+            state.last_composited_frame_number = -1;
+            goto skip_compositing;
+        }
         // Calculate stripe position using same formula as stripe rendering
         double fps_for_calc = (metrics.frame_rate > 0) ? metrics.frame_rate : 25.0;
         double frame_exact = currentTime * fps_for_calc;
         double scroll_phase = std::fmod(frame_exact, 1.0);
         if (scroll_phase < 0) scroll_phase += 1.0;
+        // At 1× reverse the tape moves backward → invert phase so seam scrolls downward
+        if (isReverseNormalSpeed) scroll_phase = 1.0 - scroll_phase;
 
         // Calculate stripe height to match stripe rendering formula exactly
         double resolutionScale = textureHeight / 480.0;
@@ -267,13 +282,16 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         int travel_distance = textureHeight + stripeHeight + extraMargin * 2;
         int stripe_center_y = static_cast<int>(scroll_phase * travel_distance) - stripeHeight / 2 - extraMargin;
 
-        // Select composite frame based on direction
-        // Forward: use prev_source_frame (N-1) for the "old" part of image
-        // Reverse: use next_source_frame (N+1) for the "old" part of image
+        // Helical scan physical model (Betacam SP drum):
+        // The drum head always scans TOP → BOTTOM.
+        // FindFrameByTime returns floor(T*fps) = frame N (the frame whose start ≤ T).
+        // At time T between frame N and N+1 the head is reading N+1's track:
+        //   ABOVE stripe = frame N+1 (data already read by the head this pass)
+        //   BELOW stripe = frame N   (residual left from the previous drum pass)
+        // For reverse: scroll_phase is inverted (1-phase) so the stripe sweeps the
+        // opposite direction, with the same frame N+1 above / frame N below assignment.
         bool isReverse = metrics.is_reverse;
-        const AVFrame* composite_frame = isReverse
-            ? frame_ctx.next_source_frame
-            : frame_ctx.prev_source_frame;
+        const AVFrame* composite_frame = frame_ctx.next_source_frame;  // N+1 for both directions
 
         // Validate composite frame
         bool have_composite = composite_frame &&
@@ -288,14 +306,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
             const int comp_uv_pitch = composite_frame->linesize[1];
 
             for (int y = 0; y < textureHeight; ++y) {
-                bool use_composite;
-                if (isReverse) {
-                    // Reverse: above stripe = composite (next) frame
-                    use_composite = (y < stripe_center_y);
-                } else {
-                    // Forward: below stripe = composite (prev) frame
-                    use_composite = (y >= stripe_center_y);
-                }
+                // ABOVE stripe = composite (N+1); reverse handled by scroll_phase flip
+                bool use_composite = (y < stripe_center_y);
 
                 if (use_composite) {
                     // Copy Y plane from composite frame
@@ -327,7 +339,9 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
                 }
             }
         }
+        state.last_composited_frame_number = frame_ctx.frame_number;
     }
+    skip_compositing:;
 
     bool effectApplied = false;
 
@@ -453,9 +467,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     int stripeHeight = baseStripeHeight;
     int stripeSpacing = baseStripeSpacing;
 
-    // SLOW MOTION (< 0.9×): Single stripe at ~25% frame height
-    // This represents the head drum "jumping" over tracks during still/slow playback
-    if (absPlaybackRate < 0.9) {
+    // SLOW MOTION (< 0.9×) OR 1× REVERSE: Single stripe
+    if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
         // At pause (0×) or very slow: fixed stripe height
         // Slight variation based on speed for visual interest
         double slowFactor = absPlaybackRate / 0.9;  // 0.0 at pause, 1.0 at 0.9×
@@ -542,11 +555,16 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
 
     double frame_exact = currentTime * fps_for_calc * effectiveSpeedMultiplier;
     double raw_scroll_phase = std::fmod(frame_exact, 1.0);  // 0.0-1.0
+    if (raw_scroll_phase < 0) raw_scroll_phase += 1.0;
 
     // NO inversion needed for reverse!
     // When position_seconds decreases (reverse), scroll_phase naturally decreases
     // → stripe moves from bottom to top (correct reverse behavior)
     // The old inversion was wrong - it reversed the natural reverse direction
+    //
+    // EXCEPTION: at 1× reverse, tape misalignment causes artifacts scrolling DOWNWARD,
+    // so we invert the phase to get the correct top-to-bottom direction.
+    if (isReverseNormalSpeed) raw_scroll_phase = 1.0 - raw_scroll_phase;
 
     // Use raw scroll_phase directly (no temporal smoothing)
     // This ensures compositing seam and stripe are always perfectly aligned
@@ -569,8 +587,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     int num_stripes = 0;
     double partial_stripe_opacity = 0.0;  // Opacity of the "newest" stripe (0.0-1.0)
 
-    if (absPlaybackRate < 0.9) {
-        // Slow motion: single stripe (head switching noise bar)
+    if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
+        // Slow motion or 1× reverse: single stripe (head switching noise bar)
         num_stripes = 1;
         fractional_stripes = 1.0;
     } else if (absPlaybackRate > 1.1) {
@@ -627,8 +645,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     // This prevents the stripe from shrinking/growing when stopping from fast speed
     double targetStripeHeight = static_cast<double>(stripeHeight);
 
-    if (absPlaybackRate < 0.9) {
-        // Slow motion: always use target height immediately
+    if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
+        // Slow motion / 1× reverse: always use target height immediately
         state.smooth_stripe_height = targetStripeHeight;
     } else if (state.smooth_stripe_height < 0.0) {
         // First initialization
@@ -653,8 +671,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         // Extended travel ensures stripe smoothly enters/exits visible area
         // instead of suddenly appearing at edges
         int stripe_y;
-        if (absPlaybackRate < 0.9) {
-            // Slow motion: larger margin for frame alignment
+        if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
+            // Slow motion / 1× reverse: larger margin for frame alignment
             int extraMargin = static_cast<int>(10.0 * (textureHeight / 480.0));
             int travel_distance = textureHeight + finalStripeHeight + extraMargin * 2;
             stripe_y = static_cast<int>(stripe_phase * travel_distance) - finalStripeHeight / 2 - extraMargin;
@@ -679,8 +697,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         // At slow motion/pause: noticeable variation (tape instability)
         // At fast shuttle: smaller proportional variation
         int height_variation = 0;
-        if (absPlaybackRate < 0.9) {
-            // Slow motion/pause: ±8-12% variation (tape head tracking instability)
+        if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
+            // Slow motion/pause/1× reverse: ±8-12% variation (tape head tracking instability)
             int variation = std::max(2, static_cast<int>(finalStripeHeight * 0.10));
             height_variation = randomInt(-variation, variation);
         } else if (absPlaybackRate >= 16.0) {
@@ -806,8 +824,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         // Independent variation for top and bottom edges (not synchronized)
         int topEdgeVariation = 0;
         int bottomEdgeVariation = 0;
-        if (absPlaybackRate < 0.9) {
-            // SLOW MOTION: Use persistent offset for asymmetry + independent jitter
+        if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
+            // SLOW MOTION / 1× REVERSE: Use persistent offset for asymmetry + independent jitter
             int persistentShift = static_cast<int>(state.grey_zone_offset * stripeH * 0.5);
             topEdgeVariation = persistentShift + randomInt(-2, 2);
             bottomEdgeVariation = -persistentShift + randomInt(-2, 2);  // Opposite direction
@@ -1380,7 +1398,7 @@ bool FSTPBetacamEffect::ApplyRenderJitter(int player_id, RenderContext& render_c
     const PlaybackMetrics& metrics = state.metrics;
 
     double absSpeed = std::abs(metrics.playback_rate);
-    bool isSlowMotion = (absSpeed < 0.9);
+    bool isSlowMotion = (absSpeed < 0.9) || (absSpeed >= 0.9 && absSpeed <= 1.1 && metrics.is_reverse);
     bool isFastShuttle = (absSpeed >= kEffectThreshold);
 
     // Effect applies to slow motion OR fast shuttle

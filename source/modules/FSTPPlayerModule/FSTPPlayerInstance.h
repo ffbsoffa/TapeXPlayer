@@ -50,8 +50,9 @@ public:
 
     // Speed and direction control
     int SetSpeed(double speed);
-    int SetSpeedInstant(double speed);  // For Mouse Shuttle - without animation
-    int SetReverse(bool reverse);
+    int SetSpeedInstant(double speed);    // For Mouse Shuttle - without animation
+    int SetReverse(bool reverse);         // With direction-change sequencer
+    int SetReverseInstant(bool reverse);  // For Mouse Shuttle - instant, no sequencer
 
     // State retrieval
     double GetPosition() const;
@@ -64,6 +65,7 @@ public:
     // Additional methods for working with audio module
     bool IsFastBufferReady() const;
     bool IsFullBufferReady() const;
+    bool IsFrameAligned() const;
     
     // Get information about loaded file
     int GetSampleRate() const;

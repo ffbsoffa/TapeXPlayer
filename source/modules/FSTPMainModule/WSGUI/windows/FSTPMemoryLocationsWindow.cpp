@@ -10,6 +10,8 @@
 
 #pragma comment(lib, "comctl32.lib")
 
+#define IDI_APPICON 101
+
 // Forward declarations
 extern "C" int GetActivePlayerID();
 extern "C" double GetInstancePosition(int player_id);
@@ -72,19 +74,19 @@ static void RefreshMemoryLocationsTable() {
             lvi.iItem = i;
             lvi.iSubItem = COL_ID;
             lvi.pszText = id_buf;
-            ListView_InsertItem(g_listview, &lvi);
+            SendMessageW(g_listview, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
 
             // Timecode
             std::wstring tc = Utf8ToWide(data.timecode_display);
             lvi.iSubItem = COL_TIMECODE;
             lvi.pszText = (LPWSTR)tc.c_str();
-            ListView_SetItem(g_listview, &lvi);
+            SendMessageW(g_listview, LVM_SETITEMW, 0, (LPARAM)&lvi);
 
             // Name
             std::wstring name = Utf8ToWide(data.name);
             lvi.iSubItem = COL_NAME;
             lvi.pszText = (LPWSTR)name.c_str();
-            ListView_SetItem(g_listview, &lvi);
+            SendMessageW(g_listview, LVM_SETITEMW, 0, (LPARAM)&lvi);
         }
     }
 }
@@ -123,20 +125,17 @@ static void OnExportToCSV() {
     }
 }
 
-// Get location ID from selected ListView item
-static int GetSelectedLocationID() {
-    int sel = ListView_GetNextItem(g_listview, -1, LVNI_SELECTED);
-    if (sel < 0) return -1;
-
-    wchar_t buf[16];
+// Get location ID from a specific ListView row (by index, not selection state)
+static int GetLocationIDFromRow(int row) {
+    if (row < 0 || !g_listview) return -1;
+    wchar_t buf[16] = {};
     LVITEMW lvi = {};
     lvi.mask = LVIF_TEXT;
-    lvi.iItem = sel;
+    lvi.iItem = row;
     lvi.iSubItem = COL_ID;
     lvi.pszText = buf;
     lvi.cchTextMax = 16;
-    ListView_GetItem(g_listview, &lvi);
-
+    SendMessageW(g_listview, LVM_GETITEMW, 0, (LPARAM)&lvi);
     return _wtoi(buf);
 }
 
@@ -173,14 +172,14 @@ static LRESULT CALLBACK MemoryLocationsProc(HWND hwnd, UINT msg, WPARAM wParam, 
             if (pnmh->idFrom == IDC_LISTVIEW) {
                 if (pnmh->code == NM_DBLCLK) {
                     // Double-click: recall location
-                    int id = GetSelectedLocationID();
-                    if (id >= 0) {
+                    // Use iItem from notification directly — do not rely on selection state.
+                    NMITEMACTIVATE* pnmia = (NMITEMACTIVATE*)lParam;
+                    int id = GetLocationIDFromRow(pnmia->iItem);
+                    if (id > 0) {
                         int active_player = GetActivePlayerID();
                         if (active_player >= 0) {
                             FSTP_RecallMemoryLocation(id, active_player);
                             std::cout << "Recalled Memory Location #" << id << std::endl;
-                        } else {
-                            std::cout << "No active player for recalling memory location" << std::endl;
                         }
                     }
                     return 0;
@@ -188,26 +187,30 @@ static LRESULT CALLBACK MemoryLocationsProc(HWND hwnd, UINT msg, WPARAM wParam, 
 
                 if (pnmh->code == NM_CLICK) {
                     NMITEMACTIVATE* pnmia = (NMITEMACTIVATE*)lParam;
+                    if (pnmia->iItem < 0) break;  // click on empty area
+
+                    // Read ID directly from the clicked row — not from selection state,
+                    // which may lag behind on the first click into an unfocused window.
+                    int id = GetLocationIDFromRow(pnmia->iItem);
+                    if (id <= 0) break;
 
                     // Ctrl+Click: edit
-                    if (pnmia->uKeyFlags & LVKF_CONTROL) {
-                        int id = GetSelectedLocationID();
-                        if (id >= 0) {
-                            std::cout << "Ctrl+Click - Editing Memory Location #" << id << std::endl;
-                            ShowAddEditMemoryLocationDialog(0, id, 0.0);
-                        }
+                    bool ctrl_held = (pnmia->uKeyFlags & LVKF_CONTROL) ||
+                                     (GetKeyState(VK_CONTROL) & 0x8000);
+                    if (ctrl_held) {
+                        std::cout << "Ctrl+Click - Editing Memory Location #" << id << std::endl;
+                        ShowAddEditMemoryLocationDialog(0, id, 0.0);
                         return 0;
                     }
 
                     // Alt+Click: delete
-                    if (pnmia->uKeyFlags & LVKF_ALT) {
-                        int id = GetSelectedLocationID();
-                        if (id >= 0) {
-                            std::cout << "Alt+Click - Deleting Memory Location #" << id << std::endl;
-                            if (FSTP_DeleteMemoryLocation(id)) {
-                                RefreshMemoryLocationsTable();
-                                std::cout << "Memory Location #" << id << " deleted" << std::endl;
-                            }
+                    bool alt_held = (pnmia->uKeyFlags & LVKF_ALT) ||
+                                    (GetKeyState(VK_MENU) & 0x8000);
+                    if (alt_held) {
+                        std::cout << "Alt+Click - Deleting Memory Location #" << id << std::endl;
+                        if (FSTP_DeleteMemoryLocation(id)) {
+                            RefreshMemoryLocationsTable();
+                            std::cout << "Memory Location #" << id << " deleted" << std::endl;
                         }
                         return 0;
                     }
@@ -237,7 +240,7 @@ static LRESULT CALLBACK MemoryLocationsProc(HWND hwnd, UINT msg, WPARAM wParam, 
             return 0;
     }
 
-    return DefWindowProc(hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 // Create the Memory Locations window
@@ -249,13 +252,18 @@ static void CreateMemoryLocationsWindow() {
     // Register window class
     static bool class_registered = false;
     if (!class_registered) {
+        HINSTANCE hInst = GetModuleHandle(NULL);
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(WNDCLASSEXW);
         wc.lpfnWndProc = MemoryLocationsProc;
-        wc.hInstance = GetModuleHandle(NULL);
+        wc.hInstance = hInst;
         wc.lpszClassName = L"FSTPMemoryLocationsClass";
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon   = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
+                                       IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+        wc.hIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
+                                       IMAGE_ICON, 16, 16, 0);
         RegisterClassExW(&wc);
         class_registered = true;
     }
@@ -306,17 +314,17 @@ static void CreateMemoryLocationsWindow() {
     lvc.fmt = LVCFMT_LEFT;
     lvc.cx = 50;
     lvc.pszText = (LPWSTR)L"#";
-    ListView_InsertColumn(g_listview, COL_ID, &lvc);
+    SendMessageW(g_listview, LVM_INSERTCOLUMNW, COL_ID, (LPARAM)&lvc);
 
     // Timecode column
     lvc.cx = 120;
     lvc.pszText = (LPWSTR)L"Timecode";
-    ListView_InsertColumn(g_listview, COL_TIMECODE, &lvc);
+    SendMessageW(g_listview, LVM_INSERTCOLUMNW, COL_TIMECODE, (LPARAM)&lvc);
 
     // Name column (auto-expand)
     lvc.cx = 500;
     lvc.pszText = (LPWSTR)L"Name";
-    ListView_InsertColumn(g_listview, COL_NAME, &lvc);
+    SendMessageW(g_listview, LVM_INSERTCOLUMNW, COL_NAME, (LPARAM)&lvc);
 
     // Bottom bar: Export button
     HWND hExport = CreateWindowExW(0, L"BUTTON", L"Export to CSV",
@@ -480,7 +488,7 @@ static LRESULT CALLBACK AddEditDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             return 0;
     }
 
-    return DefWindowProc(hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 // Unified Add/Edit Memory Location Dialog
@@ -534,13 +542,18 @@ static void ShowAddEditMemoryLocationDialog(int player_id, int location_id, doub
     // Register window class
     static bool class_registered = false;
     if (!class_registered) {
+        HINSTANCE hInst = GetModuleHandle(NULL);
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(WNDCLASSEXW);
         wc.lpfnWndProc = AddEditDialogProc;
-        wc.hInstance = GetModuleHandle(NULL);
+        wc.hInstance = hInst;
         wc.lpszClassName = L"FSTPMemLocEditClass";
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon   = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
+                                       IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+        wc.hIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
+                                       IMAGE_ICON, 16, 16, 0);
         RegisterClassExW(&wc);
         class_registered = true;
     }

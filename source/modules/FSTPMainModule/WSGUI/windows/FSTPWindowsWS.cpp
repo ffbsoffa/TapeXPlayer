@@ -702,7 +702,7 @@ int RunMainUILoop() {
         AutoRenderFrame();
 
         // CRITICAL: Asynchronous shutdown - destroy player instances in SEPARATE THREAD
-        // This allows main thread to continue rendering "unthreading" OSD
+        // This allows main thread to continue rendering OSD during cleanup.
         if (g_shutdownRequested.load() && !g_cleanupThreadStarted.load()) {
             std::cout << "[SHUTDOWN] Shutdown requested, starting async cleanup thread..." << std::endl;
             g_cleanupThreadStarted.store(true);
@@ -711,12 +711,23 @@ int RunMainUILoop() {
             cleanup_thread = std::thread([]() {
                 std::cout << "[CLEANUP THREAD] Started cleanup while main thread renders..." << std::endl;
 
-                // Destroy all player instances while main thread CONTINUES RENDERING
+                FSTPPixelBufferManager* pixel_mgr = GetPixelBufferManager();
+
                 for (int i = 0; i < MAX_WINDOWS; i++) {
                     FSTPWindow* window = GetWindowByIndex(i);
                     if (window && window->is_active) {
                         int player_id = window->player_instance_id;
                         if (player_id >= 0 && IsPlayerInstanceActive(player_id)) {
+                            // CRITICAL: Release shared_ptr<AVFrame> references BEFORE
+                            // destroying the player. LowResDecoder stores frames via a
+                            // pool-based deleter that captures a raw pool_ptr. If the
+                            // decoder (and its pool) is destroyed first, the dangling
+                            // pool_ptr in the deleter causes a segfault when the
+                            // shared_ptr is later released in pixel_mgr->Shutdown().
+                            if (pixel_mgr) {
+                                pixel_mgr->ClearPlayerBuffers(player_id);
+                            }
+
                             std::cout << "[CLEANUP] Destroying player " << player_id << std::endl;
                             DestroyPlayerInstance(player_id);
                             std::cout << "[CLEANUP] Player " << player_id << " destroyed" << std::endl;
@@ -810,12 +821,13 @@ int RunMainUILoop() {
     std::cout << "Rendering stopped" << std::endl;
 
     // Step 3: CRITICAL - Clear PixelBufferManager
+    // Use Shutdown() which internally iterates over the correct MAX_PLAYERS count.
+    // Manual loop with hardcoded 16 caused out-of-bounds access on m_buffer_mutex[5..15]
+    // (array size is MAX_PLAYERS=5) → segfault.
     std::cout << "Clearing pixel buffer manager..." << std::endl;
     FSTPPixelBufferManager* pixel_mgr = GetPixelBufferManager();
     if (pixel_mgr) {
-        for (int i = 0; i < 16; i++) {
-            pixel_mgr->ClearPlayerBuffers(i);
-        }
+        pixel_mgr->Shutdown();
         std::cout << "Pixel buffer manager cleared" << std::endl;
     }
 

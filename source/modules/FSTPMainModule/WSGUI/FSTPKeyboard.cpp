@@ -1081,8 +1081,8 @@ void UpdateMouseShuttle(int x) {
     target_speed = std::min(target_speed, max_speed);
     target_speed = std::max(target_speed, 0.1); // Minimum 0.1x (audio module rejects 0.0)
 
-    // Simplified logic - always set direction and speed
-    SetInstanceReverse(active_player_id, target_reverse);
+    // Mouse Shuttle: instant direction change (no sequencer)
+    SetInstanceReverseInstant(active_player_id, target_reverse);
     SetInstanceSpeedInstant(active_player_id, target_speed);
 
     // Update OSD
@@ -1102,9 +1102,9 @@ void StopMouseShuttle() {
 
     int active_player_id = GetActivePlayerID();
     if (active_player_id >= 0) {
-        // Set speed to 1x instantly, then pause
+        // Set speed to 1x instantly, then pause (no sequencer on stop)
         SetInstanceSpeedInstant(active_player_id, 1.0);
-        SetInstanceReverse(active_player_id, false);
+        SetInstanceReverseInstant(active_player_id, false);
         PauseInstance(active_player_id);
         // std::cout << "Mouse shuttle stopped, playback paused" << std::endl;
 

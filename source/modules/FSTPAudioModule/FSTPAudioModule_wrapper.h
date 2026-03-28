@@ -25,7 +25,8 @@ public:
     // Speed and direction control
     void SetSpeed(double speed);
     void SetSpeedInstant(double speed);  // For Mouse Shuttle - without animation
-    void SetReverse(bool reverse);
+    void SetReverse(bool reverse);          // With direction-change sequencer
+    void SetReverseInstant(bool reverse);   // Instant (Mouse Shuttle — no sequencer)
     void SetPosition(double position_seconds);
 
     // State retrieval
@@ -57,6 +58,10 @@ public:
 
     // Video sync: set frame rate for frame alignment on prolonged pause
     void SetVideoFrameRate(double fps);
+
+    // Returns true once audio position has snapped to a frame boundary during pause
+    // (Betacam stripe disappears at this point — safe to skip redundant renders)
+    bool IsFrameAligned() const;
 
     // Friend class for API
     friend class FSTPAudioModule_API;

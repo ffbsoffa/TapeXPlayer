@@ -292,14 +292,24 @@ int FSTPPlayerInstance::SetReverse(bool reverse) {
         std::cerr << "Player instance not ready for reverse change" << std::endl;
         return -1;
     }
-
-    // std::cout << "Setting reverse mode to: " << (reverse ? "ON" : "OFF") << std::endl;
-
+    // Audio module runs direction-change sequencer; video module follows immediately
+    // (video will reflect new direction via IsReverse() once sequencer flips the flag)
     m_audio_module->SetReverse(reverse);
     if (m_video_module) {
         m_video_module->SetReverse(reverse);
     }
-    // std::cout << "Reverse mode changed successfully" << std::endl;
+    return 0;
+}
+
+int FSTPPlayerInstance::SetReverseInstant(bool reverse) {
+    if (!m_initialized || !m_audio_module) {
+        std::cerr << "Player instance not ready for instant reverse change" << std::endl;
+        return -1;
+    }
+    m_audio_module->SetReverseInstant(reverse);
+    if (m_video_module) {
+        m_video_module->SetReverse(reverse);
+    }
     return 0;
 }
 
@@ -338,6 +348,13 @@ bool FSTPPlayerInstance::IsReverse() const {
         return false;
     }
     return m_audio_module->IsReverse();
+}
+
+bool FSTPPlayerInstance::IsFrameAligned() const {
+    if (!m_initialized || !m_audio_module) {
+        return false;
+    }
+    return m_audio_module->IsFrameAligned();
 }
 
 double FSTPPlayerInstance::GetActualSpeed() const {

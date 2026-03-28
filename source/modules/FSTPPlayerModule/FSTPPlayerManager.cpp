@@ -531,8 +531,15 @@ int SetInstanceReverse(int instance_id, bool reverse) {
         !g_manager_state.instances[instance_id].is_active) {
         return -1;
     }
-    
     return g_manager_state.instances[instance_id].instance->SetReverse(reverse);
+}
+
+int SetInstanceReverseInstant(int instance_id, bool reverse) {
+    if (instance_id < 0 || instance_id >= MAX_PLAYER_INSTANCES ||
+        !g_manager_state.instances[instance_id].is_active) {
+        return -1;
+    }
+    return g_manager_state.instances[instance_id].instance->SetReverseInstant(reverse);
 }
 
 // === Getting the state of the instance ===
@@ -635,6 +642,16 @@ void SetActivePlayerID(int player_id) {
     if (player_id >= -1 && player_id < MAX_PLAYER_INSTANCES) {
         g_manager_state.active_player_id = player_id;
     }
+}
+
+bool GetInstanceFrameAligned(int instance_id) {
+    if (instance_id < 0 || instance_id >= MAX_PLAYER_INSTANCES ||
+        !g_manager_state.instances[instance_id].is_active) {
+        return false;
+    }
+    auto& instance = g_manager_state.instances[instance_id].instance;
+    if (!instance) return false;
+    return instance->IsFrameAligned();
 }
 
 // === Getting audio signal levels ===

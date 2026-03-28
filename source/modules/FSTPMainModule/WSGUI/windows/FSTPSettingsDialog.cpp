@@ -2,741 +2,1111 @@
 
 #include <windows.h>
 #include <commctrl.h>
-#include <prsht.h>
 #include <uxtheme.h>
+#include <dwmapi.h>
 #include <portaudio.h>
 #include <iostream>
-#include <cmath>
 #include <string>
 #include <vector>
 #include <thread>
+#include <atomic>
+#include <algorithm>
 #include "../FSTPSettings.h"
 #include "../FSTPWindowManager.h"
 #include "../FSTPMemoryLocations.h"
 #include "FSTPSettingsDialog.h"
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "dwmapi.lib")
 
-// Dialog state (atomic — accessed from main thread and dialog threads)
-#include <atomic>
 extern std::atomic<bool> g_dialog_open;
 
-// RAII guard to ensure dialog flag is reset
-class SettingsDialogGuard {
-public:
-    SettingsDialogGuard() {
-        g_dialog_open = true;
-    }
-    ~SettingsDialogGuard() {
-        g_dialog_open = false;
-        std::cout << "Settings dialog closed (flag reset)" << std::endl;
-    }
-};
-
-// Forward declarations for MIDI functions
+// Forward declarations
 extern "C" int GetMIDIInputDeviceCount();
 extern "C" int GetMIDIOutputDeviceCount();
 extern "C" const char* GetMIDIInputDeviceName(int index);
 extern "C" const char* GetMIDIOutputDeviceName(int index);
 extern "C" void ApplyMIDISettings();
 
-// Cache/memory functions declared in FSTPMemoryLocations.h (included above)
-// Settings reset declared in FSTPSettings.h (included above)
+// ── Control IDs ──────────────────────────────────────────────────────────────
+#define IDC_SIDEBAR           100
+// IDOK=1 and IDCANCEL=2 are used so IsDialogMessageW handles Enter and Esc.
+#define IDC_BTN_RESET         103
 
-// Control IDs
+// Audio page
 #define IDC_AUDIO_DEVICE      1010
 #define IDC_VOLUME_SLIDER     1011
 #define IDC_VOLUME_LABEL      1012
 #define IDC_DUCKING_CHECK     1013
 #define IDC_BUFFER_COMBO      1014
+
+// Video & Sync page
 #define IDC_FRAME_OFFSET      1015
 #define IDC_FREEZE_CHECK      1016
 #define IDC_BETACAM_CHECK     1017
 #define IDC_DECODER_STATUS    1018
+
+// MIDI page
 #define IDC_MIDI_ENABLE       1020
 #define IDC_MIDI_INPUT        1021
 #define IDC_MIDI_OUTPUT       1022
+
+// Cache page
 #define IDC_CLEAR_PROXY       1030
 #define IDC_CLEAR_MEMORY      1031
 #define IDC_PROXY_INFO        1032
 #define IDC_MEMORY_INFO       1033
+
+// Extensions page
 #define IDC_YTDLP_CHECK       1040
 
-// Helper: Convert UTF-8 to wide string
-static std::wstring Utf8ToWide(const char* utf8) {
-    if (!utf8) return L"";
-    int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
-    if (len <= 0) return L"";
-    std::wstring wide(len - 1, 0);  // len includes null terminator, exclude it
-    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &wide[0], len);
-    return wide;
+// Hint labels use IDs 2000-2099 — PageProc uses this range to colour them gray
+#define IDC_HINT_BASE         2000
+#define IDC_HINT_MAX          2099
+
+// Indent for hint text that appears below a checkbox label.
+// Aligns hint with the checkbox's text (checkbox square ≈ 13px + 3px gap).
+static const int CHECKBOX_INDENT = 16;
+
+// ── Layout constants ──────────────────────────────────────────────────────────
+static const int DLG_W         = 680;
+static const int DLG_H         = 480;
+static const int SIDEBAR_W     = 160;
+static const int FOOTER_H      = 52;
+static const int PAGE_COUNT    = 5;
+
+// ── Sidebar colours ───────────────────────────────────────────────────────────
+static const COLORREF CLR_SIDEBAR_BG   = RGB(240, 240, 240);
+static const COLORREF CLR_SIDEBAR_SEL  = RGB(0, 120, 215);   // Windows accent blue
+static const COLORREF CLR_SIDEBAR_HOT  = RGB(229, 243, 255);
+static const COLORREF CLR_SIDEBAR_TXT  = RGB(30,  30,  30);
+static const COLORREF CLR_SIDEBAR_STXT = RGB(255, 255, 255);
+static const COLORREF CLR_CONTENT_BG   = RGB(255, 255, 255);
+static const COLORREF CLR_DIVIDER      = RGB(220, 220, 220);
+
+// ── Fonts ─────────────────────────────────────────────────────────────────────
+static HFONT g_fontNormal  = nullptr;
+static HFONT g_fontBold    = nullptr;
+static HFONT g_fontSmall   = nullptr;
+
+static void CreateFonts() {
+    // Segoe UI 10pt normal
+    g_fontNormal = CreateFontW(-MulDiv(10, GetDeviceCaps(GetDC(NULL), LOGPIXELSY), 72),
+        0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+
+    // Segoe UI 10pt bold
+    g_fontBold = CreateFontW(-MulDiv(10, GetDeviceCaps(GetDC(NULL), LOGPIXELSY), 72),
+        0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+
+    // Segoe UI 9pt for hints
+    g_fontSmall = CreateFontW(-MulDiv(9, GetDeviceCaps(GetDC(NULL), LOGPIXELSY), 72),
+        0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
 }
 
-// Apply the dialog's font to all dynamically created child controls.
-// Call at the end of WM_INITDIALOG after all CreateWindowExW calls.
-static BOOL CALLBACK SetChildFont(HWND child, LPARAM lParam) {
-    SendMessage(child, WM_SETFONT, (WPARAM)lParam, TRUE);
-    return TRUE;
-}
-static void ApplyDialogFont(HWND hwnd) {
-    HFONT hFont = (HFONT)SendMessage(hwnd, WM_GETFONT, 0, 0);
-    if (hFont)
-        EnumChildWindows(hwnd, SetChildFont, (LPARAM)hFont);
+static void DestroyFonts() {
+    if (g_fontNormal) { DeleteObject(g_fontNormal); g_fontNormal = nullptr; }
+    if (g_fontBold)   { DeleteObject(g_fontBold);   g_fontBold   = nullptr; }
+    if (g_fontSmall)  { DeleteObject(g_fontSmall);  g_fontSmall  = nullptr; }
 }
 
-// Build an in-memory DLGTEMPLATE with DS_SETFONT ("Segoe UI", 9pt)
-static std::vector<BYTE> BuildEmptyDialogTemplate(int width, int height) {
-    std::vector<BYTE> buf;
-    buf.resize(256, 0);
-    BYTE* p = buf.data();
-
-    // DLGTEMPLATE
-    DLGTEMPLATE* dlg = (DLGTEMPLATE*)p;
-    dlg->style = DS_SETFONT | DS_CONTROL | WS_CHILD;
-    dlg->dwExtendedStyle = 0;
-    dlg->cdit = 0;
-    dlg->x = 0;
-    dlg->y = 0;
-    dlg->cx = (short)width;
-    dlg->cy = (short)height;
-    p += sizeof(DLGTEMPLATE);
-
-    // Menu (none)
-    *(WORD*)p = 0; p += sizeof(WORD);
-    // Class (default)
-    *(WORD*)p = 0; p += sizeof(WORD);
-    // Title (empty)
-    *(WORD*)p = 0; p += sizeof(WORD);
-
-    // DS_SETFONT: point size + font name
-    *(WORD*)p = 9; p += sizeof(WORD);
-    const wchar_t* font = L"Segoe UI";
-    size_t font_bytes = (wcslen(font) + 1) * sizeof(wchar_t);
-    memcpy(p, font, font_bytes);
-    p += font_bytes;
-
-    buf.resize(p - buf.data());
-    return buf;
-}
-
-// Programmatic ComCtl32 v6 activation.
-// Uses the manifest embedded inside comctl32.dll (resource 124).
-// This guarantees visual styles even if .rc/.manifest not embedded in .exe.
-static HANDLE g_hActCtx = INVALID_HANDLE_VALUE;
+// ── ComCtl32 v6 activation ────────────────────────────────────────────────────
+static HANDLE    g_hActCtx   = INVALID_HANDLE_VALUE;
 static ULONG_PTR g_actCookie = 0;
 
 static void ActivateVisualStyles() {
-    if (g_hActCtx != INVALID_HANDLE_VALUE) return; // already active
-
+    if (g_hActCtx != INVALID_HANDLE_VALUE) return;
     wchar_t dllPath[MAX_PATH];
     GetSystemDirectoryW(dllPath, MAX_PATH);
     wcscat(dllPath, L"\\comctl32.dll");
-
     ACTCTXW act = {};
     act.cbSize = sizeof(act);
     act.dwFlags = ACTCTX_FLAG_RESOURCE_NAME_VALID;
     act.lpSource = dllPath;
     act.lpResourceName = MAKEINTRESOURCEW(124);
-
     g_hActCtx = CreateActCtxW(&act);
-    if (g_hActCtx != INVALID_HANDLE_VALUE) {
+    if (g_hActCtx != INVALID_HANDLE_VALUE)
         ActivateActCtx(g_hActCtx, &g_actCookie);
-        std::cout << "Visual styles activated (ComCtl32 v6)" << std::endl;
-    } else {
-        std::cerr << "Failed to activate visual styles, error: " << GetLastError() << std::endl;
-    }
 }
 
 static void DeactivateVisualStyles() {
     if (g_hActCtx != INVALID_HANDLE_VALUE) {
         DeactivateActCtx(0, g_actCookie);
         ReleaseActCtx(g_hActCtx);
-        g_hActCtx = INVALID_HANDLE_VALUE;
+        g_hActCtx   = INVALID_HANDLE_VALUE;
         g_actCookie = 0;
     }
 }
 
-// Theme handling is done automatically by EnableThemeDialogTexture(ETDT_ENABLETAB)
-// called in each page's WM_INITDIALOG. DefDlgProc returns the correct themed
-// brush for WM_CTLCOLORSTATIC/WM_CTLCOLORBTN — no manual override needed.
+// ── UTF-8 helpers ─────────────────────────────────────────────────────────────
+static std::wstring Utf8ToWide(const char* utf8) {
+    if (!utf8 || !*utf8) return L"";
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+    if (len <= 0) return L"";
+    std::wstring w(len - 1, 0);
+    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &w[0], len);
+    return w;
+}
 
-// ===== PAGE 0: Audio =====
-static INT_PTR CALLBACK AudioPageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+// ── Apply font to all children ────────────────────────────────────────────────
+static BOOL CALLBACK SetChildFontCB(HWND child, LPARAM font) {
+    SendMessage(child, WM_SETFONT, (WPARAM)font, TRUE);
+    return TRUE;
+}
+static void ApplyFontToChildren(HWND hwnd, HFONT font) {
+    EnumChildWindows(hwnd, SetChildFontCB, (LPARAM)font);
+}
+
+// Gray brush for hint text background (matches white content area)
+static HBRUSH g_hintBrush = nullptr;
+
+// ── Helper: section header + separator ───────────────────────────────────────
+// Bold label followed by a 1px gray line. Returns new y position.
+static int AddSectionHeader(HWND parent, HINSTANCE hInst, const wchar_t* text, int x, int y, int w) {
+    HWND h = CreateWindowExW(0, L"STATIC", text,
+        WS_CHILD | WS_VISIBLE, x, y, w, 19, parent, nullptr, hInst, nullptr);
+    SendMessage(h, WM_SETFONT, (WPARAM)g_fontBold, FALSE);
+    // Thin separator line below the header text
+    CreateWindowExW(0, L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+        x, y + 21, w, 2, parent, nullptr, hInst, nullptr);
+    return y + 30;
+}
+
+// ── Helper: hint label (small, gray) ─────────────────────────────────────────
+static int g_hintIdCounter = IDC_HINT_BASE;
+
+static int AddHint(HWND parent, HINSTANCE hInst, const wchar_t* text, int x, int y, int w) {
+    int id = g_hintIdCounter;
+    if (g_hintIdCounter < IDC_HINT_MAX) g_hintIdCounter++;
+    HWND h = CreateWindowExW(0, L"STATIC", text,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        x, y, w, 32, parent, (HMENU)(UINT_PTR)id, hInst, nullptr);
+    SendMessage(h, WM_SETFONT, (WPARAM)g_fontSmall, FALSE);
+    return y + 36;
+}
+
+// ── Content page scroll state ─────────────────────────────────────────────────
+struct PageScrollState {
+    int contentH = 0;  // total content height (px)
+    int scrollY  = 0;  // current scroll offset
+};
+
+// Call after building all controls on a page.
+static void SetupPageScroll(HWND page, int contentH) {
+    RECT rc;
+    GetClientRect(page, &rc);
+    int clientH = rc.bottom;
+
+    auto* sc = new PageScrollState();
+    sc->contentH = contentH + 16; // bottom padding
+    sc->scrollY  = 0;
+    SetWindowLongPtrW(page, GWLP_USERDATA, (LONG_PTR)sc);
+
+    if (sc->contentH > clientH) {
+        LONG style = GetWindowLongW(page, GWL_STYLE);
+        SetWindowLongW(page, GWL_STYLE, style | WS_VSCROLL);
+        SetWindowPos(page, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        SCROLLINFO si = {};
+        si.cbSize = sizeof(si);
+        si.fMask  = SIF_RANGE | SIF_PAGE | SIF_POS;
+        si.nMin   = 0;
+        si.nMax   = sc->contentH - 1;
+        si.nPage  = (UINT)clientH;
+        si.nPos   = 0;
+        SetScrollInfo(page, SB_VERT, &si, TRUE);
+    }
+}
+
+static void ScrollPage(HWND page, int delta) {
+    auto* sc = (PageScrollState*)GetWindowLongPtrW(page, GWLP_USERDATA);
+    if (!sc) return;
+    RECT rc;
+    GetClientRect(page, &rc);
+    int clientH   = rc.bottom;
+    int maxScroll = std::max(0, sc->contentH - clientH);
+    if (maxScroll == 0) return;
+
+    int oldY = sc->scrollY;
+    int newY = std::max(0, std::min(sc->scrollY + delta, maxScroll));
+    if (newY == oldY) return;
+
+    sc->scrollY = newY;
+    SCROLLINFO si = {};
+    si.cbSize = sizeof(si);
+    si.fMask  = SIF_POS;
+    si.nPos   = newY;
+    SetScrollInfo(page, SB_VERT, &si, TRUE);
+    ScrollWindowEx(page, 0, oldY - newY, nullptr, nullptr, nullptr, nullptr,
+                   SW_SCROLLCHILDREN | SW_ERASE | SW_INVALIDATE);
+    UpdateWindow(page);
+}
+
+// ── Content page window class ─────────────────────────────────────────────────
+static LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_INITDIALOG: {
-        EnableThemeDialogTexture(hwnd, ETDT_ENABLETAB);
-        const FSTPSettings* settings = GetSettings();
-        if (!settings) return TRUE;
-        int x = 10, y = 10;
-        HWND h;
-        HINSTANCE hInst = GetModuleHandle(NULL);
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, (HBRUSH)GetStockObject(WHITE_BRUSH));
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc  = (HDC)wParam;
+        HWND ctl = (HWND)lParam;
+        int  id  = GetDlgCtrlID(ctl);
+        SetBkColor(hdc, CLR_CONTENT_BG);
+        SetTextColor(hdc, (id >= IDC_HINT_BASE && id <= IDC_HINT_MAX)
+                          ? RGB(120, 120, 120) : CLR_SIDEBAR_TXT);
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+        return (LRESULT)DefWindowProcW(hwnd, msg, wParam, lParam);
 
-        h = CreateWindowExW(0, L"STATIC", L"Audio Device:",
-            WS_CHILD | WS_VISIBLE, x, y, 120, 20, hwnd, NULL, hInst, NULL);
+    case WM_VSCROLL: {
+        RECT rc; GetClientRect(hwnd, &rc);
+        int clientH = rc.bottom;
+        auto* sc = (PageScrollState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        if (!sc) return 0;
+        int delta = 0;
+        switch (LOWORD(wParam)) {
+            case SB_LINEUP:   delta = -20;      break;
+            case SB_LINEDOWN: delta = +20;      break;
+            case SB_PAGEUP:   delta = -clientH; break;
+            case SB_PAGEDOWN: delta = +clientH; break;
+            case SB_THUMBTRACK: {
+                SCROLLINFO si = {}; si.cbSize = sizeof(si); si.fMask = SIF_TRACKPOS;
+                GetScrollInfo(hwnd, SB_VERT, &si);
+                delta = si.nTrackPos - sc->scrollY;
+                break;
+            }
+            case SB_TOP:    delta = -sc->scrollY; break;
+            case SB_BOTTOM: delta = sc->contentH; break;
+        }
+        if (delta) ScrollPage(hwnd, delta);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        ScrollPage(hwnd, delta > 0 ? -60 : 60);
+        return 0;
+    }
+    case WM_DESTROY: {
+        auto* sc = (PageScrollState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        delete sc;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void RegisterPageClass(HINSTANCE hInst) {
+    static bool registered = false;
+    if (registered) return;
+    WNDCLASSEXW wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = PageProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    wc.lpszClassName = L"TXP_SettingsPage";
+    RegisterClassExW(&wc);
+    registered = true;
+}
+
+// ── Per-dialog state ──────────────────────────────────────────────────────────
+struct SettingsDlgState {
+    HWND pages[PAGE_COUNT];   // child windows, one per page
+    int  currentPage = 0;
+    int  hotItem     = -1;
+
+    // Audio controls (saved here so WM_COMMAND handlers can read them)
+    HWND hAudioDevice   = nullptr;
+    HWND hVolumeSlider  = nullptr;
+    HWND hVolumeLabel   = nullptr;
+    HWND hDuckingCheck  = nullptr;
+    HWND hBufferCombo   = nullptr;
+
+    // Video controls
+    HWND hFrameOffset   = nullptr;
+    HWND hFreezeCheck   = nullptr;
+    HWND hBetacamCheck  = nullptr;
+    HWND hDecoderStatus = nullptr;
+
+    // MIDI controls
+    HWND hMidiEnable    = nullptr;
+    HWND hMidiInput     = nullptr;
+    HWND hMidiOutput    = nullptr;
+
+    // Cache controls
+    HWND hClearProxy    = nullptr;
+    HWND hClearMemory   = nullptr;
+    HWND hProxyInfo     = nullptr;
+    HWND hMemoryInfo    = nullptr;
+
+    // Extensions controls
+    HWND hYtdlpCheck    = nullptr;
+};
+
+static void ShowPage(SettingsDlgState* s, int index) {
+    for (int i = 0; i < PAGE_COUNT; i++)
+        ShowWindow(s->pages[i], (i == index) ? SW_SHOW : SW_HIDE);
+    s->currentPage = index;
+    // Repaint sidebar so selection updates
+    HWND sidebar = GetDlgItem(GetParent(s->pages[0]), IDC_SIDEBAR);
+    if (sidebar) InvalidateRect(sidebar, nullptr, TRUE);
+}
+
+// ── Sidebar HWND (owner-drawn) ────────────────────────────────────────────────
+static const wchar_t* SIDEBAR_ITEMS[] = {
+    L"Audio", L"Video & Sync", L"MIDI", L"Cache & Data", L"Extensions"
+};
+static const int ITEM_H = 40;
+
+static LRESULT CALLBACK SidebarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    SettingsDlgState* s = (SettingsDlgState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+
+        // Background
+        HBRUSH bgBrush = CreateSolidBrush(CLR_SIDEBAR_BG);
+        FillRect(hdc, &rc, bgBrush);
+        DeleteObject(bgBrush);
+
+        SetBkMode(hdc, TRANSPARENT);
+        HFONT oldFont = (HFONT)SelectObject(hdc, g_fontNormal);
+
+        for (int i = 0; i < PAGE_COUNT; i++) {
+            RECT itemRc = { 0, i * ITEM_H, rc.right, (i + 1) * ITEM_H };
+            bool selected = s && (s->currentPage == i);
+            bool hot      = s && (s->hotItem     == i);
+
+            if (selected) {
+                HBRUSH selBrush = CreateSolidBrush(CLR_SIDEBAR_SEL);
+                FillRect(hdc, &itemRc, selBrush);
+                DeleteObject(selBrush);
+                SetTextColor(hdc, CLR_SIDEBAR_STXT);
+            } else if (hot) {
+                HBRUSH hotBrush = CreateSolidBrush(CLR_SIDEBAR_HOT);
+                FillRect(hdc, &itemRc, hotBrush);
+                DeleteObject(hotBrush);
+                SetTextColor(hdc, CLR_SIDEBAR_TXT);
+            } else {
+                SetTextColor(hdc, CLR_SIDEBAR_TXT);
+            }
+
+            RECT textRc = { itemRc.left + 16, itemRc.top, itemRc.right - 8, itemRc.bottom };
+            DrawTextW(hdc, SIDEBAR_ITEMS[i], -1, &textRc, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        }
+
+        // Right border
+        HPEN pen = CreatePen(PS_SOLID, 1, CLR_DIVIDER);
+        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+        MoveToEx(hdc, rc.right - 1, 0, nullptr);
+        LineTo(hdc, rc.right - 1, rc.bottom);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+
+        SelectObject(hdc, oldFont);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        int y = HIWORD(lParam);
+        int item = y / ITEM_H;
+        if (item < 0 || item >= PAGE_COUNT) item = -1;
+        if (s && s->hotItem != item) {
+            s->hotItem = item;
+            InvalidateRect(hwnd, nullptr, TRUE);
+            // Track mouse leave
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE: {
+        if (s) { s->hotItem = -1; InvalidateRect(hwnd, nullptr, TRUE); }
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        int y = HIWORD(lParam);
+        int item = y / ITEM_H;
+        if (item >= 0 && item < PAGE_COUNT && s)
+            ShowPage(s, item);
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        return 1; // handled in WM_PAINT
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ── Page builders ─────────────────────────────────────────────────────────────
+
+static HWND BuildAudioPage(HWND parent, SettingsDlgState* s) {
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+    const FSTPSettings* settings = GetSettings();
+    int pw = DLG_W - SIDEBAR_W - 1;
+    int ph = DLG_H - FOOTER_H;
+
+    HWND page = CreateWindowExW(0, L"TXP_SettingsPage", L"",
+        WS_CHILD | WS_CLIPCHILDREN,
+        SIDEBAR_W + 1, 0, pw, ph, parent, nullptr, hInst, nullptr);
+
+    int x = 20, y = 20;
+    int cw = pw - 40; // content width
+
+    // Audio Device
+    y = AddSectionHeader(page, hInst, L"Audio Device", x, y, cw);
+    s->hAudioDevice = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+        x, y, cw, 200, page, (HMENU)IDC_AUDIO_DEVICE, hInst, nullptr);
+    SendMessageW(s->hAudioDevice, CB_ADDSTRING, 0, (LPARAM)L"Default Audio Device");
+    if (settings) {
+        int cnt = Pa_GetDeviceCount();
+        for (int i = 0; i < cnt; i++) {
+            const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
+            if (di && di->maxOutputChannels > 0)
+                SendMessageW(s->hAudioDevice, CB_ADDSTRING, 0, (LPARAM)Utf8ToWide(di->name).c_str());
+        }
+        SendMessage(s->hAudioDevice, CB_SETCURSEL, settings->audio_device_index + 1, 0);
+    }
+    y += 30;
+
+    // Volume
+    y += 10;
+    // Row: label left, value right
+    HWND hVolTitle = CreateWindowExW(0, L"STATIC", L"Volume",
+        WS_CHILD | WS_VISIBLE, x, y, cw / 2, 18, page, nullptr, hInst, nullptr);
+    SendMessage(hVolTitle, WM_SETFONT, (WPARAM)g_fontBold, FALSE);
+
+    wchar_t vol_buf[32] = L"100%";
+    if (settings) swprintf(vol_buf, 32, L"%d%%", (int)(settings->audio_master_volume * 100));
+    s->hVolumeLabel = CreateWindowExW(0, L"STATIC", vol_buf,
+        WS_CHILD | WS_VISIBLE | SS_RIGHT,
+        x + cw / 2, y, cw / 2, 18, page, (HMENU)IDC_VOLUME_LABEL, hInst, nullptr);
+    SendMessage(s->hVolumeLabel, WM_SETFONT, (WPARAM)g_fontNormal, FALSE);
+    y += 22;
+
+    s->hVolumeSlider = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+        WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS | TBS_BOTH,
+        x, y, cw, 28, page, (HMENU)IDC_VOLUME_SLIDER, hInst, nullptr);
+    SendMessage(s->hVolumeSlider, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
+    if (settings) SendMessage(s->hVolumeSlider, TBM_SETPOS, TRUE, (int)(settings->audio_master_volume * 100));
+    y += 32;
+
+    s->hDuckingCheck = CreateWindowExW(0, L"BUTTON", L"Auto-Reduce Volume at High Speeds",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        x, y, cw, 20, page, (HMENU)IDC_DUCKING_CHECK, hInst, nullptr);
+    if (settings && settings->audio_volume_ducking_enabled)
+        SendMessage(s->hDuckingCheck, BM_SETCHECK, BST_CHECKED, 0);
+    y += 22;
+
+    y = AddHint(page, hInst, L"Protects your ears during shuttle (6×: fade, 12×: \u221224 dB, 32×: \u221240 dB)", x + CHECKBOX_INDENT, y, cw - CHECKBOX_INDENT);
+
+    // Buffer size
+    y += 6;
+    y = AddSectionHeader(page, hInst, L"Audio Buffer", x, y, cw);
+    s->hBufferCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+        x, y, 180, 120, page, (HMENU)IDC_BUFFER_COMBO, hInst, nullptr);
+    SendMessageW(s->hBufferCombo, CB_ADDSTRING, 0, (LPARAM)L"512 samples");
+    SendMessageW(s->hBufferCombo, CB_ADDSTRING, 0, (LPARAM)L"1024 samples");
+    SendMessageW(s->hBufferCombo, CB_ADDSTRING, 0, (LPARAM)L"2048 samples");
+    SendMessageW(s->hBufferCombo, CB_ADDSTRING, 0, (LPARAM)L"4096 samples");
+    if (settings) {
+        int idx = 1;
+        if (settings->audio_buffer_size == 512)  idx = 0;
+        if (settings->audio_buffer_size == 2048) idx = 2;
+        if (settings->audio_buffer_size == 4096) idx = 3;
+        SendMessage(s->hBufferCombo, CB_SETCURSEL, idx, 0);
+    }
+    y += 30;
+    AddHint(page, hInst, L"Requires application restart to take effect.", x, y, cw);
+    y += 36;
+
+    ApplyFontToChildren(page, g_fontNormal);
+    SetupPageScroll(page, y);
+    return page;
+}
+
+static HWND BuildVideoPage(HWND parent, SettingsDlgState* s) {
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+    const FSTPSettings* settings = GetSettings();
+    int pw = DLG_W - SIDEBAR_W - 1;
+    int ph = DLG_H - FOOTER_H;
+
+    HWND page = CreateWindowExW(0, L"TXP_SettingsPage", L"",
+        WS_CHILD | WS_CLIPCHILDREN,
+        SIDEBAR_W + 1, 0, pw, ph, parent, nullptr, hInst, nullptr);
+
+    int x = 20, y = 20;
+    int cw = pw - 40;
+
+    // Display Synchronization
+    y = AddSectionHeader(page, hInst, L"Display Synchronization", x, y, cw);
+
+    CreateWindowExW(0, L"STATIC", L"Frame Offset:",
+        WS_CHILD | WS_VISIBLE, x, y + 3, 110, 20, page, nullptr, hInst, nullptr);
+
+    wchar_t offset_buf[16] = L"0";
+    if (settings) swprintf(offset_buf, 16, L"%d", settings->frame_offset);
+    s->hFrameOffset = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", offset_buf,
+        WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_CENTER,
+        x + 118, y, 60, 24, page, (HMENU)IDC_FRAME_OFFSET, hInst, nullptr);
+
+    CreateWindowExW(0, L"STATIC", L"frames  (\u221210 to +10)",
+        WS_CHILD | WS_VISIBLE, x + 186, y + 3, 180, 20, page, nullptr, hInst, nullptr);
+    y += 34;
+    y = AddHint(page, hInst, L"Compensate for display lag or sync offset between audio and video.", x, y, cw);
+
+    // Multi-Instance Performance
+    y += 6;
+    y = AddSectionHeader(page, hInst, L"Multi-Instance Performance", x, y, cw);
+    s->hFreezeCheck = CreateWindowExW(0, L"BUTTON", L"Auto-freeze inactive players",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        x, y, cw, 20, page, (HMENU)IDC_FREEZE_CHECK, hInst, nullptr);
+    if (settings && settings->auto_freeze_inactive)
+        SendMessage(s->hFreezeCheck, BM_SETCHECK, BST_CHECKED, 0);
+    y += 22;
+    y = AddHint(page, hInst, L"Prevents forgotten players from consuming resources in the background.", x + CHECKBOX_INDENT, y, cw - CHECKBOX_INDENT);
+
+    // Visual Effects
+    y += 6;
+    y = AddSectionHeader(page, hInst, L"Visual Effects", x, y, cw);
+    s->hBetacamCheck = CreateWindowExW(0, L"BUTTON", L"Enable Betacam tape artefact emulation",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        x, y, cw, 20, page, (HMENU)IDC_BETACAM_CHECK, hInst, nullptr);
+    if (settings && settings->betacam_effect_enabled)
+        SendMessage(s->hBetacamCheck, BM_SETCHECK, BST_CHECKED, 0);
+    y += 22;
+    y = AddHint(page, hInst, L"Adds rewind/fast-forward tape jitter. May impact performance.", x + CHECKBOX_INDENT, y, cw - CHECKBOX_INDENT);
+
+    // Developer / Debug
+    y += 6;
+    y = AddSectionHeader(page, hInst, L"Developer / Debug", x, y, cw);
+    s->hDecoderStatus = CreateWindowExW(0, L"BUTTON", L"Show Decoder Status",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        x, y, cw, 20, page, (HMENU)IDC_DECODER_STATUS, hInst, nullptr);
+    if (settings && settings->show_decoder_status)
+        SendMessage(s->hDecoderStatus, BM_SETCHECK, BST_CHECKED, 0);
+    y += 22;
+    y = AddHint(page, hInst, L"Displays decoded frames indicator. Useful for debugging decoder performance.", x + CHECKBOX_INDENT, y, cw - CHECKBOX_INDENT);
+
+    ApplyFontToChildren(page, g_fontNormal);
+    SetupPageScroll(page, y);
+    return page;
+}
+
+static HWND BuildMidiPage(HWND parent, SettingsDlgState* s) {
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+    const FSTPSettings* settings = GetSettings();
+    int pw = DLG_W - SIDEBAR_W - 1;
+    int ph = DLG_H - FOOTER_H;
+
+    HWND page = CreateWindowExW(0, L"TXP_SettingsPage", L"",
+        WS_CHILD | WS_CLIPCHILDREN,
+        SIDEBAR_W + 1, 0, pw, ph, parent, nullptr, hInst, nullptr);
+
+    int x = 20, y = 20;
+    int cw = pw - 40;
+
+    y = AddSectionHeader(page, hInst, L"MIDI Controller", x, y, cw);
+    s->hMidiEnable = CreateWindowExW(0, L"BUTTON", L"Enable MIDI Controller",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        x, y, cw, 20, page, (HMENU)IDC_MIDI_ENABLE, hInst, nullptr);
+    if (settings && settings->midi_enabled)
+        SendMessage(s->hMidiEnable, BM_SETCHECK, BST_CHECKED, 0);
+    y += 34;
+
+    y = AddSectionHeader(page, hInst, L"MIDI Ports", x, y, cw);
+
+    // Input
+    CreateWindowExW(0, L"STATIC", L"Input Port:",
+        WS_CHILD | WS_VISIBLE, x, y + 4, 90, 20, page, nullptr, hInst, nullptr);
+    s->hMidiInput = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+        x + 98, y, cw - 98, 200, page, (HMENU)IDC_MIDI_INPUT, hInst, nullptr);
+    SendMessageW(s->hMidiInput, CB_ADDSTRING, 0, (LPARAM)L"(None)");
+    int mic = GetMIDIInputDeviceCount();
+    for (int i = 0; i < mic; i++) {
+        const char* n = GetMIDIInputDeviceName(i);
+        if (n) SendMessageW(s->hMidiInput, CB_ADDSTRING, 0, (LPARAM)Utf8ToWide(n).c_str());
+    }
+    if (settings) SendMessage(s->hMidiInput, CB_SETCURSEL, settings->midi_input_port + 1, 0);
+    bool midiOn = settings && settings->midi_enabled;
+    EnableWindow(s->hMidiInput, midiOn);
+    y += 34;
+
+    // Output
+    CreateWindowExW(0, L"STATIC", L"Output Port:",
+        WS_CHILD | WS_VISIBLE, x, y + 4, 90, 20, page, nullptr, hInst, nullptr);
+    s->hMidiOutput = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+        x + 98, y, cw - 98, 200, page, (HMENU)IDC_MIDI_OUTPUT, hInst, nullptr);
+    SendMessageW(s->hMidiOutput, CB_ADDSTRING, 0, (LPARAM)L"(None)");
+    int moc = GetMIDIOutputDeviceCount();
+    for (int i = 0; i < moc; i++) {
+        const char* n = GetMIDIOutputDeviceName(i);
+        if (n) SendMessageW(s->hMidiOutput, CB_ADDSTRING, 0, (LPARAM)Utf8ToWide(n).c_str());
+    }
+    if (settings) SendMessage(s->hMidiOutput, CB_SETCURSEL, settings->midi_output_port + 1, 0);
+    EnableWindow(s->hMidiOutput, midiOn);
+    y += 34;
+
+    y = AddHint(page, hInst, L"Protocol: Mackie Control. Controller support is in development.", x, y, cw);
+
+    ApplyFontToChildren(page, g_fontNormal);
+    SetupPageScroll(page, y);
+    return page;
+}
+
+static HWND BuildCachePage(HWND parent, SettingsDlgState* s) {
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+    int pw = DLG_W - SIDEBAR_W - 1;
+    int ph = DLG_H - FOOTER_H;
+
+    HWND page = CreateWindowExW(0, L"TXP_SettingsPage", L"",
+        WS_CHILD | WS_CLIPCHILDREN,
+        SIDEBAR_W + 1, 0, pw, ph, parent, nullptr, hInst, nullptr);
+
+    int x = 20, y = 20;
+    int cw = pw - 40;
+
+    // Proxy cache
+    y = AddSectionHeader(page, hInst, L"Proxy Video Cache", x, y, cw);
+
+    const char* proxy_path = FSTP_GetProxyCachePath();
+    int proxy_size  = FSTP_GetProxyCacheSize();
+    int proxy_count = FSTP_GetProxyFilesCount();
+
+    wchar_t proxy_info[512];
+    swprintf(proxy_info, 512, L"Location: %ls\nSize: %d MB  \u2022  %d files",
+             Utf8ToWide(proxy_path ? proxy_path : "Unknown").c_str(), proxy_size, proxy_count);
+    s->hProxyInfo = CreateWindowExW(0, L"STATIC", proxy_info,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        x, y, cw, 36, page, (HMENU)IDC_PROXY_INFO, hInst, nullptr);
+    y += 42;
+
+    s->hClearProxy = CreateWindowExW(0, L"BUTTON", L"Clear Proxy Cache\u2026",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        x, y, 180, 28, page, (HMENU)IDC_CLEAR_PROXY, hInst, nullptr);
+    EnableWindow(s->hClearProxy, proxy_count > 0);
+    y += 44;
+
+    // Memory Locations
+    y = AddSectionHeader(page, hInst, L"Memory Locations", x, y, cw);
+
+    const char* mem_path  = FSTP_GetMemoryLocationsCachePath();
+    int mem_count = FSTP_GetMemoryLocationsFilesCount();
+
+    wchar_t mem_info[512];
+    swprintf(mem_info, 512, L"Location: %ls/memory_locations\nSaved data for %d video files",
+             Utf8ToWide(mem_path ? mem_path : "Unknown").c_str(), mem_count);
+    s->hMemoryInfo = CreateWindowExW(0, L"STATIC", mem_info,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        x, y, cw, 36, page, (HMENU)IDC_MEMORY_INFO, hInst, nullptr);
+    y += 42;
+
+    s->hClearMemory = CreateWindowExW(0, L"BUTTON", L"Clear Memory Locations\u2026",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        x, y, 200, 28, page, (HMENU)IDC_CLEAR_MEMORY, hInst, nullptr);
+    EnableWindow(s->hClearMemory, mem_count > 0);
+    y += 34;
+
+    y = AddHint(page, hInst, L"Memory Locations are saved per-video, like browser bookmarks.", x, y, cw);
+
+    ApplyFontToChildren(page, g_fontNormal);
+    SetupPageScroll(page, y);
+    return page;
+}
+
+static HWND BuildExtensionsPage(HWND parent, SettingsDlgState* s) {
+    HINSTANCE hInst = GetModuleHandle(nullptr);
+    const FSTPSettings* settings = GetSettings();
+    int pw = DLG_W - SIDEBAR_W - 1;
+    int ph = DLG_H - FOOTER_H;
+
+    HWND page = CreateWindowExW(0, L"TXP_SettingsPage", L"",
+        WS_CHILD | WS_CLIPCHILDREN,
+        SIDEBAR_W + 1, 0, pw, ph, parent, nullptr, hInst, nullptr);
+
+    int x = 20, y = 20;
+    int cw = pw - 40;
+
+    y = AddSectionHeader(page, hInst, L"Extensions", x, y, cw);
+
+    bool yt_avail = FSTP_YTDLP_IsAvailable();
+    if (yt_avail) {
+        s->hYtdlpCheck = CreateWindowExW(0, L"BUTTON", L"Enable yt-dlp network downloader",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+            x, y, cw, 20, page, (HMENU)IDC_YTDLP_CHECK, hInst, nullptr);
+        if (settings && settings->yt_dlp_extension_enabled)
+            SendMessage(s->hYtdlpCheck, BM_SETCHECK, BST_CHECKED, 0);
         y += 22;
+        y = AddHint(page, hInst, L"Enables opening network streams via yt-dlp.", x + CHECKBOX_INDENT, y, cw - CHECKBOX_INDENT);
+    } else {
+        AddHint(page, hInst, L"yt-dlp not found. Install it to enable network downloads.", x, y, cw);
+        y += 36;
+    }
 
-        h = CreateWindowExW(0, L"COMBOBOX", L"",
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            x, y, 400, 200, hwnd, (HMENU)IDC_AUDIO_DEVICE, hInst, NULL);
-        SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)L"Default Audio Device");
-        int device_count = Pa_GetDeviceCount();
-        for (int i = 0; i < device_count; i++) {
-            const PaDeviceInfo* dev_info = Pa_GetDeviceInfo(i);
-            if (dev_info && dev_info->maxOutputChannels > 0) {
-                std::wstring name = Utf8ToWide(dev_info->name);
-                SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)name.c_str());
+    y += 10;
+    std::string ext_lang = GetExtensionLanguage();
+    std::wstring ext_desc = L"Extensions are scripted using " +
+        Utf8ToWide(ext_lang.c_str()) +
+        L" (.lua) files. Extension management tools will appear here as the system evolves.";
+    y = AddHint(page, hInst, ext_desc.c_str(), x, y, cw);
+
+    ApplyFontToChildren(page, g_fontNormal);
+    SetupPageScroll(page, y);
+    return page;
+}
+
+// ── Save settings from controls ───────────────────────────────────────────────
+static void CollectAndSave(SettingsDlgState* s) {
+    FSTPSettings* settings = GetSettings();
+    if (!settings) return;
+
+    // Audio
+    if (s->hAudioDevice)
+        settings->audio_device_index = (int)SendMessage(s->hAudioDevice, CB_GETCURSEL, 0, 0) - 1;
+    if (s->hVolumeSlider)
+        settings->audio_master_volume = (float)SendMessage(s->hVolumeSlider, TBM_GETPOS, 0, 0) / 100.0f;
+    if (s->hDuckingCheck)
+        settings->audio_volume_ducking_enabled = (IsDlgButtonChecked(GetParent(s->hDuckingCheck), IDC_DUCKING_CHECK) == BST_CHECKED) ? 1 : 0;
+    if (s->hBufferCombo) {
+        static const int buf_sizes[] = { 512, 1024, 2048, 4096 };
+        int idx = (int)SendMessage(s->hBufferCombo, CB_GETCURSEL, 0, 0);
+        if (idx >= 0 && idx < 4) settings->audio_buffer_size = buf_sizes[idx];
+    }
+
+    // Video
+    if (s->hFrameOffset) {
+        BOOL ok;
+        int v = GetDlgItemInt(GetParent(s->hFrameOffset), IDC_FRAME_OFFSET, &ok, TRUE);
+        if (ok) settings->frame_offset = std::max(-10, std::min(10, v));
+    }
+    if (s->hFreezeCheck)
+        settings->auto_freeze_inactive = (SendMessage(s->hFreezeCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+    if (s->hBetacamCheck) {
+        settings->betacam_effect_enabled = (SendMessage(s->hBetacamCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+        SetBetacamEffectEnabled(settings->betacam_effect_enabled);
+    }
+    if (s->hDecoderStatus)
+        settings->show_decoder_status = (SendMessage(s->hDecoderStatus, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+
+    // MIDI
+    if (s->hMidiEnable)
+        settings->midi_enabled = (SendMessage(s->hMidiEnable, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+    if (s->hMidiInput)
+        settings->midi_input_port = (int)SendMessage(s->hMidiInput, CB_GETCURSEL, 0, 0) - 1;
+    if (s->hMidiOutput)
+        settings->midi_output_port = (int)SendMessage(s->hMidiOutput, CB_GETCURSEL, 0, 0) - 1;
+
+    // Extensions
+    if (s->hYtdlpCheck) {
+        settings->yt_dlp_extension_enabled = (SendMessage(s->hYtdlpCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+        SetYTDLPExtensionEnabled(settings->yt_dlp_extension_enabled);
+    }
+
+    SaveSettings();
+    ApplyAudioSettings();
+    ApplyMIDISettings();
+}
+
+// ── Main dialog window proc ───────────────────────────────────────────────────
+static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    SettingsDlgState* s = (SettingsDlgState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+
+    case WM_CREATE: {
+        HINSTANCE hInst = GetModuleHandle(nullptr);
+        s = new SettingsDlgState();
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)s);
+        g_hintIdCounter = IDC_HINT_BASE; // reset per dialog open
+
+        // ── Register helper window classes (once) ────────────────────────────
+        RegisterPageClass(hInst);
+
+        // ── Register sidebar window class (once) ─────────────────────────────
+        static bool sidebarRegistered = false;
+        if (!sidebarRegistered) {
+            WNDCLASSEXW wc = {};
+            wc.cbSize        = sizeof(wc);
+            wc.style         = CS_HREDRAW | CS_VREDRAW;
+            wc.lpfnWndProc   = SidebarProc;
+            wc.hInstance     = hInst;
+            wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+            wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+            wc.lpszClassName = L"TXP_Sidebar";
+            RegisterClassExW(&wc);
+            sidebarRegistered = true;
+        }
+
+        // ── Sidebar ──────────────────────────────────────────────────────────
+        HWND sidebar = CreateWindowExW(0, L"TXP_Sidebar", L"",
+            WS_CHILD | WS_VISIBLE,
+            0, 0, SIDEBAR_W, DLG_H - FOOTER_H, hwnd, (HMENU)IDC_SIDEBAR, hInst, nullptr);
+        SetWindowLongPtrW(sidebar, GWLP_USERDATA, (LONG_PTR)s);
+
+        // ── Content pages ────────────────────────────────────────────────────
+        s->pages[0] = BuildAudioPage(hwnd, s);
+        s->pages[1] = BuildVideoPage(hwnd, s);
+        s->pages[2] = BuildMidiPage(hwnd, s);
+        s->pages[3] = BuildCachePage(hwnd, s);
+        s->pages[4] = BuildExtensionsPage(hwnd, s);
+        ShowPage(s, 0); // show Audio by default
+
+        // ── Footer separator ─────────────────────────────────────────────────
+        CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+            0, DLG_H - FOOTER_H, DLG_W, 2, hwnd, nullptr, hInst, nullptr);
+
+        // ── Footer buttons ───────────────────────────────────────────────────
+        int by = DLG_H - FOOTER_H + 12;
+        CreateWindowExW(0, L"BUTTON", L"Reset to Defaults",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            12, by, 150, 28, hwnd, (HMENU)IDC_BTN_RESET, hInst, nullptr);
+
+        CreateWindowExW(0, L"BUTTON", L"Cancel",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            DLG_W - 194, by, 88, 28, hwnd, (HMENU)IDCANCEL, hInst, nullptr);
+
+        CreateWindowExW(0, L"BUTTON", L"OK",
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            DLG_W - 98, by, 86, 28, hwnd, (HMENU)IDOK, hInst, nullptr);
+
+        // Apply fonts everywhere
+        ApplyFontToChildren(hwnd, g_fontNormal);
+
+        return 0;
+    }
+
+    case WM_COMMAND: {
+        int id   = LOWORD(wParam);
+        int code = HIWORD(wParam);
+
+        if (id == IDOK) {
+            CollectAndSave(s);
+            DestroyWindow(hwnd);
+        }
+        else if (id == IDCANCEL) {
+            DestroyWindow(hwnd);
+        }
+        else if (id == IDC_BTN_RESET) {
+            int r = MessageBoxW(hwnd, L"Reset all settings to defaults?",
+                                L"Reset to Defaults", MB_YESNO | MB_ICONQUESTION);
+            if (r == IDYES) {
+                ResetSettingsToDefault();
+                // Re-open with fresh state
+                DestroyWindow(hwnd);
+                // ShowWin32SettingsDialog() will re-open it from the destroy path
+                // but g_dialog_open will be false by then — caller can re-open.
             }
         }
-        SendMessage(h, CB_SETCURSEL, settings->audio_device_index + 1, 0);
-        y += 35;
-
-        wchar_t vol_buf[32];
-        swprintf(vol_buf, 32, L"Volume: %d%%", (int)(settings->audio_master_volume * 100));
-        h = CreateWindowExW(0, L"STATIC", vol_buf,
-            WS_CHILD | WS_VISIBLE, x, y, 100, 20,
-            hwnd, (HMENU)IDC_VOLUME_LABEL, hInst, NULL);
-        y += 20;
-
-        h = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
-            x, y, 400, 28, hwnd, (HMENU)IDC_VOLUME_SLIDER, hInst, NULL);
-        SendMessage(h, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
-        SendMessage(h, TBM_SETPOS, TRUE, (int)(settings->audio_master_volume * 100));
-        SendMessage(h, TBM_SETTICFREQ, 10, 0);
-        y += 30;
-
-        h = CreateWindowExW(0, L"BUTTON", L"Auto-Reduce Volume at High Speeds",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            x, y, 350, 20, hwnd, (HMENU)IDC_DUCKING_CHECK, hInst, NULL);
-        if (settings->audio_volume_ducking_enabled)
-            SendMessage(h, BM_SETCHECK, BST_CHECKED, 0);
-        y += 22;
-
-        h = CreateWindowExW(0, L"STATIC",
-            L"Protects ears during shuttle (6x: fade, 12x: -24dB, 32x: -40dB)",
-            WS_CHILD | WS_VISIBLE, x + 16, y, 500, 16, hwnd, NULL, hInst, NULL);
-        y += 25;
-
-        h = CreateWindowExW(0, L"STATIC", L"Buffer Size:",
-            WS_CHILD | WS_VISIBLE, x, y, 80, 20, hwnd, NULL, hInst, NULL);
-
-        h = CreateWindowExW(0, L"COMBOBOX", L"",
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-            x + 80, y - 2, 130, 120, hwnd, (HMENU)IDC_BUFFER_COMBO, hInst, NULL);
-        SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)L"512 samples");
-        SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)L"1024 samples");
-        SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)L"2048 samples");
-        SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)L"4096 samples");
-        int buffer_index = 1;
-        if (settings->audio_buffer_size == 512) buffer_index = 0;
-        else if (settings->audio_buffer_size == 1024) buffer_index = 1;
-        else if (settings->audio_buffer_size == 2048) buffer_index = 2;
-        else if (settings->audio_buffer_size == 4096) buffer_index = 3;
-        SendMessage(h, CB_SETCURSEL, buffer_index, 0);
-
-        h = CreateWindowExW(0, L"STATIC", L"(requires restart)",
-            WS_CHILD | WS_VISIBLE, x + 215, y + 2, 180, 16, hwnd, NULL, hInst, NULL);
-
-        ApplyDialogFont(hwnd);
-        return TRUE;
+        else if (id == IDC_MIDI_ENABLE && code == BN_CLICKED && s) {
+            // Enable/disable MIDI port combos live
+            BOOL on = (SendMessage(s->hMidiEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            if (s->hMidiInput)  EnableWindow(s->hMidiInput,  on);
+            if (s->hMidiOutput) EnableWindow(s->hMidiOutput, on);
+        }
+        else if (id == IDC_VOLUME_SLIDER && code == TB_THUMBTRACK) {
+            // Trackbar sends WM_HSCROLL, not WM_COMMAND — handled below
+        }
+        else if (id == IDC_CLEAR_PROXY && code == BN_CLICKED) {
+            if (MessageBoxW(hwnd, L"Clear all proxy cache files?",
+                            L"Clear Proxy Cache", MB_YESNO | MB_ICONWARNING) == IDYES) {
+                FSTP_ClearProxyCache(false);
+                if (s->hClearProxy) EnableWindow(s->hClearProxy, FALSE);
+                if (s->hProxyInfo)  SetWindowTextW(s->hProxyInfo, L"Cache cleared.");
+            }
+        }
+        else if (id == IDC_CLEAR_MEMORY && code == BN_CLICKED) {
+            if (MessageBoxW(hwnd, L"Clear all Memory Locations? This cannot be undone.",
+                            L"Clear Memory Locations", MB_YESNO | MB_ICONWARNING) == IDYES) {
+                FSTP_ClearAllMemoryLocations();
+                if (s->hClearMemory) EnableWindow(s->hClearMemory, FALSE);
+                if (s->hMemoryInfo)  SetWindowTextW(s->hMemoryInfo, L"Memory Locations cleared.");
+            }
+        }
+        return 0;
     }
 
     case WM_HSCROLL: {
-        HWND hSlider = (HWND)lParam;
-        if (GetDlgCtrlID(hSlider) == IDC_VOLUME_SLIDER) {
-            int pos = (int)SendMessage(hSlider, TBM_GETPOS, 0, 0);
-            wchar_t buf[32];
-            swprintf(buf, 32, L"Volume: %d%%", pos);
-            SetWindowTextW(GetDlgItem(hwnd, IDC_VOLUME_LABEL), buf);
+        // Volume slider
+        if (s && s->hVolumeSlider && (HWND)lParam == s->hVolumeSlider) {
+            int pos = (int)SendMessage(s->hVolumeSlider, TBM_GETPOS, 0, 0);
+            wchar_t buf[16];
+            swprintf(buf, 16, L"%d%%", pos);
+            if (s->hVolumeLabel) SetWindowTextW(s->hVolumeLabel, buf);
         }
-        return TRUE;
+        return 0;
     }
 
-    case WM_NOTIFY: {
-        NMHDR* pnmh = (NMHDR*)lParam;
-        if (pnmh->code == PSN_APPLY) {
-            FSTPSettings* settings = GetSettings();
-            if (settings) {
-                int device_sel = (int)SendDlgItemMessage(hwnd, IDC_AUDIO_DEVICE, CB_GETCURSEL, 0, 0);
-                settings->audio_device_index = device_sel - 1;
+    case WM_ERASEBKGND: {
+        // Paint main window background (footer area)
+        HDC hdc = (HDC)wParam;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, (HBRUSH)GetStockObject(WHITE_BRUSH));
+        return 1;
+    }
 
-                int vol_pos = (int)SendDlgItemMessage(hwnd, IDC_VOLUME_SLIDER, TBM_GETPOS, 0, 0);
-                settings->audio_master_volume = vol_pos / 100.0f;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) DestroyWindow(hwnd);
+        return 0;
 
-                settings->audio_volume_ducking_enabled =
-                    (IsDlgButtonChecked(hwnd, IDC_DUCKING_CHECK) == BST_CHECKED) ? 1 : 0;
-
-                int buffer_sizes[] = {512, 1024, 2048, 4096};
-                int buf_sel = (int)SendDlgItemMessage(hwnd, IDC_BUFFER_COMBO, CB_GETCURSEL, 0, 0);
-                if (buf_sel >= 0 && buf_sel < 4)
-                    settings->audio_buffer_size = buffer_sizes[buf_sel];
-            }
-            SetWindowLongPtr(hwnd, DWLP_MSGRESULT, PSNRET_NOERROR);
-            return TRUE;
-        }
-        break;
+    case WM_DESTROY: {
+        g_dialog_open = false;
+        if (s) { delete s; }
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        PostQuitMessage(0);
+        return 0;
     }
     }
-    return FALSE;
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-// ===== PAGE 1: Video & Sync =====
-static INT_PTR CALLBACK VideoPageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_INITDIALOG: {
-        EnableThemeDialogTexture(hwnd, ETDT_ENABLETAB);
-        const FSTPSettings* settings = GetSettings();
-        if (!settings) return TRUE;
-        int x = 10, y = 10;
-        HWND h;
-        HINSTANCE hInst = GetModuleHandle(NULL);
-
-        h = CreateWindowExW(0, L"STATIC", L"Display Synchronization",
-            WS_CHILD | WS_VISIBLE, x, y, 200, 20, hwnd, NULL, hInst, NULL);
-        y += 25;
-
-        h = CreateWindowExW(0, L"STATIC", L"Frame Offset:",
-            WS_CHILD | WS_VISIBLE, x, y, 100, 20, hwnd, NULL, hInst, NULL);
-
-        wchar_t offset_buf[16];
-        swprintf(offset_buf, 16, L"%d", settings->frame_offset);
-        h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", offset_buf,
-            WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_CENTER,
-            x + 110, y, 60, 22, hwnd, (HMENU)IDC_FRAME_OFFSET, hInst, NULL);
-
-        h = CreateWindowExW(0, L"STATIC", L"frames (-10 to +10)",
-            WS_CHILD | WS_VISIBLE, x + 180, y, 200, 20, hwnd, NULL, hInst, NULL);
-        y += 35;
-
-        h = CreateWindowExW(0, L"STATIC", L"Multi-Instance Performance",
-            WS_CHILD | WS_VISIBLE, x, y, 250, 20, hwnd, NULL, hInst, NULL);
-        y += 25;
-
-        h = CreateWindowExW(0, L"BUTTON", L"Auto-freeze inactive players",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            x, y, 300, 20, hwnd, (HMENU)IDC_FREEZE_CHECK, hInst, NULL);
-        if (settings->auto_freeze_inactive)
-            SendMessage(h, BM_SETCHECK, BST_CHECKED, 0);
-        y += 22;
-
-        h = CreateWindowExW(0, L"STATIC",
-            L"Prevents forgotten players from consuming resources",
-            WS_CHILD | WS_VISIBLE, x + 16, y, 500, 16, hwnd, NULL, hInst, NULL);
-        y += 35;
-
-        h = CreateWindowExW(0, L"STATIC", L"Visual Effects",
-            WS_CHILD | WS_VISIBLE, x, y, 200, 20, hwnd, NULL, hInst, NULL);
-        y += 25;
-
-        h = CreateWindowExW(0, L"BUTTON", L"Enable Betacam tape artefact emulation",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            x, y, 350, 20, hwnd, (HMENU)IDC_BETACAM_CHECK, hInst, NULL);
-        if (settings->betacam_effect_enabled)
-            SendMessage(h, BM_SETCHECK, BST_CHECKED, 0);
-        y += 22;
-
-        h = CreateWindowExW(0, L"STATIC",
-            L"Adds rewind/fast-forward tape jitter. May impact performance.",
-            WS_CHILD | WS_VISIBLE, x + 16, y, 500, 16, hwnd, NULL, hInst, NULL);
-        y += 35;
-
-        h = CreateWindowExW(0, L"STATIC", L"Developer/Debug",
-            WS_CHILD | WS_VISIBLE, x, y, 200, 20, hwnd, NULL, hInst, NULL);
-        y += 25;
-
-        h = CreateWindowExW(0, L"BUTTON", L"Show Decoder Status",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            x, y, 300, 20, hwnd, (HMENU)IDC_DECODER_STATUS, hInst, NULL);
-        if (settings->show_decoder_status)
-            SendMessage(h, BM_SETCHECK, BST_CHECKED, 0);
-        y += 22;
-
-        h = CreateWindowExW(0, L"STATIC",
-            L"Displays decoded frames indicator for debugging performance.",
-            WS_CHILD | WS_VISIBLE, x + 16, y, 500, 16, hwnd, NULL, hInst, NULL);
-
-        ApplyDialogFont(hwnd);
-        return TRUE;
-    }
-
-    case WM_NOTIFY: {
-        NMHDR* pnmh = (NMHDR*)lParam;
-        if (pnmh->code == PSN_APPLY) {
-            FSTPSettings* settings = GetSettings();
-            if (settings) {
-                BOOL success;
-                int offset = GetDlgItemInt(hwnd, IDC_FRAME_OFFSET, &success, TRUE);
-                if (success) {
-                    if (offset < -10) offset = -10;
-                    if (offset > 10) offset = 10;
-                    settings->frame_offset = offset;
-                }
-
-                settings->auto_freeze_inactive =
-                    (IsDlgButtonChecked(hwnd, IDC_FREEZE_CHECK) == BST_CHECKED) ? 1 : 0;
-
-                settings->betacam_effect_enabled =
-                    (IsDlgButtonChecked(hwnd, IDC_BETACAM_CHECK) == BST_CHECKED) ? 1 : 0;
-                SetBetacamEffectEnabled(settings->betacam_effect_enabled);
-
-                settings->show_decoder_status =
-                    (IsDlgButtonChecked(hwnd, IDC_DECODER_STATUS) == BST_CHECKED) ? 1 : 0;
-            }
-            SetWindowLongPtr(hwnd, DWLP_MSGRESULT, PSNRET_NOERROR);
-            return TRUE;
-        }
-        break;
-    }
-    }
-    return FALSE;
-}
-
-// ===== PAGE 2: MIDI =====
-static INT_PTR CALLBACK MIDIPageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_INITDIALOG: {
-        EnableThemeDialogTexture(hwnd, ETDT_ENABLETAB);
-        const FSTPSettings* settings = GetSettings();
-        if (!settings) return TRUE;
-        int x = 10, y = 10;
-        HWND h;
-        HINSTANCE hInst = GetModuleHandle(NULL);
-
-        h = CreateWindowExW(0, L"STATIC", L"MIDI Controller",
-            WS_CHILD | WS_VISIBLE, x, y, 200, 20, hwnd, NULL, hInst, NULL);
-        y += 25;
-
-        h = CreateWindowExW(0, L"BUTTON", L"Enable MIDI Controller",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            x, y, 250, 20, hwnd, (HMENU)IDC_MIDI_ENABLE, hInst, NULL);
-        if (settings->midi_enabled)
-            SendMessage(h, BM_SETCHECK, BST_CHECKED, 0);
-        y += 35;
-
-        h = CreateWindowExW(0, L"STATIC", L"MIDI Ports",
-            WS_CHILD | WS_VISIBLE, x, y, 200, 20, hwnd, NULL, hInst, NULL);
-        y += 25;
-
-        h = CreateWindowExW(0, L"STATIC", L"Input Port:",
-            WS_CHILD | WS_VISIBLE, x, y, 80, 20, hwnd, NULL, hInst, NULL);
-
-        h = CreateWindowExW(0, L"COMBOBOX", L"",
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            x + 90, y, 350, 200, hwnd, (HMENU)IDC_MIDI_INPUT, hInst, NULL);
-        SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)L"(None)");
-        int midi_input_count = GetMIDIInputDeviceCount();
-        for (int i = 0; i < midi_input_count; i++) {
-            const char* name = GetMIDIInputDeviceName(i);
-            if (name) {
-                std::wstring wname = Utf8ToWide(name);
-                SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)wname.c_str());
-            }
-        }
-        SendMessage(h, CB_SETCURSEL, settings->midi_input_port + 1, 0);
-        EnableWindow(h, settings->midi_enabled);
-        y += 30;
-
-        h = CreateWindowExW(0, L"STATIC", L"Output Port:",
-            WS_CHILD | WS_VISIBLE, x, y, 80, 20, hwnd, NULL, hInst, NULL);
-
-        h = CreateWindowExW(0, L"COMBOBOX", L"",
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-            x + 90, y, 350, 200, hwnd, (HMENU)IDC_MIDI_OUTPUT, hInst, NULL);
-        SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)L"(None)");
-        int midi_output_count = GetMIDIOutputDeviceCount();
-        for (int i = 0; i < midi_output_count; i++) {
-            const char* name = GetMIDIOutputDeviceName(i);
-            if (name) {
-                std::wstring wname = Utf8ToWide(name);
-                SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)wname.c_str());
-            }
-        }
-        SendMessage(h, CB_SETCURSEL, settings->midi_output_port + 1, 0);
-        EnableWindow(h, settings->midi_enabled);
-        y += 35;
-
-        h = CreateWindowExW(0, L"STATIC", L"Protocol: Mackie Control",
-            WS_CHILD | WS_VISIBLE, x, y, 250, 20, hwnd, NULL, hInst, NULL);
-        y += 22;
-
-        h = CreateWindowExW(0, L"STATIC", L"Controller support is in development",
-            WS_CHILD | WS_VISIBLE, x, y, 350, 16, hwnd, NULL, hInst, NULL);
-
-        ApplyDialogFont(hwnd);
-        return TRUE;
-    }
-
-    case WM_COMMAND: {
-        int id = LOWORD(wParam);
-        int code = HIWORD(wParam);
-        if (id == IDC_MIDI_ENABLE && code == BN_CLICKED) {
-            BOOL enabled = IsDlgButtonChecked(hwnd, IDC_MIDI_ENABLE) == BST_CHECKED;
-            EnableWindow(GetDlgItem(hwnd, IDC_MIDI_INPUT), enabled);
-            EnableWindow(GetDlgItem(hwnd, IDC_MIDI_OUTPUT), enabled);
-        }
-        break;
-    }
-
-    case WM_NOTIFY: {
-        NMHDR* pnmh = (NMHDR*)lParam;
-        if (pnmh->code == PSN_APPLY) {
-            FSTPSettings* settings = GetSettings();
-            if (settings) {
-                settings->midi_enabled =
-                    (IsDlgButtonChecked(hwnd, IDC_MIDI_ENABLE) == BST_CHECKED) ? 1 : 0;
-                settings->midi_input_port =
-                    (int)SendDlgItemMessage(hwnd, IDC_MIDI_INPUT, CB_GETCURSEL, 0, 0) - 1;
-                settings->midi_output_port =
-                    (int)SendDlgItemMessage(hwnd, IDC_MIDI_OUTPUT, CB_GETCURSEL, 0, 0) - 1;
-            }
-            SetWindowLongPtr(hwnd, DWLP_MSGRESULT, PSNRET_NOERROR);
-            return TRUE;
-        }
-        break;
-    }
-    }
-    return FALSE;
-}
-
-// ===== PAGE 3: Cache & Data =====
-static INT_PTR CALLBACK CachePageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_INITDIALOG: {
-        EnableThemeDialogTexture(hwnd, ETDT_ENABLETAB);
-        int x = 10, y = 10;
-        HWND h;
-        HINSTANCE hInst = GetModuleHandle(NULL);
-
-        h = CreateWindowExW(0, L"STATIC", L"Proxy Video Cache",
-            WS_CHILD | WS_VISIBLE, x, y, 200, 20, hwnd, NULL, hInst, NULL);
-        y += 25;
-
-        const char* proxy_path = FSTP_GetProxyCachePath();
-        int proxy_size = FSTP_GetProxyCacheSize();
-        int proxy_count = FSTP_GetProxyFilesCount();
-
-        std::wstring proxy_path_w = Utf8ToWide(proxy_path ? proxy_path : "Unknown");
-        wchar_t proxy_info[512];
-        swprintf(proxy_info, 512, L"Location: %ls\nCache Size: %d MB (%d files)",
-                 proxy_path_w.c_str(), proxy_size, proxy_count);
-        h = CreateWindowExW(0, L"STATIC", proxy_info,
-            WS_CHILD | WS_VISIBLE, x, y, 500, 40, hwnd, (HMENU)IDC_PROXY_INFO, hInst, NULL);
-        y += 45;
-
-        h = CreateWindowExW(0, L"BUTTON", L"Clear All Proxy Cache",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            x, y, 200, 28, hwnd, (HMENU)IDC_CLEAR_PROXY, hInst, NULL);
-        EnableWindow(h, proxy_count > 0);
-        y += 45;
-
-        h = CreateWindowExW(0, L"STATIC", L"Memory Locations",
-            WS_CHILD | WS_VISIBLE, x, y, 200, 20, hwnd, NULL, hInst, NULL);
-        y += 25;
-
-        const char* memory_path = FSTP_GetMemoryLocationsCachePath();
-        int memory_count = FSTP_GetMemoryLocationsFilesCount();
-
-        std::wstring memory_path_w = Utf8ToWide(memory_path ? memory_path : "Unknown");
-        wchar_t memory_info[512];
-        swprintf(memory_info, 512, L"Location: %ls/memory_locations\nSaved Data: %d video files",
-                 memory_path_w.c_str(), memory_count);
-        h = CreateWindowExW(0, L"STATIC", memory_info,
-            WS_CHILD | WS_VISIBLE, x, y, 500, 40, hwnd, (HMENU)IDC_MEMORY_INFO, hInst, NULL);
-        y += 45;
-
-        h = CreateWindowExW(0, L"BUTTON", L"Clear All Memory Locations",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            x, y, 200, 28, hwnd, (HMENU)IDC_CLEAR_MEMORY, hInst, NULL);
-        EnableWindow(h, memory_count > 0);
-        y += 30;
-
-        h = CreateWindowExW(0, L"STATIC",
-            L"Memory Locations are saved per-video like browser cookies",
-            WS_CHILD | WS_VISIBLE, x, y, 500, 16, hwnd, NULL, hInst, NULL);
-
-        ApplyDialogFont(hwnd);
-        return TRUE;
-    }
-
-    case WM_COMMAND: {
-        int id = LOWORD(wParam);
-        int code = HIWORD(wParam);
-
-        if (id == IDC_CLEAR_PROXY && code == BN_CLICKED) {
-            int result = MessageBoxW(hwnd, L"Clear all proxy cache files?",
-                                      L"Clear Proxy Cache", MB_YESNO | MB_ICONWARNING);
-            if (result == IDYES) {
-                FSTP_ClearProxyCache(false);
-                std::cout << "All proxy cache cleared" << std::endl;
-            }
-        }
-
-        if (id == IDC_CLEAR_MEMORY && code == BN_CLICKED) {
-            int result = MessageBoxW(hwnd, L"Clear all Memory Locations? This cannot be undone.",
-                                      L"Clear Memory Locations", MB_YESNO | MB_ICONWARNING);
-            if (result == IDYES) {
-                FSTP_ClearAllMemoryLocations();
-                std::cout << "All Memory Locations cleared" << std::endl;
-            }
-        }
-        break;
-    }
-
-    case WM_NOTIFY: {
-        NMHDR* pnmh = (NMHDR*)lParam;
-        if (pnmh->code == PSN_APPLY) {
-            // Cache page has no persistent settings to save
-            SetWindowLongPtr(hwnd, DWLP_MSGRESULT, PSNRET_NOERROR);
-            return TRUE;
-        }
-        break;
-    }
-    }
-    return FALSE;
-}
-
-// ===== PAGE 4: Extensions =====
-static INT_PTR CALLBACK ExtensionsPageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_INITDIALOG: {
-        EnableThemeDialogTexture(hwnd, ETDT_ENABLETAB);
-        const FSTPSettings* settings = GetSettings();
-        if (!settings) return TRUE;
-        int x = 10, y = 10;
-        HWND h;
-        HINSTANCE hInst = GetModuleHandle(NULL);
-
-        h = CreateWindowExW(0, L"STATIC", L"Extensions",
-            WS_CHILD | WS_VISIBLE, x, y, 200, 20, hwnd, NULL, hInst, NULL);
-        y += 30;
-
-        bool yt_dlp_available = FSTP_YTDLP_IsAvailable();
-        if (yt_dlp_available) {
-            h = CreateWindowExW(0, L"BUTTON", L"Enable yt-dlp network downloader",
-                WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                x, y, 350, 20, hwnd, (HMENU)IDC_YTDLP_CHECK, hInst, NULL);
-            if (settings->yt_dlp_extension_enabled)
-                SendMessage(h, BM_SETCHECK, BST_CHECKED, 0);
-        } else {
-            h = CreateWindowExW(0, L"STATIC",
-                L"yt-dlp not found. Install it to enable network downloads.",
-                WS_CHILD | WS_VISIBLE, x, y, 500, 20, hwnd, NULL, hInst, NULL);
-        }
-        y += 30;
-
-        std::string ext_lang = GetExtensionLanguage();
-        std::wstring ext_info = L"TapeXPlayer extensions are scripted using " +
-            Utf8ToWide(ext_lang.c_str()) +
-            L" (.lua) files.\r\n\r\n"
-            L"Extension loading is being prepared; this section will expand "
-            L"with management tools as the system evolves.";
-        h = CreateWindowExW(0, L"STATIC", ext_info.c_str(),
-            WS_CHILD | WS_VISIBLE, x, y, 500, 80, hwnd, NULL, hInst, NULL);
-
-        ApplyDialogFont(hwnd);
-        return TRUE;
-    }
-
-    case WM_NOTIFY: {
-        NMHDR* pnmh = (NMHDR*)lParam;
-        if (pnmh->code == PSN_APPLY) {
-            FSTPSettings* settings = GetSettings();
-            if (settings) {
-                settings->yt_dlp_extension_enabled =
-                    (IsDlgButtonChecked(hwnd, IDC_YTDLP_CHECK) == BST_CHECKED) ? 1 : 0;
-                SetYTDLPExtensionEnabled(settings->yt_dlp_extension_enabled);
-            }
-            SetWindowLongPtr(hwnd, DWLP_MSGRESULT, PSNRET_NOERROR);
-            return TRUE;
-        }
-        break;
-    }
-    }
-    return FALSE;
-}
-
-// Settings dialog thread function — runs PropertySheet in its own thread
-// so the main SDL loop continues rendering.
+// ── Dialog thread ─────────────────────────────────────────────────────────────
 static void SettingsDialogThread() {
-    // Enable ComCtl32 v6 visual styles for this thread
     ActivateVisualStyles();
 
-    // Initialize Common Controls
-    INITCOMMONCONTROLSEX icex;
-    icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
-    icex.dwICC = ICC_TAB_CLASSES | ICC_BAR_CLASSES;
+    INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icex);
 
-    // Build in-memory dialog template (shared by all pages)
-    std::vector<BYTE> dlgTemplate = BuildEmptyDialogTemplate(285, 195);
+    CreateFonts();
 
-    // Set up 5 property sheet pages
-    PROPSHEETPAGEW psp[5] = {};
-    const wchar_t* tabNames[] = {
-        L"Audio", L"Video && Sync", L"MIDI", L"Cache && Data", L"Extensions"
-    };
-    DLGPROC procs[] = {
-        AudioPageProc, VideoPageProc, MIDIPageProc, CachePageProc, ExtensionsPageProc
-    };
+    HINSTANCE hInst = GetModuleHandle(nullptr);
 
-    for (int i = 0; i < 5; i++) {
-        psp[i].dwSize = sizeof(PROPSHEETPAGEW);
-        psp[i].dwFlags = PSP_DLGINDIRECT | PSP_USETITLE;
-        psp[i].hInstance = GetModuleHandle(NULL);
-        psp[i].pResource = (DLGTEMPLATE*)dlgTemplate.data();
-        psp[i].pszTitle = tabNames[i];
-        psp[i].pfnDlgProc = procs[i];
+    // Register main window class (once)
+    static bool mainRegistered = false;
+    if (!mainRegistered) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize        = sizeof(wc);
+        wc.style         = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc   = SettingsDlgProc;
+        wc.hInstance     = hInst;
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+        wc.lpszClassName = L"TXP_SettingsWnd";
+        RegisterClassExW(&wc);
+        mainRegistered = true;
     }
 
-    // Set up the property sheet header
-    PROPSHEETHEADERW psh = {};
-    psh.dwSize = sizeof(PROPSHEETHEADERW);
-    psh.dwFlags = PSH_PROPSHEETPAGE | PSH_NOAPPLYNOW;
-    psh.hwndParent = NULL;
-    psh.hInstance = GetModuleHandle(NULL);
-    psh.pszCaption = L"Settings";
-    psh.nPages = 5;
-    psh.nStartPage = 0;
-    psh.ppsp = psp;
+    // Calculate total window size so client area == DLG_W x DLG_H
+    DWORD wndStyle   = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    DWORD wndExStyle = WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW;
+    RECT  wndRect    = { 0, 0, DLG_W, DLG_H };
+    AdjustWindowRectEx(&wndRect, wndStyle, FALSE, wndExStyle);
+    int wndW = wndRect.right  - wndRect.left;
+    int wndH = wndRect.bottom - wndRect.top;
 
-    // PropertySheetW blocks until user closes dialog — but only THIS thread
-    INT_PTR result = PropertySheetW(&psh);
+    // Center on screen
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    int wx = (sw - wndW) / 2;
+    int wy = (sh - wndH) / 2;
 
-    if (result > 0) {
-        SaveSettings();
-        ApplyAudioSettings();
-        ApplyMIDISettings();
-        std::cout << "Settings saved" << std::endl;
-    } else {
-        std::cout << "Settings dialog cancelled" << std::endl;
-    }
+    HWND hwnd = CreateWindowExW(
+        wndExStyle,
+        L"TXP_SettingsWnd",
+        L"Settings \u2014 TapeXPlayer",
+        wndStyle,
+        wx, wy, wndW, wndH,
+        nullptr, nullptr, hInst, nullptr);
 
-    DeactivateVisualStyles();
-    g_dialog_open = false;
-    std::cout << "Settings dialog closed (flag reset)" << std::endl;
-}
-
-void ShowWin32SettingsDialog() {
-    std::cout << "ShowWin32SettingsDialog called" << std::endl;
-
-    if (g_dialog_open) {
-        std::cout << "Dialog already open, skipping call" << std::endl;
+    if (!hwnd) {
+        std::cerr << "Failed to create settings window, error: " << GetLastError() << std::endl;
+        g_dialog_open = false;
+        DestroyFonts();
+        DeactivateVisualStyles();
         return;
     }
 
+    // Windows 10/11: respect system dark mode for the title bar
+    BOOL darkMode = FALSE;
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD val = 1, sz = sizeof(val);
+        RegQueryValueExW(hKey, L"AppsUseLightTheme", nullptr, nullptr, (LPBYTE)&val, &sz);
+        RegCloseKey(hKey);
+        darkMode = (val == 0) ? TRUE : FALSE;
+    }
+    DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &darkMode, sizeof(darkMode));
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    // Message loop
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        // Forward mouse wheel to the current page (works even if a child has focus)
+        if (msg.message == WM_MOUSEWHEEL) {
+            SettingsDlgState* ds = (SettingsDlgState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if (ds) {
+                SendMessage(ds->pages[ds->currentPage], WM_MOUSEWHEEL, msg.wParam, msg.lParam);
+                continue;
+            }
+        }
+        // Up/Down arrows switch sidebar page regardless of focused control
+        if (msg.message == WM_KEYDOWN &&
+            (msg.wParam == VK_UP || msg.wParam == VK_DOWN)) {
+            SettingsDlgState* ds = (SettingsDlgState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            if (ds) {
+                int dir  = (msg.wParam == VK_DOWN) ? 1 : -1;
+                int next = std::max(0, std::min(PAGE_COUNT - 1, ds->currentPage + dir));
+                ShowPage(ds, next);
+                continue;
+            }
+        }
+        if (!IsDialogMessageW(hwnd, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    DestroyFonts();
+    DeactivateVisualStyles();
+    std::cout << "Settings dialog closed" << std::endl;
+}
+
+// ── Public entry point ────────────────────────────────────────────────────────
+void ShowWin32SettingsDialog() {
+    if (g_dialog_open) {
+        std::cout << "Settings dialog already open" << std::endl;
+        return;
+    }
     const FSTPSettings* settings = GetSettings();
     if (!settings) {
         std::cerr << "Failed to get settings" << std::endl;
         return;
     }
-
     g_dialog_open = true;
-
-    // Launch dialog in separate thread so main SDL loop continues rendering
-    std::thread dialog_thread(SettingsDialogThread);
-    dialog_thread.detach();
+    std::thread(SettingsDialogThread).detach();
 }
 
 #else
-// Stub translation unit for non-Windows builds.
+// Stub for non-Windows builds.
 #endif

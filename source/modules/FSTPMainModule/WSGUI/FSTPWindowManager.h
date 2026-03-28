@@ -41,6 +41,8 @@ typedef struct {
     int last_rendered_frame;               // Last frame number rendered (for effects)
     int betacam_hold_frames;
     double last_effect_speed;
+    bool last_frame_aligned;         // Previous IsFrameAligned() state (for transition detection)
+    uint64_t last_settled_render_ms; // Timestamp of last render in settled pause (for throttling)
     
     // DEPRECATED fields - kept for compatibility but use new buffers
     SDL_Texture* video_texture;            // -> texture_buffer[current_buffer_index]

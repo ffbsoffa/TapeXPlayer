@@ -1,11 +1,11 @@
 #pragma once
 
 // Auto-generated build information for Windows
-// Generated on: Sat Feb 21 10:37:35 PST 2026
+// Generated on: Sat Mar 28 13:06:14 PDT 2026
 
 #define TAPEXPLAYER_VERSION "2026.01"
 #define TAPEXPLAYER_CODE_NAME "Albatross"
-#define TAPEXPLAYER_BUILD_NUMBER "1488"
+#define TAPEXPLAYER_BUILD_NUMBER "1513"
 #define TAPEXPLAYER_BUILD_DATE __DATE__
 
 // Helper functions

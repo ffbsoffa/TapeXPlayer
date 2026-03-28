@@ -31,6 +31,7 @@ typedef struct {
     // Developer/Debug settings
     int show_decoder_status;        // 1 = Show decoder status indicator (OSD), 0 = hidden (default)
 
+
 } FSTPSettings;
 
 // Settings management functions
