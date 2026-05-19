@@ -11,7 +11,7 @@
 
 ---
 
-## ✨ Key Features
+## Key Features
 
 TapeXPlayer is built with **C**,**C++**, **Objective-C**, **Swift** using industry-standard libraries: **FFmpeg**, **SDL2**, **PortAudio**, and **RtMidi**. It brings professional tape-based video player functionality to modern computers, enabling thorough video sequence examination with frame-accurate control.
 
@@ -26,7 +26,7 @@ TapeXPlayer is built with **C**,**C++**, **Objective-C**, **Swift** using indust
 - **Performance**: ~52% CPU @ 32x shuttle, ~11-32% CPU @ 1x playback
 
 ---
-## 🖥️ Platform Support
+## Platform Support
 
 | Platform | Status | Architecture | Build |
 |----------|--------|--------------|-------|
@@ -36,7 +36,7 @@ TapeXPlayer is built with **C**,**C++**, **Objective-C**, **Swift** using indust
 
 ---
 
-## 📦 Installation
+## Installation
 ### Method 1: Automatic Installation (Recommended)
 
 #### macOS
@@ -128,7 +128,7 @@ On the recommended configuration, the application ensures smooth operation of bo
 
 --- 
 
-## 📄 License
+## License
 
 TapeXPlayer is distributed under the **GNU General Public License version 3.0 (GPL-3.0)**.
 
