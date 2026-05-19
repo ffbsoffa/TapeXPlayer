@@ -8,7 +8,6 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)]()
 [![Architecture](https://img.shields.io/badge/arch-Universal%20Binary%20(x86__64%20%2B%20arm64)-brightgreen)]()
-[![Documentation](https://img.shields.io/badge/docs-docs.ffbsoffa.org-blue)](https://docs.ffbsoffa.org/en)
 
 ---
 
@@ -220,14 +219,13 @@ Support for the Mackie Control protocol for controlling playback via physical fa
 
 ## Links
 
-- **Website**: [docs.ffbsoffa.org/en](https://docs.ffbsoffa.org/en)  
 - **GitHub**: [github.com/ffbsoffa/TapeXPlayer](https://github.com/ffbsoffa/TapeXPlayer)
 - **Issues**: [Report a bug](https://github.com/ffbsoffa/TapeXPlayer/issues)
 - **Releases**: [Download latest version](https://github.com/ffbsoffa/TapeXPlayer/releases)
   
 
 ---
-## 🙏 Acknowledgments
+## Acknowledgments
 
 Special thanks to:
 - The FFmpeg team for their incredible codec library
