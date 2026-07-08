@@ -20,6 +20,7 @@
 #include "../FSTPPixelBufferManager.h"
 #include "../FSTPKeyboard.h"
 #include "../FSTPMemoryLocations.h"
+#include "../FSTPWelcomeScreen.h"
 #include "FSTPWaylandWS.h"
 #include "FSTPSettingsDialog.h"
 #include "FSTPMemoryLocationsWindow.h"
@@ -838,6 +839,12 @@ int RunMainUILoop() {
         LoadFileFromPath(g_initial_file_to_load, 0);  // Load into player 0
     }
 
+    // First-run onboarding: show the Welcome overlay once per FSTP_WELCOME_VERSION.
+    if (GetWelcomeVersion() < FSTP_WELCOME_VERSION) {
+        FSTPWelcome_Show();
+        SetWelcomeVersion(FSTP_WELCOME_VERSION);
+    }
+
     // Main event loop - similar to macOS version
     bool running = true;
     SDL_Event event;
@@ -890,6 +897,10 @@ int RunMainUILoop() {
 
         // Process events with PollEvent (non-blocking)
         while (SDL_PollEvent(&event)) {
+            // Welcome overlay (first-run) intercepts its own clicks/keys — and
+            // Esc to dismiss — before the loop treats Esc as "quit".
+            if (FSTPWelcome_HandleEvent(&event)) { continue; }
+
             // Intercept exit events and trigger graceful shutdown
             if (event.type == SDL_QUIT) {
                 std::cout << "[EXIT] SDL_QUIT received - requesting asynchronous shutdown" << std::endl;

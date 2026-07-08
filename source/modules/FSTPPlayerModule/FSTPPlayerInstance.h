@@ -32,7 +32,7 @@ public:
     void Shutdown();
 
     // Load specific video file into this instance
-    int LoadFile(const std::string& filepath);
+    int LoadFile(const std::string& filepath, double resume_position = 0.0);
 
     // Unload file from instance
     void UnloadFile();
@@ -53,10 +53,12 @@ public:
     int SetSpeedInstant(double speed);    // For Mouse Shuttle - without animation
     int SetReverse(bool reverse);         // With direction-change sequencer
     int SetReverseInstant(bool reverse);  // For Mouse Shuttle - instant, no sequencer
+    void SetBackgrounded(bool backgrounded); // Free/restore the full-res decoder when unfocused
 
     // State retrieval
     double GetPosition() const;
     double GetDuration() const;
+    double GetTimecodeOffset() const;
     bool IsPlaying() const;
     double GetSpeed() const;            // Target speed
     double GetActualSpeed() const;      // Actual animated speed

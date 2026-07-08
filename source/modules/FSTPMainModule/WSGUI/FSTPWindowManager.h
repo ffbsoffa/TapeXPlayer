@@ -134,14 +134,29 @@ void UpdateWindowLoadingProgress(int window_index, int progress);
 // Update window title with instance number and filename
 void UpdateWindowTitle(int window_index, int instance_id, const char* filename);
 
+// Presentation display enumeration for the Settings UI. Uses the SAME SDL indices as the
+// presentation window code, so a choice made in Settings maps 1:1 to the output target.
+int FSTP_GetPresentationDisplayCount(void);
+const char* FSTP_GetPresentationDisplayName(int idx);
+// Re-apply the presentation output target if presentation is currently active — called after a
+// Settings change so display/output-mode edits take effect live.
+void FSTP_ReapplyPresentationIfActive(void);
+
 #ifdef __cplusplus
 }  // end extern "C"
-#endif
 
-// C++ ONLY functions (use std::shared_ptr) - MOVED OUTSIDE extern "C"
-#ifdef __cplusplus
+// Presentation mode: output clean video (no OSD / indicators / cursor — ever) to an external
+// display or, as a fallback / by choice, a separate movable window.
+//   output_mode: 0 = external display (falls back to windowed if none), 1 = separate window
+bool CreatePresentationWindow(int player_id, int output_mode = 0, int display_index = -1);
+void ClosePresentationWindow();
+bool IsPresentationWindowActive();
+void SetPresentationModeEnabled(bool enabled);
+bool IsPresentationModeEnabled();
+// Focus/pin: follow_focus = output follows the focused player; otherwise pinned to pinned_player.
+void SetPresentationFollow(bool follow_focus, int pinned_player);
+
 // ZERO-COPY method - pass shared_ptr<AVFrame> directly (RECOMMENDED)
-// Optional: prev_frame (N-1) and next_frame (N+1) for Betacam slow-motion compositing
 void SubmitAVFrame(int player_id, std::shared_ptr<AVFrame> av_frame,
                   double timestamp, int frame_number,
                   std::shared_ptr<AVFrame> prev_frame = nullptr,

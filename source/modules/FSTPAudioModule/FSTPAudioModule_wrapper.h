@@ -14,7 +14,7 @@ public:
     bool Initialize();
     void Shutdown();
 
-    bool LoadFile(const std::string& filepath);
+    bool LoadFile(const std::string& filepath, double resume_position = 0.0);
     void UnloadFile();
 
     // Playback control
@@ -46,6 +46,7 @@ public:
     int GetSampleRate() const;
     int GetChannels() const;
     std::string GetAudioCodecName() const;
+    double GetTimecodeOffset() const;
 
     // Audio signal levels for VU meters
     float GetAudioLevelLeft() const;

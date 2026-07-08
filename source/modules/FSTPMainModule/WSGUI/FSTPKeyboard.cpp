@@ -7,9 +7,12 @@
 #include "FSTPScreenshot.h"
 #include "darwin/sdl/FSTPToolsMenu.h"
 #include "FSTPMemoryLocations.h"
+#include "FSTPKeyBindings.h"
+#include "FSTPSubtitles.h"
 #include "FSTPHardwareDetection.h"
 #include <iostream>
 #include <cmath>
+#include <cstdlib>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -43,6 +46,11 @@ static bool g_alt_shuttle_active = false;
 static bool timecode_seek_active = false;
 static std::string timecode_input = "";
 static int timecode_seek_player_id = -1;
+
+// Memory Location recall-by-number (Pro Tools numpad: . N .)
+static bool memloc_recall_active = false;
+static std::string memloc_recall_input = "";
+static int memloc_recall_player_id = -1;
 
 // Parse timecode (HH:MM:SS:FF or MMSSFF format) to seconds
 static double ParseTimecode(const std::string& input, double fps) {
@@ -420,6 +428,70 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                 break;
             }
 
+            // === MEMORY LOCATION RECALL MODE (Pro Tools numpad: . N .) ===
+            if (memloc_recall_active) {
+                // ESC - cancel
+                if (event.key.keysym.sym == SDLK_ESCAPE) {
+                    memloc_recall_active = false;
+                    memloc_recall_input.clear();
+                    std::cout << "Memory Location recall cancelled" << std::endl;
+                    break;
+                }
+
+                // Confirm: second NumPad '.', or Enter
+                if (event.key.keysym.sym == SDLK_KP_PERIOD ||
+                    event.key.keysym.sym == SDLK_KP_ENTER ||
+                    event.key.keysym.sym == SDLK_RETURN) {
+                    if (!memloc_recall_input.empty() && memloc_recall_player_id >= 0) {
+                        int loc_id = atoi(memloc_recall_input.c_str());
+                        std::cout << "📍 Recalling Memory Location #" << loc_id
+                                  << " on player " << memloc_recall_player_id << std::endl;
+                        FSTP_RecallMemoryLocation(loc_id, memloc_recall_player_id);
+                    }
+                    memloc_recall_active = false;
+                    memloc_recall_input.clear();
+                    break;
+                }
+
+                // Backspace - delete last digit
+                if (event.key.keysym.sym == SDLK_BACKSPACE) {
+                    if (!memloc_recall_input.empty()) memloc_recall_input.pop_back();
+                    break;
+                }
+
+                // Digits from the top row (0-9)
+                if (event.key.keysym.sym >= SDLK_0 && event.key.keysym.sym <= SDLK_9) {
+                    if (memloc_recall_input.length() < 3) {
+                        memloc_recall_input += (char)('0' + (event.key.keysym.sym - SDLK_0));
+                    }
+                    break;
+                }
+
+                // Digits from the NumPad
+                {
+                    char digit = 0;
+                    switch (event.key.keysym.sym) {
+                        case SDLK_KP_0: digit = '0'; break;
+                        case SDLK_KP_1: digit = '1'; break;
+                        case SDLK_KP_2: digit = '2'; break;
+                        case SDLK_KP_3: digit = '3'; break;
+                        case SDLK_KP_4: digit = '4'; break;
+                        case SDLK_KP_5: digit = '5'; break;
+                        case SDLK_KP_6: digit = '6'; break;
+                        case SDLK_KP_7: digit = '7'; break;
+                        case SDLK_KP_8: digit = '8'; break;
+                        case SDLK_KP_9: digit = '9'; break;
+                        default: break;
+                    }
+                    if (digit && memloc_recall_input.length() < 3) {
+                        memloc_recall_input += digit;
+                    }
+                }
+
+                // Ignore everything else while recalling
+                break;
+            }
+
 #ifdef __APPLE__
             // Check if text field is active in any window
             // If yes - ignore all player keys (except Cmd+combinations)
@@ -434,6 +506,18 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                 }
             }
 #endif
+
+            // Remap a user-customised key combo back to the default combo of its
+            // action (and neutralise a default that was rebound elsewhere). The big
+            // switch below keeps working on the default keys, so transport logic is
+            // untouched.
+            {
+                int t_sym = (int)event.key.keysym.sym;
+                int t_mod = (int)event.key.keysym.mod;
+                FSTP_KB_TranslateEvent(&t_sym, &t_mod);
+                event.key.keysym.sym = (SDL_Keycode)t_sym;
+                event.key.keysym.mod = (Uint16)t_mod;
+            }
 
             // Cmd+G - activate timecode input mode
             if ((event.key.keysym.mod & KMOD_GUI) && event.key.keysym.sym == SDLK_g) {
@@ -455,6 +539,18 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                     timecode_seek_player_id = active_player_id;
                     UpdateOSDSeekMode(active_player_id, true, timecode_input);
                     std::cout << "Timecode seek mode activated (NumPad *)" << std::endl;
+                }
+                break;
+            }
+
+            // . on NumPad - activate Memory Location recall-by-number (Pro Tools: . N .)
+            if (event.key.keysym.sym == SDLK_KP_PERIOD) {
+                if (active_player_id >= 0) {
+                    memloc_recall_active = true;
+                    memloc_recall_input.clear();
+                    memloc_recall_player_id = active_player_id;
+                    std::cout << "📍 Memory Location recall mode (NumPad .) — type number, '.' to go"
+                              << std::endl;
                 }
                 break;
             }
@@ -495,14 +591,27 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                                 // If speed = 1x - start playback
                                 PlayInstance(active_player_id);
                                 HandlePlaybackControl(active_player_id, "Playing");
+                                // Resume from pause → fire a Betacam dropout-compensation burst.
+                                if (auto* pbm = GetPixelBufferManager()) {
+                                    pbm->TriggerDropoutBurst(active_player_id);
+                                }
                             }
                         }
                     }
                     break;
 
                 case SDLK_p:
-                    // P - Play
-                    if (active_player_id >= 0) {
+                    // Shift+P - Presentation Mode
+                    if (event.key.keysym.mod & KMOD_SHIFT) {
+#ifdef __APPLE__
+                        TogglePresentationMode();
+#else
+                        // TODO(linux/windows): presentation mode is implemented only
+                        // in the darwin backend (FSTPToolsMenu.mm) — without this stub
+                        // the Linux/Windows link failed.
+#endif
+                    } else if (active_player_id >= 0) {
+                        // P - Play
                         PlayInstance(active_player_id);
                         HandlePlaybackControl(active_player_id, "Play");
                     }
@@ -805,6 +914,11 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                         CopyScreenshotToClipboard();
                     }
 #endif
+                    // Plain C (no Cmd/Ctrl) = toggle captions / subtitles.
+                    if (!(event.key.keysym.mod & (KMOD_GUI | KMOD_CTRL))) {
+                        FSTPSubtitles_Toggle();
+                        std::cout << "Subtitles " << (FSTPSubtitles_IsEnabled() ? "ON" : "OFF") << std::endl;
+                    }
                     break;
 
                 case SDLK_n:
@@ -827,10 +941,60 @@ bool HandleKeyboardEvents(SDL_Event& event) {
 #endif
                     break;
 
+                // === Memory Location navigation (focused player) ===
+                case SDLK_RIGHTBRACKET:   // ] — jump to next marker
+                case SDLK_LEFTBRACKET: {  // [ — jump to previous marker
+                    if (active_player_id >= 0) {
+                        bool go_next = (event.key.keysym.sym == SDLK_RIGHTBRACKET);
+                        auto& mgr = FSTP::MemoryLocationsManager::GetInstance();
+                        mgr.SetActivePlayer(active_player_id);
+                        double t = GetInstancePosition(active_player_id);
+                        FSTP::MemoryLocation* loc = go_next ? mgr.GetNextLocation(t)
+                                                            : mgr.GetPreviousLocation(t);
+                        if (loc) {
+                            std::cout << "📍 " << (go_next ? "Next" : "Prev")
+                                      << " Memory Location #" << loc->id
+                                      << " on player " << active_player_id << std::endl;
+                            mgr.RecallLocation(loc->id, active_player_id);
+                        } else {
+                            std::cout << "📍 No " << (go_next ? "next" : "previous")
+                                      << " Memory Location" << std::endl;
+                        }
+                    }
+                    break;
+                }
+
+                // === Delete Memory Location at the playhead (Shift+Backspace) ===
+                case SDLK_BACKSPACE: {
+                    if ((event.key.keysym.mod & KMOD_SHIFT) && active_player_id >= 0) {
+                        auto& mgr = FSTP::MemoryLocationsManager::GetInstance();
+                        mgr.SetActivePlayer(active_player_id);
+                        double t = GetInstancePosition(active_player_id);
+                        int best_id = -1;
+                        double best_d = 0.5;  // within half a second of the playhead
+                        for (const auto& l : mgr.GetAllLocations()) {
+                            double d = std::fabs(l.timecode_seconds - t);
+                            if (d <= best_d) { best_d = d; best_id = l.id; }
+                        }
+                        if (best_id >= 0) {
+                            std::cout << "🗑️ Deleting Memory Location #" << best_id
+                                      << " near playhead on player " << active_player_id << std::endl;
+                            mgr.DeleteLocation(best_id);
+#ifdef __APPLE__
+                            RefreshMemoryLocationsWindowIfOpen();
+#endif
+                        } else {
+                            std::cout << "📍 No Memory Location near playhead to delete" << std::endl;
+                        }
+                    }
+                    break;
+                }
+
                 // === Memory Locations ===
                 case SDLK_RETURN:
                 case SDLK_KP_ENTER:
-                    // Return or Enter on numpad - create Memory Location
+                    // Enter — open the New Memory Location dialog (Pro Tools paradigm:
+                    // type name/comments, Tab between fields, Enter to confirm & return).
 #ifdef __APPLE__
                     CreateMemoryLocationAtCurrentTime();
                     std::cout << "📍 Creating Memory Location via hotkey..." << std::endl;
@@ -1123,4 +1287,9 @@ void StopMouseShuttle() {
 // Check if zoom panning is active (for increased rendering FPS)
 bool IsZoomPanningActive() {
     return zoom_panning_active;
+}
+
+// Check if mouse shuttle is active (for adaptive event loop timing on Windows)
+bool IsMouseShuttleActive() {
+    return mouse_shuttle_active;
 }

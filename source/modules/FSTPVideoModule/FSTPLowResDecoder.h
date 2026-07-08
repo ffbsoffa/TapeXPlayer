@@ -37,6 +37,12 @@ public:
 
     static std::string getCachePath();
     static std::string generateFileId(const std::string& filename);
+
+    // Validate a cached proxy against its source via the sidecar manifest (size+mtime+schema).
+    // Returns false for a missing/old-schema/mismatched manifest → caller should rebuild.
+    // Use this anywhere a cached proxy is reused, so stale/gappy proxies never get trusted.
+    static bool isCachedProxyValid(const std::string& proxyPath,
+                                   const std::string& sourceFilename);
     static void removeLowResFrames(std::vector<FSTP::FrameInfo>& frameIndex, int start, int end);
 
     bool decodeLowResRange(std::vector<FSTP::FrameInfo>& frameIndex,
@@ -45,7 +51,11 @@ public:
                            int highResStart,
                            int highResEnd,
                            bool skipHighResWindow = false,
-                           bool isReverse = false);
+                           bool isReverse = false,
+                           bool keyframesOnly = false,    // shuttle: decode keyframes only (skip_frame)
+                           int threadIdBase = 0);          // base id for the 2 internal decode contexts
+                                                           // (on-demand decode uses a separate base so it
+                                                           //  never shares an AVCodecContext with the manager)
 
     bool isInitialized() const;
     int getWidth() const;

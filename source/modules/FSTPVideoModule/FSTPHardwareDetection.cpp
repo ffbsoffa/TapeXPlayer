@@ -51,41 +51,41 @@ extern "C" {
 FSTPHardwareDetection* g_hardware_detection = nullptr;
 
 // ============================================================
-// Вспомогательная функция: извлечение поколения Intel CPU из строки бренда.
+// Helper: extract the Intel CPU generation from the brand string.
 // "Intel Core i5-6267U CPU @ 2.90GHz" → 6  (Skylake, 2015–2016)
 // "Intel Core i7-8750H CPU @ 2.20GHz" → 8  (Coffee Lake, 2018)
 // "Intel Core i9-10900K"               → 10 (Comet Lake, 2020)
-// Возвращает 0, если бренд не является Core iX или поколение не определено.
+// Returns 0 if the brand is not a Core iX or the generation is undetermined.
 // ============================================================
 static int ExtractIntelGeneration(const std::string& brand) {
     size_t pos = brand.find("Core i");
     if (pos == std::string::npos) return 0;
-    pos += 6;  // пропускаем "Core i"
-    // ищем тире после буквы (3/5/7/9)
+    pos += 6;  // skip "Core i"
+    // find the dash after the digit (3/5/7/9)
     while (pos < brand.size() && brand[pos] != '-') ++pos;
     if (pos >= brand.size()) return 0;
-    ++pos;  // пропускаем '-'
+    ++pos;  // skip '-'
     if (pos >= brand.size() || !std::isdigit(brand[pos])) return 0;
-    // читаем цифры номера модели
+    // read the model number digits
     std::string digits;
     while (pos < brand.size() && std::isdigit(brand[pos])) digits += brand[pos++];
-    // 4 цифры: первая = поколение (6xxx → 6, 8xxx → 8)
-    // 5 цифр:  первые две = поколение (10xxx → 10, 11xxx → 11)
+    // 4 digits: first = generation (6xxx → 6, 8xxx → 8)
+    // 5 digits: first two = generation (10xxx → 10, 11xxx → 11)
     if (digits.size() == 4) return digits[0] - '0';
     if (digits.size() == 5) return std::stoi(digits.substr(0, 2));
     return 0;
 }
 
 // ============================================================
-// Корректный парсинг года выпуска Mac из идентификатора модели.
-// Исправляет ошибку оригинального кода: он брал цифру ПОСЛЕ запятой
-// ("MacBookPro13,3" → "3"), тогда как нужна цифра ДО запятой ("13").
+// Correctly parse the Mac release year from the model identifier.
+// Fixes a bug in the original code: it took the digit AFTER the comma
+// ("MacBookPro13,3" → "3"), when the digit BEFORE the comma ("13") is needed.
 // ============================================================
 static int GetMacYearFromModelString(const std::string& mac_model) {
     size_t comma = mac_model.find(',');
     if (comma == std::string::npos || comma == 0) return 0;
 
-    // Находим начало числа перед запятой
+    // Find the start of the number before the comma
     size_t num_end = comma;
     size_t num_start = num_end;
     while (num_start > 0 && std::isdigit(mac_model[num_start - 1])) num_start--;
@@ -95,12 +95,12 @@ static int GetMacYearFromModelString(const std::string& mac_model) {
     std::string family = mac_model.substr(0, num_start);
 
     if (family == "MacBookPro") {
-        // MacBookPro: основные версии → годы выпуска
-        // Источник: Apple Hardware Identifiers
-        // major 8  = 2011 (Sandy Bridge) ← минимальный Mac по выбору пользователя
-        // major 12 = 2015 (Broadwell)    ← минимальный для надёжного H.264 HW decode
-        // major 13 = 2016 (Skylake)      ← эталонное устройство HYBRID (тест пользователя)
-        // major 17 = 2020 (M1)           ← Apple Silicon начинается здесь
+        // MacBookPro: major versions → release years
+        // Source: Apple Hardware Identifiers
+        // major 8  = 2011 (Sandy Bridge) ← minimum Mac per user's choice
+        // major 12 = 2015 (Broadwell)    ← minimum for reliable H.264 HW decode
+        // major 13 = 2016 (Skylake)      ← HYBRID reference device (user tested)
+        // major 17 = 2020 (M1)           ← Apple Silicon starts here
         static const int tbl[] = {
             0,    // 0  invalid
             2006, // 1  Core Duo
@@ -114,8 +114,8 @@ static int GetMacYearFromModelString(const std::string& mac_model) {
             2012, // 9  Ivy Bridge    (3rd gen)
             2012, // 10 Ivy Bridge Retina
             2013, // 11 Haswell       (4th gen, 2013–2014)
-            2015, // 12 Broadwell     (5th gen) — мин. надёжный H.264 HW
-            2016, // 13 Skylake       (6th gen) — эталон HYBRID (тест)
+            2015, // 12 Broadwell     (5th gen) — min. reliable H.264 HW
+            2016, // 13 Skylake       (6th gen) — HYBRID reference (tested)
             2017, // 14 Kaby Lake     (7th gen)
             2018, // 15 Coffee Lake   (8th gen)
             2019, // 16 Coffee Lake   (9th gen)
@@ -125,7 +125,7 @@ static int GetMacYearFromModelString(const std::string& mac_model) {
         };
         int n = (int)(sizeof(tbl) / sizeof(tbl[0]));
         if (major >= 0 && major < n) return tbl[major];
-        if (major >= n) return 2024;  // будущий Apple Silicon
+        if (major >= n) return 2024;  // future Apple Silicon
     }
     else if (family == "MacBookAir") {
         static const int tbl[] = {0, 2008, 2009, 2010, 2011, 2012, 2013, 2015,
@@ -143,7 +143,7 @@ static int GetMacYearFromModelString(const std::string& mac_model) {
         // iMac7=2007, iMac8=2008 ... iMac20=2020, iMac21=2021 M1
         if (major >= 7 && major <= 21) return 2000 + major;
     }
-    // MacBook, MacPro, iMacPro и т.п. — приблизительно по номеру
+    // MacBook, MacPro, iMacPro, etc. — approximately by number
     if (major >= 15) return 2020;
     if (major >= 12) return 2017;
     if (major >= 9)  return 2014;
@@ -152,55 +152,55 @@ static int GetMacYearFromModelString(const std::string& mac_model) {
 }
 
 // ============================================================
-// Определение профиля декодера по характеристикам CPU/GPU.
+// Determine the decoder profile from CPU/GPU characteristics.
 //
-// Три эталонных устройства пользователя:
+// Three user reference devices:
 //   FULL_HARDWARE  → Apple M1 Mac
 //   HYBRID_VT_CPU  → MacBook Pro 2016 Intel (Skylake i7-6xxx)
 //   MINIMUM        → Intel Celeron Gold 7505 (Tiger Lake 2-core, 15 W)
 // ============================================================
 FSTPDecoderProfile FSTPHardwareDetection::DetermineDecoderProfile(const FSTPCPUInfo& cpu) const {
 
-    // ── Профиль 1: Apple Silicon (M1/M2/M3/M4) ──────────────────────────────
-    // Измерение: sysctl hw.optional.arm64 != 0
+    // ── Profile 1: Apple Silicon (M1/M2/M3/M4) ──────────────────────────────
+    // Measurement: sysctl hw.optional.arm64 != 0
     if (cpu.is_apple_silicon) {
         std::cout << "  🎯 Decoder Profile: FULL_HARDWARE (Apple Silicon M1+)" << std::endl;
         return FSTPDecoderProfile::FULL_HARDWARE;
     }
 
-    // ── Профиль 3: MINIMUM-класс CPU ─────────────────────────────────────────
-    // Первичный: бренд "Celeron" / "Pentium" / "Atom"
-    //   Прямо соответствует эталону: Celeron Gold 7505
-    //   Экстраполяция: все варианты Celeron/Pentium/Atom разделяют этот профиль
-    // Вторичный: ≤2 физических ядра x86
-    //   Основание: Celeron 7505 (2-ядерный, 15 W) ≈ по пропускной способности декода
-    //   двухъядерным Core i3/i5 предыдущих поколений (i3-6006U 2016, i5-5300U 2015 и т.п.)
+    // ── Profile 3: MINIMUM-class CPU ─────────────────────────────────────────
+    // Primary: brand "Celeron" / "Pentium" / "Atom"
+    //   Directly matches the reference: Celeron Gold 7505
+    //   Extrapolation: all Celeron/Pentium/Atom variants share this profile
+    // Secondary: ≤2 physical x86 cores
+    //   Rationale: Celeron 7505 (2-core, 15 W) ≈ decode throughput of two-core
+    //   Core i3/i5 of previous generations (i3-6006U 2016, i5-5300U 2015, etc.)
     if (cpu.IsMinimumClass()) {
         std::cout << "  🎯 Decoder Profile: MINIMUM" << std::endl;
         if (cpu.model_name.find("Celeron") != std::string::npos ||
             cpu.model_name.find("Pentium") != std::string::npos ||
             cpu.model_name.find("Atom")    != std::string::npos) {
-            std::cout << "     Причина: CPU класса Celeron/Pentium/Atom — '"
+            std::cout << "     Reason: Celeron/Pentium/Atom-class CPU — '"
                       << cpu.model_name << "'" << std::endl;
         } else {
-            std::cout << "     Причина: ≤2 физических ядра x86 → пропускная способность"
-                      << " аналогична Celeron Gold 7505" << std::endl;
+            std::cout << "     Reason: ≤2 physical x86 cores → throughput"
+                      << " similar to Celeron Gold 7505" << std::endl;
         }
         return FSTPDecoderProfile::MINIMUM;
     }
 
 #ifdef PLATFORM_MACOS
     // ── macOS Intel Mac ───────────────────────────────────────────────────────
-    // Все Intel Mac от 2012+ = HYBRID_VT_CPU
-    // Подтверждено тестом: MacBook Pro 2016 (Skylake) работает лучше всего
-    // в комбинированном режиме — VideoToolbox для full-res, CPU для прокси ≤640p.
-    // Экстраполяция назад: 2012 (Ivy Bridge, gen 3) — минимум для HYBRID.
-    // Нижняя граница поддержки: 2011 MacBook Pro (Sandy Bridge).
+    // All Intel Macs from 2012+ = HYBRID_VT_CPU
+    // Confirmed by test: MacBook Pro 2016 (Skylake) works best in the combined
+    // mode — VideoToolbox for full-res, CPU for proxy ≤640p.
+    // Extrapolated back: 2012 (Ivy Bridge, gen 3) — minimum for HYBRID.
+    // Lower support bound: 2011 MacBook Pro (Sandy Bridge).
     if (cpu.IsIntelMac()) {
         if (cpu.mac_year > 0 && cpu.mac_year < 2012) {
-            // Sandy Bridge (2011) и старше: VideoToolbox слишком ограничен
+            // Sandy Bridge (2011) and older: VideoToolbox too limited
             std::cout << "  🎯 Decoder Profile: SOFTWARE_ONLY"
-                      << " (Intel Mac " << cpu.mac_year << ", Sandy Bridge или старше)" << std::endl;
+                      << " (Intel Mac " << cpu.mac_year << ", Sandy Bridge or older)" << std::endl;
             return FSTPDecoderProfile::SOFTWARE_ONLY;
         }
         std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
@@ -209,26 +209,26 @@ FSTPDecoderProfile FSTPHardwareDetection::DetermineDecoderProfile(const FSTPCPUI
         std::cout << ")" << std::endl;
         return FSTPDecoderProfile::HYBRID_VT_CPU;
     }
-    // Intel Mac, год не определён → используем поколение CPU как запасной вариант
+    // Intel Mac, year undetermined → use CPU generation as fallback
     if (cpu.intel_generation >= 3) {
         std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
-                  << " (Intel Mac gen " << cpu.intel_generation << ", год не определён)" << std::endl;
+                  << " (Intel Mac gen " << cpu.intel_generation << ", year undetermined)" << std::endl;
         return FSTPDecoderProfile::HYBRID_VT_CPU;
     }
 #endif
 
 #if defined(PLATFORM_LINUX) || defined(PLATFORM_WINDOWS)
     // ── AMD Ryzen / Athlon ────────────────────────────────────────────────────
-    // Примечание: Athlon Silver/Gold уже отфильтрованы IsMinimumClass() выше.
-    // Сюда доходят только более мощные AMD процессоры.
+    // Note: Athlon Silver/Gold are already filtered out by IsMinimumClass() above.
+    // Only more capable AMD processors reach here.
     //
-    // Иерархия AMD (аналог Intel):
-    //   Athlon Silver/Gold  ≈ Celeron/Pentium   → MINIMUM (поймано выше)
+    // AMD hierarchy (analogous to Intel):
+    //   Athlon Silver/Gold  ≈ Celeron/Pentium   → MINIMUM (caught above)
     //   Ryzen 3             ≈ Core i3            → HYBRID_VT_CPU
     //   Ryzen 5/7/9         ≈ Core i5/i7/i9      → HYBRID_VT_CPU
     //
-    // HW decode на AMD:
-    //   Linux:   VA-API через Mesa AMDGPU (все Zen-based, 2017+)
+    // HW decode on AMD:
+    //   Linux:   VA-API via Mesa AMDGPU (all Zen-based, 2017+)
     //   Windows: D3D11VA + AMF (Advanced Media Framework)
     bool is_amd = (cpu.vendor == "AuthenticAMD" ||
                    cpu.model_name.find("AMD ") != std::string::npos ||
@@ -240,20 +240,20 @@ FSTPDecoderProfile FSTPHardwareDetection::DetermineDecoderProfile(const FSTPCPUI
                       << " (AMD Ryzen, VA-API/D3D11VA/AMF capable)" << std::endl;
             return FSTPDecoderProfile::HYBRID_VT_CPU;
         }
-        // Прочие AMD с AVX2 (Zen без "Ryzen" в бренде)
+        // Other AMD with AVX2 (Zen without "Ryzen" in the brand)
         if (cpu.has_avx2 || cpu.physical_cores >= 4) {
             std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
                       << " (AMD, AVX2/4+ cores)" << std::endl;
             return FSTPDecoderProfile::HYBRID_VT_CPU;
         }
-        // Слабый AMD без Ryzen, без AVX2, мало ядер → MINIMUM
-        std::cout << "  🎯 Decoder Profile: MINIMUM (AMD маломощный, без AVX2)" << std::endl;
+        // Weak AMD without Ryzen, without AVX2, few cores → MINIMUM
+        std::cout << "  🎯 Decoder Profile: MINIMUM (AMD low-power, no AVX2)" << std::endl;
         return FSTPDecoderProfile::MINIMUM;
     }
 
-    // ── Linux / Windows: Intel по поколению ──────────────────────────────────
-    // gen 5+ (Broadwell, 2015) = минимум для надёжного H.264 QSV/VAAPI
-    // gen 3-4 (Ivy Bridge/Haswell, 2012-2014) = ограниченный, но допустимый HYBRID
+    // ── Linux / Windows: Intel by generation ─────────────────────────────────
+    // gen 5+ (Broadwell, 2015) = minimum for reliable H.264 QSV/VAAPI
+    // gen 3-4 (Ivy Bridge/Haswell, 2012-2014) = limited but acceptable HYBRID
     if (cpu.intel_generation >= 5) {
         std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
                   << " (Intel gen " << cpu.intel_generation << ", QSV/VAAPI capable)" << std::endl;
@@ -261,23 +261,23 @@ FSTPDecoderProfile FSTPHardwareDetection::DetermineDecoderProfile(const FSTPCPUI
     }
     if (cpu.intel_generation >= 3 && (cpu.has_avx || cpu.has_avx2)) {
         std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
-                  << " (Intel gen " << cpu.intel_generation << " + AVX, консервативный)" << std::endl;
+                  << " (Intel gen " << cpu.intel_generation << " + AVX, conservative)" << std::endl;
         return FSTPDecoderProfile::HYBRID_VT_CPU;
     }
     if (cpu.intel_generation > 0) {
         std::cout << "  🎯 Decoder Profile: SOFTWARE_ONLY"
-                  << " (Intel gen " << cpu.intel_generation << ", слишком старый для HW decode)" << std::endl;
+                  << " (Intel gen " << cpu.intel_generation << ", too old for HW decode)" << std::endl;
         return FSTPDecoderProfile::SOFTWARE_ONLY;
     }
 #endif
 
-    // ── Запасной вариант для неизвестного железа ─────────────────────────────
+    // ── Fallback for unknown hardware ────────────────────────────────────────
     if (cpu.has_avx2) {
-        // AVX2 = Haswell (gen 4) или новее → скорее всего способен на HW decode
-        std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU (AVX2 обнаружен, gen 4+)" << std::endl;
+        // AVX2 = Haswell (gen 4) or newer → most likely HW decode capable
+        std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU (AVX2 detected, gen 4+)" << std::endl;
         return FSTPDecoderProfile::HYBRID_VT_CPU;
     }
-    std::cout << "  🎯 Decoder Profile: SOFTWARE_ONLY (нет подходящего HW ускорения)" << std::endl;
+    std::cout << "  🎯 Decoder Profile: SOFTWARE_ONLY (no suitable HW acceleration)" << std::endl;
     return FSTPDecoderProfile::SOFTWARE_ONLY;
 }
 
@@ -304,13 +304,13 @@ bool FSTPHardwareDetection::DetectAllHardware() {
     // Detect GPU (requires CPU info to be already detected)
     gpu_info_ = DetectGPU();
 
-    // Определяем профиль декодера (на основе CPU + GPU вместе)
+    // Determine the decoder profile (based on CPU + GPU together)
     cpu_info_.decoder_profile = DetermineDecoderProfile(cpu_info_);
     static const char* profile_names[] = {"UNKNOWN", "FULL_HARDWARE", "HYBRID_VT_CPU",
                                            "MINIMUM", "SOFTWARE_ONLY"};
     int pidx = static_cast<int>(cpu_info_.decoder_profile);
     if (pidx >= 0 && pidx <= 4)
-        std::cout << "  → Активный профиль: " << profile_names[pidx] << std::endl;
+        std::cout << "  → Active profile: " << profile_names[pidx] << std::endl;
 
     detected_hardware_.clear();
     bool found_any = false;
@@ -519,55 +519,72 @@ bool FSTPHardwareDetection::DetectMetalPerformanceShaders() {
 #endif
 
 #ifdef PLATFORM_WINDOWS
+// Real detection happens in DetectGPU_Windows (DXGI adapter enumeration) and is
+// already written to gpu_info_ by the time these methods run. Here we only copy
+// the result into detected_hardware_ — previously these methods unconditionally
+// returned true and the list showed DXVA2/D3D11VA even on a machine without a
+// single hardware GPU.
 bool FSTPHardwareDetection::DetectDXVA2() {
-    // Simplified implementation - in reality, a more complex check is needed
-    FSTPHardwareInfo dxva_info;
+    if (!gpu_info_.dxva2_available) return false;
+    FSTPHardwareInfo dxva_info{};
     dxva_info.accel_type = FSTPHWAccelType::DXVA2;
-    dxva_info.device_name = "DirectX Video Acceleration 2.0";
+    dxva_info.device_name = gpu_info_.model_name + " (DXVA2)";
     dxva_info.driver_version = "System";
     dxva_info.supported_codecs = FSTPCodecSupport::H264_DECODE | FSTPCodecSupport::MPEG2_DECODE;
-    dxva_info.performance_score = 70.0;
+    dxva_info.performance_score = gpu_info_.hw_decode_score - 5.0;  // legacy path, just below D3D11VA
+    dxva_info.memory_mb = gpu_info_.memory_mb;
 
     detected_hardware_.push_back(dxva_info);
     return true;
 }
 
 bool FSTPHardwareDetection::DetectD3D11VA() {
-    FSTPHardwareInfo d3d11_info;
+    if (!gpu_info_.d3d11va_available) return false;
+    FSTPHardwareInfo d3d11_info{};
     d3d11_info.accel_type = FSTPHWAccelType::D3D11VA;
-    d3d11_info.device_name = "Direct3D 11 Video Acceleration";
+    d3d11_info.device_name = gpu_info_.model_name + " (D3D11VA)";
     d3d11_info.driver_version = "System";
-    d3d11_info.supported_codecs = FSTPCodecSupport::H264_DECODE | FSTPCodecSupport::H265_DECODE;
-    d3d11_info.performance_score = 75.0;
+    d3d11_info.supported_codecs = gpu_info_.supported_codecs;
+    d3d11_info.performance_score = gpu_info_.hw_decode_score;
+    d3d11_info.memory_mb = gpu_info_.memory_mb;
 
     detected_hardware_.push_back(d3d11_info);
     return true;
 }
 
 bool FSTPHardwareDetection::DetectIntelQSV() {
-    // Here should be a check for the presence of Intel GPU and QSV
-    return false;
+    return gpu_info_.qsv_available;   // set by VendorId in DetectGPU_Windows
 }
 
 bool FSTPHardwareDetection::DetectNVIDIANVENC() {
-    // Here should be a check for NVIDIA GPU
-    return false;
+    return gpu_info_.nvenc_available; // set by VendorId in DetectGPU_Windows
 }
 
 bool FSTPHardwareDetection::DetectAMDAdvancedMediaFramework() {
-    // Here should be a check for AMD GPU
-    return false;
+    return gpu_info_.amf_available;   // set by VendorId in DetectGPU_Windows
 }
 #endif
 
 #ifdef PLATFORM_LINUX
 bool FSTPHardwareDetection::DetectVAAPI() {
-    // Simplified check VA-API
-    return false;
+    // Real check is in DetectGPU_Linux (av_hwdevice_ctx_create probe over render
+    // nodes); here the result is copied into detected_hardware_. Previously this
+    // method always returned false, so DetectAllHardware printed "Hardware
+    // acceleration not detected" even with a working VA-API.
+    if (!gpu_info_.vaapi_available || gpu_info_.vaapi_devices.empty()) return false;
+    FSTPHardwareInfo va_info{};
+    va_info.accel_type = FSTPHWAccelType::VAAPI;
+    va_info.device_name = gpu_info_.model_name + " (" + gpu_info_.vaapi_devices[0] + ")";
+    va_info.driver_version = "libva";
+    va_info.supported_codecs = gpu_info_.supported_codecs;
+    va_info.performance_score = gpu_info_.hw_decode_score;
+
+    detected_hardware_.push_back(va_info);
+    return true;
 }
 
 bool FSTPHardwareDetection::DetectIntelQSVLinux() {
-    return false;
+    return gpu_info_.qsv_available;   // Intel GPU with working VA-API
 }
 #endif
 
@@ -718,7 +735,7 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
     // Detect power mode
     DetectCPUPowerMode(info);
 
-    // Определяем поколение Intel из строки бренда
+    // Determine the Intel generation from the brand string
     info.intel_generation = ExtractIntelGeneration(info.model_name);
 
     // Apply CPU-specific optimizations
@@ -737,8 +754,8 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
     sysctlbyname("hw.model", model, &model_size, nullptr, 0);
     info.mac_model = std::string(model);
 
-    // Парсим год выпуска из идентификатора модели ("MacBookPro13,3" → 2016).
-    // Исправлено: оригинальный код брал цифру ПОСЛЕ запятой ("3"), нужна ДО ("13").
+    // Parse the release year from the model identifier ("MacBookPro13,3" → 2016).
+    // Fixed: the original code took the digit AFTER the comma ("3"), we need BEFORE ("13").
     info.mac_year = GetMacYearFromModelString(info.mac_model);
 
     // NEW: Set architecture
@@ -750,7 +767,7 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
     sysctlbyname("machdep.cpu.brand_string", cpu_brand, &cpu_brand_size, nullptr, 0);
     info.model_name = std::string(cpu_brand);
 
-    // Определяем поколение Intel из строки бренда (кросс-платформенный метод)
+    // Determine the Intel generation from the brand string (cross-platform method)
     // "Core i7-6920HQ" → gen 6 (Skylake), "Core i5-8259U" → gen 8 (Coffee Lake)
     if (!info.is_apple_silicon) {
         info.intel_generation = ExtractIntelGeneration(info.model_name);
@@ -850,12 +867,12 @@ void FSTPHardwareDetection::DetectCPUFeatures(FSTPCPUInfo& info) {
     bool got_vendor = false;
 
     while (std::getline(cpuinfo, line)) {
-        // Читаем vendor_id: "GenuineIntel" или "AuthenticAMD"
+        // Read vendor_id: "GenuineIntel" or "AuthenticAMD"
         if (!got_vendor && line.find("vendor_id") != std::string::npos) {
             size_t pos = line.find(':');
             if (pos != std::string::npos) {
                 info.vendor = line.substr(pos + 2);
-                // Убираем возможный trailing whitespace
+                // Strip any trailing whitespace
                 while (!info.vendor.empty() && (info.vendor.back() == '\n' ||
                                                 info.vendor.back() == '\r' ||
                                                 info.vendor.back() == ' '))
@@ -863,12 +880,12 @@ void FSTPHardwareDetection::DetectCPUFeatures(FSTPCPUInfo& info) {
                 got_vendor = true;
             }
         }
-        // Читаем флаги SIMD
+        // Read SIMD flags
         if (!got_flags &&
             (line.find("flags") != std::string::npos || line.find("Features") != std::string::npos)) {
             info.has_sse2   = (line.find("sse2")    != std::string::npos);
             info.has_sse4_2 = (line.find("sse4_2")  != std::string::npos);
-            info.has_avx    = (line.find("avx")     != std::string::npos);  // включает avx2
+            info.has_avx    = (line.find("avx")     != std::string::npos);  // includes avx2
             info.has_avx2   = (line.find("avx2")    != std::string::npos);
             info.has_avx512 = (line.find("avx512f") != std::string::npos);
             got_flags = true;
@@ -888,75 +905,75 @@ void FSTPHardwareDetection::DetectCPUPowerMode(FSTPCPUInfo& info) {
 }
 
 void FSTPHardwareDetection::ApplyCPUSpecificOptimizations(FSTPCPUInfo& info) {
-    // ── MINIMUM-класс: Celeron / Pentium / Atom ───────────────────────────────
-    // Эталон: Intel Celeron Gold 7505 (Tiger Lake, 2-ядра, 15 W, тест пользователя)
-    // Экстраполяция: все Celeron, Pentium, Atom имеют аналогичные ограничения
+    // ── MINIMUM class: Celeron / Pentium / Atom ───────────────────────────────
+    // Reference: Intel Celeron Gold 7505 (Tiger Lake, 2-core, 15 W, user tested)
+    // Extrapolation: all Celeron, Pentium, Atom share similar limitations
 
     bool is_celeron = info.model_name.find("Celeron") != std::string::npos;
     bool is_pentium = info.model_name.find("Pentium") != std::string::npos;
     bool is_atom    = info.model_name.find("Atom")    != std::string::npos;
 
     if (is_celeron || is_pentium || is_atom) {
-        // Точное совпадение с эталонным устройством пользователя: Pentium/Celeron 7505
+        // Exact match with the user's reference device: Pentium/Celeron 7505
         bool is_7505 = info.model_name.find("7505") != std::string::npos;
 
         if (is_7505) {
-            std::cout << "  🎯 Intel Celeron/Pentium Gold 7505 (эталонное устройство MINIMUM)" << std::endl;
-            std::cout << "     Тест пользователя: 24× макс., прокси 360p, QSV" << std::endl;
+            std::cout << "  🎯 Intel Celeron/Pentium Gold 7505 (MINIMUM reference device)" << std::endl;
+            std::cout << "     User test: 24× max, 360p proxy, QSV" << std::endl;
             info.decode_throughput_fps = 1450.0;  // QSV: 1400-1500 fps
         } else if (is_atom) {
             std::cout << "  🔧 Intel Atom detected: " << info.model_name << std::endl;
-            std::cout << "     Max speed: 16× (очень маломощный процессор)" << std::endl;
-            info.recommended_max_speed = 16;  // Atom медленнее Celeron
+            std::cout << "     Max speed: 16× (very low-power CPU)" << std::endl;
+            info.recommended_max_speed = 16;  // Atom slower than Celeron
         } else {
             std::cout << "  🔧 Intel Celeron/Pentium detected: " << info.model_name << std::endl;
-            std::cout << "     Экстраполяция от Celeron 7505: 24× макс., прокси 360p" << std::endl;
+            std::cout << "     Extrapolated from Celeron 7505: 24× max, 360p proxy" << std::endl;
         }
 
         info.requires_performance_mode = true;
-        if (info.recommended_max_speed == 32) info.recommended_max_speed = 24;  // лимит
-        info.is_pentium_gold_7505 = true;  // флаг для оптимизаций MINIMUM-профиля
+        if (info.recommended_max_speed == 32) info.recommended_max_speed = 24;  // limit
+        info.is_pentium_gold_7505 = true;  // flag for MINIMUM-profile optimizations
         return;
     }
 
-    // ── Вторичный критерий MINIMUM: ≤2 физических ядра x86 ──────────────────
-    // Основание: 2-ядерные Core i3/i5 предыдущих поколений имеют аналогичную
-    // пропускную способность декодера (i3-6006U 2016, i5-5300U 2015 и т.п.)
+    // ── Secondary MINIMUM criterion: ≤2 physical x86 cores ──────────────────
+    // Rationale: 2-core Core i3/i5 of previous generations have similar
+    // decoder throughput (i3-6006U 2016, i5-5300U 2015, etc.)
     if (!info.is_apple_silicon && info.physical_cores <= 2 &&
         (info.architecture == "x86_64" || info.architecture.find("i686") != std::string::npos)) {
-        std::cout << "  🔧 2-ядерный x86 CPU: " << info.model_name << std::endl;
-        std::cout << "     Пропускная способность аналогична Celeron 7505 → лимит 24×" << std::endl;
+        std::cout << "  🔧 2-core x86 CPU: " << info.model_name << std::endl;
+        std::cout << "     Throughput similar to Celeron 7505 → 24× limit" << std::endl;
         info.requires_performance_mode = true;
         if (info.recommended_max_speed == 32) info.recommended_max_speed = 24;
         info.is_pentium_gold_7505 = true;
         return;
     }
 
-    // ── AMD Athlon Silver/Gold (MINIMUM-класс, аналог Celeron/Pentium) ────────
+    // ── AMD Athlon Silver/Gold (MINIMUM class, like Celeron/Pentium) ─────────
     bool is_athlon_low = (info.model_name.find("Athlon Silver") != std::string::npos ||
                           info.model_name.find("Athlon Gold")   != std::string::npos);
     if (is_athlon_low) {
         std::cout << "  🔧 AMD Athlon Silver/Gold detected: " << info.model_name << std::endl;
-        std::cout << "     AMD-эквивалент Celeron/Pentium → лимит 24×, прокси 360p" << std::endl;
+        std::cout << "     AMD equivalent of Celeron/Pentium → 24× limit, 360p proxy" << std::endl;
         info.requires_performance_mode = true;
         if (info.recommended_max_speed == 32) info.recommended_max_speed = 24;
-        info.is_pentium_gold_7505 = true;  // используем тот же MINIMUM-профиль
+        info.is_pentium_gold_7505 = true;  // use the same MINIMUM profile
         return;
     }
 
-    // ── AMD Ryzen (HYBRID-класс) ──────────────────────────────────────────────
+    // ── AMD Ryzen (HYBRID class) ──────────────────────────────────────────────
     if (info.model_name.find("Ryzen") != std::string::npos) {
-        // Все Ryzen: VA-API (Linux) / D3D11VA + AMF (Windows)
+        // All Ryzen: VA-API (Linux) / D3D11VA + AMF (Windows)
         std::cout << "  ✅ AMD Ryzen detected: " << info.model_name << std::endl;
         std::cout << "     VA-API (Linux) / D3D11VA + AMF (Windows)" << std::endl;
-        // Не меняем рекомендованную скорость (32×) — Ryzen справляется
+        // Keep the recommended speed (32×) — Ryzen handles it
         return;
     }
 
-    // ── Высокопроизводительные CPU (AVX-512) ─────────────────────────────────
+    // ── High-performance CPUs (AVX-512) ──────────────────────────────────────
     if (info.has_avx512) {
         std::cout << "  ⚡ AVX-512 CPU detected: " << info.model_name << std::endl;
-        std::cout << "     Max speed: 32× (высокопроизводительный CPU)" << std::endl;
+        std::cout << "     Max speed: 32× (high-performance CPU)" << std::endl;
         info.recommended_max_speed = 32;
     }
 }
@@ -1071,48 +1088,48 @@ void FSTPHardwareDetection::DetectGPU_macOS(FSTPGPUInfo& info) {
         std::cout << "   Supported codecs: H.264, H.265, VP9, AV1, MPEG-2, MPEG-4" << std::endl;
 
     } else {
-        // Intel Mac — любой (2011–2021, до Apple Silicon)
-        // Эталон: MacBook Pro 2016 (Skylake, тест пользователя) работает лучше всего
-        // в режиме HYBRID_VT_CPU: VideoToolbox для full-res + CPU для прокси ≤640p.
-        // Экстраполяция: это поведение распространяется на ВСЕ Intel Mac,
-        // так как накладные расходы GPU-pipeline VideoToolbox на малых разрешениях
-        // постоянны и CPU decode для прокси всегда конкурентоспособен.
+        // Intel Mac — any (2011–2021, before Apple Silicon)
+        // Reference: MacBook Pro 2016 (Skylake, user tested) works best in
+        // HYBRID_VT_CPU mode: VideoToolbox for full-res + CPU for proxy ≤640p.
+        // Extrapolation: this behavior applies to ALL Intel Macs, because the
+        // VideoToolbox GPU-pipeline overhead at small resolutions is constant
+        // and CPU decode for the proxy is always competitive.
         info.vendor = "Intel";
         info.videotoolbox_available = true;
-        info.prefer_cpu_for_lowres = true;  // HYBRID: CPU для прокси, VT для full-res
+        info.prefer_cpu_for_lowres = true;  // HYBRID: CPU for proxy, VT for full-res
 
         info.supported_codecs = FSTPCodecSupport::H264_DECODE | FSTPCodecSupport::H264_ENCODE |
                                FSTPCodecSupport::H265_DECODE | FSTPCodecSupport::H265_ENCODE |
                                FSTPCodecSupport::MPEG2_DECODE | FSTPCodecSupport::MPEG4_DECODE;
 
-        // Оценка VideoToolbox зависит от поколения CPU (измеряется по году Mac)
-        // Чем новее Mac, тем лучше VideoToolbox для full-res, но прокси всё равно CPU
+        // The VideoToolbox score depends on CPU generation (measured by Mac year).
+        // The newer the Mac, the better VideoToolbox for full-res, but proxy stays CPU.
         int year = cpu_info_.mac_year;
         if (year >= 2018) {
-            // Coffee Lake (8th gen) и новее — VideoToolbox хорош для full-res
+            // Coffee Lake (8th gen) and newer — VideoToolbox good for full-res
             info.model_name = "Intel GPU (Mac 2018+, Coffee Lake+)";
             info.hw_decode_score = 70.0;
             std::cout << "   ✅ Intel Mac GPU (2018+): VideoToolbox full-res"
                       << " + CPU proxy (score: 70)" << std::endl;
         } else if (year >= 2015) {
-            // Broadwell–Kaby Lake (5–7 gen) — тестовый диапазон пользователя (2016 MBP)
+            // Broadwell–Kaby Lake (5–7 gen) — user's test range (2016 MBP)
             info.model_name = "Intel GPU (Mac 2015–2017, Broadwell/Skylake/KabyLake)";
             info.hw_decode_score = 55.0;
             std::cout << "   ⚙️  Intel Mac GPU (" << year << "): HYBRID — VideoToolbox full-res"
                       << " + CPU proxy (score: 55)" << std::endl;
-            std::cout << "      Профиль подтверждён тестом пользователя (MacBook Pro 2016)" << std::endl;
+            std::cout << "      Profile confirmed by user test (MacBook Pro 2016)" << std::endl;
         } else if (year >= 2012) {
             // Ivy Bridge / Haswell (3–4 gen, 2012–2014)
             info.model_name = "Intel GPU (Mac 2012–2014, Ivy Bridge/Haswell)";
             info.hw_decode_score = 45.0;
-            std::cout << "   ⚙️  Intel Mac GPU (" << year << "): HYBRID консервативный"
+            std::cout << "   ⚙️  Intel Mac GPU (" << year << "): HYBRID conservative"
                       << " (score: 45)" << std::endl;
         } else {
-            // Sandy Bridge (2011) — минимальная поддержка VideoToolbox
+            // Sandy Bridge (2011) — minimal VideoToolbox support
             info.model_name = "Intel GPU (Mac 2011, Sandy Bridge)";
             info.hw_decode_score = 25.0;
             std::cout << "   ⚠️  Intel Mac GPU (" << year << "): Sandy Bridge,"
-                      << " минимальная поддержка VideoToolbox (score: 25)" << std::endl;
+                      << " minimal VideoToolbox support (score: 25)" << std::endl;
         }
     }
 
@@ -1124,50 +1141,84 @@ void FSTPHardwareDetection::DetectGPU_macOS(FSTPGPUInfo& info) {
 void FSTPHardwareDetection::DetectGPU_Linux(FSTPGPUInfo& info) {
     std::cout << "🎨 [GPU] Detecting Linux GPU and hardware acceleration..." << std::endl;
 
-    // Detect VA-API devices
+    // Walk the render nodes and actually TRY to create a VA-API device via FFmpeg.
+    // The presence of /dev/dri/renderD* does not mean VA-API works: a proprietary
+    // NVIDIA driver, a missing libva-driver package, or an unprivileged container
+    // give a node where av_hwdevice_ctx_create() will fail later in the decoder.
+    // One probe at startup guarantees that only working nodes land in vaapi_devices,
+    // so decoders don't waste time on a path that is known to be dead.
+    int present_nodes = 0;
     for (int i = 128; i < 140; ++i) {
         std::string device_path = "/dev/dri/renderD" + std::to_string(i);
         int fd = open(device_path.c_str(), O_RDWR);
-        if (fd >= 0) {
+        if (fd < 0) continue;
+        close(fd);
+        ++present_nodes;
+
+        AVBufferRef* test_ctx = nullptr;
+        int ret = av_hwdevice_ctx_create(&test_ctx, AV_HWDEVICE_TYPE_VAAPI,
+                                         device_path.c_str(), nullptr, 0);
+        if (ret >= 0) {
+            av_buffer_unref(&test_ctx);
             info.vaapi_devices.push_back(device_path);
-            close(fd);
+            std::cout << "   ✅ VA-API works on " << device_path << std::endl;
+        } else {
+            char errbuf[128] = {0};
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            std::cout << "   ⚠️  " << device_path << ": VA-API init failed ("
+                      << errbuf << ")" << std::endl;
         }
     }
 
     if (!info.vaapi_devices.empty()) {
         info.vaapi_available = true;
-        info.hw_decode_score = 80.0;  // Good performance for Intel GPUs
         info.prefer_cpu_for_lowres = false;
 
         info.supported_codecs = FSTPCodecSupport::H264_DECODE | FSTPCodecSupport::H265_DECODE |
                                FSTPCodecSupport::VP9_DECODE | FSTPCodecSupport::MPEG2_DECODE;
 
-        std::cout << "   ✅ VA-API devices found: " << info.vaapi_devices.size() << std::endl;
+        // Vendor comes from sysfs of the SELECTED node, not card0: on hybrid
+        // graphics (Intel+NVIDIA laptop) card0 may not be the GPU whose render
+        // node we actually use.
+        std::string node = info.vaapi_devices[0];
+        std::string node_name = node.substr(node.find_last_of('/') + 1);
+        std::string vendor_id;
+        std::ifstream vendor_file("/sys/class/drm/" + node_name + "/device/vendor");
+        if (vendor_file.is_open()) vendor_file >> vendor_id;
+
+        if (vendor_id == "0x8086") {
+            info.vendor = "Intel";
+            info.model_name = "Intel GPU (VA-API)";
+            info.qsv_available = true;  // Intel GPUs support QSV
+            info.hw_decode_score = 80.0;
+        } else if (vendor_id == "0x1002") {
+            info.vendor = "AMD";
+            info.model_name = "AMD GPU (VA-API)";
+            info.hw_decode_score = 75.0;  // Mesa VA-API on AMD is stable
+        } else if (vendor_id == "0x10de") {
+            info.vendor = "NVIDIA";
+            info.model_name = "NVIDIA GPU (VA-API)";
+            info.hw_decode_score = 60.0;  // nouveau/vaapi-nvidia: works, but conservative
+        } else {
+            info.vendor = "Unknown";
+            info.model_name = "GPU (VA-API)";
+            info.hw_decode_score = 60.0;  // probe passed → VA-API actually works
+        }
+
+        std::cout << "   ✅ VA-API devices working: " << info.vaapi_devices.size() << std::endl;
         for (const auto& device : info.vaapi_devices) {
             std::cout << "      • " << device << std::endl;
         }
-        std::cout << "   Hardware Acceleration: VA-API available (score: 80)" << std::endl;
-
-        // Try to detect GPU vendor from device
-        std::ifstream vendor_file("/sys/class/drm/card0/device/vendor");
-        if (vendor_file.is_open()) {
-            std::string vendor_id;
-            vendor_file >> vendor_id;
-            if (vendor_id == "0x8086") {
-                info.vendor = "Intel";
-                info.model_name = "Intel GPU (VA-API)";
-                info.qsv_available = true;  // Intel GPUs support QSV
-            } else if (vendor_id == "0x1002") {
-                info.vendor = "AMD";
-                info.model_name = "AMD GPU (VA-API)";
-            } else if (vendor_id == "0x10de") {
-                info.vendor = "NVIDIA";
-                info.model_name = "NVIDIA GPU (VA-API)";
-            }
-        }
+        std::cout << "   Hardware Acceleration: VA-API available (score: "
+                  << static_cast<int>(info.hw_decode_score) << ")" << std::endl;
 
     } else {
-        std::cout << "   ⚠️  No VA-API devices found" << std::endl;
+        if (present_nodes == 0) {
+            std::cout << "   ⚠️  No /dev/dri/renderD* nodes found" << std::endl;
+        } else {
+            std::cout << "   ⚠️  Render nodes present, but VA-API failed to initialize"
+                      << " (no libva driver? NVIDIA proprietary?)" << std::endl;
+        }
         std::cout << "   Hardware Acceleration: NOT AVAILABLE (CPU decode only)" << std::endl;
         info.model_name = "No GPU acceleration";
         info.vendor = "Unknown";
@@ -1180,16 +1231,94 @@ void FSTPHardwareDetection::DetectGPU_Linux(FSTPGPUInfo& info) {
 void FSTPHardwareDetection::DetectGPU_Windows(FSTPGPUInfo& info) {
     std::cout << "🎨 [GPU] Detecting Windows GPU and hardware acceleration..." << std::endl;
 
-    // TODO: Implement Windows GPU detection
-    // - Use DXGI to enumerate adapters
-    // - Detect DXVA2/D3D11VA support
-    // - Detect NVIDIA NVENC, Intel QSV, AMD AMF
+    // Enumerate GPUs via DXGI and pick the most capable adapter. Any real (non-WARP)
+    // GPU from the last decade can do D3D11VA decode for H.264/H.265, so the mere
+    // presence of an adapter is enough to enable the existing D3D11VA branch in
+    // FSTPFullResDecoderV2. If av_hwdevice_ctx_create() fails at runtime anyway,
+    // there is a software fallback there.
+    IDXGIFactory* factory = nullptr;
+    HRESULT hr = CreateDXGIFactory(__uuidof(IDXGIFactory), reinterpret_cast<void**>(&factory));
+    if (FAILED(hr) || !factory) {
+        std::cout << "   ⚠️  CreateDXGIFactory failed — CPU decode only" << std::endl;
+        info.model_name = "No GPU acceleration";
+        info.vendor = "Unknown";
+        info.hw_decode_score = 0.0;
+        return;
+    }
 
-    info.model_name = "Windows GPU (Not yet implemented)";
-    info.vendor = "Unknown";
-    info.hw_decode_score = 0.0;
+    IDXGIAdapter* adapter = nullptr;
+    IDXGIAdapter* best_adapter = nullptr;
+    DXGI_ADAPTER_DESC best_desc = {};
+    SIZE_T best_vram = 0;
 
-    std::cout << "   ⚠️  Windows GPU detection not yet implemented" << std::endl;
+    for (UINT i = 0; factory->EnumAdapters(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC desc = {};
+        if (SUCCEEDED(adapter->GetDesc(&desc))) {
+            // Skip Microsoft Basic Render Driver (WARP, pure software): vendor 0x1414
+            bool is_software = (desc.VendorId == 0x1414);
+            if (!is_software && desc.DedicatedVideoMemory >= best_vram) {
+                if (best_adapter) best_adapter->Release();
+                best_adapter = adapter;
+                best_desc = desc;
+                best_vram = desc.DedicatedVideoMemory;
+                adapter = nullptr;  // ownership moved to best_adapter
+            }
+        }
+        if (adapter) { adapter->Release(); adapter = nullptr; }
+    }
+
+    if (!best_adapter) {
+        std::cout << "   ⚠️  No hardware GPU found (software adapter only) — CPU decode" << std::endl;
+        info.model_name = "No GPU acceleration";
+        info.vendor = "Unknown";
+        info.hw_decode_score = 0.0;
+        factory->Release();
+        return;
+    }
+
+    // Adapter description WCHAR → UTF-8
+    char name_buf[256] = {0};
+    WideCharToMultiByte(CP_UTF8, 0, best_desc.Description, -1,
+                        name_buf, sizeof(name_buf) - 1, nullptr, nullptr);
+    info.model_name = name_buf;
+    info.memory_mb = static_cast<int>(best_desc.DedicatedVideoMemory / (1024 * 1024));
+
+    // All real Windows GPUs of recent years support D3D11VA decode.
+    info.d3d11va_available = true;
+    info.dxva2_available = true;  // legacy path as a fallback
+    info.supported_codecs = FSTPCodecSupport::H264_DECODE | FSTPCodecSupport::H265_DECODE |
+                            FSTPCodecSupport::MPEG2_DECODE;
+
+    switch (best_desc.VendorId) {
+        case 0x10DE:  // NVIDIA
+            info.vendor = "NVIDIA";
+            info.nvenc_available = true;
+            info.hw_decode_score = 85.0;
+            break;
+        case 0x1002:  // AMD / ATI
+            info.vendor = "AMD";
+            info.amf_available = true;
+            info.hw_decode_score = 80.0;
+            break;
+        case 0x8086:  // Intel
+            info.vendor = "Intel";
+            info.qsv_available = true;
+            info.hw_decode_score = 75.0;
+            break;
+        default:
+            info.vendor = "Unknown";
+            info.hw_decode_score = 60.0;  // unknown but real GPU → assume D3D11VA is usable
+            break;
+    }
+    info.prefer_cpu_for_lowres = false;
+
+    std::cout << "   ✅ GPU detected: " << info.model_name
+              << " (" << info.vendor << ", " << info.memory_mb << " MB VRAM)" << std::endl;
+    std::cout << "   Hardware Acceleration: D3D11VA available (score: "
+              << static_cast<int>(info.hw_decode_score) << ")" << std::endl;
+
+    best_adapter->Release();
+    factory->Release();
 }
 #endif
 

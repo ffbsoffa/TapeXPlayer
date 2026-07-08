@@ -152,123 +152,149 @@ struct MemoryLocationDialog: View {
 
     var onClose: (() -> Void)?
 
+    private let labelWidth: CGFloat = 88
+
+    private var isEditing: Bool { viewModel.editingLocationId != nil }
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header
-            ZStack(alignment: .leading) {
-                Color(NSColor.windowBackgroundColor)
-
-                HStack(spacing: 8) {
-                    Image(systemName: "mappin.circle.fill")
-                        .font(.system(size: 18))
-                        .foregroundColor(.accentColor)
-
-                    Text(viewModel.editingLocationId != nil ? "Edit Memory Location" : "New Memory Location")
-                        .font(.system(size: 16, weight: .semibold))
-
-                    Spacer()
-                }
-                .padding(.leading, 20)
-            }
-            .frame(height: 50)
-
+            header
             Divider()
+            content
+            Divider()
+            footer
+        }
+        .frame(width: 460)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
 
-            // Content
-            VStack(alignment: .leading, spacing: 16) {
-                // Number and Timecode row
-                HStack(alignment: .center, spacing: 20) {
-                    HStack(spacing: 8) {
-                        Text("Number:")
-                            .frame(width: 60, alignment: .trailing)
-                        TextField("", text: $viewModel.locationNumber)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 70)
-                            .focused($focusedField, equals: .number)
-                            .onSubmit {
-                                focusedField = .timecode
-                            }
-                    }
+    // MARK: Header — icon, title, and a prominent timecode badge
+    private var header: some View {
+        HStack(spacing: 14) {
+            ZStack {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.15))
+                    .frame(width: 40, height: 40)
+                Image(systemName: "mappin.and.ellipse")
+                    .font(.system(size: 19, weight: .semibold))
+                    .foregroundColor(.accentColor)
+            }
 
-                    Spacer()
+            VStack(alignment: .leading, spacing: 2) {
+                Text(isEditing ? "Edit Memory Location" : "New Memory Location")
+                    .font(.system(size: 16, weight: .semibold))
+                Text("Player \(viewModel.playerId + 1)  ·  #\(viewModel.locationNumber)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
 
-                    HStack(spacing: 8) {
-                        Text("Timecode:")
-                            .frame(width: 70, alignment: .trailing)
-                        TextField("", text: $viewModel.timecode)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 110)
-                            .font(.system(.body, design: .monospaced))
-                            .focused($focusedField, equals: .timecode)
-                            .onSubmit {
-                                focusedField = .name
-                            }
-                    }
-                }
+            Spacer()
 
-                // Name row
-                HStack(spacing: 8) {
-                    Text("Name:")
-                        .frame(width: 60, alignment: .trailing)
-                    TextField("", text: $viewModel.name)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("TIMECODE")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(.secondary)
+                Text(viewModel.timecode)
+                    .font(.system(.title3, design: .monospaced).weight(.semibold))
+                    .foregroundColor(.primary)
+            }
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 16)
+        .background(.regularMaterial)
+    }
+
+    // MARK: Content — labelled fields
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // Number + Timecode (compact, editable)
+            HStack(spacing: 18) {
+                labeledField("Number") {
+                    TextField("", text: $viewModel.locationNumber)
                         .textFieldStyle(.roundedBorder)
-                        .frame(width: 307)
-                        .focused($focusedField, equals: .name)
-                        .onSubmit {
-                            focusedField = .comments
-                        }
+                        .frame(width: 64)
+                        .focused($focusedField, equals: .number)
                 }
-
-                // Comments field (multiline)
-                HStack(alignment: .top, spacing: 8) {
-                    Text("Comments:")
-                        .frame(width: 60, alignment: .trailing)
-                        .padding(.top, 8)
-
-                    ZStack(alignment: .topLeading) {
-                        TextEditor(text: $viewModel.comments)
-                            .font(.system(size: 12))
-                            .frame(width: 307, height: 80)
-                            .focused($focusedField, equals: .comments)
-                    }
-                    .border(Color.gray.opacity(0.3), width: 1)
-                    .cornerRadius(4)
-                }
-            }
-            .padding(.horizontal, 30)
-            .padding(.vertical, 24)
-            .onAppear {
-                // Set initial focus to Name field
-                focusedField = .name
-            }
-
-            Divider()
-
-            // Buttons
-            HStack(spacing: 12) {
-                Toggle("Recall zoom settings", isOn: $viewModel.recallZoom)
-
                 Spacer()
+                HStack(spacing: 10) {
+                    Text("Timecode")
+                        .frame(width: 70, alignment: .trailing)
+                        .foregroundStyle(.secondary)
+                    TextField("", text: $viewModel.timecode)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 120)
+                        .font(.system(.body, design: .monospaced))
+                        .focused($focusedField, equals: .timecode)
+                }
+            }
 
-                Button("Cancel") {
+            labeledField("Name") {
+                TextField("", text: $viewModel.name)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .name)
+            }
+
+            // Comments — single line so Tab moves on and Enter creates the marker
+            labeledField("Comments") {
+                TextField("", text: $viewModel.comments)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .comments)
+            }
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
+        .onAppear {
+            // Start in the Name field
+            focusedField = .name
+        }
+    }
+
+    // MARK: Footer — recall-zoom toggle + actions
+    private var footer: some View {
+        HStack(spacing: 12) {
+            Toggle(isOn: $viewModel.recallZoom) {
+                Label("Recall zoom", systemImage: "viewfinder")
+            }
+            .toggleStyle(.checkbox)
+
+            Spacer()
+
+            Button("Cancel") {
+                onClose?()
+                NSApp.stopModal()
+            }
+            .keyboardShortcut(.cancelAction)
+            .controlSize(.large)
+
+            Button(isEditing ? "Save" : "Create") {
+                if viewModel.save() {
+                    // Keep the Memory Locations list window (if open) in sync
+                    RefreshSwiftUIMemoryLocationsWindow()
                     onClose?()
                     NSApp.stopModal()
                 }
-                .keyboardShortcut(.cancelAction)
-
-                Button("OK") {
-                    if viewModel.save() {
-                        onClose?()
-                        NSApp.stopModal()
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
-                .disabled(viewModel.name.isEmpty)
             }
-            .padding(20)
+            .keyboardShortcut(.defaultAction)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .disabled(viewModel.name.isEmpty)
         }
-        .frame(width: 430, height: 340)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 16)
+        .background(.regularMaterial)
+    }
+
+    // MARK: Helper — a right-aligned label paired with a field
+    @ViewBuilder
+    private func labeledField<Content: View>(_ label: String,
+                                             @ViewBuilder _ field: () -> Content) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .frame(width: labelWidth, alignment: .trailing)
+                .foregroundStyle(.secondary)
+            field()
+        }
     }
 }
 
@@ -301,6 +327,9 @@ public func ShowSwiftUIMemoryLocationDialogEdit(_ playerId: Int32, _ currentTime
             window = NSWindow(contentViewController: hostingController)
             window?.title = ""
             window?.styleMask = [.titled, .closable]
+            window?.titlebarAppearsTransparent = true
+            window?.titleVisibility = .hidden
+            window?.isMovableByWindowBackground = true
             window?.isReleasedWhenClosed = false
             window?.center()
 

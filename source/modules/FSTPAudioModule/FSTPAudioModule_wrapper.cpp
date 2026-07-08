@@ -175,6 +175,9 @@ public:
     double duration = 0.0;
     std::string codec_name;
 
+    // Timecode offset from file metadata (e.g. QuickTime shows 10:00:00:00)
+    double timecode_offset_seconds = 0.0;
+
     // For tracking current PortAudio stream parameters
     int pa_stream_sample_rate = 0;
     int pa_stream_channels = 0;
@@ -245,6 +248,12 @@ public:
     std::atomic<size_t> fast_buffer_samples{0}; // Fast buffer size
     std::atomic<bool> fast_buffer_ready{false};
     std::atomic<bool> full_buffer_ready{false};
+
+    // Resume / priority-zone decode: start of the first decoded region.
+    // Normally 0 (decode from beginning). When resuming a long file at position T,
+    // the priority zone starts at T, so the region [0, decode_range_start) is
+    // filled later in background phase 2.
+    std::atomic<size_t> decode_range_start{0};
 
     // PortAudio
     PaStream* pa_stream = nullptr;
@@ -709,7 +718,7 @@ public:
                 double start_rate = playback_speed.load();
                 double snap_target = target_playback_speed.load();
 
-                const int smooth_ms = 100;   // total smoothing duration ~40ms
+                const int smooth_ms = 100;   // total smoothing duration 100ms
                 const int step_ms = 2;      // interval step 2ms
                 const int steps = smooth_ms / step_ms;
 
@@ -736,6 +745,33 @@ public:
 
             bool is_pausing = (target == 0.0 && current > 0.0);
             bool is_jogging = jog_forward.load() || jog_backward.load();
+
+            // === TAPE PAUSE DECELERATION (Betacam SP servo physics) ===
+            // Real Betacam SP: capstan servo brakes tape over 150-250ms at normal play speed.
+            // Quadratic profile v(t) = v0*(1-t/T)^2: rapid initial braking, smooth tail.
+            // Audio advances ~v0*T/3 during braking so the pause stripe drifts ~0.3-0.5
+            // frames before locking — exactly the "settle" visible on real hardware.
+            // Duration scales with starting speed: faster shuttle stops sooner.
+            if (is_pausing && current > 0.01) {
+                int brake_ms = (current <= 1.5) ? 240 :
+                               (current <= 3.0) ? 180 :
+                               130;
+                const int step_ms = 5;
+                const int steps = brake_ms / step_ms;
+
+                for (int s = 1; s <= steps && !should_exit_smooth_speed.load(); ++s) {
+                    if (target_playback_speed.load() != 0.0) break;  // User resumed playback
+                    double t = static_cast<double>(s) / steps;
+                    double new_speed = current * (1.0 - t) * (1.0 - t);
+                    if (new_speed < 0.003) new_speed = 0.0;
+                    playback_speed.store(new_speed);
+                    calculate_and_set_volume(new_speed);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+                }
+                playback_speed.store(0.0);
+                calculate_and_set_volume(0.0);
+                continue;
+            }
 
             int interval = normal_interval; // Default interval
 
@@ -899,7 +935,7 @@ public:
         }
     }
 
-    bool LoadFile(const std::string& filepath) {
+    bool LoadFile(const std::string& filepath, double resume_position = 0.0) {
         std::cout << "FSTPAudioModuleImpl::LoadFile called with: " << filepath << std::endl;
 
         // Reset elastic ease flags for new file
@@ -913,7 +949,7 @@ public:
             return false;
         }
         std::cout << "File analyzed successfully. Sample rate: " << sample_rate << ", Channels: " << channels << ", Duration: " << duration << std::endl;
-        
+
         std::cout << "Creating mmap buffer..." << std::endl;
         if (!CreateMmapBuffer()) {
             std::cerr << "CreateMmapBuffer failed" << std::endl;
@@ -922,16 +958,190 @@ public:
         std::cout << "Mmap buffer created successfully" << std::endl;
 
         const double fast_duration = reduce_fast_buffer_for_pcm ? FAST_BUFFER_DURATION_PCM : FAST_BUFFER_DURATION;
+        constexpr double PRIORITY_ZONE_DURATION = 10.0 * 60.0;  // 10 minutes around resume point
+
+        // Guard against a stale/invalid saved resume position at or beyond the end of THIS
+        // file. Causes seen: the file at this path changed/shortened, the position overshot
+        // EOF during fast shuttle, or it carried a timecode offset. Left unclamped, the
+        // priority zone collapses to 0 samples and the whole load fails (file won't open).
+        if (resume_position > 0.0 && duration > 0.0 && resume_position > duration - 1.0) {
+            double clamped = std::max(0.0, duration - 1.0);
+            std::cout << "[RESUME] Saved position " << resume_position << "s is past EOF ("
+                      << duration << "s) — clamping to " << clamped << "s" << std::endl;
+            resume_position = clamped;
+        }
+
+        // If resume position is beyond the fast buffer, use priority-zone decode.
+        // Exception: PCM files decode at memcpy speed — decode the full file immediately
+        // and then just set the playback head, no need for a zone + 2-phase background.
+        if (resume_position > fast_duration && duration > fast_duration) {
+            if (reduce_fast_buffer_for_pcm) {
+                std::cout << "[RESUME] PCM file + long resume: decoding full file immediately (no priority zone)" << std::endl;
+                size_t decoded = DecodePCMFast(filepath, 0, total_samples);
+                if (decoded > 0) {
+                    decode_range_start.store(0);
+                    decoded_samples.store(decoded);
+                    fast_buffer_samples.store(decoded);
+                    fast_buffer_ready.store(true);
+                    full_buffer_ready.store(true);
+                    double sample_pos = resume_position * sample_rate * channels;
+                    playback_position.store(std::min(sample_pos, static_cast<double>(decoded)));
+                    std::cout << "[RESUME] PCM full decode done, position set to " << resume_position << "s" << std::endl;
+                    return StartPermanentAudioStream();
+                }
+                std::cout << "[RESUME] PCM fast decode failed, falling back to priority zone" << std::endl;
+            }
+            std::cout << "[RESUME] Priority-zone decode: position=" << resume_position << "s, duration=" << duration << "s" << std::endl;
+            if (DecodePriorityZone(filepath, resume_position, PRIORITY_ZONE_DURATION)) {
+                return true;
+            }
+            std::cerr << "[RESUME] Priority-zone decode failed — falling back to normal load "
+                         "from start so the file still opens" << std::endl;
+            // Fall through to the standard two-stage decode below: a bad resume position must
+            // never make the file unloadable.
+        }
 
         if (duration <= fast_duration) {
             std::cout << "Decoding full file (duration <= " << fast_duration << " seconds)"
                       << (reduce_fast_buffer_for_pcm ? " [PCM fast buffer]" : "") << std::endl;
-            return DecodeFullFile(filepath);
+            if (!DecodeFullFile(filepath)) return false;
+            if (resume_position > 0.0) {
+                double sample_pos = resume_position * sample_rate * channels;
+                double max_pos = static_cast<double>(decoded_samples.load());
+                playback_position.store(std::min(sample_pos, max_pos));
+                std::cout << "[RESUME] Set position to " << resume_position << "s after full decode" << std::endl;
+            }
+            return true;
         }
 
         if (!DecodeTwoStage(filepath, fast_duration)) {
             return false;
         }
+        // For resume within the fast buffer range, set position now.
+        // Resume beyond fast buffer is handled by DecodePriorityZone above.
+        if (resume_position > 0.0 && resume_position <= fast_duration) {
+            double sample_pos = resume_position * sample_rate * channels;
+            double max_pos = static_cast<double>(decoded_samples.load());
+            playback_position.store(std::min(sample_pos, max_pos));
+            std::cout << "[RESUME] Set position to " << resume_position << "s after two-stage decode" << std::endl;
+        }
+        return true;
+    }
+
+    // Decode a priority zone around the resume position, then fill gaps in background.
+    // Zone: [resume_pos, resume_pos + zone_duration].
+    // Background phase 1: forward from zone end to file end.
+    // Background phase 2: backward from resume_pos to 0 (for shuttle rewind).
+    bool DecodePriorityZone(const std::string& filepath, double resume_pos, double zone_duration) {
+        // Keep resume_pos exact; shrink zone_duration if it would overshoot end of file.
+        // This preserves the exact saved position instead of moving the head backward.
+        resume_pos = std::max(0.0, std::min(resume_pos, duration));
+        double zone_end = std::min(resume_pos + zone_duration, duration);
+        // Never let the zone collapse to nothing (resume_pos at/near EOF) — that produced a
+        // 0-sample decode that failed the whole load. Pull the head back ~1s so there is a
+        // usable zone that ends at the file end.
+        if (zone_end - resume_pos < 1.0) {
+            resume_pos = std::max(0.0, duration - 1.0);
+            zone_end = duration;
+        }
+        zone_duration = zone_end - resume_pos;
+
+        size_t resume_sample = static_cast<size_t>(resume_pos * sample_rate * channels);
+        size_t zone_samples  = static_cast<size_t>(zone_duration * sample_rate * channels);
+
+        std::cout << "[RESUME] Decoding priority zone: " << resume_pos << "s – "
+                  << zone_end << "s (" << zone_samples << " samples)" << std::endl;
+
+        size_t decoded_zone = 0;
+        if (reduce_fast_buffer_for_pcm) {
+            decoded_zone = DecodePCMFast(filepath, resume_sample, zone_samples);
+            if (decoded_zone == 0)
+                decoded_zone = DecodeToBuffer(filepath, resume_sample, zone_samples);
+        } else {
+            decoded_zone = DecodeToBuffer(filepath, resume_sample, zone_samples);
+        }
+
+        if (decoded_zone == 0) {
+            std::cerr << "[RESUME] Priority zone decode failed" << std::endl;
+            return false;
+        }
+
+        // The decoded region starts at resume_sample, not at 0
+        decode_range_start.store(resume_sample);
+        fast_buffer_samples.store(resume_sample + decoded_zone);
+        decoded_samples.store(resume_sample + decoded_zone);
+        fast_buffer_ready.store(true);
+
+        // Place playback head at resume position
+        playback_position.store(static_cast<double>(resume_sample));
+
+        std::cout << "[RESUME] Priority zone ready. Starting stream, then background fill." << std::endl;
+        if (!StartPermanentAudioStream()) {
+            std::cout << "[RESUME] ERROR: Failed to start permanent stream!" << std::endl;
+        }
+
+        // Stop any leftover background thread
+        if (background_decode_thread.joinable()) {
+            should_stop_background_decode.store(true);
+            background_decode_thread.join();
+        }
+        should_stop_background_decode.store(false);
+        background_decode_running.store(true);
+
+        background_decode_thread = std::thread([this, filepath, resume_sample, decoded_zone]() {
+            std::cout << "[RESUME BG] Phase 1: forward from " << (resume_sample + decoded_zone)
+                      << " to end (" << total_samples << ")" << std::endl;
+
+            size_t zone_end = resume_sample + decoded_zone;
+
+            // Phase 1: decode forward from end of priority zone to file end.
+            // No throttle (is_background=false) — we want to fill the gap as fast as possible
+            // so that forward shuttle into undecoded territory doesn't stall.
+            size_t fwd = 0;
+            if (zone_end < total_samples) {
+                size_t fwd_max = total_samples - zone_end;
+                if (reduce_fast_buffer_for_pcm) {
+                    fwd = DecodePCMFast(filepath, zone_end, fwd_max);
+                    if (fwd == 0) fwd = DecodeToBuffer(filepath, zone_end, fwd_max, false);
+                } else {
+                    fwd = DecodeToBuffer(filepath, zone_end, fwd_max, false);
+                }
+                if (fwd > 0) {
+                    decoded_samples.store(zone_end + fwd);
+                    std::cout << "[RESUME BG] Phase 1 done: decoded to " << (zone_end + fwd) << std::endl;
+                }
+            }
+
+            if (should_stop_background_decode.load()) {
+                background_decode_running.store(false);
+                return;
+            }
+
+            // Phase 2: backward fill from 0 to resume_sample (for shuttle rewind support).
+            // Also no throttle — want backward region available quickly.
+            if (resume_sample > 0) {
+                std::cout << "[RESUME BG] Phase 2: backward fill [0, " << resume_sample << "]" << std::endl;
+                size_t bwd = 0;
+                if (reduce_fast_buffer_for_pcm) {
+                    bwd = DecodePCMFast(filepath, 0, resume_sample);
+                    if (bwd == 0) bwd = DecodeToBuffer(filepath, 0, resume_sample, false);
+                } else {
+                    bwd = DecodeToBuffer(filepath, 0, resume_sample, false);
+                }
+                if (bwd > 0) {
+                    // The whole file is now decoded — reset range to full [0, total]
+                    decode_range_start.store(0);
+                    decoded_samples.store(total_samples);
+                    full_buffer_ready.store(true);
+                    std::cout << "[RESUME BG] Phase 2 done. Full buffer ready." << std::endl;
+                }
+            } else {
+                full_buffer_ready.store(true);
+            }
+
+            background_decode_running.store(false);
+        });
+
         return true;
     }
 
@@ -952,12 +1162,14 @@ public:
         sample_rate = 0;
         channels = 0;
         duration = 0.0;
+        timecode_offset_seconds = 0.0;
         total_samples = 0;
         playback_position.store(0.0);
         decoded_samples.store(0);
         fast_buffer_samples.store(0);
         fast_buffer_ready.store(false);
         full_buffer_ready.store(false);
+        decode_range_start.store(0);
         // first_play is no longer needed - old system
     }
 
@@ -1160,10 +1372,10 @@ private:
             size_t total_decoded = std::max(actual_decoded, fast_decoded);
             max_available_samples = total_decoded / impl->channels;
 
-            // Only output silence if we're truly beyond the buffer (not just near the end)
-            // GetSafeSample will return 0 for out-of-bounds indices, allowing graceful interpolation
-            if (base_index >= max_available_samples) {
-                // Completely outside boundaries - silence
+            // Check both upper bound and lower bound (for priority-zone / resume decode)
+            size_t range_start_samples = impl->decode_range_start.load() / impl->channels;
+            if (base_index >= max_available_samples || base_index < range_start_samples) {
+                // Outside decoded region — output silence
                 for (int ch = 0; ch < impl->channels; ch++) {
                     output[frame * impl->channels + ch] = 0;
                     clean_buffer[frame * impl->channels + ch] = 0;
@@ -1262,51 +1474,41 @@ private:
         // Peak Program Meter (PPM) calculation - quasi-peak behavior like Pro Tools/iZotope
         // NOTE: VU meters read from clean_buffer (audio file only, excluding servomotor)
         {
-            float sum_left = 0.0f, sum_right = 0.0f;
+            // Audio metering, DAW-style (Logic/FCP/Pro Tools): the solid bar shows RMS (true
+            // program level / loudness) and the cap shows true sample PEAK. dBFS conversion and
+            // ballistics (attack/decay, peak-hold) are applied in the renderer. Replaces the old
+            // ad-hoc avg(|x|)×1.5 "quasi-peak" — which was neither RMS nor peak and under-read
+            // real material, so the meter never matched a pro DAW.
+            float sumsq_left = 0.0f, sumsq_right = 0.0f;
             float peak_left = 0.0f, peak_right = 0.0f;
 
             for (unsigned long frame = 0; frame < framesPerBuffer; frame++) {
                 if (impl->channels >= 1) {
-                    float sample_left = static_cast<float>(clean_buffer[frame * impl->channels]) / 32768.0f;
-                    float abs_left = std::abs(sample_left);
-                    // Quasi-peak: accumulate absolute values (not RMS!)
-                    sum_left += abs_left;
-                    peak_left = std::max(peak_left, abs_left);
+                    float s = static_cast<float>(clean_buffer[frame * impl->channels]) / 32768.0f;
+                    sumsq_left += s * s;
+                    peak_left = std::max(peak_left, std::abs(s));
                 }
 
                 if (impl->channels >= 2) {
-                    float sample_right = static_cast<float>(clean_buffer[frame * impl->channels + 1]) / 32768.0f;
-                    float abs_right = std::abs(sample_right);
-                    // Quasi-peak: accumulate absolute values (not RMS!)
-                    sum_right += abs_right;
-                    peak_right = std::max(peak_right, abs_right);
+                    float s = static_cast<float>(clean_buffer[frame * impl->channels + 1]) / 32768.0f;
+                    sumsq_right += s * s;
+                    peak_right = std::max(peak_right, std::abs(s));
                 } else if (impl->channels == 1) {
-                    // Mono: copy left channel to right for VU meters
-                    float sample = static_cast<float>(clean_buffer[frame * impl->channels]) / 32768.0f;
-                    float abs_sample = std::abs(sample);
-                    // Quasi-peak: accumulate absolute values (not RMS!)
-                    sum_right += abs_sample;
-                    peak_right = std::max(peak_right, abs_sample);
+                    // Mono: mirror the single channel to the right meter.
+                    float s = static_cast<float>(clean_buffer[frame * impl->channels]) / 32768.0f;
+                    sumsq_right += s * s;
+                    peak_right = std::max(peak_right, std::abs(s));
                 }
             }
 
-            // Quasi-peak (PPM-style): average of absolute values scaled to be closer to peak
-            // This matches iZotope/Pro Tools behavior better than true RMS
-            float avg_left = sum_left / static_cast<float>(framesPerBuffer);
-            float avg_right = sum_right / static_cast<float>(framesPerBuffer);
+            // RMS = sqrt(mean(x²)) over the block — the true program level (a full-scale sine
+            // reads -3 dBFS, exactly like a DAW). True peak drives the peak-hold cap.
+            float n = static_cast<float>(framesPerBuffer > 0 ? framesPerBuffer : 1);
+            float rms_left  = std::sqrt(sumsq_left  / n);
+            float rms_right = std::sqrt(sumsq_right / n);
 
-            // Scale average absolute value to approximate quasi-peak (closer to true peak)
-            // Factor of 1.5 brings it closer to peak for typical audio material
-            float quasi_peak_left = avg_left * 1.5f;
-            float quasi_peak_right = avg_right * 1.5f;
-
-            // Clamp to not exceed true peak
-            quasi_peak_left = std::min(quasi_peak_left, peak_left);
-            quasi_peak_right = std::min(quasi_peak_right, peak_right);
-
-            // Save quasi-peak as "level" and true peak as "peak"
-            impl->audio_level_left.store(quasi_peak_left);
-            impl->audio_level_right.store(quasi_peak_right);
+            impl->audio_level_left.store(rms_left);
+            impl->audio_level_right.store(rms_right);
             impl->audio_peak_left.store(peak_left);
             impl->audio_peak_right.store(peak_right);
         }
@@ -1391,6 +1593,52 @@ private:
             duration = static_cast<double>(format_ctx->duration) / AV_TIME_BASE;
         }
         total_samples = static_cast<size_t>(duration * sample_rate * channels * 1.1);
+
+        // Extract timecode from file metadata (professional video: QuickTime, MXF, etc.)
+        // QuickTime stores it as "timecode" in format or stream metadata (e.g. "10:00:00:00")
+        {
+            const char* tc = nullptr;
+            double fps = 0.0;
+
+            // Try format-level metadata first
+            const AVDictionaryEntry* entry = av_dict_get(format_ctx->metadata, "timecode", nullptr, 0);
+            if (entry && entry->value) {
+                tc = entry->value;
+                std::cout << "[Audio] Timecode in format metadata: " << tc << std::endl;
+            }
+
+            // Try video stream metadata
+            if (!tc) {
+                int vidx = av_find_best_stream(format_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                if (vidx >= 0) {
+                    AVStream* vs = format_ctx->streams[vidx];
+                    entry = av_dict_get(vs->metadata, "timecode", nullptr, 0);
+                    if (entry && entry->value) {
+                        tc = entry->value;
+                        std::cout << "[Audio] Timecode in video stream metadata: " << tc << std::endl;
+                    }
+                    // Get FPS from video stream
+                    if (vs->avg_frame_rate.num > 0 && vs->avg_frame_rate.den > 0) {
+                        fps = av_q2d(vs->avg_frame_rate);
+                    } else if (vs->r_frame_rate.num > 0 && vs->r_frame_rate.den > 0) {
+                        fps = av_q2d(vs->r_frame_rate);
+                    }
+                }
+            }
+
+            // Parse HH:MM:SS:FF timecode string to seconds
+            if (tc) {
+                int h = 0, m = 0, s = 0, f = 0;
+                double use_fps = (fps > 0.0) ? fps : 25.0;
+                if (sscanf(tc, "%d:%d:%d:%d", &h, &m, &s, &f) == 4) {
+                    timecode_offset_seconds = (h * 3600.0) + (m * 60.0) + s + (f / use_fps);
+                    if (timecode_offset_seconds > 0.001) {
+                        std::cout << "[Audio] Timecode offset: " << std::fixed << std::setprecision(3)
+                                  << timecode_offset_seconds << "s (" << tc << " @ " << use_fps << " fps)" << std::endl;
+                    }
+                }
+            }
+        }
 
         // Get codec name
         if (codec && codec->long_name) {
@@ -2051,9 +2299,9 @@ void FSTPAudioModuleWrapper::Shutdown() {
     }
 }
 
-bool FSTPAudioModuleWrapper::LoadFile(const std::string& filepath) {
+bool FSTPAudioModuleWrapper::LoadFile(const std::string& filepath, double resume_position) {
     std::cout << "FSTPAudioModuleWrapper::LoadFile called with: " << filepath << std::endl;
-    
+
     if (!m_initialized) {
         std::cerr << "Audio module not initialized" << std::endl;
         return false;
@@ -2064,8 +2312,8 @@ bool FSTPAudioModuleWrapper::LoadFile(const std::string& filepath) {
         UnloadFile();
     }
 
-    std::cout << "Calling m_impl->LoadFile..." << std::endl;
-    if (m_impl->LoadFile(filepath)) {
+    std::cout << "Calling m_impl->LoadFile (resume=" << resume_position << "s)..." << std::endl;
+    if (m_impl->LoadFile(filepath, resume_position)) {
         std::cout << "File loaded successfully, duration: " << m_impl->duration << " seconds" << std::endl;
         m_current_file = filepath;
         m_loaded = true;
@@ -2199,20 +2447,30 @@ void FSTPAudioModuleWrapper::SetReverseInstant(bool reverse) {
 void FSTPAudioModuleWrapper::SetPosition(double position_seconds) {
     if (m_impl && m_loaded) {
         double sample_pos = position_seconds * m_impl->sample_rate * m_impl->channels;
-        sample_pos = std::max(0.0, std::min(sample_pos, static_cast<double>(m_impl->decoded_samples.load())));
+        double range_start = static_cast<double>(m_impl->decode_range_start.load());
+        double range_end   = static_cast<double>(m_impl->decoded_samples.load());
+        sample_pos = std::max(range_start, std::min(sample_pos, range_end));
         m_impl->playback_position.store(sample_pos);
     }
 }
 
 double FSTPAudioModuleWrapper::GetPosition() const {
     if (m_impl && m_loaded && m_impl->sample_rate > 0 && m_impl->channels > 0) {
-        return m_impl->playback_position.load() / (m_impl->sample_rate * m_impl->channels);
+        double raw_seconds = m_impl->playback_position.load() / (m_impl->sample_rate * m_impl->channels);
+        return raw_seconds + m_impl->timecode_offset_seconds;
     }
     return 0.0;
 }
 
 double FSTPAudioModuleWrapper::GetDuration() const {
     return m_duration.load();
+}
+
+double FSTPAudioModuleWrapper::GetTimecodeOffset() const {
+    if (m_impl && m_loaded) {
+        return m_impl->timecode_offset_seconds;
+    }
+    return 0.0;
 }
 
 bool FSTPAudioModuleWrapper::IsPlaying() const {

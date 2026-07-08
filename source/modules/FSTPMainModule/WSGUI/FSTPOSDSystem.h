@@ -49,7 +49,12 @@ void UpdateOSDPosition(int player_id, double currentTime, double totalDuration);
 void UpdateOSDSeekMode(int player_id, bool seeking, const std::string& input_timecode);
 void UpdateOSDDisplayMode(int player_id, OSDDisplayMode mode);
 void UpdateOSDLoadingProgress(int player_id, int percent);
+// TAPE THREADING badge: background proxy conversion progress shown while the video
+// already plays (transport limited to ≤1× forward). percent 0-100 shows "thread nn%",
+// -1 hides the badge. Safe to call from any thread (single int store, like other OSD setters).
+void UpdateOSDProxyThreading(int player_id, int percent);
 void SetOSDFileType(int player_id, bool is_audio);
+void SetOSDTimecodeOffset(int player_id, double offset_seconds);
 void UpdateOSDDecodedFrames(int player_id, const std::vector<bool>& decoded_map, int total_frames);
 
 // Backward compatibility - functions without player_id (use player 0)

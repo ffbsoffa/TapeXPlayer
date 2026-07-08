@@ -77,9 +77,16 @@ ifneq (,$(findstring _NT,$(UNAME_S)))
     USE_SWIFT = no
     
     # Windows compilation flags
-    CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g \
-               -msse2 -msse4.1 -mavx -mavx2 \
-               -Wno-unused-parameter
+    # NOTE: detect arch by MSYSTEM_CARCH, not uname -m — the msys runtime on
+    # Windows ARM64 is itself x86_64 (emulation), so uname -m lies about the build target.
+    ifeq ($(MSYSTEM_CARCH),aarch64)
+        # CLANGARM64: NEON is always on, x86 flags break compilation
+        CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -Wno-unused-parameter
+    else
+        CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g \
+                   -msse2 -msse4.1 -mavx -mavx2 \
+                   -Wno-unused-parameter
+    endif
     
     # Include paths
     INCLUDES = -I$(MINGW_PATH)/include \
@@ -96,9 +103,10 @@ ifneq (,$(findstring _NT,$(UNAME_S)))
 
     # Library paths and libs
     LDFLAGS = -L$(MINGW_PATH)/lib -mwindows
-    LIBS = -lmingw32 -lSDL2main -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavutil -lswscale \
+    LIBS = -lmingw32 -lSDL2main -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavfilter -lavutil -lswscale \
            -lssl -lcrypto -lrtmidi \
-           -lwinmm -lole32 -lgdi32 -lcomdlg32 -lcomctl32 -lshell32 -lshlwapi -luuid -luxtheme -ldwmapi
+           -lwinmm -lole32 -lgdi32 -lcomdlg32 -lcomctl32 -lshell32 -lshlwapi -luuid -luxtheme -ldwmapi \
+           -ld3d11 -ldxgi
     
     # Resource compiler for manifest embedding
     WINDRES = windres
@@ -145,7 +153,13 @@ ifeq ($(UNAME_S),Linux)
 
     # REMOVED AVX512 due to heap corruption issues on Intel CPUs
     # AVX512 requires 64-byte alignment which causes problems with AVFrame allocation
-    CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -march=x86-64-v3 -msse2 -msse4.1 -mavx -mavx2 -Wno-unused-parameter
+    ifeq ($(UNAME_M),x86_64)
+        CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -march=x86-64-v3 -msse2 -msse4.1 -mavx -mavx2 -Wno-unused-parameter
+    else
+        # arm64 Linux (VM on Apple Silicon, Raspberry Pi 5, etc.): NEON in AArch64
+        # is always on, x86 flags (-march/-msse/-mavx) break the build here.
+        CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -Wno-unused-parameter
+    endif
 
     # GTK+ flags for file dialogs
     GTK_CFLAGS = $(shell pkg-config --cflags gtk+-3.0)
@@ -162,7 +176,7 @@ ifeq ($(UNAME_S),Linux)
 
     # Library flags
     LIBS = -lSDL2 -lSDL2_ttf -lportaudio \
-           -lavformat -lavcodec -lavutil -lswscale \
+           -lavformat -lavcodec -lavfilter -lavutil -lswscale \
            -lssl -lcrypto -lrtmidi \
            -lpthread -ldl -lm \
            $(GTK_LIBS)
@@ -190,7 +204,16 @@ else
     SWIFTFLAGS = -target $(SWIFT_TARGET) -import-objc-header modules/FSTPMainModule/WSGUI/darwin/sdl/TapeXPlayer-Bridging-Header.h -parse-as-library
     SDL_PATH = $(HOMEBREW_PATH)
     INCLUDES = -I$(SDL_PATH)/include -Imodules/FSTPMainModule -Imodules/FSTPMainModule/WSGUI -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule -Imodules/FSTPAudioModule
-    LIBS = -L$(SDL_PATH)/lib -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavutil -lswscale -lssl -lcrypto -lrtmidi -framework Cocoa -framework CoreFoundation -framework CoreVideo -framework UniformTypeIdentifiers -framework VideoToolbox -framework IOKit -framework QuartzCore -framework CoreMIDI
+    LIBS = -L$(SDL_PATH)/lib -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavfilter -lavutil -lswscale -lssl -lcrypto -lrtmidi -framework Cocoa -framework CoreFoundation -framework CoreVideo -framework UniformTypeIdentifiers -framework VideoToolbox -framework IOKit -framework QuartzCore -framework CoreMIDI -framework AVFoundation -framework CoreMedia
+    # Optional Lua for the extension executor. Linked only when pkg-config finds a
+    # 'lua' package (e.g. `brew install lua`); otherwise the build proceeds with the
+    # executor stubbed out (FSTP_HAVE_LUA undefined), so it never breaks a build.
+    LUA_LIBS := $(shell pkg-config --libs lua 2>/dev/null)
+    ifneq ($(LUA_LIBS),)
+        CXXFLAGS += -DFSTP_HAVE_LUA
+        INCLUDES += $(shell pkg-config --cflags lua 2>/dev/null)
+        LIBS += $(LUA_LIBS)
+    endif
     LINKER = $(SWIFTC)
     LINKER_FLAGS = $(SWIFT_TARGET:%= -target %) -Xlinker -lc++
     OBJDIR = ../builds/obj
@@ -241,6 +264,7 @@ else
                   $(filter-out modules/FSTPMainModule/WSGUI/windows/%, \
                   $(CPP_SOURCES_RAW)))
     MM_SOURCES = $(wildcard modules/*/*.mm) $(wildcard modules/*/*/*.mm) $(wildcard modules/*/*/*/*.mm) $(wildcard modules/*/*/*/*/*.mm)
+    MM_SOURCES += objc_proxy_encoder.mm
     # Exclude BuildInfo.swift from scanning (it's auto-generated)
     SWIFT_SOURCES = $(filter-out $(BUILD_INFO_SWIFT), $(wildcard modules/*/*/*/*.swift) $(wildcard modules/*/*/*/*/*.swift))
 endif
@@ -392,8 +416,11 @@ update-buildinfo-windows:
 	@echo "    return TAPEXPLAYER_BUILD_DATE;" >> $(WINDOWS_BUILDINFO_H)
 	@echo "}" >> $(WINDOWS_BUILDINFO_H)
 	@echo "✅ Windows BuildInfo.h updated: $(VERSION) \"$(CODE_NAME)\" Build $(BUILD_NUMBER)"
-	@# Force recompile of About dialog so new build number appears immediately
-	@rm -f $(OBJDIR)/modules/FSTPMainModule/WSGUI/windows/FSTPAboutDialog.o
+
+# BuildInfo.h is rewritten every run → the About dialog rebuilds itself.
+# (This used to be `rm -f FSTPAboutDialog.o` inside a phony target — with -j8 it
+# raced object compilation and the link failed on the missing .o.)
+$(OBJDIR)/modules/FSTPMainModule/WSGUI/windows/FSTPAboutDialog.o: modules/FSTPMainModule/WSGUI/windows/BuildInfo.h
 
 $(RC_OBJECT): $(RC_SOURCE)
 	@echo "[RC] $(notdir $(RC_SOURCE))"
@@ -422,8 +449,11 @@ else
 update-buildinfo:
 	@chmod +x update_buildinfo.sh
 	@./update_buildinfo.sh
-	@# Force recompile of About dialog so new build number appears immediately
-	@rm -f $(OBJDIR)/modules/FSTPMainModule/WSGUI/linux/FSTPAboutDialog.o
+
+# BuildInfo.h is rewritten every run → the About dialog rebuilds itself.
+# (This used to be `rm -f FSTPAboutDialog.o` inside a phony target — with -j8 it
+# raced object compilation and the link failed on the missing .o.)
+$(OBJDIR)/modules/FSTPMainModule/WSGUI/linux/FSTPAboutDialog.o: modules/FSTPMainModule/WSGUI/linux/BuildInfo.h
 
 $(TARGET): update-buildinfo $(OBJECTS)
 	@echo "[Link] $(notdir $(TARGET))"
@@ -453,6 +483,12 @@ $(OBJDIR)/%.o: %.mm
 	@echo "[ObjC++] $<"
 	@mkdir -p $(dir $@)
 	@$(CXX) $(OBJCFLAGS) $(INCLUDES) -c $< -o $@
+
+# objc_proxy_encoder.mm requires ARC (more specific rule overrides the generic %.mm rule)
+$(OBJDIR)/objc_proxy_encoder.o: objc_proxy_encoder.mm
+	@echo "[ObjC+ARC] $<"
+	@mkdir -p $(dir $@)
+	@$(CXX) $(OBJCFLAGS) -fobjc-arc $(INCLUDES) -I. -c $< -o $@
 
 # Compile Swift module (all files together + BuildInfo.swift) - only on macOS
 ifeq ($(USE_SWIFT),yes)

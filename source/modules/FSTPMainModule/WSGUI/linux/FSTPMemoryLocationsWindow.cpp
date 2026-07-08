@@ -4,6 +4,7 @@
 #include <iostream>
 #include <string>
 #include <cmath>
+#include <cstdio>
 #include "../FSTPMemoryLocations.h"
 #include "FSTPMemoryLocationsWindow.h"
 
@@ -15,13 +16,15 @@ extern "C" double GetInstancePosition(int player_id);
 static GtkWidget* g_memory_locations_window = nullptr;
 static GtkWidget* g_treeview = nullptr;
 static GtkListStore* g_liststore = nullptr;
+static GtkWidget* g_subtitle_label = nullptr;   // "Player N · X markers" (matches macOS)
 static guint g_refresh_timer = 0;
 
-// GTK TreeView columns
+// GTK TreeView columns (mirror the macOS table: # / Timecode / Name / Comments)
 enum {
     COL_ID = 0,
     COL_TIMECODE,
     COL_NAME,
+    COL_COMMENTS,
     NUM_COLS
 };
 
@@ -43,8 +46,22 @@ static void RefreshMemoryLocationsTable() {
                              COL_ID, data.id,
                              COL_TIMECODE, data.timecode_display,
                              COL_NAME, data.name,
+                             COL_COMMENTS, data.comments,
                              -1);
         }
+    }
+
+    // Header subtitle: player + count (doubles as the empty-state hint).
+    if (g_subtitle_label) {
+        char sub[160];
+        if (count == 0) {
+            snprintf(sub, sizeof(sub), "No markers — press Enter during playback to add one");
+        } else {
+            int player = GetActivePlayerID();
+            snprintf(sub, sizeof(sub), "Player %d  ·  %d %s",
+                     (player >= 0 ? player + 1 : 1), count, count == 1 ? "marker" : "markers");
+        }
+        gtk_label_set_text(GTK_LABEL(g_subtitle_label), sub);
     }
 }
 
@@ -381,6 +398,60 @@ static gboolean OnWindowClose(GtkWidget* widget, GdkEvent* event, gpointer data)
     return TRUE;  // Prevent actual destruction
 }
 
+// --- Footer / context-menu helpers (mirror the macOS window) -------------
+static int GetSelectedLocationId() {
+    if (!g_treeview) return -1;
+    GtkTreeSelection* sel = gtk_tree_view_get_selection(GTK_TREE_VIEW(g_treeview));
+    GtkTreeModel* model; GtkTreeIter iter;
+    if (gtk_tree_selection_get_selected(sel, &model, &iter)) {
+        gint id; gtk_tree_model_get(model, &iter, COL_ID, &id, -1);
+        return id;
+    }
+    return -1;
+}
+
+static void OnAddClicked(GtkWidget*, gpointer) {
+    int player = GetActivePlayerID();
+    if (player < 0) player = 0;
+    FSTP_AddMemoryLocationAtCurrentTime(player, "", "");  // quick-add at current time
+    RefreshMemoryLocationsTable();
+}
+
+static void OnDeleteClicked(GtkWidget*, gpointer) {
+    int id = GetSelectedLocationId();
+    if (id > 0) { FSTP_DeleteMemoryLocation(id); RefreshMemoryLocationsTable(); }
+}
+
+static void OnImportClicked(GtkWidget*, gpointer) {
+    GtkWidget* dialog = gtk_file_chooser_dialog_new(
+        "Import Memory Locations", GTK_WINDOW(g_memory_locations_window),
+        GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, nullptr);
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        if (filename) {
+            FSTP_LoadMemoryLocations(filename);
+            g_free(filename);
+            RefreshMemoryLocationsTable();
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void OnCtxRecall(GtkWidget*, gpointer) {
+    int id = GetSelectedLocationId();
+    int player = GetActivePlayerID();
+    if (id > 0 && player >= 0) FSTP_RecallMemoryLocation(id, player);
+}
+static void OnCtxEdit(GtkWidget*, gpointer) {
+    int id = GetSelectedLocationId();
+    if (id > 0) ShowAddEditMemoryLocationDialog(0, id, 0.0);
+}
+static void OnCtxDelete(GtkWidget*, gpointer) {
+    int id = GetSelectedLocationId();
+    if (id > 0) { FSTP_DeleteMemoryLocation(id); RefreshMemoryLocationsTable(); }
+}
+
 // Create the Memory Locations window
 static void CreateMemoryLocationsWindow() {
     if (g_memory_locations_window) return;
@@ -400,6 +471,24 @@ static void CreateMemoryLocationsWindow() {
     GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(g_memory_locations_window), vbox);
 
+    // Header: icon + title + subtitle "Player N · X markers" (mirrors macOS).
+    GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(header), 12);
+    GtkWidget* header_icon = gtk_label_new("📍");
+    gtk_box_pack_start(GTK_BOX(header), header_icon, FALSE, FALSE, 0);
+    GtkWidget* header_text = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+    GtkWidget* title_label = gtk_label_new(nullptr);
+    gtk_label_set_markup(GTK_LABEL(title_label), "<b>Memory Locations</b>");
+    gtk_widget_set_halign(title_label, GTK_ALIGN_START);
+    g_subtitle_label = gtk_label_new("");
+    gtk_widget_set_halign(g_subtitle_label, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(g_subtitle_label), "dim-label");
+    gtk_box_pack_start(GTK_BOX(header_text), title_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header_text), g_subtitle_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), header_text, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), header, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+
     // Create scrolled window for table
     GtkWidget* scrolled = gtk_scrolled_window_new(nullptr, nullptr);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled),
@@ -410,7 +499,8 @@ static void CreateMemoryLocationsWindow() {
     g_liststore = gtk_list_store_new(NUM_COLS,
                                      G_TYPE_INT,      // ID
                                      G_TYPE_STRING,   // Timecode
-                                     G_TYPE_STRING);  // Name
+                                     G_TYPE_STRING,   // Name
+                                     G_TYPE_STRING);  // Comments
 
     // Create tree view (table widget)
     g_treeview = gtk_tree_view_new_with_model(GTK_TREE_MODEL(g_liststore));
@@ -423,6 +513,31 @@ static void CreateMemoryLocationsWindow() {
     // Connect button-press-event for modifier key handling
     g_signal_connect(g_treeview, "button-press-event", G_CALLBACK(+[](GtkWidget* widget, GdkEventButton* event, gpointer user_data) -> gboolean {
         GtkTreeView* tree_view = GTK_TREE_VIEW(widget);
+
+        // Right-click → context menu (Go to / Edit / Delete), like macOS.
+        if (event->button == 3) {
+            GtkTreePath* rpath = nullptr;
+            if (gtk_tree_view_get_path_at_pos(tree_view, (gint)event->x, (gint)event->y,
+                                              &rpath, nullptr, nullptr, nullptr)) {
+                gtk_tree_selection_select_path(gtk_tree_view_get_selection(tree_view), rpath);
+                gtk_tree_path_free(rpath);
+            }
+            GtkWidget* menu = gtk_menu_new();
+            GtkWidget* mi_go = gtk_menu_item_new_with_label("Go to");
+            GtkWidget* mi_ed = gtk_menu_item_new_with_label("Edit…");
+            GtkWidget* mi_del = gtk_menu_item_new_with_label("Delete");
+            g_signal_connect(mi_go, "activate", G_CALLBACK(OnCtxRecall), nullptr);
+            g_signal_connect(mi_ed, "activate", G_CALLBACK(OnCtxEdit), nullptr);
+            g_signal_connect(mi_del, "activate", G_CALLBACK(OnCtxDelete), nullptr);
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_go);
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_ed);
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+            gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_del);
+            gtk_widget_show_all(menu);
+            gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent*)event);
+            return TRUE;
+        }
+
         GtkTreePath* path = nullptr;
 
         // Get clicked row
@@ -487,29 +602,49 @@ static void CreateMemoryLocationsWindow() {
     gtk_tree_view_column_set_fixed_width(column, 120);
     gtk_tree_view_append_column(GTK_TREE_VIEW(g_treeview), column);
 
-    // Name column (expands to fill remaining space)
+    // Name column
     renderer = gtk_cell_renderer_text_new();
     column = gtk_tree_view_column_new_with_attributes("Name", renderer,
                                                       "text", COL_NAME,
                                                       nullptr);
     gtk_tree_view_column_set_resizable(column, TRUE);
+    gtk_tree_view_column_set_min_width(column, 140);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(g_treeview), column);
+
+    // Comments column (expands to fill remaining space)
+    renderer = gtk_cell_renderer_text_new();
+    column = gtk_tree_view_column_new_with_attributes("Comments", renderer,
+                                                      "text", COL_COMMENTS,
+                                                      nullptr);
+    gtk_tree_view_column_set_resizable(column, TRUE);
     gtk_tree_view_column_set_expand(column, TRUE);
     gtk_tree_view_append_column(GTK_TREE_VIEW(g_treeview), column);
 
-    // Bottom button bar
-    GtkWidget* button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-    gtk_container_set_border_width(GTK_CONTAINER(button_box), 5);
+    // Footer: separator + Add / Delete (left) · Import / Export (right) — macOS layout.
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+    GtkWidget* button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(button_box), 8);
     gtk_box_pack_start(GTK_BOX(vbox), button_box, FALSE, FALSE, 0);
 
-    // Export to CSV button
-    GtkWidget* export_button = gtk_button_new_with_label("📊 Export to CSV");
+    GtkWidget* add_button = gtk_button_new_with_label("＋");
+    gtk_widget_set_tooltip_text(add_button, "Add memory location at current time");
+    g_signal_connect(add_button, "clicked", G_CALLBACK(OnAddClicked), nullptr);
+    gtk_box_pack_start(GTK_BOX(button_box), add_button, FALSE, FALSE, 0);
+
+    GtkWidget* del_button = gtk_button_new_with_label("－");
+    gtk_widget_set_tooltip_text(del_button, "Delete selected");
+    g_signal_connect(del_button, "clicked", G_CALLBACK(OnDeleteClicked), nullptr);
+    gtk_box_pack_start(GTK_BOX(button_box), del_button, FALSE, FALSE, 0);
+
+    GtkWidget* export_button = gtk_button_new_with_label("Export…");
+    gtk_widget_set_tooltip_text(export_button, "Export Memory Locations to CSV");
     g_signal_connect(export_button, "clicked", G_CALLBACK(OnExportToCSV), nullptr);
     gtk_box_pack_end(GTK_BOX(button_box), export_button, FALSE, FALSE, 0);
 
-    // Info label
-    GtkWidget* info_label = gtk_label_new("Double-click: Recall | Ctrl+Click: Edit | Alt+Click: Delete");
-    gtk_widget_set_halign(info_label, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(button_box), info_label, FALSE, FALSE, 0);
+    GtkWidget* import_button = gtk_button_new_with_label("Import…");
+    gtk_widget_set_tooltip_text(import_button, "Import Memory Locations from a file");
+    g_signal_connect(import_button, "clicked", G_CALLBACK(OnImportClicked), nullptr);
+    gtk_box_pack_end(GTK_BOX(button_box), import_button, FALSE, FALSE, 0);
 
     // Show all widgets
     gtk_widget_show_all(g_memory_locations_window);
@@ -523,6 +658,13 @@ static void CreateMemoryLocationsWindow() {
 // Show the Memory Locations window
 void ShowGTKMemoryLocationsWindow() {
     std::cout << "🔵 ShowGTKMemoryLocationsWindow called" << std::endl;
+
+    // Don't create the window without a loaded file: markers are tied to the
+    // material, an empty window is just confusing.
+    if (!FSTP_IsAnyPlayerActive()) {
+        std::cout << "🔵 Memory Locations: no file loaded, window not shown" << std::endl;
+        return;
+    }
 
     // Initialize Memory Locations system
     FSTP_InitMemoryLocations();

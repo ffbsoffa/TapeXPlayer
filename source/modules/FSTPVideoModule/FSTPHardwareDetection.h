@@ -42,31 +42,31 @@ enum class FSTPCodecSupport {
 };
 
 // ============================================================
-// Decoder Profile — три профиля, откалиброванных на реальных устройствах:
+// Decoder Profile — three profiles calibrated on real devices:
 //
 //   FULL_HARDWARE  → Apple M1 Mac (2020+)
-//                    VideoToolbox отлично работает для всех разрешений.
-//                    Измерение: hw.optional.arm64 != 0 (sysctl macOS)
+//                    VideoToolbox works great at all resolutions.
+//                    Measurement: hw.optional.arm64 != 0 (sysctl macOS)
 //
-//   HYBRID_VT_CPU  → MacBook Pro 2016 Intel (Skylake i7-6xxx) — тест пользователя
-//                    VideoToolbox для полного разрешения + CPU для прокси ≤640p.
-//                    Измерение: Intel Mac год 2012+, или Intel gen ≥ 5 (Broadwell+)
-//                    Граница снизу: 2011 MacBook Pro (Sandy Bridge, gen 2) = граница поддержки
-//                    Минимальный надёжный H.264 HW: 2015 Mac (Broadwell, gen 5)
+//   HYBRID_VT_CPU  → MacBook Pro 2016 Intel (Skylake i7-6xxx) — user tested
+//                    VideoToolbox for full resolution + CPU for proxy ≤640p.
+//                    Measurement: Intel Mac year 2012+, or Intel gen ≥ 5 (Broadwell+)
+//                    Lower bound: 2011 MacBook Pro (Sandy Bridge, gen 2) = support edge
+//                    Minimum reliable H.264 HW: 2015 Mac (Broadwell, gen 5)
 //
-//   MINIMUM        → Intel Celeron Gold 7505 (Tiger Lake 2-core, 15W) — тест пользователя
-//                    QSV-decode + прокси 360p + ограничение 24× скорости.
-//                    Измерение (первичное):  бренд содержит "Celeron"/"Pentium"/"Atom"
-//                    Измерение (вторичное):  ≤2 физических ядра на x86
-//                    Экстраполяция: более ранние 2-ядерные Core i3/i5 имеют аналогичную
-//                    пропускную способность декодера (i3-6006U 2016, i5-5300U 2015 и т.п.)
+//   MINIMUM        → Intel Celeron Gold 7505 (Tiger Lake 2-core, 15W) — user tested
+//                    QSV decode + 360p proxy + 24× speed limit.
+//                    Measurement (primary):   brand contains "Celeron"/"Pentium"/"Atom"
+//                    Measurement (secondary): ≤2 physical cores on x86
+//                    Extrapolation: earlier 2-core Core i3/i5 have similar decoder
+//                    throughput (i3-6006U 2016, i5-5300U 2015, etc.)
 // ============================================================
 enum class FSTPDecoderProfile {
     UNKNOWN       = 0,
-    FULL_HARDWARE = 1,   // Apple Silicon: VideoToolbox/Metal для всего
-    HYBRID_VT_CPU = 2,   // Intel Mac 2012+ или способный x86: HW для full-res, CPU для прокси
-    MINIMUM       = 3,   // Celeron/Pentium/Atom или ≤2-ядерный x86: QSV, 360p, лимит 24×
-    SOFTWARE_ONLY = 4    // Нет жизнеспособного HW-ускорения: чистый CPU decode
+    FULL_HARDWARE = 1,   // Apple Silicon: VideoToolbox/Metal for everything
+    HYBRID_VT_CPU = 2,   // Intel Mac 2012+ or capable x86: HW for full-res, CPU for proxy
+    MINIMUM       = 3,   // Celeron/Pentium/Atom or ≤2-core x86: QSV, 360p, 24× limit
+    SOFTWARE_ONLY = 4    // No viable HW acceleration: pure CPU decode
 };
 
 // CPU capabilities and performance profile
@@ -108,17 +108,17 @@ struct FSTPCPUInfo {
     // === macOS Specific ===
     bool is_apple_silicon;           // true for M1/M2/M3/M4
     std::string mac_model;           // "MacBookPro14,3" (via hw.model)
-    int mac_year;                    // 2016, 2020, etc. (корректно распарсен из модели)
+    int mac_year;                    // 2016, 2020, etc. (parsed correctly from the model)
 
-    // === Intel CPU Generation (кросс-платформенно) ===
-    // Извлекается из строки бренда: "Core i5-6267U" → 6, "Core i7-8750H" → 8
-    // Используется для определения поддержки H.264 HW decode:
-    //   gen 5+ (Broadwell, 2015) = минимум для надёжного VideoToolbox/QSV на H.264
-    //   gen 3-4 (Ivy Bridge/Haswell, 2012-2014) = ограниченный HW decode
-    //   gen 1-2 (Sandy Bridge, 2011) = очень ограниченный, граница поддержки
+    // === Intel CPU Generation (cross-platform) ===
+    // Extracted from the brand string: "Core i5-6267U" → 6, "Core i7-8750H" → 8
+    // Used to determine H.264 HW decode support:
+    //   gen 5+ (Broadwell, 2015) = minimum for reliable VideoToolbox/QSV on H.264
+    //   gen 3-4 (Ivy Bridge/Haswell, 2012-2014) = limited HW decode
+    //   gen 1-2 (Sandy Bridge, 2011) = very limited, support edge
     int intel_generation;
 
-    // === Decoder Profile (определяется после полного обнаружения оборудования) ===
+    // === Decoder Profile (determined after full hardware detection) ===
     FSTPDecoderProfile decoder_profile;
 
     // === Helper Methods ===
@@ -128,36 +128,36 @@ struct FSTPCPUInfo {
                model_name.find("Atom") != std::string::npos;
     }
 
-    // Возвращает true для MINIMUM-класса CPU:
-    //   Intel — первичный критерий:  бренд Celeron / Pentium / Atom
-    //   AMD   — первичный критерий:  "Athlon Silver" / "Athlon Gold"
-    //             (AMD-эквивалент Intel Pentium/Celeron: 2–4 ядра, 6–15 W, APU)
-    //   Вторичный критерий:  ≤2 физических ядра x86
-    //             (i3-6006U 2016, i5-5300U 2015, Athlon Silver 3050e — аналог Celeron 7505)
+    // Returns true for a MINIMUM-class CPU:
+    //   Intel — primary criterion:   brand Celeron / Pentium / Atom
+    //   AMD   — primary criterion:   "Athlon Silver" / "Athlon Gold"
+    //             (AMD equivalent of Intel Pentium/Celeron: 2–4 cores, 6–15 W, APU)
+    //   Secondary criterion:  ≤2 physical x86 cores
+    //             (i3-6006U 2016, i5-5300U 2015, Athlon Silver 3050e — like Celeron 7505)
     bool IsMinimumClass() const {
         // Intel low-end
         if (model_name.find("Celeron") != std::string::npos ||
             model_name.find("Pentium") != std::string::npos ||
             model_name.find("Atom")    != std::string::npos) return true;
-        // AMD low-end: Athlon Silver/Gold = AMD-эквивалент Intel Pentium/Celeron
+        // AMD low-end: Athlon Silver/Gold = AMD equivalent of Intel Pentium/Celeron
         // "Athlon Silver 3050e" (2C, 6W), "Athlon Gold 3150U" (2C, 15W),
-        // "Athlon Gold Pro 3150GE" (4C, 35W) — все MINIMUM по пропускной способности
+        // "Athlon Gold Pro 3150GE" (4C, 35W) — all MINIMUM by throughput
         if (model_name.find("Athlon Silver") != std::string::npos ||
             model_name.find("Athlon Gold")   != std::string::npos) return true;
-        // Вторичный: ≤2 физических ядра x86 (не Apple Silicon)
+        // Secondary: ≤2 physical x86 cores (not Apple Silicon)
         if (!is_apple_silicon && physical_cores <= 2 &&
             (architecture == "x86_64" || architecture.find("i686") != std::string::npos))
             return true;
         return false;
     }
 
-    // Возвращает true для любого Intel Mac (2011–2021, до Apple Silicon)
+    // Returns true for any Intel Mac (2011–2021, before Apple Silicon)
     bool IsIntelMac() const {
         return !is_apple_silicon && !mac_model.empty();
     }
 
     bool IsOldIntelMac() const {
-        // Обратная совместимость: 2016-2017 MacBook Pro с плохим VideoToolbox на прокси
+        // Backward compat: 2016-2017 MacBook Pro with poor VideoToolbox on the proxy
         return mac_model.find("MacBookPro13") != std::string::npos ||
                mac_model.find("MacBookPro14") != std::string::npos ||
                (mac_year >= 2016 && mac_year <= 2017);
@@ -293,7 +293,7 @@ public:
     // CPU-specific speed limit
     double GetMaxRecommendedSpeed() const { return cpu_info_.recommended_max_speed; }
 
-    // Профиль декодера для текущего оборудования
+    // Decoder profile for the current hardware
     FSTPDecoderProfile GetDecoderProfile() const { return cpu_info_.decoder_profile; }
 
     // Device type detection
@@ -359,8 +359,8 @@ private:
     void DetectCPUPowerMode(FSTPCPUInfo& info);
     void ApplyCPUSpecificOptimizations(FSTPCPUInfo& info);
 
-    // Определение профиля декодера по характеристикам CPU
-    // (вызывается из DetectAllHardware после заполнения cpu_info_ и gpu_info_)
+    // Determine the decoder profile from CPU characteristics
+    // (called from DetectAllHardware after cpu_info_ and gpu_info_ are filled)
     FSTPDecoderProfile DetermineDecoderProfile(const FSTPCPUInfo& cpu) const;
 
     // Utilities

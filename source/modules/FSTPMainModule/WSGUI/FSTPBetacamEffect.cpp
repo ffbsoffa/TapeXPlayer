@@ -101,7 +101,11 @@ FSTPBetacamEffect::PlayerState::PlayerState()
     , is_fast(false)
     , smooth_stripe_height(-1.0)
     , smooth_stripe_spacing(-1.0)
-    , hold_timer(0) {}
+    , hold_timer(0) {
+    // Seed the fast per-pixel generator from the (already seeded) mt19937.
+    // OR with 1 guarantees a non-zero state — xorshift32 is stuck at 0.
+    xrng = static_cast<uint32_t>(rng()) | 1u;
+}
 
 FSTPBetacamEffect::FSTPBetacamEffect() = default;
 
@@ -117,6 +121,150 @@ void FSTPBetacamEffect::ResetPlayer(int player_id) {
         return;
     }
     m_players[player_id] = PlayerState{};
+}
+
+void FSTPBetacamEffect::RequestDropoutBurst(int player_id, DropoutKind kind) {
+    if (player_id < 0 || player_id >= kMaxPlayers) {
+        return;
+    }
+    // One-shot flag carrying the kind; the burst itself (alternation, rare extended duration,
+    // RNG) is started inside ApplyPixelFX on the effect thread. Plain write — consistent with
+    // the rest of PlayerState's cross-thread fields; a missed/duplicated trigger is harmless.
+    m_players[player_id].doc_request = static_cast<int>(kind);
+}
+
+bool FSTPBetacamEffect::HasPendingDropout(int player_id) const {
+    if (player_id < 0 || player_id >= kMaxPlayers) {
+        return false;
+    }
+    const PlayerState& s = m_players[player_id];
+    if (s.doc_request != 0) {
+        return true;
+    }
+    if (s.doc_duration_ms > 0) {
+        double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - s.doc_start).count();
+        return elapsed < s.doc_duration_ms;
+    }
+    return false;
+}
+
+void FSTPBetacamEffect::ApplyEdgeFade(uint8_t* y_plane, int pitch, int width, int height, uint32_t format) {
+    if (!m_enabled || !y_plane || pitch <= 0 || width <= 0 || height <= 0) {
+        return;
+    }
+    // Scale the fade width with resolution (authored at the 360-line proxy) so the soft border
+    // looks the same at full-res as it did on the proxy, instead of a 3 px sliver at 1080p.
+    double scale = height / 360.0;
+    int fadeL = std::max(1, static_cast<int>(std::lround(kEdgeFadeLeft  * scale)));
+    int fadeR = std::max(1, static_cast<int>(std::lround(kEdgeFadeRight * scale)));
+    if (width <= fadeL + fadeR) {
+        return;
+    }
+    for (int y = 0; y < height; ++y) {
+        uint8_t* rowStart = y_plane + static_cast<size_t>(y) * pitch;
+        for (int x = 0; x < fadeL; ++x) {
+            float fade = (fadeL > 1) ? static_cast<float>(x) / static_cast<float>(fadeL - 1) : 1.0f;
+            if (format == SDL_PIXELFORMAT_UYVY) {
+                int gi = x / 2, ig = x % 2;
+                uint8_t* group = rowStart + gi * 4;
+                if (gi * 4 + (1 + ig * 2) < pitch) {
+                    uint8_t cy = group[1 + ig * 2];
+                    group[1 + ig * 2] = static_cast<uint8_t>(cy * fade + 16.0f * (1.0f - fade));
+                }
+            } else {
+                uint8_t cy = rowStart[x];
+                rowStart[x] = static_cast<uint8_t>(cy * fade + 16.0f * (1.0f - fade));
+            }
+        }
+        for (int x = 0; x < fadeR; ++x) {
+            int realX = width - 1 - x;
+            float fade = (fadeR > 1) ? static_cast<float>(x) / static_cast<float>(fadeR - 1) : 1.0f;
+            if (format == SDL_PIXELFORMAT_UYVY) {
+                int gi = realX / 2, ig = realX % 2;
+                uint8_t* group = rowStart + gi * 4;
+                if (gi * 4 + (1 + ig * 2) < pitch) {
+                    uint8_t cy = group[1 + ig * 2];
+                    group[1 + ig * 2] = static_cast<uint8_t>(cy * fade + 16.0f * (1.0f - fade));
+                }
+            } else {
+                uint8_t cy = rowStart[realX];
+                rowStart[realX] = static_cast<uint8_t>(cy * fade + 16.0f * (1.0f - fade));
+            }
+        }
+    }
+}
+
+void FSTPBetacamEffect::ApplyAnalogSmear(uint8_t* y_plane, int y_pitch,
+        uint8_t* u_plane, uint8_t* v_plane, int u_pitch, int v_pitch,
+        int width, int height, uint32_t format) {
+    if (!m_enabled || !y_plane || width < 2 || height < 1) return;
+    // One-pole IIR (out = in*(256-k)/256 + prev*k/256), trailing left→right. Chroma smears
+    // more than luma. Strength scales with resolution so the trail is a consistent fraction of
+    // width (a fixed k over-smears the low-res proxy). Calibrated at full-res (~1080).
+    double scale = std::max(0.30, std::min(1.0, height / 1080.0));
+    double rL = 0.575 * scale;  // was 1.15 — smear cut another 50% on owner's request
+    double rC = 1.425 * scale;  // was 2.85 — chroma smear cut to match
+    const int khLuma   = static_cast<int>(std::lround(256.0 * rL / (1.0 + rL)));
+    const int khChroma = static_cast<int>(std::lround(256.0 * rC / (1.0 + rC)));
+
+    for (int yy = 0; yy < height; ++yy) {
+        uint8_t* row = y_plane + static_cast<size_t>(yy) * y_pitch;
+        int prev = row[0];
+        for (int xx = 1; xx < width; ++xx) {
+            int cur = (row[xx] * (256 - khLuma) + prev * khLuma) >> 8;
+            row[xx] = static_cast<uint8_t>(cur);
+            prev = cur;
+        }
+    }
+
+    int cw = width / 2, ch = height / 2;
+    if (cw < 2 || ch < 1) return;
+    if (format == SDL_PIXELFORMAT_NV12 && u_plane) {
+        for (int yy = 0; yy < ch; ++yy) {
+            uint8_t* row = u_plane + static_cast<size_t>(yy) * u_pitch;  // interleaved UV
+            int pu = row[0], pv = row[1];
+            for (int xx = 1; xx < cw; ++xx) {
+                int cu = (row[xx * 2]     * (256 - khChroma) + pu * khChroma) >> 8;
+                int cv = (row[xx * 2 + 1] * (256 - khChroma) + pv * khChroma) >> 8;
+                row[xx * 2]     = static_cast<uint8_t>(cu); pu = cu;
+                row[xx * 2 + 1] = static_cast<uint8_t>(cv); pv = cv;
+            }
+        }
+    } else if ((format == SDL_PIXELFORMAT_IYUV || format == SDL_PIXELFORMAT_YV12) && u_plane && v_plane) {
+        for (int yy = 0; yy < ch; ++yy) {
+            uint8_t* urow = u_plane + static_cast<size_t>(yy) * u_pitch;
+            uint8_t* vrow = v_plane + static_cast<size_t>(yy) * v_pitch;
+            int pu = urow[0], pv = vrow[0];
+            for (int xx = 1; xx < cw; ++xx) {
+                int cu = (urow[xx] * (256 - khChroma) + pu * khChroma) >> 8; urow[xx] = static_cast<uint8_t>(cu); pu = cu;
+                int cv = (vrow[xx] * (256 - khChroma) + pv * khChroma) >> 8; vrow[xx] = static_cast<uint8_t>(cv); pv = cv;
+            }
+        }
+    }
+}
+
+void FSTPBetacamEffect::ApplySoftEdges(uint8_t* y_plane, int y_pitch,
+        int width, int height, uint32_t /*format*/) {
+    if (!m_enabled || !y_plane || width < 1 || height < 3) return;
+    // Modest vertical 3-tap blur (out = (above + 2*cur + below)/4) blended back
+    // toward the original by `mix`. Softens the hard horizontal edges of the grey
+    // Betacam bands so they read as soft SD rather than razor-sharp digital. Luma
+    // only (chroma is already subsampled). Uses the ORIGINAL neighbour rows (a one
+    // row backup) so the blur is symmetric and frame-rate stable.
+    const int mix = 96; // 0..256, ~37% toward blurred — subtle, tunable
+    std::vector<uint8_t> above(width), curOrig(width);
+    std::memcpy(above.data(), y_plane, width);            // row 0 (top edge clamp)
+    for (int yy = 1; yy < height - 1; ++yy) {
+        uint8_t* cur = y_plane + static_cast<size_t>(yy) * y_pitch;
+        const uint8_t* below = y_plane + static_cast<size_t>(yy + 1) * y_pitch; // original
+        std::memcpy(curOrig.data(), cur, width);
+        for (int xx = 0; xx < width; ++xx) {
+            int blurred = (above[xx] + 2 * curOrig[xx] + below[xx]) >> 2;
+            cur[xx] = static_cast<uint8_t>(curOrig[xx] + (((blurred - curOrig[xx]) * mix) >> 8));
+        }
+        std::memcpy(above.data(), curOrig.data(), width); // next row's "above" = this row's original
+    }
 }
 
 FSTPBetacamEffect::PlayerState& FSTPBetacamEffect::GetPlayerState(int player_id) {
@@ -148,7 +296,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
 
     const double currentPlaybackRate = metrics.playback_rate;
     const double rawPlaybackRate = std::abs(currentPlaybackRate);
-    const double currentTime = metrics.position_seconds;
+    // Use file-relative position: position_seconds includes timecode offset, duration_seconds does not.
+    const double currentTime = metrics.position_seconds - metrics.timecode_offset_seconds;
     const double totalDuration = metrics.duration_seconds;
     // 1× reverse: tape moves backward at normal speed → helical scan misaligned → tracking artifacts
     const bool isReverseNormalSpeed = (rawPlaybackRate >= 0.9 && rawPlaybackRate <= 1.1 && metrics.is_reverse);
@@ -169,7 +318,10 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     // - Slow motion / pause (< 0.9×) - shows single stripe like real Betacam pause
     // - Fast shuttle (> 1.2×) - shows multiple stripes
     // - Normal playback (0.9× - 1.1×) - NO effect (perfect tracking)
-    bool isSlowMotion = (rawPlaybackRate < 0.9) || isReverseNormalSpeed;
+    // 1× reverse is treated the same as 1× forward: no effect, no compositing.
+    // The tracking-artifact model was physically correct but too expensive at 60fps
+    // (per-row composite memcpy + noise generation caused visible FPS drops).
+    bool isSlowMotion = (rawPlaybackRate < 0.9);
     bool isFastShuttle = (rawPlaybackRate >= kEffectThreshold);
     bool shouldShowEffect = isSlowMotion || isFastShuttle;
 
@@ -189,11 +341,52 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     }
     state.was_slow_motion = isSlowMotion;
 
+    // === DROPOUT-COMPENSATION (DOC) BURST ===
+    // Started via RequestDropoutBurst() from outside: the resume-from-pause key (spacebar)
+    // and proxy↔full-res source switches (both detected in FSTPPixelBufferManager, which sees
+    // every frame's resolution even at 1× where this effect is otherwise gated off). Each
+    // trigger alternates aggressive (heavy bands) ↔ light (thin lines), and RARELY produces an
+    // extended (longer-lived) dropout. Lifetime is wall-clock based so it's frame-rate independent.
+    bool   docActive = false;
+    double docIntensity = 0.0;
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (state.doc_request != 0) {
+            int kind = state.doc_request;   // 1 = Gentle (pause-exit), 2 = Alternating (proxy switch)
+            state.doc_request = 0;
+            bool gentle = (kind == 1);
+            bool heavy;
+            if (gentle) {
+                heavy = false;                                  // pause-exit: keep it soft
+            } else {
+                heavy = state.doc_exit_heavy;
+                state.doc_exit_heavy = !state.doc_exit_heavy;   // alternate heavy/light on switches
+            }
+            state.doc_gentle = gentle;
+            state.doc_heavy  = heavy;
+            int baseMs = heavy ? 300 : (gentle ? 200 : 250);   // toned down (was 450/300/380)
+            if (!gentle) {                                      // gentle never gets the rare long one
+                std::uniform_int_distribution<int> ext(0, 99);
+                if (ext(state.rng) < 7) baseMs = heavy ? 900 : 750;  // rarer + shorter extended (was 15% / 1400/1100)
+            }
+            state.doc_duration_ms = baseMs;
+            state.doc_start = now;
+        }
+
+        if (state.doc_duration_ms > 0) {
+            double elapsed = std::chrono::duration<double, std::milli>(now - state.doc_start).count();
+            if (elapsed < state.doc_duration_ms) {
+                docActive = true;
+                docIntensity = 1.0 - elapsed / static_cast<double>(state.doc_duration_ms);  // 1→0
+            }
+        }
+    }
+
     if (!holdActive) {
-        if (!shouldShowEffect || !timelineValid) {
-            // При нормальной скорости (1.0×) эффекта нет — гасим hsync немедленно.
-            // Без этого UpdateHsyncEffect не вызывается (ранний return),
-            // и hsyncCurrentSkew «замерзает» в ненулевом значении.
+        if ((!shouldShowEffect || !timelineValid) && !docActive) {
+            // At normal speed (1.0×) there is no effect — kill hsync immediately.
+            // Without this UpdateHsyncEffect is never called (early return), and
+            // hsyncCurrentSkew "freezes" at a nonzero value.
             if (state.hsync.hsyncLossActive) {
                 state.hsync.hsyncLossActive = false;
                 state.hsync.hsyncCurrentSkew = 0.0f;
@@ -212,9 +405,12 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         absPlaybackRate = std::max(state.last_speed, rawPlaybackRate);
     }
 
-    // Update HSync loss effect state (triggers at 1.5x-2.2x speed)
+    // Update HSync loss effect state (triggers at 1.5x-2.2x speed).
+    // When the main effect is no longer active (e.g. jumped back to 1×), allow any
+    // in-flight animation to finish naturally (it's time-based, ~150ms), but block
+    // new triggers — otherwise holdActive keeps re-triggering HSync at the old speed.
     double fps = (metrics.frame_rate > 1.0) ? metrics.frame_rate : 60.0;
-    UpdateHsyncEffect(state, absPlaybackRate, fps);
+    UpdateHsyncEffect(state, absPlaybackRate, fps, /*allow_new_triggers=*/shouldShowEffect);
 
     uint8_t** dst_data = frame_ctx.planes;
     int* dst_linesize = frame_ctx.linesize;
@@ -223,22 +419,84 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     const int pitch = frame_ctx.linesize[0];
     const Uint32 lastSdlPixFormat = frame_ctx.pixel_format;
 
+    // Global effect scale. All artefact pixel sizes are authored at the 360p proxy
+    // scale — the resolution where the Betacam effect looks/behaves best (the app's own
+    // proxy). This factor scales the "absolute pixel" elements (snow, satellites, ragged
+    // edges) proportionally on full-res frames so the look matches the 360p proxy.
+    // 1.0 at 360p (a no-op for the proxy), ~2.0 at 720p, ~3.0 at 1080p.
+    // (Stripe geometry scales via effectiveHeight/resolutionScale once uncapped below.)
+    const double effectScale = textureHeight / 360.0;
+
+    // Fast xorshift32: cheap uniform noise for the per-pixel hot loops.
+    // Replaces per-call std::uniform_int_distribution + std::mt19937, which were
+    // constructed and invoked for every noise/snow/satellite pixel.
+    auto xrand = [&]() -> uint32_t {
+        uint32_t x = state.xrng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        state.xrng = x;
+        return x;
+    };
     auto randomInt = [&](int min_val, int max_val) {
-        std::uniform_int_distribution<int> dist(min_val, max_val);
-        return dist(state.rng);
+        if (max_val <= min_val) return min_val;
+        uint32_t range = static_cast<uint32_t>(max_val - min_val + 1);
+        return min_val + static_cast<int>(xrand() % range);
     };
-    auto randomFloat = [&](double min_val, double max_val) {
-        std::uniform_real_distribution<double> dist(min_val, max_val);
-        return dist(state.rng);
+
+    // Paint a horizontal grey run [x0,x1) on luma row y, neutralising chroma over the
+    // same span. Used for the 1–2 px micro-ragged edges of the solid grey band so the
+    // head-switch boundary isn't a perfectly straight line (matches real Betacam/S-VHS).
+    // Grey only — colour of the surrounding image is never shifted.
+    auto paintGreyRun = [&](int y, int x0, int x1) {
+        if (y < 0 || y >= textureHeight) return;
+        x0 = std::max(0, x0);
+        x1 = std::min(textureWidth, x1);
+        if (x1 <= x0) return;
+        uint8_t* rowStart = dst_data[0] + y * pitch;
+        if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
+            for (int i = x0 / 2; i < (x1 + 1) / 2; ++i) {
+                uint8_t* group = rowStart + i * 4;
+                group[0] = 128; group[1] = 128; group[2] = 128; group[3] = 128;
+            }
+            return;
+        }
+        std::memset(rowStart + x0, 128, x1 - x0);
+        int uvY = y / 2;
+        if (uvY >= textureHeight / 2) return;
+        int cx0 = x0 / 2;
+        int cx1 = (x1 + 1) / 2;
+        if (cx1 <= cx0) return;
+        if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
+            if (dst_data[1]) std::memset(dst_data[1] + uvY * dst_linesize[1] + cx0, 128, cx1 - cx0);
+            if (dst_data[2]) std::memset(dst_data[2] + uvY * dst_linesize[2] + cx0, 128, cx1 - cx0);
+        } else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) {
+            if (dst_data[1]) {
+                uint8_t* uv = dst_data[1] + uvY * dst_linesize[1];
+                for (int i = cx0; i < cx1; ++i) { uv[i * 2] = 128; uv[i * 2 + 1] = 128; }
+            }
+        }
     };
+
+    // === RAGGED GREY EDGE — single head-switch step per edge ===
+    // Each grey band gets exactly ONE horizontal break on its top edge and ONE on its
+    // bottom edge (not many bumps). Left of the break the edge is "free" (grey not filled
+    // in — the noise edge shows); right of the break the grey is fully filled, stepped
+    // up/down by jagAmp (1–2 px @360). The break X is drawn per stripe from the xorshift
+    // RNG and re-rolled every frame, so it jerks aggressively across the width (interlaced
+    // "partial signal loss" / dropout jitter) — deliberately NOT a smooth drift. Break
+    // positions are computed per stripe below.
+    const int jagAmp = std::max(2, static_cast<int>(std::lround(1.5 * effectScale)));
 
     // === SLOW MOTION FRAME COMPOSITING (DECODER-PROVIDED FRAMES) ===
     // Decoder provides adjacent frames: prev_source_frame (N-1) and next_source_frame (N+1)
     // This eliminates internal frame caching and enables seamless direction changes
     //
-    // Physics: Video head scans from top to bottom
-    // - Forward: above stripe = current (N), below stripe = prev (N-1)
-    // - Reverse: above stripe = next (N+1), below stripe = current (N)
+    // Physics: video head scans top → bottom. Base buffer holds frame N = floor(T*fps).
+    // At time T (between N and N+1) the head has already read N+1's track on top:
+    // - Above stripe = frame N+1 (next_source_frame) — newer, just read by the head
+    // - Below stripe = frame N   (the base buffer)    — residual from the previous pass
+    // Same N+1-above / N-below assignment for both directions; only the seam sweep flips.
     //
     // Support both planar YUV (IYUV/YV12) and semi-planar (NV12)
     bool isYUVFormat = (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV ||
@@ -264,14 +522,24 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         // Calculate stripe position using same formula as stripe rendering
         double fps_for_calc = (metrics.frame_rate > 0) ? metrics.frame_rate : 25.0;
         double frame_exact = currentTime * fps_for_calc;
-        double scroll_phase = std::fmod(frame_exact, 1.0);
-        if (scroll_phase < 0) scroll_phase += 1.0;
+        // Phase RELATIVE to the actually-displayed frame (frame_ctx.frame_number), not frac() of a
+        // separately-sampled currentTime. The shown frame and currentTime are sampled at different
+        // pipeline moments and disagree by 1 at a frame boundary → the seam wrapped while the
+        // composite frames (keyed to frame_number) had not advanced → a spike on each new frame.
+        // Keying the phase to the shown frame keeps seam + frames in lockstep; the clamp absorbs skew.
+        double scroll_phase = frame_exact - static_cast<double>(frame_ctx.frame_number);
+        if (scroll_phase < 0.0) scroll_phase = 0.0;
+        else if (scroll_phase > 1.0) scroll_phase = 1.0;
         // At 1× reverse the tape moves backward → invert phase so seam scrolls downward
         if (isReverseNormalSpeed) scroll_phase = 1.0 - scroll_phase;
 
         // Calculate stripe height to match stripe rendering formula exactly
-        double resolutionScale = textureHeight / 480.0;
-        int slowMotionStripeHeight = static_cast<int>(textureHeight * 0.25);
+        // Scale effect geometry with the actual frame height so artefacts keep the same
+        // proportions on full-res as on the 480p proxy. (Was capped to 480p, which froze
+        // artefact pixel sizes and made the whole effect look miniature on full-res frames.)
+        const int effectiveHeight_comp = textureHeight;
+        double resolutionScale = static_cast<double>(effectiveHeight_comp) / 480.0;
+        int slowMotionStripeHeight = static_cast<int>(effectiveHeight_comp * 0.25);
         double slowFactor = absPlaybackRate / 0.9;
         int stripeHeight = static_cast<int>(slowMotionStripeHeight * (1.0 - slowFactor * 0.3));
         stripeHeight = std::max(static_cast<int>(3 * resolutionScale), stripeHeight);
@@ -305,35 +573,29 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
             const int comp_y_pitch = composite_frame->linesize[0];
             const int comp_uv_pitch = composite_frame->linesize[1];
 
-            for (int y = 0; y < textureHeight; ++y) {
-                // ABOVE stripe = composite (N+1); reverse handled by scroll_phase flip
-                bool use_composite = (y < stripe_center_y);
+            // Iterate only over rows that need compositing (above stripe center).
+            // Avoids the per-row branch that was costing ~N/2 mispredictions at 1080p.
+            int comp_rows = std::max(0, std::min(stripe_center_y, textureHeight));
+            for (int y = 0; y < comp_rows; ++y) {
+                std::memcpy(dst_data[0] + y * pitch,
+                           composite_frame->data[0] + y * comp_y_pitch,
+                           textureWidth);
 
-                if (use_composite) {
-                    // Copy Y plane from composite frame
-                    std::memcpy(dst_data[0] + y * pitch,
-                               composite_frame->data[0] + y * comp_y_pitch,
-                               textureWidth);
-
-                    // Copy UV planes (every 2nd Y line)
-                    if (y % 2 == 0) {
-                        int uv_y = y / 2;
-                        if (isNV12) {
-                            // NV12: UV interleaved in single plane, width = textureWidth
-                            std::memcpy(dst_data[1] + uv_y * dst_linesize[1],
-                                       composite_frame->data[1] + uv_y * comp_uv_pitch,
-                                       textureWidth);
-                        } else {
-                            // Planar YUV: separate U and V planes, width = textureWidth/2
-                            std::memcpy(dst_data[1] + uv_y * dst_linesize[1],
-                                       composite_frame->data[1] + uv_y * comp_uv_pitch,
+                if (y % 2 == 0) {
+                    int uv_y = y / 2;
+                    if (isNV12) {
+                        std::memcpy(dst_data[1] + uv_y * dst_linesize[1],
+                                   composite_frame->data[1] + uv_y * comp_uv_pitch,
+                                   textureWidth);
+                    } else {
+                        std::memcpy(dst_data[1] + uv_y * dst_linesize[1],
+                                   composite_frame->data[1] + uv_y * comp_uv_pitch,
+                                   textureWidth / 2);
+                        if (dst_data[2] && composite_frame->data[2]) {
+                            int comp_v_pitch = composite_frame->linesize[2];
+                            std::memcpy(dst_data[2] + uv_y * dst_linesize[2],
+                                       composite_frame->data[2] + uv_y * comp_v_pitch,
                                        textureWidth / 2);
-                            if (dst_data[2] && composite_frame->data[2]) {
-                                int comp_v_pitch = composite_frame->linesize[2];
-                                std::memcpy(dst_data[2] + uv_y * dst_linesize[2],
-                                           composite_frame->data[2] + uv_y * comp_v_pitch,
-                                           textureWidth / 2);
-                            }
                         }
                     }
                 }
@@ -342,6 +604,21 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         state.last_composited_frame_number = frame_ctx.frame_number;
     }
     skip_compositing:;
+
+    // Horizontal analog smear — applied AFTER compositing (so slow-mo compositing doesn't
+    // wipe it, unlike before) but BEFORE the stripe/dropout overlays (they stay crisp). At 1×
+    // the manager applies it instead.
+    if (frame_ctx.smear) {
+        ApplyAnalogSmear(dst_data[0], pitch, dst_data[1], dst_data[2],
+                         dst_linesize[1], dst_linesize[2], textureWidth, textureHeight, lastSdlPixFormat);
+    }
+
+    // Soft L/R border — applied AFTER compositing (so the composited region is faded too and
+    // the left edge no longer flickers) but BEFORE the stripe/dropout overlays (so the grey
+    // stripe stays in FRONT of the border). At 1× this is done by the manager instead.
+    if (frame_ctx.edge_fade) {
+        ApplyEdgeFade(dst_data[0], pitch, textureWidth, textureHeight, lastSdlPixFormat);
+    }
 
     bool effectApplied = false;
 
@@ -438,6 +715,57 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         return true;
     }
 
+    // === DOC (DROPOUT COMPENSATION) BURST ===
+    // Runs of "lost" lines hold the last good line above them (1H) and repeat it downward →
+    // the band collapses into vertical streaks (the aggressive Betacam weak-signal look).
+    // Re-rolled every frame via the xorshift RNG so it flickers; intensity decays over the
+    // burst. Heavy = a few large contiguous bands (biased to the bottom, where signal is
+    // worst); light = many thin 1–few-line repeats. Colour preserved (chroma copied).
+    if (docActive && textureHeight > 4 && textureWidth > 0) {
+        double tInt = docIntensity;
+        auto repeatLineDown = [&](int seedY, int y0, int runH) {
+            if (seedY < 0) return;
+            for (int y = y0; y < y0 + runH && y < textureHeight; ++y) {
+                if (y <= 0) continue;
+                // Luma row (for UYVY this copies the full packed Y+C row, so colour rides along).
+                std::memcpy(dst_data[0] + y * pitch, dst_data[0] + seedY * pitch, pitch);
+                if (lastSdlPixFormat == SDL_PIXELFORMAT_IYUV) {
+                    int cy = y / 2, csy = seedY / 2;
+                    if (dst_data[1] && cy < textureHeight / 2)
+                        std::memcpy(dst_data[1] + cy * dst_linesize[1], dst_data[1] + csy * dst_linesize[1], textureWidth / 2);
+                    if (dst_data[2] && cy < textureHeight / 2)
+                        std::memcpy(dst_data[2] + cy * dst_linesize[2], dst_data[2] + csy * dst_linesize[2], textureWidth / 2);
+                } else if (lastSdlPixFormat == SDL_PIXELFORMAT_NV12) {
+                    int cy = y / 2, csy = seedY / 2;
+                    if (dst_data[1] && cy < textureHeight / 2)
+                        std::memcpy(dst_data[1] + cy * dst_linesize[1], dst_data[1] + csy * dst_linesize[1], textureWidth);
+                }
+            }
+        };
+        int runs = state.doc_heavy
+                 ? std::max(1, static_cast<int>(std::lround(2.0 * tInt)))   // few big bands (was 3.0 — toned down)
+                 : std::max(1, static_cast<int>(std::lround((state.doc_gentle ? 3.0 : 5.0) * tInt)));  // thin lines (was 4.0/9.0)
+        for (int r = 0; r < runs; ++r) {
+            int runH, y0;
+            if (state.doc_heavy) {
+                int band = std::max(2, static_cast<int>(textureHeight * 0.18 * tInt));  // thinner heavy bands (was 0.28)
+                runH = randomInt(std::max(2, band / 3), std::max(3, band));
+                if (randomInt(0, 99) < 60) {  // bottom-weighted
+                    int lo = std::max(1, textureHeight - runH - 1 - static_cast<int>(textureHeight * 0.35));
+                    y0 = randomInt(lo, std::max(lo, textureHeight - runH - 1));
+                } else {
+                    y0 = randomInt(1, std::max(1, textureHeight - runH - 1));
+                }
+            } else {
+                runH = randomInt(1, std::max(1, static_cast<int>(std::lround(3.0 * effectScale))));
+                y0 = randomInt(1, std::max(1, textureHeight - runH - 1));
+            }
+            y0 = std::max(1, std::min(y0, textureHeight - runH - 1));
+            repeatLineDown(y0 - 1, y0, runH);  // hold the last good line above the run
+        }
+        effectApplied = true;
+    }
+
     // Skip stripe generation ONLY if not fast AND not slow motion
     // Slow motion (< 0.9×) also needs to show the pause stripe
     if (!state.is_fast && !isSlowMotion) {
@@ -454,10 +782,14 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     }
 
     // Stripe parameter calculation
-    const double resolutionScale = static_cast<double>(textureHeight) / 1080.0;
-    // Slow motion stripe: ~25% of frame height (120px for 480p, 270px for 1080p)
-    // This is the "still frame" noise band seen on real Betacam during pause
-    const int slowMotionStripeHeight = std::max(1, textureHeight / 4);
+    // Scale effect geometry with the actual frame height: stripe sizes / spacings /
+    // margins / jitter are proportional to resolution, so the full-res look matches the
+    // 480p proxy scaled up. (Previously capped to 480p, which froze artefact sizes and
+    // made full-res miniature.) Stripe positions are still calculated against textureHeight.
+    const int effectiveHeight = textureHeight;
+    const double resolutionScale = static_cast<double>(effectiveHeight) / 1080.0;
+    // Slow motion stripe: ~25% of 480p frame height = 120px, regardless of actual res
+    const int slowMotionStripeHeight = std::max(1, effectiveHeight / 4);
     const int baseStripeHeight = static_cast<int>(85 * resolutionScale);
     const int baseStripeSpacing = static_cast<int>(450 * resolutionScale);
     const int minStripeSpacing = static_cast<int>(62 * resolutionScale);
@@ -483,28 +815,40 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         stripeSpacing = baseStripeSpacing;
     } else if (absPlaybackRate >= 2.0 && absPlaybackRate < 3.7) {
         double t = (absPlaybackRate - 2.0) / 1.7;
-        stripeHeight = static_cast<int>(baseStripeHeight * (1.0 - t * 0.3));
+        stripeHeight = static_cast<int>(baseStripeHeight * (1.0 - t * 0.25));
         stripeSpacing = static_cast<int>(baseStripeSpacing * (1.0 - t * 0.2));
     } else if (absPlaybackRate >= 3.7 && absPlaybackRate < 14.0) {
+        // Mid shuttle (≈4–14×) previously thinned out too aggressively, which read as
+        // "unnaturally thin" and gave the emulation away. Keep the grey band fuller:
+        // gentle LINEAR taper toward a thicker mid-shuttle target (not the very thin
+        // currentMinStripeHeight). Continuous with the ≥14× plateau (24·scale) below.
         double t = (absPlaybackRate - 3.7) / 10.3;
-        t = std::pow(t, 0.7);
-        stripeHeight = static_cast<int>(baseStripeHeight * 0.7 * (1.0 - t) + currentMinStripeHeight * t);
+        const int midShuttleHeight = static_cast<int>(24 * resolutionScale);
+        stripeHeight = static_cast<int>(baseStripeHeight * 0.75 * (1.0 - t) + midShuttleHeight * t);
         stripeSpacing = static_cast<int>(baseStripeSpacing * 0.8 * (1.0 - t) + minStripeSpacing * t);
     } else { // ≥ 14.0x
         stripeSpacing = minStripeSpacing;
 
-        const double thickPixels = 14.0; // desired thickness in lower fast-forward range
-        const double thinPixels = 5.0;    // target thickness for extreme speeds
+        // Fuller through ≈8–14×, then thin out again across 15–18× (thin as it used
+        // to be), continuing to a very thin band at extreme speeds. fullMid matches the
+        // 3.7–14× branch at 14× for a seamless join; the sqrt curve makes the band thin
+        // quickly right after 14× so 15–18× already reads as thin.
+        const double fullMidPixels = 24.0; // join with 3.7–14× branch at 14×
+        const double thinPixels    = 10.0; // 15–18× thin band (as it used to be)
+        const double minPixels     = 6.0;  // extreme speeds (24×+)
 
         double targetMinPixels;
-        if (absPlaybackRate < 18.0) {
-            targetMinPixels = thickPixels;
-        } else if (absPlaybackRate <= 24.0) {
-            double t = (absPlaybackRate - 18.0) / (24.0 - 18.0);
+        if (absPlaybackRate <= 18.0) {
+            double t = (absPlaybackRate - 14.0) / (18.0 - 14.0);  // 0 at 14×, 1 at 18×
             t = clamp_val(t, 0.0, 1.0);
-            targetMinPixels = thickPixels - (thickPixels - thinPixels) * t;
+            t = std::sqrt(t);  // quick initial thinning right after 14×
+            targetMinPixels = fullMidPixels - (fullMidPixels - thinPixels) * t;
+        } else if (absPlaybackRate <= 28.0) {
+            double t = (absPlaybackRate - 18.0) / (28.0 - 18.0);
+            t = clamp_val(t, 0.0, 1.0);
+            targetMinPixels = thinPixels - (thinPixels - minPixels) * t;
         } else {
-            targetMinPixels = thinPixels;
+            targetMinPixels = minPixels;
         }
 
         currentMinStripeHeight = std::max(1, static_cast<int>(targetMinPixels * resolutionScale));
@@ -540,34 +884,79 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     // At slow motion: stripe moves slowly with audio time
     // At shuttle: stripes move fast with audio time
 
-    // === ANTI-FLICKER DETUNING ===
-    // At exact integer speeds (2x, 3x, 4x...), stripes can "beat" with 60fps rendering
-    // causing visible flicker. Real VCRs added slight offset to avoid this.
-    // Based on observations: 3x→3.123x, 4x→4.188x gives smooth motion.
-    // Apply detuning for speeds 2x-8x (9x+ already smooth)
-    double effectiveSpeedMultiplier = 1.0;
-    if (absPlaybackRate >= 2.0 && absPlaybackRate < 9.0) {
-        // Add small fractional offset that increases with speed
-        // This breaks the integer alignment that causes beating
-        double detuneOffset = absPlaybackRate * 0.045;  // ~0.09 at 2x, ~0.36 at 8x
-        effectiveSpeedMultiplier = (absPlaybackRate + detuneOffset) / absPlaybackRate;
+    // === ANTI-STROBE ===
+    // Two regimes for the shuttle comb (cosmetic; actual playback is governed by audio):
+    //  • STEADY 3× and 10× (the integer "analysis" speeds the owner parks on): a SMOOTH wall-clock
+    //    glide — the comb drifts at a constant rate in stripe-periods/second, accumulated from REAL
+    //    time so it's refresh/fps/RESOLUTION-independent (tuned at the 540p base; phase-based so it
+    //    looks identical on proxy 540p and full-res). The narrow ±0.25 bands sit ENTIRELY inside a
+    //    constant stripe-count range (count changes at ~2.3/3.3 and ~9.3/10.3 fall outside), so no
+    //    new stripe forms while smooth → nothing is given away.
+    //  • EVERY OTHER 2–14× speed: the multiplier-detune masking — its slight per-frame beat HIDES
+    //    the formation of new grey stripes during speed ramps (the smooth glide exposed that).
+    //  • ≥14×: race straight off audio time (dense comb already masks any beat).
+    // Slow-mo & 1× reverse keep their frame-tied phase.
+    double frame_exact = currentTime * fps_for_calc;
+    double raw_scroll_phase;
+    if (isSlowMotion) {
+        // SLOW MOTION: tie the visible seam to the DISPLAYED frame (same basis as the compositing
+        // seam above) so it never wraps ahead of the composite frames → no per-new-frame spike.
+        raw_scroll_phase = (currentTime * fps_for_calc) - static_cast<double>(frame_ctx.frame_number);
+        if (raw_scroll_phase < 0.0) raw_scroll_phase = 0.0;
+        else if (raw_scroll_phase > 1.0) raw_scroll_phase = 1.0;
+    } else if (isReverseNormalSpeed) {
+        // 1× reverse: single tracking stripe tied to audio time; invert so it scrolls top→bottom.
+        raw_scroll_phase = std::fmod(frame_exact, 1.0);
+        if (raw_scroll_phase < 0) raw_scroll_phase += 1.0;
+        raw_scroll_phase = 1.0 - raw_scroll_phase;
+    } else if (absPlaybackRate < 14.0) {
+        // Smooth only within ±0.25 of 3× or 10×; masking elsewhere. Band edges are crossed only
+        // while RAMPING, where a 1-frame seam is invisible.
+        bool smoothBand = (std::abs(absPlaybackRate - 3.0) < 0.25) ||
+                          (std::abs(absPlaybackRate - 10.0) < 0.25);
+        if (smoothBand) {
+            // Constant VISIBLE comb drift = kGlideHz periods/sec (÷ stripe count). 540p-tuned, but
+            // phase-based → identical at any resolution.
+            constexpr double kGlideHz = 1.4;
+            double N = std::max(1.0, std::round(absPlaybackRate - 1.0));   // visible stripe count in-band
+            auto now = std::chrono::steady_clock::now();
+            double dt = state.shuttle_comb_init
+                      ? std::chrono::duration<double>(now - state.shuttle_comb_last_t).count()
+                      : 0.0;
+            state.shuttle_comb_last_t = now;
+            state.shuttle_comb_init = true;
+            if (dt < 0.0 || dt > 0.1) dt = 0.0;
+            double dir = metrics.is_reverse ? -1.0 : 1.0;
+            state.shuttle_comb_phase += dir * kGlideHz * dt / N;
+            state.shuttle_comb_phase -= std::floor(state.shuttle_comb_phase);
+            raw_scroll_phase = state.shuttle_comb_phase;
+        } else {
+            // Masking multiplier-detune: tiny per-frame beat hides new-stripe formation on ramps.
+            constexpr double kRefreshHz     = 60.0;
+            constexpr double kGlidePerFrame = 0.06;
+            double advancePerFrame = absPlaybackRate * fps_for_calc / kRefreshHz;
+            double mult = 1.0;
+            if (advancePerFrame > kGlidePerFrame) {
+                double base    = std::round(advancePerFrame - kGlidePerFrame);
+                double desired = base + kGlidePerFrame;
+                if (desired > 0.05) mult = desired / advancePerFrame;
+            }
+            raw_scroll_phase = std::fmod(currentTime * fps_for_calc * mult, 1.0);
+            if (raw_scroll_phase < 0) raw_scroll_phase += 1.0;
+            // Seed the accumulator so ENTERING a smooth band continues seamlessly from here.
+            state.shuttle_comb_phase   = raw_scroll_phase;
+            state.shuttle_comb_last_t  = std::chrono::steady_clock::now();
+            state.shuttle_comb_init    = true;
+        }
+    } else {
+        // ≥14×: race straight off audio time.
+        raw_scroll_phase = std::fmod(frame_exact, 1.0);
+        if (raw_scroll_phase < 0) raw_scroll_phase += 1.0;
+        state.shuttle_comb_phase   = raw_scroll_phase;
+        state.shuttle_comb_last_t  = std::chrono::steady_clock::now();
+        state.shuttle_comb_init    = true;
     }
 
-    double frame_exact = currentTime * fps_for_calc * effectiveSpeedMultiplier;
-    double raw_scroll_phase = std::fmod(frame_exact, 1.0);  // 0.0-1.0
-    if (raw_scroll_phase < 0) raw_scroll_phase += 1.0;
-
-    // NO inversion needed for reverse!
-    // When position_seconds decreases (reverse), scroll_phase naturally decreases
-    // → stripe moves from bottom to top (correct reverse behavior)
-    // The old inversion was wrong - it reversed the natural reverse direction
-    //
-    // EXCEPTION: at 1× reverse, tape misalignment causes artifacts scrolling DOWNWARD,
-    // so we invert the phase to get the correct top-to-bottom direction.
-    if (isReverseNormalSpeed) raw_scroll_phase = 1.0 - raw_scroll_phase;
-
-    // Use raw scroll_phase directly (no temporal smoothing)
-    // This ensures compositing seam and stripe are always perfectly aligned
     double scroll_phase = raw_scroll_phase;
     state.prev_scroll_phase = scroll_phase;
     state.smoothed_scroll_phase = scroll_phase;
@@ -588,9 +977,14 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     double partial_stripe_opacity = 0.0;  // Opacity of the "newest" stripe (0.0-1.0)
 
     if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
-        // Slow motion or 1× reverse: single stripe (head switching noise bar)
-        num_stripes = 1;
-        fractional_stripes = 1.0;
+        // Slow motion or 1× reverse: single stripe (head switching noise bar).
+        // EXCEPTION: a pure pause snapped to a frame boundary (frame_aligned) = the head is tracking
+        // the recorded frame perfectly → NO head-switch stripe. Without this the stripe sits at
+        // scroll_phase≈0 and leaves a sliver at the top edge (the stripe didn't fully vanish). Matches
+        // the compositing skip above, which already goes clean when aligned.
+        bool aligned_pause = (rawPlaybackRate < 0.05) && metrics.frame_aligned && !isReverseNormalSpeed;
+        num_stripes = aligned_pause ? 0 : 1;
+        fractional_stripes = static_cast<double>(num_stripes);
     } else if (absPlaybackRate > 1.1) {
         // Fast motion: stripes = track boundaries crossed = speed - 1
         int targetSpacing = static_cast<int>(18.0 * resolutionScale);
@@ -673,7 +1067,7 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         int stripe_y;
         if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
             // Slow motion / 1× reverse: larger margin for frame alignment
-            int extraMargin = static_cast<int>(10.0 * (textureHeight / 480.0));
+            int extraMargin = static_cast<int>(10.0 * (effectiveHeight / 480.0));
             int travel_distance = textureHeight + finalStripeHeight + extraMargin * 2;
             stripe_y = static_cast<int>(stripe_phase * travel_distance) - finalStripeHeight / 2 - extraMargin;
         } else {
@@ -684,33 +1078,40 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
             stripe_y = static_cast<int>(stripe_phase * travel_distance) - finalStripeHeight / 2;
         }
 
-        // Individual position jitter for each stripe (uneven spacing)
-        // Makes stripes look analog/authentic, not digitally perfect
-        // Scale jitter with resolution (3-5 pixels at 480p)
+        // Per-slot pseudo-random that is STABLE across frames, so the comb of stripes
+        // scrolls smoothly instead of teleporting every frame (the per-frame randomInt was
+        // the visible "jitter"). Derived from the slot index i → each slot keeps its
+        // uneven offset/height while the whole comb glides. Slow-mo/pause still uses
+        // per-frame randomness (tape instability on a held, non-scrolling frame).
+        auto slotRand = [&](int salt) -> uint32_t {
+            uint32_t h = (static_cast<uint32_t>(i) * 2654435761u)
+                       ^ (static_cast<uint32_t>(salt) * 40503u);
+            h ^= h >> 13; h *= 2246822519u; h ^= h >> 16; return h;
+        };
+
+        // Individual position offset for uneven (analog) spacing.
         if (absPlaybackRate >= 1.1) {
-            int maxJitter = static_cast<int>(4.0 * (textureHeight / 480.0));
-            int positionJitter = randomInt(-maxJitter, maxJitter);
-            stripe_y += positionJitter;
+            int maxJitter = std::max(1, static_cast<int>(2.5 * (effectiveHeight / 480.0)));
+            int slotOffset = static_cast<int>(slotRand(1) % static_cast<uint32_t>(2 * maxJitter + 1)) - maxJitter;
+            stripe_y += slotOffset;
         }
 
-        // Add frame-to-frame height variation for realism
-        // At slow motion/pause: noticeable variation (tape instability)
-        // At fast shuttle: smaller proportional variation
+        // Stripe height variation.
         int height_variation = 0;
         if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
-            // Slow motion/pause/1× reverse: ±8-12% variation (tape head tracking instability)
+            // Slow motion/pause/1× reverse: per-frame variation (tape head tracking instability)
             int variation = std::max(2, static_cast<int>(finalStripeHeight * 0.10));
             height_variation = randomInt(-variation, variation);
         } else if (absPlaybackRate >= 16.0) {
             int variation = std::max(1, static_cast<int>(0.6 * resolutionScale));
-            height_variation = randomInt(-variation, variation);
+            height_variation = static_cast<int>(slotRand(2) % static_cast<uint32_t>(2 * variation + 1)) - variation;
         } else if (absPlaybackRate >= 4.0) {
-            int variation = std::max(1, static_cast<int>(finalStripeHeight * 0.08));
-            height_variation = randomInt(-variation, variation);
+            int variation = std::max(1, static_cast<int>(finalStripeHeight * 0.05));
+            height_variation = static_cast<int>(slotRand(2) % static_cast<uint32_t>(2 * variation + 1)) - variation;
         } else if (absPlaybackRate >= 1.1) {
-            // Low shuttle speeds (1.1x-4x): moderate variation
-            int variation = std::max(1, static_cast<int>(finalStripeHeight * 0.06));
-            height_variation = randomInt(-variation, variation);
+            // Low shuttle speeds (1.1x-4x): moderate, but stable per slot
+            int variation = std::max(1, static_cast<int>(finalStripeHeight * 0.04));
+            height_variation = static_cast<int>(slotRand(2) % static_cast<uint32_t>(2 * variation + 1)) - variation;
         }
         int this_stripe_height = std::max(1, finalStripeHeight + height_variation);
 
@@ -847,6 +1248,18 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
             solidEndY = endY - stripeH / 4;
         }
 
+        // === RAGGED GREY EDGE (single head-switch step per edge) ===
+        // One horizontal break on top + one on bottom. Left of break = "free" (noise edge
+        // shows); right of break = grey fully filled (stepped by ragStep). The break X is
+        // re-rolled every frame from the xorshift RNG → aggressive dropout jitter, not a
+        // smooth slide. Skip on thin/very-fast stripes and where scanline-duplication takes
+        // over (>=14×).
+        bool doRagged = (absPlaybackRate < 14.0) &&
+                        ((solidEndY - solidStartY) >= (3 * jagAmp + 2));
+        int ragStep   = doRagged ? std::max(1, randomInt(1, jagAmp)) : 0;  // 1–2 px @360
+        int ragBreakT = doRagged ? randomInt(0, textureWidth - 1) : 0;     // top break X (xorshift)
+        int ragBreakB = doRagged ? randomInt(0, textureWidth - 1) : 0;     // bottom break X (xorshift)
+
         // === SATELLITE STRIPE (disintegration effect) ===
         // Thin grey lines appear in noise edge zone - works at all speeds
         // More frequent at slow motion, less frequent at fast speeds
@@ -865,7 +1278,7 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
             } else if (satelliteActiveFrames > 0) {
                 // Show satellite for a few frames
                 satelliteActiveFrames--;
-                satelliteHeight = randomInt(1, 2);
+                satelliteHeight = std::max(1, static_cast<int>(std::lround(randomInt(1, 2) * effectScale)));
                 bool atTop = randomInt(0, 1) == 0;
                 if (atTop && hasTopEdge && topEdgeHeight > satelliteHeight + 2) {
                     satelliteY = startY + randomInt(2, topEdgeHeight - satelliteHeight - 1);
@@ -883,7 +1296,7 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
             int satelliteChance = (absPlaybackRate < 4.0) ? 8 :
                                   (absPlaybackRate < 10.0) ? 5 : 3;
             if (randomInt(0, 100) < satelliteChance) {
-                satelliteHeight = randomInt(1, 3);
+                satelliteHeight = std::max(1, static_cast<int>(std::lround(randomInt(1, 3) * effectScale)));
                 bool atTop = randomInt(0, 1) == 0;
                 if (atTop && hasTopEdge && topEdgeHeight > satelliteHeight + 2) {
                     satelliteY = startY + randomInt(2, topEdgeHeight - satelliteHeight - 1);
@@ -929,8 +1342,16 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
                     }
                 }
             } else if (isEdgeZone) {
-                // NOISE EDGE: Subtle noise with strong desaturation
-                // Minimal digital noise, focus on desaturation
+                // NOISE EDGE: subtle noise + strong desaturation.
+                // In slow-mo / pause / 1× reverse the picture INSIDE the edge (where the
+                // satellites sit) should read darker AND more contrasty "like at 10×":
+                // crush blacks + stretch the luma, and mix toward a darker pedestal (96)
+                // instead of mid-grey 128. Shuttle keeps the original mid-grey wash.
+                const bool slowEdges = (absPlaybackRate < 0.9 || isReverseNormalSpeed);
+                const int  edgePed   = slowEdges ? 96 : 128;
+                auto edgeY = [&](int v) -> int {
+                    return slowEdges ? static_cast<int>((v - 32) * 1.12f) : v;
+                };
                 if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
                     for (int i = 0; i < textureWidth / 2; ++i) {
                         uint8_t* group = rowStart + i * 4;
@@ -939,18 +1360,18 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
                         int noise = randomInt(-3, 3);  // Very subtle noise
                         group[0] = static_cast<uint8_t>(clamp_val(128 + noise, 122, 134));  // U toward grey
                         group[1] = static_cast<uint8_t>(clamp_val(
-                            static_cast<int>(group[1] * keepOriginal + 128 * (1.0f - keepOriginal)), 16, 235));
+                            static_cast<int>(edgeY(group[1]) * keepOriginal + edgePed * (1.0f - keepOriginal)), 16, 235));
                         group[2] = static_cast<uint8_t>(clamp_val(128 + noise, 122, 134));  // V toward grey
                         group[3] = static_cast<uint8_t>(clamp_val(
-                            static_cast<int>(group[3] * keepOriginal + 128 * (1.0f - keepOriginal)), 16, 235));
+                            static_cast<int>(edgeY(group[3]) * keepOriginal + edgePed * (1.0f - keepOriginal)), 16, 235));
                     }
                 } else {
                     // IYUV/NV12: Strong desaturation, subtle noise to Y plane
                     for (int x = 0; x < textureWidth; ++x) {
                         int noise = randomInt(-4, 4);  // Very subtle
                         float keepOriginal = 0.50f + (randomInt(0, 15) / 100.0f);  // 50-65% original
-                        int origVal = rowStart[x];
-                        int newVal = static_cast<int>(origVal * keepOriginal + (128 + noise) * (1.0f - keepOriginal));
+                        int origVal = edgeY(rowStart[x]);
+                        int newVal = static_cast<int>(origVal * keepOriginal + (edgePed + noise) * (1.0f - keepOriginal));
                         rowStart[x] = static_cast<uint8_t>(clamp_val(newVal, 16, 235));
                     }
                     // UV planes: 80% desaturation in edge zones (very strong)
@@ -1006,6 +1427,16 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
                     }
                 }
             }
+        }
+
+        // Apply the single-step ragged edges: the "filled" side (right of the break) gets
+        // grey extended by ragStep into the noise-edge zone; the "free" side (left of the
+        // break) keeps the noise edge. One step on top, one on bottom.
+        if (doRagged) {
+            if (hasTopEdge)
+                for (int d = 1; d <= ragStep; ++d) paintGreyRun(solidStartY - d, ragBreakT, textureWidth);
+            if (hasBottomEdge)
+                for (int d = 0; d <  ragStep; ++d) paintGreyRun(solidEndY + d, ragBreakB, textureWidth);
         }
 
         // === EXTERNAL MICRO-SATELLITES ===
@@ -1109,6 +1540,12 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
                 tailLength = tailBase + static_cast<int>(speedFactor * 5.0);
             }
 
+            // Resolution scaling: snow is authored at the 480p scale. Scale the head
+            // thickness and tail length by effectScale so a particle keeps its 480p
+            // proportions on full-res frames. No-op at <=480p (effectScale == 1).
+            const int snowThickness = std::max(1, static_cast<int>(std::lround(effectScale)));
+            tailLength = std::max(1, static_cast<int>(tailLength * effectScale));
+
             // Pick Y position for snow
             int snowY = startY;
             for (int j = 0; j < snowCount; ++j) {
@@ -1127,31 +1564,27 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
                     snowY = (j % 2 == 0) ? solidStartY : std::max(solidStartY, solidEndY - 1);
                 }
 
-                if (snowY >= 0 && snowY < textureHeight && snowX >= 0 && snowX < textureWidth) {
-                    uint8_t* rowStart = dst_data[0] + snowY * pitch;
-                    if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
-                        int group_idx = snowX / 2;
-                        int in_group_idx = snowX % 2;
-                        uint8_t* group = rowStart + group_idx * 4;
-                        if (group_idx * 4 + (1 + in_group_idx * 2) < pitch) {
-                            group[0] = 128;
-                            group[1 + in_group_idx * 2] = 235;
-                            group[2] = 128;
-                        }
-                    } else {
-                        rowStart[snowX] = 235;
-                    }
-                }
-
-                for (int k = 1; k < tailLength; ++k) {
+                // Head (k==0, bright 235) + horizontal tail, drawn over snowThickness rows
+                // so the particle keeps its 480p proportions at higher resolutions.
+                for (int k = 0; k < tailLength; ++k) {
                     int xPos = snowX + k;
                     if (xPos >= textureWidth) {
-                        continue;
+                        break;
                     }
-                    double fadeFactor = std::exp(-0.15 * k);
-                    int brightness = 128 + static_cast<int>(107 * fadeFactor);
-                    if (snowY >= 0 && snowY < textureHeight && xPos >= 0) {
-                        uint8_t* rowStart = dst_data[0] + snowY * pitch;
+                    int brightness;
+                    if (k == 0) {
+                        brightness = 235;
+                    } else {
+                        // Fade over the SCALED length so the tail shape matches 480p.
+                        double fadeFactor = std::exp(-0.15 * k / effectScale);
+                        brightness = 128 + static_cast<int>(107 * fadeFactor);
+                    }
+                    for (int dy = 0; dy < snowThickness; ++dy) {
+                        int yRow = snowY + dy;
+                        if (yRow < 0 || yRow >= textureHeight) {
+                            continue;
+                        }
+                        uint8_t* rowStart = dst_data[0] + yRow * pitch;
                         if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
                             int group_idx = xPos / 2;
                             int in_group_idx = xPos % 2;
@@ -1169,38 +1602,49 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
             }
         }
 
-        // Dark outline directly below solid grey zone - gradual appearance from 2x
-        // Real Betacam shows thin dark edge at head switch point (boundary of solid grey)
+        // Thin, FAINT dark line just below the solid grey (head-switch point).
+        // Kept barely visible (request: "even thinner, barely visible") — a soft 1 px line,
+        // not a near-black bar. Follows the ragged grey bottom when raggedness is active.
         if (absPlaybackRate >= 2.0) {
-            // Calculate darkness: gradual appearance, then darker at higher speeds
+            // Soft darkness: a gentle dip from grey, never approaching black.
             uint8_t targetYValue;
             if (absPlaybackRate < 4.0) {
-                // 2x-4x: gradual fade-in from barely visible to noticeable
                 double t = (absPlaybackRate - 2.0) / 2.0;  // 0.0 at 2x, 1.0 at 4x
                 t = t * t;  // Smooth ease-in
-                targetYValue = static_cast<uint8_t>(120 - t * 60);  // 120 → 60
+                targetYValue = static_cast<uint8_t>(122 - t * 18);  // 122 → 104
             } else if (absPlaybackRate < 8.0) {
-                // 4x-8x: continue darkening
                 double t = (absPlaybackRate - 4.0) / 4.0;
-                targetYValue = static_cast<uint8_t>(60 - t * 28);  // 60 → 32
+                targetYValue = static_cast<uint8_t>(104 - t * 14);  // 104 → 90
             } else {
-                targetYValue = 32;  // 8x+: dark but visible
+                targetYValue = 90;  // 8x+: faint, barely-visible line
             }
 
-            // Draw at solidEndY (directly after solid grey, within noise edge if present)
-            // This keeps it connected to the solid grey zone
-            int outlineY = solidEndY;
-            if (outlineY >= 0 && outlineY < textureHeight) {
-                uint8_t* rowStart = dst_data[0] + outlineY * pitch;
+            auto drawDarkRun = [&](int y, int x0, int x1) {
+                if (y < 0 || y >= textureHeight) return;
+                x0 = std::max(0, x0);
+                x1 = std::min(textureWidth, x1);
+                if (x1 <= x0) return;
+                uint8_t* rowStart = dst_data[0] + y * pitch;
                 if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
-                    for (int i = 0; i < textureWidth / 2; ++i) {
+                    for (int i = x0 / 2; i < (x1 + 1) / 2; ++i) {
                         uint8_t* group = rowStart + i * 4;
                         group[1] = targetYValue;
                         group[3] = targetYValue;
                     }
                 } else {
-                    std::memset(rowStart, targetYValue, textureWidth);
+                    std::memset(rowStart + x0, targetYValue, x1 - x0);
                 }
+            };
+
+            // Follow the ragged bottom (sit just under the deepest grey bulge of each
+            // segment); otherwise a single straight line at solidEndY.
+            if (doRagged && hasBottomEdge) {
+                // Follow the single bottom step: base line on the free part, stepped line on
+                // the filled part.
+                drawDarkRun(solidEndY, 0, ragBreakB);
+                drawDarkRun(solidEndY + ragStep, ragBreakB, textureWidth);
+            } else {
+                drawDarkRun(solidEndY, 0, textureWidth);
             }
         }
     }
@@ -1330,53 +1774,9 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         }
     }
 
-    // Edge fade
-    if ((kEdgeFadeLeft > 0 || kEdgeFadeRight > 0) &&
-        textureWidth > (kEdgeFadeLeft + kEdgeFadeRight) && pitch > 0) {
-        for (int y = 0; y < textureHeight; ++y) {
-            uint8_t* rowStart = dst_data[0] + y * pitch;
-            // Left edge
-            for (int x = 0; x < static_cast<int>(kEdgeFadeLeft); ++x) {
-                float fade = (kEdgeFadeLeft > 1)
-                                 ? static_cast<float>(x) / static_cast<float>(kEdgeFadeLeft - 1)
-                                 : 1.0f;
-                if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
-                    int group_idx = x / 2;
-                    int in_group_idx = x % 2;
-                    uint8_t* group = rowStart + group_idx * 4;
-                    if (group_idx * 4 + (1 + in_group_idx * 2) < pitch) {
-                        uint8_t currentY = group[1 + in_group_idx * 2];
-                        group[1 + in_group_idx * 2] =
-                            static_cast<uint8_t>(currentY * fade + 16.0f * (1.0f - fade));
-                    }
-                } else {
-                    uint8_t currentY = rowStart[x];
-                    rowStart[x] = static_cast<uint8_t>(currentY * fade + 16.0f * (1.0f - fade));
-                }
-            }
-            // Right edge
-            for (int x = 0; x < static_cast<int>(kEdgeFadeRight); ++x) {
-                int realX = textureWidth - 1 - x;
-                float fade = (kEdgeFadeRight > 1)
-                                 ? static_cast<float>(x) / static_cast<float>(kEdgeFadeRight - 1)
-                                 : 1.0f;
-                if (lastSdlPixFormat == SDL_PIXELFORMAT_UYVY) {
-                    int group_idx = realX / 2;
-                    int in_group_idx = realX % 2;
-                    uint8_t* group = rowStart + group_idx * 4;
-                    if (group_idx * 4 + (1 + in_group_idx * 2) < pitch) {
-                        uint8_t currentY = group[1 + in_group_idx * 2];
-                        group[1 + in_group_idx * 2] =
-                            static_cast<uint8_t>(currentY * fade + 16.0f * (1.0f - fade));
-                    }
-                } else {
-                    uint8_t currentY = rowStart[realX];
-                    rowStart[realX] = static_cast<uint8_t>(currentY * fade + 16.0f * (1.0f - fade));
-                }
-            }
-        }
-        effectApplied = true;
-    }
+    // Edge fade moved to FSTPBetacamEffect::ApplyEdgeFade(), applied by the pixel-buffer
+    // manager on EVERY frame (incl. 1×) so the soft L/R border is always present and doesn't
+    // snap sharp at normal speed.
 
     state.last_frame_number = frame_ctx.frame_number;
     state.last_new_frame = frame_ctx.new_frame;
@@ -1398,10 +1798,10 @@ bool FSTPBetacamEffect::ApplyRenderJitter(int player_id, RenderContext& render_c
     const PlaybackMetrics& metrics = state.metrics;
 
     double absSpeed = std::abs(metrics.playback_rate);
-    bool isSlowMotion = (absSpeed < 0.9) || (absSpeed >= 0.9 && absSpeed <= 1.1 && metrics.is_reverse);
+    bool isSlowMotion = (absSpeed < 0.9);
     bool isFastShuttle = (absSpeed >= kEffectThreshold);
 
-    // Effect applies to slow motion OR fast shuttle
+    // Effect applies to slow motion OR fast shuttle; 1× reverse treated like 1× forward.
     if (!isSlowMotion && !isFastShuttle) {
         return false;
     }
@@ -1464,10 +1864,15 @@ bool FSTPBetacamEffect::ApplyRenderJitter(int player_id, RenderContext& render_c
         }
     }
 
-    // === SLOW MOTION: Image Y offset follows stripe/audio time ===
-    // The video frame moves slightly with the stripe position
-    // At frame boundary (scroll_phase = 0 or 1): offset = 0
-    // At mid-frame (scroll_phase = 0.5): offset = max (±5 pixels)
+    // === SLOW MOTION: image is elastically PULLED + a touch of rigid nudge ===
+    // A real Betacam transport's vertical servo "hunts" at slow speed: the picture is
+    // mostly STRETCHED (one edge anchored, the opposite edge dragged) but the whole raster
+    // also JUMPS a little the same way. We combine both — a big edge-anchored stretch
+    // (pull) plus a small whole-frame translate (shift, the original idea) — for a more
+    // aggressive, more realistic hunt. Triangle timing kept (0 at frame boundaries, max
+    // mid-frame — deliberately NOT a sine; that linear ramp is the Betacam character).
+    //   Forward → pull/nudge DOWN  (anchor top,    stretch bottom edge down)
+    //   Reverse → pull/nudge UP    (anchor bottom, stretch top    edge up)
     if (isSlowMotion && metrics.frame_rate > 0) {
         double fps = metrics.frame_rate;
         double currentTime = metrics.position_seconds;
@@ -1478,23 +1883,29 @@ bool FSTPBetacamEffect::ApplyRenderJitter(int player_id, RenderContext& render_c
         if (scroll_phase < 0) scroll_phase += 1.0;
 
         // Triangle wave: 0 at boundaries, max at center
-        // scroll_phase 0.0 → 0.5: offset increases
-        // scroll_phase 0.5 → 1.0: offset decreases back to 0
+        // scroll_phase 0.0 → 0.5: pull increases
+        // scroll_phase 0.5 → 1.0: pull relaxes back to 0
         double triangle = (scroll_phase < 0.5)
                          ? (scroll_phase * 2.0)         // 0→1 as phase goes 0→0.5
                          : (2.0 - scroll_phase * 2.0);  // 1→0 as phase goes 0.5→1
 
-        // Max offset: ±5 pixels
-        constexpr double maxYOffset = 5.0;
-        double yOffset = triangle * maxYOffset;
+        // Dragged edge STRETCHES (pull); whole frame also NUDGES a little the same way
+        // (shift, the old rigid translate). Combined = jump + stretch = aggressive hunt.
+        constexpr double maxPull  = 9.0;  // stretch on the dragged edge
+        constexpr double maxShift = 3.0;  // small whole-frame translate (the "old idea")
+        int pull  = static_cast<int>(std::round(triangle * maxPull));
+        int shift = static_cast<int>(std::round(triangle * maxShift));
 
-        // Direction: forward = pull down (positive), reverse = pull up (negative)
-        if (metrics.is_reverse) {
-            yOffset = -yOffset;
+        if (pull > 0 || shift > 0) {
+            if (metrics.is_reverse) {
+                dst.y -= (pull + shift);  // top dragged up by pull + frame nudged up by shift
+                dst.h += pull;            // bottom ends up nudged up by shift only
+            } else {
+                dst.y += shift;           // whole frame nudged down by shift
+                dst.h += pull;            // bottom dragged down by pull (top only by shift)
+            }
+            modified = true;
         }
-
-        dst.y += static_cast<int>(std::round(yOffset));
-        modified = true;
     }
 
     return modified;
@@ -1502,7 +1913,8 @@ bool FSTPBetacamEffect::ApplyRenderJitter(int player_id, RenderContext& render_c
 
 // ========== HSYNC LOSS EFFECT (Restored from original effects_renderer.mm) ==========
 
-void FSTPBetacamEffect::UpdateHsyncEffect(PlayerState& state, double abs_playback_rate, double /*fps*/) {
+void FSTPBetacamEffect::UpdateHsyncEffect(PlayerState& state, double abs_playback_rate, double /*fps*/,
+                                           bool allow_new_triggers) {
     constexpr std::chrono::milliseconds HSYNC_MIN_INTERVAL(300);  // Reduced: 300ms between hsync triggers
 
     auto now = std::chrono::steady_clock::now();
@@ -1524,7 +1936,7 @@ void FSTPBetacamEffect::UpdateHsyncEffect(PlayerState& state, double abs_playbac
     bool hsyncConditionMet = (abs_playback_rate >= 1.5 && abs_playback_rate <= 2.2);
     bool shouldTrigger = hsyncConditionMet || abruptSpeedChange;
 
-    if (shouldTrigger && !state.hsync.hsyncLossActive) {
+    if (shouldTrigger && !state.hsync.hsyncLossActive && allow_new_triggers) {
         if (now - state.hsync.hsyncLastTriggerTime > HSYNC_MIN_INTERVAL) {
             // Random chance to trigger:
             // - Abrupt speed change: 1 in 4 chance (25%) - more frequent but not always
@@ -1601,8 +2013,30 @@ bool FSTPBetacamEffect::RenderWithHsync(
         return false;
     }
 
+    // SELF-EXPIRING, WALL-CLOCK DRIVEN — fixes the long-standing "horizontal shift freezes"
+    // bug. RenderWithHsync runs on every presented frame, but UpdateHsyncEffect (which
+    // advances/animates and clears the effect) only runs when a NEW source frame is
+    // processed. When the display refreshes without a new frame (pause, slow source, a speed
+    // change that produces no new frames) the effect's timer never advanced and this drew a
+    // FROZEN max-skew tear forever. Recompute progress from the wall clock here so the tear
+    // always rolls out and disappears on time, independent of when UpdateHsyncEffect last
+    // ran. (hsyncLossActive itself is cleared later by UpdateHsyncEffect.)
+    int durationMs = (hsync.hsyncEffectDurationMs > 0) ? hsync.hsyncEffectDurationMs : 150;
+    double elapsedMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - hsync.hsyncEffectStartTime).count();
+    if (elapsedMs >= durationMs) {
+        // Lifetime over — render normally, never a frozen tear.
+        return false;
+    }
+    float progress = static_cast<float>(elapsedMs / durationMs);
+    progress = std::max(0.0f, std::min(1.0f, progress));
+    // Smooth in/out skew + tear-line wobble, recomputed locally (cached values only update
+    // on new frames, so relying on them is what allowed the freeze).
+    float skewMag  = hsync.hsyncMaxSkewAmount * std::sin(progress * static_cast<float>(M_PI));
+    float tearNorm = 0.5f + 0.3f * std::sin(progress * static_cast<float>(M_PI) * 4.0f);
+
     // Calculate tear line position in screen coordinates
-    int actualTearLineScreenY = dest_rect.y + static_cast<int>(hsync.tearLineNormalized * dest_rect.h);
+    int actualTearLineScreenY = dest_rect.y + static_cast<int>(tearNorm * dest_rect.h);
     actualTearLineScreenY = std::max(dest_rect.y, std::min(actualTearLineScreenY, dest_rect.y + dest_rect.h - 1));
 
     // ========== PART 1: Below the tear (renders normally) ==========
@@ -1634,7 +2068,7 @@ bool FSTPBetacamEffect::RenderWithHsync(
             // Calculate skew for this line (increases towards tear line)
             float normalizedYInSkewArea = static_cast<float>(actualTearLineScreenY - 1 - y_screen) /
                                           std::max(1, topPartScreenHeight - 1);
-            float currentLineSkew = hsync.hsyncMaxSkewAmount * normalizedYInSkewArea;
+            float currentLineSkew = skewMag * normalizedYInSkewArea;
 
             // Destination line (horizontally shifted)
             dstLine.x = dest_rect.x + static_cast<int>(currentLineSkew);

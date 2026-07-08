@@ -59,12 +59,19 @@ struct PlayerOSDData {
     std::string loading_status = "threading";  // Stage text: threading, indexing, proxy
     bool is_audio_file = false;
 
+    // TAPE THREADING badge: background proxy conversion progress (-1 = hidden).
+    // Set from the conversion thread while the video is already playing.
+    int proxy_threading_progress = -1;
+
     // Toggle between time and frame numbers
     bool show_frame_numbers = false;  // false = time (00:00:00:00), true = frames (0000000000)
     int current_frame_number = 0;     // Frame number from audio module
 
     // Real file FPS (for correct timecode display)
     double fps = 25.0;  // Default PAL, but updated when file is loaded
+
+    // Timecode offset from file metadata (e.g. 00:59:30:00 = 3570s)
+    double timecode_offset_seconds = 0.0;
 
     // Smoothing for VU meters
     float smooth_left = 0.0f;
@@ -233,6 +240,10 @@ void UpdateOSDFullResMode(int player_id, bool is_full_res) {
     GetPlayerOSDData(player_id).is_full_res = is_full_res;
 }
 
+void UpdateOSDProxyThreading(int player_id, int percent) {
+    GetPlayerOSDData(player_id).proxy_threading_progress = percent;
+}
+
 void UpdateOSDPlayState(int player_id, bool isPlaying, bool jog_forward, bool jog_backward) {
     GetPlayerOSDData(player_id).is_playing = isPlaying;
     GetPlayerOSDData(player_id).jog_forward = jog_forward;
@@ -298,6 +309,14 @@ void SetOSDFileType(int player_id, bool is_audio) {
     data.is_audio_file = is_audio;
     std::cout << "OSD Player " << player_id << " file type set to: "
               << (is_audio ? "audio" : "video") << std::endl;
+}
+
+void SetOSDTimecodeOffset(int player_id, double offset_seconds) {
+    auto& data = GetPlayerOSDData(player_id);
+    data.timecode_offset_seconds = offset_seconds;
+    if (offset_seconds > 0.001) {
+        std::cout << "[OSD] Timecode offset set: " << offset_seconds << "s for player " << player_id << std::endl;
+    }
 }
 
 void UpdateOSDDecodedFrames(int player_id, const std::vector<bool>& decoded_map, int total_frames) {
@@ -827,6 +846,9 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
         SDL_Color redColor = {255, 0, 0, 255};
         SDL_Color bgColor = {40, 40, 40, 255};
         SDL_Color grayColor = {180, 180, 180, 255};
+        // VU/PPM meter colour zones (like Logic/FCP/Pro Tools): green safe → amber → red near 0 dBFS.
+        SDL_Color greenColor = {0, 200, 60, 255};
+        SDL_Color amberColor = {235, 190, 0, 255};
 
         // ========== 1. CENTRAL TIMECODE AND STATUS ==========
         std::string timecode;
@@ -943,7 +965,16 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
         std::string speedText;
         double abs_speed = std::abs(data.actual_playback_rate);
 
-        if (data.is_full_res && abs_speed >= 0.95 && abs_speed <= 1.05) {
+        // TAPE THREADING: while the proxy builds in the background, transport is
+        // limited (shuttle/reverse locked). Minimal indication: the speed itself
+        // in blinking GREY text — no separate badge.
+        bool tape_threading = (data.proxy_threading_progress >= 0);
+
+        if (tape_threading) {
+            char speedBuffer[10];
+            snprintf(speedBuffer, sizeof(speedBuffer), "%.1f", abs_speed);
+            speedText = speedBuffer;  // during threading always a number, not "lock"
+        } else if (data.is_full_res && abs_speed >= 0.95 && abs_speed <= 1.05) {
             speedText = "lock";  // Locked 1:1 speed with full-res decoder
         } else {
             char speedBuffer[10];
@@ -955,7 +986,15 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
         TTF_SizeText(g_normal_font, speedText.c_str(), &speed_width, &speed_height);
         int speedX = timecodeX + text_width - speed_width;
         int speedY = timecodeY + text_height;
-        RenderCachedText(renderer, speedText, speedX, speedY, textColor, shadowColor, g_normal_font);
+        if (tape_threading) {
+            // Blink ~1 Hz (600 ms visible / 400 ms hidden), grey = limited mode.
+            if (SDL_GetTicks() % 1000 < 600) {
+                SDL_Color threadingGray = {150, 150, 150, 255};
+                RenderCachedText(renderer, speedText, speedX, speedY, threadingGray, shadowColor, g_normal_font);
+            }
+        } else {
+            RenderCachedText(renderer, speedText, speedX, speedY, textColor, shadowColor, g_normal_font);
+        }
 
         // auto status_end = std::chrono::high_resolution_clock::now();
         // total_status_us += std::chrono::duration_cast<std::chrono::microseconds>(status_end - status_start).count();
@@ -976,17 +1015,21 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
         const float STOP_DECAY = 0.05f;
 
         if (is_playing) {
-            // Asymmetric ballistics for quasi-peak (PPM bar): fast attack, slower decay
-            if (data.audio_left > data.smooth_left) {
-                data.smooth_left += (data.audio_left - data.smooth_left) * LEVEL_ATTACK;
+            // Peak meter (FCP/Pro Tools style): the solid bar follows TRUE PEAK with fast attack and
+            // a moderate fall-back, and the cap holds the peak — so the cap sits just above the bar
+            // instead of floating far from a low RMS bar (the big gap the RMS bar showed). RMS is
+            // still computed in the audio callback (audio_left/right) and available for a future
+            // inner loudness sub-bar.
+            if (data.audio_left_peak > data.smooth_left) {
+                data.smooth_left += (data.audio_left_peak - data.smooth_left) * LEVEL_ATTACK;
             } else {
-                data.smooth_left += (data.audio_left - data.smooth_left) * LEVEL_DECAY;
+                data.smooth_left += (data.audio_left_peak - data.smooth_left) * LEVEL_DECAY;
             }
 
-            if (data.audio_right > data.smooth_right) {
-                data.smooth_right += (data.audio_right - data.smooth_right) * LEVEL_ATTACK;
+            if (data.audio_right_peak > data.smooth_right) {
+                data.smooth_right += (data.audio_right_peak - data.smooth_right) * LEVEL_ATTACK;
             } else {
-                data.smooth_right += (data.audio_right - data.smooth_right) * LEVEL_DECAY;
+                data.smooth_right += (data.audio_right_peak - data.smooth_right) * LEVEL_DECAY;
             }
 
             // True peak line: instant attack, slow decay (hold behavior)
@@ -1048,12 +1091,28 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
             peakWidth = std::max(0.0f, std::min(static_cast<float>(METER_WIDTH), peakWidth));
 
             if (levelWidth > 0) {
-                int barWidth = static_cast<int>(levelWidth);
-                SDL_Color barColor = (levelDB > -6.0f) ? redColor : whiteColor;
-
-                SDL_SetRenderDrawColor(renderer, barColor.r, barColor.g, barColor.b, barColor.a);
-                SDL_Rect barRect = {meterX + 1, y + 1, barWidth - 1, METER_HEIGHT - 2};
-                SDL_RenderFillRect(renderer, &barRect);
+                // Colour-zoned fill (green ≤ -18, amber -18..-6, red -6..0 dBFS), each segment drawn
+                // up to the current level — the classic DAW peak/PPM look.
+                auto dbToW = [&](float db) {
+                    float w = ((db - MIN_DB) / (MAX_DB - MIN_DB)) * METER_WIDTH;
+                    return std::max(0.0f, std::min(static_cast<float>(METER_WIDTH), w));
+                };
+                const float amberAt = dbToW(-18.0f);
+                const float redAt   = dbToW(-6.0f);
+                const int barTop = y + 1;
+                const int barH   = METER_HEIGHT - 2;
+                auto fillSeg = [&](float fromW, float toW, SDL_Color c) {
+                    float a = std::max(fromW, 0.0f);
+                    float b = std::min(toW, levelWidth);
+                    if (b - a < 1.0f) return;
+                    SDL_SetRenderDrawColor(renderer, c.r, c.g, c.b, c.a);
+                    SDL_Rect r = {meterX + 1 + static_cast<int>(a), barTop,
+                                  static_cast<int>(b - a), barH};
+                    SDL_RenderFillRect(renderer, &r);
+                };
+                fillSeg(0.0f,    amberAt,    greenColor);
+                fillSeg(amberAt, redAt,      amberColor);
+                fillSeg(redAt,   levelWidth, redColor);
             }
 
             if (peakWidth > 2) {
@@ -1114,7 +1173,9 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
 
         double position = 0.0;
         if (data.total_duration > 0.0) {
-            position = data.current_time / data.total_duration;
+            // Subtract timecode offset for correct position indicator
+            double raw_time = data.current_time - data.timecode_offset_seconds;
+            position = raw_time / data.total_duration;
             position = std::max(0.0, std::min(1.0, position));
         }
 
@@ -1174,7 +1235,8 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
 
             // Current position indicator (white vertical line)
             if (data.total_duration > 0.0 && data.current_time >= 0.0) {
-                double position = data.current_time / data.total_duration;
+                double raw_time = data.current_time - data.timecode_offset_seconds;
+                double position = raw_time / data.total_duration;
                 int posX = BAR_MARGIN + static_cast<int>(BAR_WIDTH * position);
                 SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
                 SDL_RenderDrawLine(renderer, posX, BAR_Y, posX, BAR_Y + BAR_HEIGHT - 1);

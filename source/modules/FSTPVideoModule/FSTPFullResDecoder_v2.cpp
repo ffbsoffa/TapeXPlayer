@@ -56,7 +56,7 @@ static uint64_t GetThreadCPUTimeMicroseconds() {
 #endif
 }
 
-FSTPFullResDecoderV2::FSTPFullResDecoderV2(const std::string& sourceFilename)
+FSTPFullResDecoderV2::FSTPFullResDecoderV2(const std::string& sourceFilename, double initial_time)
     : source_filename_(sourceFilename)
     , initialized_(false)
     , stop_requested_(false)
@@ -94,15 +94,18 @@ FSTPFullResDecoderV2::FSTPFullResDecoderV2(const std::string& sourceFilename)
     initialized_ = Initialize();
 
     if (initialized_) {
+        // ADAPTIVE FPS: Adjust buffer windows based on video frame rate
+        UpdateBufferWindowsForFPS();
+        
         // Start background decoding thread
         thread_running_.store(true);
         decoding_thread_ = std::thread(&FSTPFullResDecoderV2::DecodingThreadLoop, this);
         std::cout << "✅ [FULL-RES V2] Background decoding thread started" << std::endl;
 
         // IMPORTANT: Decode first frame immediately on load!
-        // Set playback time to beginning, so background thread can start decoding immediately
-        SetPlaybackTime(0.0);
-        std::cout << "📸 [FULL-RES V2] Triggered initial frame decoding at time 0.0" << std::endl;
+        // Start at initial_time (resume position) instead of always 0.0
+        SetPlaybackTime(initial_time);
+        std::cout << "📸 [FULL-RES V2] Triggered initial frame decoding at time " << initial_time << std::endl;
 
         // OPTIMIZATION: Yield to give the decoding thread a chance to run immediately
         std::this_thread::yield();
@@ -111,8 +114,8 @@ FSTPFullResDecoderV2::FSTPFullResDecoderV2(const std::string& sourceFilename)
         // Wait for at least 3 frames to prevent jitter when switching from proxy to full-res
         auto wait_start = std::chrono::steady_clock::now();
         bool buffer_ready = false;
-        const int max_wait_ms = 500;  // Maximum 500ms waiting
-        const size_t min_frames_for_smooth_start = 3;  // Need at least 3 frames for smooth playback
+        const int max_wait_ms = (frame_rate_ >= 50.0) ? 800 : 800;  // Extra margin for software-decoded codecs (AV1, VP9)
+        const size_t min_frames_for_smooth_start = (frame_rate_ >= 50.0) ? 5 : 10;  // 10 frames (~333ms at 30fps) before starting
 
         while (!buffer_ready) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -245,6 +248,37 @@ bool FSTPFullResDecoderV2::Initialize() {
     return true;
 }
 
+void FSTPFullResDecoderV2::UpdateBufferWindowsForFPS() {
+    // ADAPTIVE FPS: Scale buffer windows based on frame rate
+    // High FPS videos need larger buffers to handle frame density
+    if (frame_rate_ >= 55.0) {
+        // 60 FPS: Need 4.0s ahead (~240 frames) and 2.5s behind (~150 frames)
+        buffer_window_ahead_ = 4.0;
+        buffer_window_behind_ = 2.5;
+        std::cout << "🎬 [FULL-RES V2] High FPS detected (" << frame_rate_ 
+                  << "), buffer windows: ahead=" << buffer_window_ahead_ 
+                  << "s, behind=" << buffer_window_behind_ << "s" << std::endl;
+    } else if (frame_rate_ >= 45.0) {
+        // ~50 FPS: Moderate increase
+        buffer_window_ahead_ = 3.5;
+        buffer_window_behind_ = 2.2;
+        std::cout << "🎬 [FULL-RES V2] Medium-high FPS (" << frame_rate_ 
+                  << "), buffer windows: ahead=" << buffer_window_ahead_ 
+                  << "s, behind=" << buffer_window_behind_ << "s" << std::endl;
+    } else {
+        // Standard 24-30 FPS: default values are fine
+        std::cout << "🎬 [FULL-RES V2] Standard FPS (" << frame_rate_ 
+                  << "), using default buffer windows" << std::endl;
+    }
+}
+
+#ifdef _WIN32
+// Which Windows format was actually created: D3D11 (default) or DXVA2_VLD (fallback).
+// GetHWFormat is static (no this), so the choice is stored at file scope; on one
+// machine every decoder instance uses the same API.
+static AVPixelFormat g_win_hw_pix_fmt = AV_PIX_FMT_D3D11;
+#endif
+
 bool FSTPFullResDecoderV2::InitializeHardwareAcceleration(const AVCodec* codec) {
     // ========================================
     // UNIFIED HARDWARE DETECTION (NEW!)
@@ -301,7 +335,18 @@ bool FSTPFullResDecoderV2::InitializeHardwareAcceleration(const AVCodec* codec) 
         if (ret >= 0) {
             hw_pix_fmt_ = AV_PIX_FMT_D3D11;
             std::cout << "✅ [FULL-RES V2] D3D11VA hardware acceleration enabled" << std::endl;
+        } else {
+            // DXVA2 fallback: old drivers and remote sessions where a D3D11
+            // device won't create but DXVA2 (D3D9) still works.
+            ret = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_DXVA2, nullptr, nullptr, 0);
+            if (ret >= 0) {
+                hw_pix_fmt_ = AV_PIX_FMT_DXVA2_VLD;
+                std::cout << "✅ [FULL-RES V2] DXVA2 fallback enabled (D3D11VA unavailable)" << std::endl;
+            }
         }
+#ifdef _WIN32
+        if (ret >= 0) g_win_hw_pix_fmt = hw_pix_fmt_;
+#endif
     }
 
     if (ret < 0) {
@@ -330,7 +375,8 @@ AVPixelFormat FSTPFullResDecoderV2::GetHWFormat(AVCodecContext* ctx, const enum 
 #elif defined(__linux__)
         if (*p == AV_PIX_FMT_VAAPI)         return *p;
 #elif defined(_WIN32)
-        if (*p == AV_PIX_FMT_D3D11)         return *p;
+        // D3D11 or DXVA2_VLD — whichever device was actually created (see init).
+        if (*p == g_win_hw_pix_fmt)         return *p;
 #endif
     }
     return AV_PIX_FMT_NONE;
@@ -396,9 +442,12 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::GetFrameForTime(double time_secon
     // CORRECTION: Use dynamic tolerance based on frame_rate
     const double ONE_FRAME_MS = 1000.0 / (frame_rate_ > 0 ? frame_rate_ : 25.0);
 
+    // ADAPTIVE FPS: High FPS needs tighter cache tolerance for smoother playback
+    const double CACHE_TOLERANCE_FRAMES = (frame_rate_ >= 55.0) ? 0.5 : 0.7;
+    
     // FAST PATH: Check cache without lock (optimization for 60 FPS)
     double cached_time = cached_frame_time_.load(std::memory_order_relaxed);
-    const double TOLERANCE = (ONE_FRAME_MS * 0.7) / 1000.0; // 0.7 frames for cache
+    const double TOLERANCE = (ONE_FRAME_MS * CACHE_TOLERANCE_FRAMES) / 1000.0;
 
     if (cached_time >= 0.0 && std::abs(cached_time - time_seconds) < TOLERANCE) {
         // Cache hit - return without lock!
@@ -414,21 +463,52 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::GetFrameForTime(double time_secon
 
     // CORRECTION: Search CLOSEST frame to requested_time (not necessarily <=)
     // This allows taking a frame slightly FORWARD if it's closer, avoiding "stuttering"
+    
+    // LOW FPS FIX (25fps): Search for best frame <= requested_time to avoid 1-frame jitter
+    // At 25fps, each frame = 40ms. "Closest" can jump between N and N+1 causing visible stutter.
+    // Instead: prefer frame <= requested_time (already displayed or current)
     StreamFrame* best_match = nullptr;
     double best_diff = 1e9;
+    // AT-OR-BEFORE (floor) at ALL fps: the displayed base frame must be floor(audio*fps) = N, the
+    // SAME the proxy shows (slot[floor]) and the same the Betacam helical model assumes below the
+    // stripe. "Nearest" would jump the base to N+1 once the audio phase passes 0.5 → a 1-frame jump
+    // at the proxy→full-res switch. (Re-enabled: the earlier spike this caused was because the N+1
+    // adjacent frame was ALSO fetched via this nearest/at-or-before path; adjacents now come from
+    // GetFrameTriplet straight off the buffer, so capping the BASE at <= time is safe.)
+    bool is_low_fps = true;
 
     for (auto& sf : stream_buffer_) {
         double diff = std::abs(sf.time_seconds - time_seconds);
-        if (diff < best_diff) {
-            best_diff = diff;
-            best_match = &sf;
+        
+        if (is_low_fps) {
+            // PREFER frames <= requested_time to avoid jumping ahead
+            // Only accept frame > requested_time if no earlier frame exists
+            if (sf.time_seconds <= time_seconds + 0.001) {  // <= requested (with tiny tolerance)
+                if (diff < best_diff) {
+                    best_diff = diff;
+                    best_match = &sf;
+                }
+            } else if (!best_match) {
+                // Fallback: accept next frame only if nothing earlier available
+                if (diff < best_diff) {
+                    best_diff = diff;
+                    best_match = &sf;
+                }
+            }
+        } else {
+            // High FPS: use standard closest-frame logic
+            if (diff < best_diff) {
+                best_diff = diff;
+                best_match = &sf;
+            }
         }
     }
 
-    // Tolerance for frame search: 3.1 frames
-    // Stay strict - return nullptr if exact frame not available
-    // This keeps proxy showing until full-res catches up to correct frame
-    const double MAX_DIFF = (ONE_FRAME_MS * 3.1) / 1000.0;
+    // ADAPTIVE FPS: Tolerance for frame search scales with frame rate
+    // 60 FPS: 4.0 frames = ~66.7ms (more lenient to catch up)
+    // 30 FPS: 3.1 frames = ~103ms (standard)
+    const double SEARCH_TOLERANCE_FRAMES = (frame_rate_ >= 55.0) ? 4.0 : 3.1;
+    const double MAX_DIFF = (ONE_FRAME_MS * SEARCH_TOLERANCE_FRAMES) / 1000.0;
 
     // Check that found frame is within tolerance
     if (best_match && best_diff <= MAX_DIFF) {
@@ -439,39 +519,74 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::GetFrameForTime(double time_secon
             cached_frame_time_.store(best_match->time_seconds, std::memory_order_release);
         }
 
-        // DIAGNOSTICS: Log successful hits for comparison with miss
-        static int hit_log = 0;
-        if (++hit_log % 60 == 1) {  // Every 60th frame (every ~2 seconds at 25fps)
-            std::cout << std::fixed << std::setprecision(4);
-            std::cout << "✅ [V2 HIT] requested=" << time_seconds
-                      << "s, found=" << best_match->time_seconds
-                      << "s, diff=" << (best_diff * 1000.0) << "ms"
-                      << ", buf_size=" << stream_buffer_.size()
-                      << " [" << stream_buffer_.front().time_seconds
-                      << "s.." << stream_buffer_.back().time_seconds << "s]"
-                      << std::defaultfloat << std::endl;
+        if (ENABLE_FULLRES_V2_DEBUG) {
+            static int hit_log = 0;
+            if (++hit_log % 60 == 1) {
+                std::cout << std::fixed << std::setprecision(4);
+                std::cout << "✅ [V2 HIT] requested=" << time_seconds
+                          << "s, found=" << best_match->time_seconds
+                          << "s, diff=" << (best_diff * 1000.0) << "ms"
+                          << ", buf_size=" << stream_buffer_.size()
+                          << " [" << stream_buffer_.front().time_seconds
+                          << "s.." << stream_buffer_.back().time_seconds << "s]"
+                          << std::defaultfloat << std::endl;
+            }
         }
 
         return best_match->frame;
     }
 
-    // DIAGNOSTICS: Log EVERY miss for understanding stuttering
-    double diff_ms = best_match ? (best_diff * 1000.0) : 9999.0;
-
-    std::cout << std::fixed << std::setprecision(4);  // High precision for diagnostics
-    std::cout << "⚠️ [V2 MISS] requested=" << time_seconds
-              << "s, best=" << (best_match ? best_match->time_seconds : -1.0)
-              << "s, diff=" << diff_ms << "ms"
-              << ", tol=" << (MAX_DIFF * 1000.0) << "ms"
-              << ", buf_size=" << stream_buffer_.size();
-
-    if (!stream_buffer_.empty()) {
-        std::cout << " [" << stream_buffer_.front().time_seconds
-                  << "s.." << stream_buffer_.back().time_seconds << "s]";
+    if (ENABLE_FULLRES_V2_DEBUG) {
+        double diff_ms = best_match ? (best_diff * 1000.0) : 9999.0;
+        std::cout << std::fixed << std::setprecision(4);
+        std::cout << "⚠️ [V2 MISS] requested=" << time_seconds
+                  << "s, best=" << (best_match ? best_match->time_seconds : -1.0)
+                  << "s, diff=" << diff_ms << "ms"
+                  << ", tol=" << (MAX_DIFF * 1000.0) << "ms"
+                  << ", buf_size=" << stream_buffer_.size();
+        if (!stream_buffer_.empty()) {
+            std::cout << " [" << stream_buffer_.front().time_seconds
+                      << "s.." << stream_buffer_.back().time_seconds << "s]";
+        }
+        std::cout << std::defaultfloat << std::endl;
     }
-    std::cout << std::defaultfloat << std::endl;
 
     return nullptr;
+}
+
+void FSTPFullResDecoderV2::GetFrameTriplet(double now_time,
+                                           std::shared_ptr<AVFrame>& prev,
+                                           std::shared_ptr<AVFrame>& now,
+                                           std::shared_ptr<AVFrame>& next) {
+    prev = now = next = nullptr;
+
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    if (stream_buffer_.empty()) return;
+
+    // AT-OR-BEFORE (floor) `now`: the last buffered frame whose time <= now_time. This matches
+    // GetFrameForTime's at-or-before base selection, so `now` here is the SAME frame the base shows
+    // — and then the buffer-contiguous neighbours are exactly its N-1 / N+1. (The buffer holds
+    // frames in ascending time order, so the highest-index qualifying entry is the floor frame.)
+    const double tol = 0.001;
+    size_t best = SIZE_MAX;
+    for (size_t i = 0; i < stream_buffer_.size(); ++i) {
+        if (stream_buffer_[i].time_seconds <= now_time + tol) best = i;  // keep last → at-or-before
+    }
+
+    const double one_frame = (frame_rate_ > 0.0) ? (1.0 / frame_rate_) : 0.04;
+    if (best == SIZE_MAX) {
+        // now_time is before the whole buffer → use the first frame only if it's close enough.
+        if (std::abs(stream_buffer_.front().time_seconds - now_time) > one_frame * 3.1) return;
+        best = 0;
+    } else if (now_time - stream_buffer_[best].time_seconds > one_frame * 3.1) {
+        return;  // nearest at-or-before is too far back → "now" not really buffered
+    }
+
+    now = stream_buffer_[best].frame;
+    // The buffer holds contiguous decoded frames in time order, so the immediate neighbours ARE
+    // N-1 and N+1 — a guaranteed-consistent triplet, no second time-query needed.
+    if (best > 0)                              prev = stream_buffer_[best - 1].frame;
+    if (best + 1 < stream_buffer_.size())      next = stream_buffer_[best + 1].frame;
 }
 
 void FSTPFullResDecoderV2::ClearBuffer() {
@@ -514,11 +629,14 @@ bool FSTPFullResDecoderV2::DownscaleFrame(AVFrame* src, AVFrame* dst) {
 
     AVPixelFormat src_format = static_cast<AVPixelFormat>(src->format);
 
-    // Handle hardware frame transfer first (VideoToolbox on macOS, VA-API on Linux)
+    // Handle hardware frame transfer first (VideoToolbox on macOS, VA-API on Linux, D3D11 on Windows)
     AVFrame* sw_src = src;
     AVFrame* temp_hw_frame = nullptr;
 
-    bool is_hw_frame = (src_format == AV_PIX_FMT_VIDEOTOOLBOX) || (src_format == AV_PIX_FMT_VAAPI);
+    bool is_hw_frame = (src_format == AV_PIX_FMT_VIDEOTOOLBOX) ||
+                       (src_format == AV_PIX_FMT_VAAPI) ||
+                       (src_format == AV_PIX_FMT_D3D11) ||
+                       (src_format == AV_PIX_FMT_DXVA2_VLD);
 
     if (is_hw_frame) {
         temp_hw_frame = av_frame_alloc();
@@ -650,7 +768,8 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
 
                 bool is_hw_frame = (decoded_frame->format == AV_PIX_FMT_VIDEOTOOLBOX) ||
                                    (decoded_frame->format == AV_PIX_FMT_VAAPI) ||
-                                   (decoded_frame->format == AV_PIX_FMT_D3D11);
+                                   (decoded_frame->format == AV_PIX_FMT_D3D11) ||
+                                   (decoded_frame->format == AV_PIX_FMT_DXVA2_VLD);
 
                 if (is_hw_frame) {
                     // PROFILING: Measurement of av_frame_alloc
@@ -717,33 +836,35 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
                                  << ", trc=" << result->color_trc << std::endl;
                     }
 
-                    // PROFILING: Output detailed statistics every 60 frames
-                    profile_samples++;
-                    if (profile_samples >= 60) {
-                        uint64_t avg_read = total_read_us / profile_samples;
-                        uint64_t avg_send = total_send_packet_us / profile_samples;
-                        uint64_t avg_receive = total_receive_frame_us / profile_samples;
-                        uint64_t avg_alloc = total_hw_alloc_us / profile_samples;
-                        uint64_t avg_transfer = total_hw_transfer_us / profile_samples;
-                        uint64_t avg_clone = total_clone_us / profile_samples;
-                        uint64_t total_avg = avg_read + avg_send + avg_receive + avg_alloc + avg_transfer + avg_clone;
+                    // PROFILING: Output detailed statistics every 60 frames (gated by flag)
+                    if (ENABLE_FULLRES_V2_PROFILING) {
+                        profile_samples++;
+                        if (profile_samples >= 60) {
+                            uint64_t avg_read = total_read_us / profile_samples;
+                            uint64_t avg_send = total_send_packet_us / profile_samples;
+                            uint64_t avg_receive = total_receive_frame_us / profile_samples;
+                            uint64_t avg_alloc = total_hw_alloc_us / profile_samples;
+                            uint64_t avg_transfer = total_hw_transfer_us / profile_samples;
+                            uint64_t avg_clone = total_clone_us / profile_samples;
+                            uint64_t total_avg = avg_read + avg_send + avg_receive + avg_alloc + avg_transfer + avg_clone;
 
-                        std::cout << "📊 [DECODE PROFILE] Read: " << avg_read << "μs"
-                                  << ", Send: " << avg_send << "μs"
-                                  << ", Receive(VT): " << avg_receive << "μs"
-                                  << ", Alloc: " << avg_alloc << "μs"
-                                  << ", Transfer: " << avg_transfer << "μs"
-                                  << ", Clone: " << avg_clone << "μs"
-                                  << " | TOTAL: " << total_avg << "μs/frame" << std::endl;
+                            std::cout << "📊 [DECODE PROFILE] Read: " << avg_read << "μs"
+                                      << ", Send: " << avg_send << "μs"
+                                      << ", Receive(VT): " << avg_receive << "μs"
+                                      << ", Alloc: " << avg_alloc << "μs"
+                                      << ", Transfer: " << avg_transfer << "μs"
+                                      << ", Clone: " << avg_clone << "μs"
+                                      << " | TOTAL: " << total_avg << "μs/frame" << std::endl;
 
-                        // Reset
-                        total_read_us = 0;
-                        total_send_packet_us = 0;
-                        total_receive_frame_us = 0;
-                        total_hw_alloc_us = 0;
-                        total_hw_transfer_us = 0;
-                        total_clone_us = 0;
-                        profile_samples = 0;
+                            // Reset
+                            total_read_us = 0;
+                            total_send_packet_us = 0;
+                            total_receive_frame_us = 0;
+                            total_hw_alloc_us = 0;
+                            total_hw_transfer_us = 0;
+                            total_clone_us = 0;
+                            profile_samples = 0;
+                        }
                     }
 
                     // Return frame immediately
@@ -770,7 +891,9 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
             AVFrame* temp_hw_frame = nullptr;
 
             bool is_hw_frame = (decoded_frame->format == AV_PIX_FMT_VIDEOTOOLBOX) ||
-                               (decoded_frame->format == AV_PIX_FMT_VAAPI);
+                               (decoded_frame->format == AV_PIX_FMT_VAAPI) ||
+                               (decoded_frame->format == AV_PIX_FMT_D3D11) ||
+                               (decoded_frame->format == AV_PIX_FMT_DXVA2_VLD);
 
             if (is_hw_frame) {
                 temp_hw_frame = av_frame_alloc();
@@ -897,6 +1020,7 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
     while (thread_running_.load()) {
         auto iteration_start = std::chrono::high_resolution_clock::now();
         double playback_time = current_playback_time_.load();
+        bool is_high_fps = (frame_rate_ >= 55.0);  // ADAPTIVE FPS helper
 
         // PROFILING: Buffer check
         auto buffer_check_start = std::chrono::high_resolution_clock::now();
@@ -920,19 +1044,24 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                 bool playback_outside_buffer = (playback_time < bufferMinTime - 0.1) ||
                                                (playback_time > bufferMaxTime + 0.1);
 
-                // CRITICAL: Buffer must be ahead of playback by at least 1.0s!
+                // CRITICAL: Buffer must be ahead of playback by at least 1.5s for high FPS!
                 // Otherwise it will stutter due to showing old frames
-                // Increased thresholds to prevent jitter during 1x playback
-                bool playback_near_end = (playback_time > bufferMaxTime - 2.0);  // Start decoding 2s before end of buffer
+                // Adaptive thresholds: high FPS needs larger buffers
+                double ahead_threshold = (frame_rate_ >= 55.0) ? 2.5 : 1.0;
+                double decode_start_threshold = (frame_rate_ >= 55.0) ? 3.0 : 2.0;
+                
+                bool playback_near_end = (playback_time > bufferMaxTime - decode_start_threshold);  // Start decoding earlier for high FPS
 
-                bool buffer_too_short = (bufferMaxTime < playback_time + 1.0);  // Buffer MUST be at least 1.0s ahead
+                bool buffer_too_short = (bufferMaxTime < playback_time + ahead_threshold);  // Buffer MUST be ahead
 
                 needs_update = playback_outside_buffer || playback_near_end || buffer_too_short;
 
                 // DO NOT decode if buffer is full AND playback is inside range AND buffer is long enough forward
                 // CRITICAL: Allow decoding even if buffer is full if buffer is behind!
                 int target_size = buffer_size_target_.load();
-                if (stream_buffer_.size() >= static_cast<size_t>(target_size * 3) &&
+                // High FPS needs larger buffer (3x instead of 3x)
+                int buffer_full_multiplier = (frame_rate_ >= 55.0) ? 4 : 3;
+                if (stream_buffer_.size() >= static_cast<size_t>(target_size * buffer_full_multiplier) &&
                     !playback_outside_buffer &&
                     !buffer_too_short) {
                     needs_update = false;  // Buffer is full, playback is normal, AND buffer is ahead
@@ -973,12 +1102,17 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                     // Seek needed if:
                     // 1. Playback jumped BACK (user rewound)
                     // 2. Playback is VERY FAR ahead (shuttle/scrub forward)
-                    if (playback_time < bufferMinTime - 0.5) {
+                    // ADAPTIVE FPS: High FPS needs tighter seek thresholds
+                    double seek_backward_threshold = is_high_fps ? 0.8 : 0.5;
+                    double shuttle_ahead_threshold = is_high_fps ? 8.0 : 10.0;
+                    
+                    if (playback_time < bufferMinTime - seek_backward_threshold) {
                         need_seek = true;
                     }
-                    // SHUTTLE FIX: Seek forward if playback is >10s ahead of buffer
+                    // SHUTTLE FIX: Seek forward if playback is >Xs ahead of buffer
                     // Without this, decoder gets stuck decoding from wrong position during shuttle
-                    else if (playback_time > bufferMaxTime + 10.0) {
+                    // High FPS: reduce threshold to catch up faster
+                    else if (playback_time > bufferMaxTime + shuttle_ahead_threshold) {
                         need_seek = true;
                         static int shuttle_seek_log = 0;
                         if (++shuttle_seek_log % 10 == 1) {
@@ -1025,32 +1159,53 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                 const double frameDuration = (frame_rate_ > 0.0) ? (1.0 / frame_rate_) : (1.0 / 25.0);
                 int target_size = buffer_size_target_.load();
 
-                // Base budget is modest for steady playback, but scale up when catching up
-                // INCREASED: After shuttle/seek, we need more aggressive initial fill
-                int max_decode = near_eof ? 200 : 20;
+                // High FPS needs larger initial decode batch
+                // 60 FPS: 20 frames = only 0.33s, need at least 0.5-1.0s
+                int min_decode_batch = (frame_rate_ >= 55.0) ? 60 : 20;
+                int max_decode_batch = (frame_rate_ >= 55.0) ? 600 : 400;  // Increased max for 60fps
+                
+                int max_decode = near_eof ? 200 : min_decode_batch;
                 double desiredAheadTime = playback_time + buffer_window_ahead_;
 
                 if (bufferEmpty) {
                     // CRITICAL: After seek/shuttle, decode many frames immediately to minimize jitter
-                    // Keep at 400 max to avoid excessive RAM usage
+                    // High FPS needs more frames to fill the same time window
                     int desired_frames = static_cast<int>(std::ceil((buffer_window_ahead_ + buffer_window_behind_ + 2.0) / frameDuration));
                     desired_frames = std::max(desired_frames, target_size * 3);
-                    max_decode = std::min(400, std::max(max_decode, desired_frames));
+                    max_decode = std::min(max_decode_batch, std::max(max_decode, desired_frames));
                 } else {
                     if (bufferMaxForDecode < desiredAheadTime) {
                         double missing = desiredAheadTime - bufferMaxForDecode;
                         int extra_frames = static_cast<int>(std::ceil(missing / frameDuration)) + (target_size * 2);
-                        max_decode = std::min(400, std::max(max_decode, extra_frames));
+                        max_decode = std::min(max_decode_batch, std::max(max_decode, extra_frames));
                     }
 
                     if (playback_time - bufferMinForDecode > 1.0) {
-                        max_decode = std::min(400, std::max(max_decode, target_size * 3));
+                        max_decode = std::min(max_decode_batch, std::max(max_decode, target_size * 3));
                     }
                 }
 
                 bool reached_eof = false;
+                
+                // CRITICAL: Track initial playback time to detect seeks during decoding
+                double initial_playback_time = playback_time;
+                const double SEEK_ABORT_THRESHOLD = is_high_fps ? 1.0 : 0.5;  // High FPS: more sensitive
 
                 while (decoded_count < max_decode && !stop_requested_.load() && thread_running_.load()) {
+                    // CRITICAL CHECK: Detect if playback time changed significantly (seek/scrub)
+                    // Abort current decoding batch and re-evaluate buffer needs
+                    double current_playback = current_playback_time_.load();
+                    if (std::abs(current_playback - initial_playback_time) > SEEK_ABORT_THRESHOLD) {
+                        static int seek_abort_log = 0;
+                        if (++seek_abort_log % 20 == 1) {
+                            std::cout << "⚡ [V2 THREAD] Seek detected during decoding - aborting batch "
+                                      << "(decoded=" << decoded_count << "/" << max_decode 
+                                      << ", old=" << std::fixed << std::setprecision(2) << initial_playback_time
+                                      << "s, new=" << current_playback << "s)" << std::defaultfloat << std::endl;
+                        }
+                        break;  // Abort this decoding batch, re-evaluate at loop start
+                    }
+                    
                     // PROFILING: DecodeAndProcessFrame
                     auto decode_start = std::chrono::high_resolution_clock::now();
                     auto decoded_frame = DecodeAndProcessFrame(playback_time);
@@ -1076,9 +1231,14 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                     // PROFILING: Timestamp calculation
                     auto timestamp_start = std::chrono::high_resolution_clock::now();
 
-                    // Calculate frame time with MICROSECOND precision (like LowResDecoder)
-                    // IMPORTANT: Use PTS from RETURNED frame (decoded_frame), not from internal!
-                    int64_t framePts = decoded_frame->pts;
+                    // Calculate frame time with MICROSECOND precision (like LowResDecoder).
+                    // Use best_effort_timestamp (canonical DISPLAY time) — NOT raw .pts. On B-frame
+                    // sources (the original is long-GOP w/ B-frames) raw .pts can sit a frame off the
+                    // display order, which time-stamped V2 frames a frame early → GetFrameForTime's
+                    // "nearest" returned clamped+1 → the stable +1 proxy→full-res shift. The proxy
+                    // decoder (LowResDecoder) already uses best_effort_timestamp, so this matches it.
+                    int64_t framePts = decoded_frame->best_effort_timestamp;
+                    if (framePts == AV_NOPTS_VALUE) framePts = decoded_frame->pts;
 
                     double frame_time = 0.0;
                     if (framePts != AV_NOPTS_VALUE) {
@@ -1179,9 +1339,11 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                         }
 
                         // Check buffer overflow
-                        // target * 3 = 60 frames to cover 2.4s at 25fps
+                        // High FPS needs larger buffer capacity (60fps = 2x more frames than 30fps)
                         int target_size = buffer_size_target_.load();
-                        if (stream_buffer_.size() >= static_cast<size_t>(target_size * 3)) {
+                        int buffer_overflow_multiplier = (frame_rate_ >= 55.0) ? 5 : 3;
+                        
+                        if (stream_buffer_.size() >= static_cast<size_t>(target_size * buffer_overflow_multiplier)) {
                             // If close to end of file (last 3 sec) - continue decoding
                             double file_duration = video_stream_->duration * av_q2d(video_stream_->time_base);
                             bool near_eof = (frame_time > file_duration - 3.0);
@@ -1216,31 +1378,36 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
         }
 
         // CPU OPTIMIZATION: Balance between CPU and responsiveness
-        // Reduced sleep times to prevent jitter during 1x playback
-        int sleep_ms = 100;  // By default 100ms (reduced from 200ms)
+        // Adaptive sleep times based on FPS - high FPS needs faster response
+        // (is_high_fps already defined at loop start)
+        // NOTE: Software-decoded codecs (AV1, VP9) have no hw pipeline — short sleeps
+        // are critical so the buffer stays ahead of the render thread.
+        int sleep_ms = 40;  // By default 40ms
 
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
-            int target_size = buffer_size_target_.load();
             bool bufferBehind = stream_buffer_.empty();
 
             if (!stream_buffer_.empty()) {
                 double currentMax = stream_buffer_.back().time_seconds;
                 double desiredAheadTime = playback_time + std::max(buffer_window_ahead_, 1.5);
-                bufferBehind = (currentMax < desiredAheadTime - 0.5);  // Increased threshold from 0.2 to 0.5
+                bufferBehind = (currentMax < desiredAheadTime - 0.5);
             }
 
             // Adaptive sleep depending on buffer fill
             if (bufferBehind) {
                 // CRITICAL: When buffer is empty (after seek/shuttle), decode at max speed
-                // No sleep at all - just yield to avoid hogging CPU
-                sleep_ms = stream_buffer_.empty() ? 0 : 20;
-            } else if (stream_buffer_.size() >= 18) {
-                sleep_ms = 300;  // 300ms when buffer is full (reduced from 400ms for better responsiveness)
-            } else if (stream_buffer_.size() >= 12) {
-                sleep_ms = 150;  // 150ms when buffer is half full (reduced from 250ms)
-            } else if (stream_buffer_.size() < 8) {
-                sleep_ms = 50;  // 50ms when buffer is low (reduced from 100ms)
+                // High FPS: no sleep at all for faster catch-up
+                // Low FPS: minimal 10ms sleep to avoid CPU hogging
+                sleep_ms = (stream_buffer_.empty() || is_high_fps) ? 0 : 10;
+            } else if (stream_buffer_.size() >= static_cast<size_t>(is_high_fps ? 30 : 18)) {
+                // 300ms was too long for software codecs: buffer drains while thread sleeps.
+                // 80ms ≈ 2.4 frames at 30fps — enough CPU savings, safe margin.
+                sleep_ms = is_high_fps ? 66 : 80;
+            } else if (stream_buffer_.size() >= static_cast<size_t>(is_high_fps ? 20 : 12)) {
+                sleep_ms = is_high_fps ? 33 : 50;
+            } else if (stream_buffer_.size() < static_cast<size_t>(is_high_fps ? 12 : 8)) {
+                sleep_ms = is_high_fps ? 16 : 20;
             }
         }
 

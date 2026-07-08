@@ -238,8 +238,14 @@ int CreatePlayerInstance(const char* filepath, int player_id) {
         return init_result;
     }
 
+    // Restore resume position for this file (if any)
+    double resume_pos = LoadResumePosition(filepath);
+    if (resume_pos > 0.0) {
+        std::cout << "[RESUME] Restoring position " << resume_pos << "s for: " << filepath << std::endl;
+    }
+
     // Load file into instance
-    int load_result = new_instance->LoadFile(filepath);
+    int load_result = new_instance->LoadFile(filepath, resume_pos > 0.0 ? resume_pos : 0.0);
     if (load_result != 0) {
         std::cerr << "Failed to load file into player instance " << instance_id << std::endl;
         return load_result;
@@ -258,6 +264,13 @@ int CreatePlayerInstance(const char* filepath, int player_id) {
 
     // Set file type in OSD
     SetOSDFileType(instance_id, is_audio_file);
+
+    // Set timecode offset from file metadata (professional video files)
+    auto* audio_mod = new_instance->GetAudioModule();
+    if (audio_mod) {
+        double tc_offset = audio_mod->GetTimecodeOffset();
+        SetOSDTimecodeOffset(instance_id, tc_offset);
+    }
 
     // Save instance in slot
     g_manager_state.instances[instance_id].instance = std::move(new_instance);
@@ -303,9 +316,18 @@ int LoadFileIntoPlayerInstance(const char* filepath, int player_id) {
 
     std::cout << "Loading file into existing player instance " << player_id << ": " << filepath << std::endl;
 
+    // Note: save of old file position is handled inside FSTPPlayerInstance::UnloadFile()
+    // which runs BEFORE Stop() resets playback_position to 0.
+
+    // Restore resume position for the new file (if any)
+    double resume_pos = LoadResumePosition(filepath);
+    if (resume_pos > 0.0) {
+        std::cout << "[RESUME] Restoring position " << resume_pos << "s for: " << filepath << std::endl;
+    }
+
     // Load file into existing instance
     std::cout << "Calling LoadFile on player instance " << player_id << " with file: " << filepath << std::endl;
-    int load_result = g_manager_state.instances[player_id].instance->LoadFile(filepath);
+    int load_result = g_manager_state.instances[player_id].instance->LoadFile(filepath, resume_pos > 0.0 ? resume_pos : 0.0);
     if (load_result != 0) {
         std::cerr << "Failed to load file into player instance " << player_id << " - LoadFile returned " << load_result << std::endl;
         return -5;
@@ -324,6 +346,13 @@ int LoadFileIntoPlayerInstance(const char* filepath, int player_id) {
 
     // Set file type in OSD (assuming OSD is bound to player_id)
     SetOSDFileType(player_id, is_audio_file);
+
+    // Set timecode offset from file metadata
+    auto* audio_mod = g_manager_state.instances[player_id].instance->GetAudioModule();
+    if (audio_mod) {
+        double tc_offset = audio_mod->GetTimecodeOffset();
+        SetOSDTimecodeOffset(player_id, tc_offset);
+    }
 
     // Set real file FPS in OSD for correct timecode display
     if (!is_audio_file) {
@@ -350,9 +379,17 @@ void DestroyPlayerInstance(int instance_id) {
 
     std::cout << "Destroying player instance " << instance_id << std::endl;
 
-    // Destroy instance (destructor will automatically perform cleanup)
-    g_manager_state.instances[instance_id].instance.reset();
+    // Note: save of position is handled inside FSTPPlayerInstance::UnloadFile()
+    // which is called from the destructor BEFORE Stop() resets playback_position to 0.
+
+    // CRITICAL: clear is_active BEFORE destroying the instance. The autonomous
+    // render thread keeps rendering this window during teardown (is_closing is set
+    // only afterwards, to show "unthreading" OSD progress), so accessors like
+    // GetInstanceFilePath()/GetInstancePosition() can run concurrently. They guard
+    // on is_active, so flipping it first makes them bail out instead of
+    // dereferencing the half-/fully-destroyed instance (null-deref on close).
     g_manager_state.instances[instance_id].is_active = false;
+    g_manager_state.instances[instance_id].instance.reset();
 
     std::cout << "Player instance " << instance_id << " destroyed" << std::endl;
 }
@@ -484,8 +521,16 @@ int PauseInstance(int instance_id) {
         !g_manager_state.instances[instance_id].is_active) {
         return -1;
     }
-    
+
     return g_manager_state.instances[instance_id].instance->Pause();
+}
+
+void SetInstanceBackgrounded(int instance_id, int backgrounded) {
+    if (instance_id < 0 || instance_id >= MAX_PLAYER_INSTANCES ||
+        !g_manager_state.instances[instance_id].is_active) {
+        return;
+    }
+    g_manager_state.instances[instance_id].instance->SetBackgrounded(backgrounded != 0);
 }
 
 int StopInstance(int instance_id) {
@@ -572,6 +617,18 @@ double GetInstanceDuration(int instance_id) {
     }
 
     return instance->GetDuration();
+}
+
+double GetInstanceTimecodeOffset(int instance_id) {
+    if (instance_id < 0 || instance_id >= MAX_PLAYER_INSTANCES ||
+        !g_manager_state.instances[instance_id].is_active) {
+        return 0.0;
+    }
+    auto& instance = g_manager_state.instances[instance_id].instance;
+    if (!instance) {
+        return 0.0;
+    }
+    return instance->GetTimecodeOffset();
 }
 
 int IsInstancePlaying(int instance_id) {

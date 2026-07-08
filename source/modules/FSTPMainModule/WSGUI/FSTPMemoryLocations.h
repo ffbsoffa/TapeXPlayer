@@ -3,6 +3,7 @@
 
 #include <string>
 #include <vector>
+#include <map>
 #include <cstdint>
 
 // Cross-platform C++ backend for Memory Locations
@@ -46,8 +47,14 @@ public:
 
     // Data retrieval
     MemoryLocation* GetLocation(int id);
-    const std::vector<MemoryLocation>& GetAllLocations() const { return locations_; }
-    int GetCount() const { return static_cast<int>(locations_.size()); }
+    const std::vector<MemoryLocation>& GetAllLocations() const { return locations(); }
+    int GetCount() const { return static_cast<int>(locations().size()); }
+
+    // Multi-instance: select which player's marker set is active.
+    // All operations (Add/Recall/Get/Delete/Save/Load…) act on the active set,
+    // so markers follow the focused instance. Called by the C API before each op.
+    void SetActivePlayer(int player_id);
+    int GetActivePlayer() const { return active_player_; }
 
     // Navigation
     bool RecallLocation(int id, int player_id);  // Go to location
@@ -69,8 +76,16 @@ private:
     MemoryLocationsManager(const MemoryLocationsManager&) = delete;
     MemoryLocationsManager& operator=(const MemoryLocationsManager&) = delete;
 
-    std::vector<MemoryLocation> locations_;
-    int next_id_ = 1;
+    // Per-player marker sets, keyed by player_id. Markers are isolated per
+    // instance and follow the focused player (see SetActivePlayer).
+    std::map<int, std::vector<MemoryLocation>> player_locations_;
+    std::map<int, int> player_next_id_;
+    int active_player_ = 0;
+
+    // Accessors to the active player's set (used in place of the old locations_/next_id_).
+    std::vector<MemoryLocation>& locations();
+    const std::vector<MemoryLocation>& locations() const;
+    int& next_id();
 
     int FindLocationIndex(int id) const;
 };

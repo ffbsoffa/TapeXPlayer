@@ -1,0 +1,10 @@
+# Smart shuttle-locate: auto-winds the transport to a target timecode and lands
+# exactly on it — a closed-loop "locate" built entirely on the fstp host API.
+id          = shuttle-locate
+name        = Shuttle Locate (example)
+version     = 0.1.0
+author      = TapeXPlayer
+description = Auto-shuttles to a target time, decelerating to land precisely.
+type        = lua
+entry       = main.lua
+enabled     = false

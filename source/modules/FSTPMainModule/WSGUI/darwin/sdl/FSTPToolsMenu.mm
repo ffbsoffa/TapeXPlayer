@@ -26,6 +26,10 @@ extern "C" {
     void HideSwiftUIInspector();
     void ToggleSwiftUIInspector();
     void ShowSwiftUIMemoryLocationDialogEdit(int player_id, double current_time, int location_id);
+    // SwiftUI Memory Locations window
+    void ShowSwiftUIMemoryLocationsWindow();
+    void RefreshSwiftUIMemoryLocationsWindow();
+    int  IsSwiftUIMemoryLocationsWindowOpen();
 }
 
 // Inspector state
@@ -366,13 +370,19 @@ void InitToolsMenu() {
     [memoryLocationsItem setTarget:[NSApp delegate]];
     [toolsMenu addItem:memoryLocationsItem];
 
-    // Add "Export Memory Locations" item
-    NSMenuItem* exportMemoryLocationsItem = [[NSMenuItem alloc]
-        initWithTitle:@"📊 Export Memory Locations..."
-        action:@selector(exportMemoryLocationsAction:)
-        keyEquivalent:@""];
-    [exportMemoryLocationsItem setTarget:[NSApp delegate]];
-    [toolsMenu addItem:exportMemoryLocationsItem];
+    // Export moved into the Memory Locations window's toolbar (keeps this menu concise).
+
+    // Add separator
+    [toolsMenu addItem:[NSMenuItem separatorItem]];
+
+    // Add "Presentation Mode" item
+    NSMenuItem* presentationItem = [[NSMenuItem alloc]
+        initWithTitle:@"📺 Presentation Mode..."
+        action:@selector(presentationModeAction:)
+        keyEquivalent:@"P"];
+    [presentationItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagShift];
+    [presentationItem setTarget:[NSApp delegate]];
+    [toolsMenu addItem:presentationItem];
 
     // Add separator
     [toolsMenu addItem:[NSMenuItem separatorItem]];
@@ -640,7 +650,9 @@ void CopyScreenshotToClipboard() {
     }
 }
 
-// Create Memory Locations window
+// Create Memory Locations window (legacy AppKit — superseded by the SwiftUI window
+// in FSTPMemoryLocationsWindow.swift; kept for reference, no longer invoked).
+__attribute__((unused))
 static void CreateMemoryLocationsWindow() {
     if (g_memory_locations_window != nil) return;
 
@@ -669,11 +681,67 @@ static void CreateMemoryLocationsWindow() {
     [contentView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [g_memory_locations_window setContentView:contentView];
 
-    // Create ScrollView for table (with small top padding)
-    NSScrollView* scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 5, 600, 395)];
+    const CGFloat kContentW = 600.0;
+    const CGFloat kContentH = 400.0;
+    const CGFloat kBarH = 46.0;
+
+    // --- Bottom toolbar (Add / Delete on the left, Import / Export on the right) ---
+    NSView* toolbar = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, kContentW, kBarH)];
+    [toolbar setWantsLayer:YES];
+    [toolbar setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
+    [contentView addSubview:toolbar];
+
+    // Hairline separator above the toolbar
+    NSBox* separator = [[NSBox alloc] initWithFrame:NSMakeRect(0, kBarH - 1, kContentW, 1)];
+    [separator setBoxType:NSBoxSeparator];
+    [separator setAutoresizingMask:NSViewWidthSizable];
+    [toolbar addSubview:separator];
+
+    // + Add
+    NSButton* addBtn = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"plus" accessibilityDescription:@"Add"]
+                                          target:[NSApp delegate]
+                                          action:@selector(memoryLocationAdd:)];
+    [addBtn setFrame:NSMakeRect(12, 9, 30, 28)];
+    [addBtn setBezelStyle:NSBezelStyleRounded];
+    [addBtn setToolTip:@"Add Memory Location"];
+    [addBtn setAutoresizingMask:NSViewMaxXMargin];
+    [toolbar addSubview:addBtn];
+
+    // − Delete
+    NSButton* delBtn = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"minus" accessibilityDescription:@"Delete"]
+                                          target:[NSApp delegate]
+                                          action:@selector(memoryLocationDelete:)];
+    [delBtn setFrame:NSMakeRect(46, 9, 30, 28)];
+    [delBtn setBezelStyle:NSBezelStyleRounded];
+    [delBtn setToolTip:@"Delete selected Memory Location"];
+    [delBtn setAutoresizingMask:NSViewMaxXMargin];
+    [toolbar addSubview:delBtn];
+
+    // Export… (CSV) — right edge
+    NSButton* exportBtn = [NSButton buttonWithTitle:@"Export…"
+                                             target:[NSApp delegate]
+                                             action:@selector(exportMemoryLocationsAction:)];
+    [exportBtn setFrame:NSMakeRect(kContentW - 12 - 96, 9, 96, 28)];
+    [exportBtn setBezelStyle:NSBezelStyleRounded];
+    [exportBtn setToolTip:@"Export Memory Locations to CSV"];
+    [exportBtn setAutoresizingMask:NSViewMinXMargin];
+    [toolbar addSubview:exportBtn];
+
+    // Import… — left of Export
+    NSButton* importBtn = [NSButton buttonWithTitle:@"Import…"
+                                             target:[NSApp delegate]
+                                             action:@selector(memoryLocationImport:)];
+    [importBtn setFrame:NSMakeRect(kContentW - 12 - 96 - 8 - 96, 9, 96, 28)];
+    [importBtn setBezelStyle:NSBezelStyleRounded];
+    [importBtn setToolTip:@"Import Memory Locations from a file"];
+    [importBtn setAutoresizingMask:NSViewMinXMargin];
+    [toolbar addSubview:importBtn];
+
+    // --- Table area (inset, sitting above the toolbar) ---
+    NSScrollView* scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, kBarH, kContentW - 24, kContentH - kBarH - 12)];
     [scrollView setHasVerticalScroller:YES];
     [scrollView setHasHorizontalScroller:NO];
-    [scrollView setAutohidesScrollers:NO];
+    [scrollView setAutohidesScrollers:YES];
     [scrollView setBorderType:NSBezelBorder];
     [scrollView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [contentView addSubview:scrollView];
@@ -685,7 +753,9 @@ static void CreateMemoryLocationsWindow() {
     [g_memory_locations_table setAllowsMultipleSelection:NO];
     [g_memory_locations_table setDoubleAction:@selector(memoryLocationDoubleClick:)];
     [g_memory_locations_table setTarget:[NSApp delegate]];
-    [g_memory_locations_table setRowHeight:20.0];
+    [g_memory_locations_table setRowHeight:22.0];
+    [g_memory_locations_table setIntercellSpacing:NSMakeSize(3.0, 4.0)];
+    [g_memory_locations_table setGridStyleMask:NSTableViewGridNone];
     [g_memory_locations_table setHeaderView:[[NSTableHeaderView alloc] init]];
 
     // Column #
@@ -728,25 +798,20 @@ static void CreateMemoryLocationsWindow() {
 
 // Implementation of show Memory Locations function
 void ShowMemoryLocations() {
-    NSLog(@"📍 Showing Memory Locations window...");
+    // Don't create the window without a loaded file: markers are tied to the
+    // material, an empty window is just confusing.
+    if (!FSTP_IsAnyPlayerActive()) {
+        NSLog(@"📍 Memory Locations: no file loaded, window not shown");
+        return;
+    }
+
+    NSLog(@"📍 Showing Memory Locations window (SwiftUI)...");
 
     // Initialize Memory Locations system
     FSTP_InitMemoryLocations();
 
-    // Create window if it doesn't exist yet
-    CreateMemoryLocationsWindow();
-
-    // Show window
-    [g_memory_locations_window makeKeyAndOrderFront:nil];
-    [NSApp activateIgnoringOtherApps:YES];
-
-    // Update table asynchronously
-    if (g_memory_locations_delegate) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            g_memory_locations_delegate.needsRefresh = YES;
-            [g_memory_locations_table reloadData];
-        });
-    }
+    // Modern SwiftUI list window (shows the focused player's markers)
+    ShowSwiftUIMemoryLocationsWindow();
 }
 
 // Category for adding methods to App Delegate
@@ -754,6 +819,7 @@ void ShowMemoryLocations() {
 - (void)showDecoderVisualizationAction:(id)sender;
 - (void)copyScreenshotAction:(id)sender;
 - (void)showMemoryLocationsAction:(id)sender;
+- (void)presentationModeAction:(id)sender;
 - (void)memoryLocationAdd:(id)sender;
 - (void)memoryLocationDelete:(id)sender;
 - (void)memoryLocationRecall:(id)sender;
@@ -766,12 +832,26 @@ void ShowMemoryLocations() {
 static void ShowMemoryLocationDialog(int active_player);
 
 @implementation NSObject (ToolsMenuAdditions)
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if ([item action] == @selector(presentationModeAction:)) {
+        bool active = IsPresentationModeActive();
+        [item setState:active ? NSControlStateValueOn : NSControlStateValueOff];
+        [item setTitle:active ? @"📺 Stop Presentation" : @"📺 Presentation Mode"];
+    }
+    return YES;
+}
+
 - (void)showInspectorAction:(id)sender {
     ToggleInspector();
 }
 
 - (void)copyScreenshotAction:(id)sender {
     CopyScreenshotToClipboard();
+}
+
+- (void)presentationModeAction:(id)sender {
+    ShowPresentationMode();
 }
 
 - (void)showMemoryLocationsAction:(id)sender {
@@ -997,6 +1077,37 @@ void CreateMemoryLocationAtCurrentTime() {
     ShowMemoryLocationDialog(active_player);
 }
 
+// Reload the Memory Locations table if the window is open. Safe to call from
+// any thread — the table mutation is dispatched to the main queue.
+void RefreshMemoryLocationsWindowIfOpen() {
+    // SwiftUI window reloads its model from the (player-scoped) C API.
+    RefreshSwiftUIMemoryLocationsWindow();
+}
+
+// Instant, auto-named Memory Location on the focused player (no dialog).
+// Bound to Enter — the fast "drop a marker" path in the Pro Tools paradigm.
+void CreateMemoryLocationInstant() {
+    int active_player = GetActivePlayerID();
+    if (active_player < 0) {
+        NSLog(@"⚠️ No active player for instant memory location");
+        return;
+    }
+    if (GetInstanceDuration(active_player) <= 0.0) {
+        NSLog(@"⚠️ No video file loaded - cannot create memory location");
+        return;
+    }
+
+    // Auto-name in the focused player's own numbering (Count is player-scoped).
+    int next = FSTP_GetMemoryLocationsCount() + 1;
+    char name[64];
+    snprintf(name, sizeof(name), "Location %d", next);
+
+    if (FSTP_AddMemoryLocationAtCurrentTime(active_player, name, "")) {
+        NSLog(@"📍 Instant Memory Location \"%s\" created for player %d", name, active_player);
+        RefreshMemoryLocationsWindowIfOpen();
+    }
+}
+
 // Check if text field is active
 bool IsTextFieldActive() {
     NSWindow* keyWindow = [NSApp keyWindow];
@@ -1011,11 +1122,54 @@ bool IsTextFieldActive() {
 }
 
 bool IsMemoryLocationsWindowActive() {
-    return g_memory_locations_active;
+    return IsSwiftUIMemoryLocationsWindowOpen() != 0;
 }
 
 bool IsMemoryLocationDialogActive() {
     return g_memory_location_dialog_open;
+}
+
+// ============================================================================
+// PRESENTATION MODE
+// ============================================================================
+
+void ShowPresentationMode() {
+    if (IsPresentationWindowActive()) {
+        ClosePresentationWindow();
+        NSLog(@"✅ [PRESENTATION] Mode deactivated");
+        return;
+    }
+
+    // Settings drive everything — no per-launch modal (display/output-mode/focus are chosen once in
+    // Settings ▸ Presentation). Output is always clean (no OSD / indicators / cursor). External mode
+    // with no external display falls back to a separate window inside CreatePresentationWindow, so
+    // the user is never blocked by a "connect a display" wall.
+    int output_mode   = GetPresentationOutputMode();   // 0 = external, 1 = separate window
+    int display       = GetPresentationDisplayIndex(); // -1 = auto (first external)
+    int display_count = SDL_GetNumVideoDisplays();
+
+    if (CreatePresentationWindow(-1, output_mode, display)) {
+        if (output_mode == 0 && display_count > 1) {
+            NSLog(@"✅ [PRESENTATION] Activated on external display %d", (display >= 1 ? display : 1));
+        } else {
+            NSLog(@"✅ [PRESENTATION] Activated in windowed mode");
+        }
+    } else {
+        NSLog(@"❌ [PRESENTATION] Activation failed");
+    }
+}
+
+void TogglePresentationMode() {
+    if (IsPresentationWindowActive()) {
+        ClosePresentationWindow();
+        NSLog(@"✅ [PRESENTATION] Mode deactivated");
+    } else {
+        ShowPresentationMode();
+    }
+}
+
+bool IsPresentationModeActive() {
+    return IsPresentationWindowActive();
 }
 
 #endif // __APPLE__

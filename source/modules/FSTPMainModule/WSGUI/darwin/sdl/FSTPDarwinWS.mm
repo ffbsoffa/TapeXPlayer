@@ -6,6 +6,7 @@
 #import <dispatch/dispatch.h>
 #import <CoreVideo/CoreVideo.h>
 #include <cmath>
+#include <pthread.h>
 #include <portaudio.h>
 #include <atomic>
 #include <thread>
@@ -24,6 +25,10 @@
 #include "FSTPOSDInstance.h"
 #include "FSTPToolsMenu.h"
 #include "FSTPMemoryLocations.h"
+#include "FSTPWelcomeScreen.h"
+#include "FSTPSubtitles.h"
+#include "FSTPExtensions.h"
+#include "FSTPLuaExtension.h"
 
 // Debug control: set to true to enable verbose logging
 [[maybe_unused]] static constexpr bool ENABLE_DARWIN_WS_DEBUG = false;
@@ -37,6 +42,11 @@
 
 // Flag to prevent multiple dialog invocations
 static bool g_dialog_open = false;
+
+// File path passed on the command line (parsed in main.cpp → SetInitialFileToLoad),
+// consumed once in RunMainUILoop after the player window is up. Declared here so the
+// loop (above its definition) can see it.
+static std::string g_initial_file_to_load;
 
 static void BeginLoadingFileAtPath(NSString* path, int target_player_id) {
     if (!path || [path length] == 0) {
@@ -536,6 +546,12 @@ void CreateNativeMenu() {
                                                     keyEquivalent:@""];
         [appMenu addItem:aboutItem];
 
+        // Welcome / Getting Started window (re-openable first-run onboarding)
+        NSMenuItem* welcomeItem = [[NSMenuItem alloc] initWithTitle:@"Welcome to TapeXPlayer"
+                                                             action:@selector(showWelcomeWindow:)
+                                                      keyEquivalent:@""];
+        [appMenu addItem:welcomeItem];
+
         [appMenu addItem:[NSMenuItem separatorItem]];
 
         // Preferences menu item
@@ -575,6 +591,18 @@ void CreateNativeMenu() {
                                                         keyEquivalent:@"o"];
         [openInNewItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagShift];
         [fileMenu addItem:openInNewItem];
+
+        // Subtitles (first extension): load a sidecar / arbitrary .srt and toggle display.
+        [fileMenu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem* openSubItem = [[NSMenuItem alloc] initWithTitle:@"Open Subtitle File..."
+                                                             action:@selector(openSubtitleFile:)
+                                                      keyEquivalent:@""];
+        [fileMenu addItem:openSubItem];
+        NSMenuItem* toggleSubItem = [[NSMenuItem alloc] initWithTitle:@"Subtitles"
+                                                              action:@selector(toggleSubtitles:)
+                                                       keyEquivalent:@""];
+        [toggleSubItem setState:(FSTPSubtitles_IsEnabled() ? NSControlStateValueOn : NSControlStateValueOff)];
+        [fileMenu addItem:toggleSubItem];
 
         [fileMenuItem setSubmenu:fileMenu];
         [mainMenu addItem:fileMenuItem];
@@ -667,9 +695,12 @@ void HandleNativeAppEvents() {
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 - (IBAction)showAboutWindow:(id)sender;
+- (IBAction)showWelcomeWindow:(id)sender;
 - (IBAction)newWindow:(id)sender;
 - (IBAction)openFile:(id)sender;
 - (IBAction)openInNewInstance:(id)sender;
+- (IBAction)openSubtitleFile:(id)sender;
+- (IBAction)toggleSubtitles:(id)sender;
 - (IBAction)settingsOKClicked:(id)sender;
 - (IBAction)settingsCancelClicked:(id)sender;
 - (IBAction)settingsResetClicked:(id)sender;
@@ -722,6 +753,11 @@ void HandleNativeAppEvents() {
     }
 }
 
+- (IBAction)showWelcomeWindow:(id)sender {
+    // First-run / getting-started overlay (cross-platform SDL, see FSTPWelcomeScreen).
+    FSTPWelcome_Show();
+}
+
 - (IBAction)newWindow:(id)sender {
     // Create new window with automatic player binding
     int window_index = CreateNewWindow("TapeXPlayer 2026 - New Player", 1280, 720);
@@ -734,6 +770,40 @@ void HandleNativeAppEvents() {
 
 - (IBAction)openFile:(id)sender {
     ShowNativeFileDialog();
+}
+
+- (IBAction)openSubtitleFile:(id)sender {
+    // Load an arbitrary .srt into the active player (overrides the auto-sidecar).
+    int player_id = GetActivePlayerID();
+    if (player_id < 0) player_id = 0;
+
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    [panel setCanChooseFiles:YES];
+    [panel setCanChooseDirectories:NO];
+    [panel setAllowsMultipleSelection:NO];
+    if (@available(macOS 11.0, *)) {
+        UTType* srt = [UTType typeWithFilenameExtension:@"srt"];
+        if (srt) [panel setAllowedContentTypes:@[srt]];
+    } else {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [panel setAllowedFileTypes:@[@"srt"]];
+        #pragma clang diagnostic pop
+    }
+    if ([panel runModal] == NSModalResponseOK) {
+        NSString* path = [[[panel URLs] objectAtIndex:0] path];
+        bool ok = FSTPSubtitles_LoadForPlayer(player_id, [path UTF8String]);
+        FSTPSubtitles_SetEnabled(true);
+        NSLog(@"Subtitles %s for player %d from %@", ok ? "loaded" : "FAILED to load", player_id, path);
+    }
+    RestoreFocusToMainWindow();
+}
+
+- (IBAction)toggleSubtitles:(id)sender {
+    FSTPSubtitles_Toggle();
+    if ([sender isKindOfClass:[NSMenuItem class]]) {
+        [(NSMenuItem*)sender setState:(FSTPSubtitles_IsEnabled() ? NSControlStateValueOn : NSControlStateValueOff)];
+    }
 }
 
 - (IBAction)openInNewInstance:(id)sender {
@@ -1308,6 +1378,11 @@ void StartAutonomousRendering(SDL_Renderer* renderer) {
 
     // Render thread waits for signals from CVDisplayLink
     g_renderThread = std::thread([]() {
+        // Elevate to user-interactive QoS so the OS wakes this thread promptly
+        // after each CVDisplayLink signal. Default priority causes 1–3ms scheduling
+        // jitter that eats into the 16.67ms frame budget and causes dropped frames.
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+
         // std::cout << "🎬 [RENDER THREAD] CVDisplayLink-based render thread started" << std::endl;
 
         // FPS counter for diagnostics
@@ -1363,15 +1438,17 @@ void StopAutonomousRendering() {
     // Notify render thread about termination
     g_vsyncCV.notify_all();
 
-    // Wait for render thread to finish
+    // Wait for render thread to finish BEFORE touching any SDL resources.
+    // SDL2 Metal backend shares internal state (shader pipeline caches) between
+    // renderers — destroying a renderer while another is active causes corruption.
     if (g_renderThread.joinable()) {
         g_renderThread.join();
-
-        // CRITICAL: Give render thread extra time to fully exit RenderAllWindows()
-        // This prevents race condition where thread may still be accessing windows
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         NSLog(@"🎬 [RENDER THREAD] Waited for thread cleanup");
     }
+
+    // Render thread is fully stopped — now safe to destroy presentation window.
+    // SDL_DestroyWindow requires main thread (AppKit requirement).
+    ClosePresentationWindow();
 
     g_renderer = nullptr;
 }
@@ -1380,7 +1457,7 @@ void StopAutonomousRendering() {
 int RunMainUILoop() {
     // OPTIMIZED CONFIGURATION: Surface-based textures + VSync + full 60 FPS
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");     // Bilinear filtering
-    SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");             // ENABLE VSync for smoothness
+    SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");             // VSync enabled (Metal displaySyncEnabled=YES)
     SDL_SetHint("SDL_VIDEODRIVER", "cocoa");             // Use native Cocoa
 
     // PROTECTION: FramePacing for stable synchronization
@@ -1390,10 +1467,11 @@ int RunMainUILoop() {
     // Allow system screen saver and display sleep to work normally
     SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
 
-    // VSYNC: Enable to eliminate tearing
-    // CVDisplayLink synchronized with VBlank, render constantly at 60 FPS for stability
-    SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");
-    NSLog(@"🚀 [VSYNC] Enabled VSync to eliminate tearing");
+    // VSync + CVDisplayLink: CVDisplayLink fires at VBlank to wake the render thread;
+    // Metal VSync (displaySyncEnabled=YES) prevents tearing. The render thread runs at
+    // QOS_CLASS_USER_INTERACTIVE so scheduling jitter is <0.5ms, keeping renders
+    // within the 16.67ms budget and avoiding missed VBlanks.
+    NSLog(@"🎬 [VSYNC] CVDisplayLink + Metal VSync — render thread at USER_INTERACTIVE QoS");
 
     NSLog(@"🎬 [OPTIMIZED CONFIG] Surface textures + VSync + Full 60 FPS rendering");
 
@@ -1450,6 +1528,26 @@ int RunMainUILoop() {
     // Start autonomous rendering of all windows
     StartAutonomousRendering(main_window->renderer);
 
+    // Build the extension registry and start any enabled lua extensions.
+    FSTPExt_Init();
+
+    // Load a file passed on the command line (parsed in main.cpp → SetInitialFileToLoad).
+    // Linux/Windows do this in their own RunMainUILoop; macOS was missing it, so a file
+    // argument (or "open"/drag) was silently dropped. Loads into the active player (0).
+    if (!g_initial_file_to_load.empty()) {
+        std::cout << "📂 Loading initial file from command line: " << g_initial_file_to_load << std::endl;
+        BeginLoadingFileAtPath([NSString stringWithUTF8String:g_initial_file_to_load.c_str()], -1);
+        g_initial_file_to_load.clear();
+    }
+
+    // First-run onboarding: show the Welcome overlay once per FSTP_WELCOME_VERSION.
+    // The player window already exists and is rendering, so the SDL overlay
+    // appears on top of it; the menu item re-opens it any time.
+    if (GetWelcomeVersion() < FSTP_WELCOME_VERSION) {
+        FSTPWelcome_Show();
+        SetWelcomeVersion(FSTP_WELCOME_VERSION);
+    }
+
     // Main macOS UI loop - only event processing
     bool running = true;
     SDL_Event event;
@@ -1471,6 +1569,10 @@ int RunMainUILoop() {
         // Process native macOS events (may block - but rendering continues!)
         HandleNativeAppEvents();
 
+        // Run actions Lua extensions requested from the render thread (seek,
+        // play, screenshot, markers) here on the main thread.
+        FSTPLua_ProcessPending();
+
         // CPU OPTIMIZATION: Use SDL_WaitEventTimeout instead of PollEvent + usleep
         // Blocks until event or timeout → CPU savings!
         // Adaptive timeout: zoom panning requires fast response (1ms), normally 16ms (60 Hz)
@@ -1481,6 +1583,9 @@ int RunMainUILoop() {
         if (SDL_WaitEventTimeout(&event, timeout_ms)) {
             // Event available - process it
             do {
+            // Welcome overlay (first-run) consumes its own clicks/keys while shown.
+            if (FSTPWelcome_HandleEvent(&event)) { continue; }
+
             // Process window events through window manager
             HandleWindowEvents(&event);
 
@@ -1589,10 +1694,8 @@ extern "C" void RequestForceRender() {
     g_vsyncCV.notify_one();
 }
 
-// Initial file to load from command line
-static std::string g_initial_file_to_load;
-
-// Set initial file to load from command line
+// Set initial file to load from command line (storage declared near the top of the
+// file so RunMainUILoop can consume it).
 void SetInitialFileToLoad(const char* filepath) {
     g_initial_file_to_load = filepath;
     std::cout << "📂 Initial file to load set: " << filepath << std::endl;

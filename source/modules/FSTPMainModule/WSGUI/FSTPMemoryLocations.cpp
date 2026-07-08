@@ -22,29 +22,57 @@ MemoryLocationsManager& MemoryLocationsManager::GetInstance() {
     return instance;
 }
 
+// ── Per-player active-set accessors ──────────────────────────────────────────
+// The manager keeps one marker set per player_id; these return the set for the
+// currently active player so all existing logic stays unchanged.
+std::vector<MemoryLocation>& MemoryLocationsManager::locations() {
+    return player_locations_[active_player_];  // default-constructs an empty set if absent
+}
+
+const std::vector<MemoryLocation>& MemoryLocationsManager::locations() const {
+    static const std::vector<MemoryLocation> empty;
+    auto it = player_locations_.find(active_player_);
+    return it != player_locations_.end() ? it->second : empty;
+}
+
+int& MemoryLocationsManager::next_id() {
+    auto it = player_next_id_.find(active_player_);
+    if (it == player_next_id_.end()) {
+        it = player_next_id_.emplace(active_player_, 1).first;
+    }
+    return it->second;
+}
+
+// Switch which player's marker set subsequent operations act on.
+void MemoryLocationsManager::SetActivePlayer(int player_id) {
+    if (player_id < 0) return;  // keep current set for invalid id
+    active_player_ = player_id;
+}
+
 // Add new location
 bool MemoryLocationsManager::AddLocation(const MemoryLocation& location) {
     MemoryLocation new_loc = location;
 
     // Automatically assign ID if not specified
     if (new_loc.id == 0) {
-        new_loc.id = next_id_++;
+        new_loc.id = next_id()++;
     } else {
         // Check ID uniqueness
         if (FindLocationIndex(new_loc.id) >= 0) {
             std::cerr << "Memory Location ID " << new_loc.id << " already exists" << std::endl;
             return false;
         }
-        // Update next_id_ if needed
-        if (new_loc.id >= next_id_) {
-            next_id_ = new_loc.id + 1;
+        // Update next id if needed
+        if (new_loc.id >= next_id()) {
+            next_id() = new_loc.id + 1;
         }
     }
 
-    locations_.push_back(new_loc);
+    auto& locs = locations();
+    locs.push_back(new_loc);
 
     // Sort by time
-    std::sort(locations_.begin(), locations_.end(),
+    std::sort(locs.begin(), locs.end(),
         [](const MemoryLocation& a, const MemoryLocation& b) {
             return a.timecode_seconds < b.timecode_seconds;
         });
@@ -62,11 +90,12 @@ bool MemoryLocationsManager::UpdateLocation(int id, const MemoryLocation& locati
         return false;
     }
 
-    locations_[index] = location;
-    locations_[index].id = id; // Preserve original ID
+    auto& locs = locations();
+    locs[index] = location;
+    locs[index].id = id; // Preserve original ID
 
     // Re-sort if time changed
-    std::sort(locations_.begin(), locations_.end(),
+    std::sort(locs.begin(), locs.end(),
         [](const MemoryLocation& a, const MemoryLocation& b) {
             return a.timecode_seconds < b.timecode_seconds;
         });
@@ -82,15 +111,15 @@ bool MemoryLocationsManager::DeleteLocation(int id) {
         return false;
     }
 
-    locations_.erase(locations_.begin() + index);
+    locations().erase(locations().begin() + index);
     std::cout << "📍 Deleted Memory Location #" << id << std::endl;
     return true;
 }
 
 // Clear all locations
 bool MemoryLocationsManager::ClearAll() {
-    locations_.clear();
-    next_id_ = 1;
+    locations().clear();
+    next_id() = 1;
     std::cout << "📍 Cleared all Memory Locations" << std::endl;
     return true;
 }
@@ -101,7 +130,7 @@ MemoryLocation* MemoryLocationsManager::GetLocation(int id) {
     if (index < 0) {
         return nullptr;
     }
-    return &locations_[index];
+    return &locations()[index];
 }
 
 // Go to location
@@ -153,7 +182,7 @@ bool MemoryLocationsManager::RecallLocation(int id, int player_id) {
 
 // Next location
 MemoryLocation* MemoryLocationsManager::GetNextLocation(double current_time) {
-    for (auto& loc : locations_) {
+    for (auto& loc : locations()) {
         if (loc.is_active && loc.timecode_seconds > current_time) {
             return &loc;
         }
@@ -163,7 +192,8 @@ MemoryLocation* MemoryLocationsManager::GetNextLocation(double current_time) {
 
 // Previous location
 MemoryLocation* MemoryLocationsManager::GetPreviousLocation(double current_time) {
-    for (auto it = locations_.rbegin(); it != locations_.rend(); ++it) {
+    auto& locs = locations();
+    for (auto it = locs.rbegin(); it != locs.rend(); ++it) {
         if (it->is_active && it->timecode_seconds < current_time) {
             return &(*it);
         }
@@ -182,7 +212,7 @@ bool MemoryLocationsManager::SaveToFile(const std::string& filepath) {
     file << "# TapeXPlayer Memory Locations\n";
     file << "# Format: ID|Name|Timecode|Comments|ZoomLevel|RecallZoom|Active\n\n";
 
-    for (const auto& loc : locations_) {
+    for (const auto& loc : locations()) {
         file << loc.id << "|"
              << loc.name << "|"
              << loc.timecode_display << "|"
@@ -193,7 +223,7 @@ bool MemoryLocationsManager::SaveToFile(const std::string& filepath) {
     }
 
     file.close();
-    std::cout << "📍 Saved " << locations_.size() << " Memory Locations to " << filepath << std::endl;
+    std::cout << "📍 Saved " << locations().size() << " Memory Locations to " << filepath << std::endl;
     return true;
 }
 
@@ -250,7 +280,7 @@ bool MemoryLocationsManager::ExportToCSV(const std::string& filepath) {
     file << "ID,Name,Timecode,Seconds,Comments,Active\n";
 
     // Export each location
-    for (const auto& loc : locations_) {
+    for (const auto& loc : locations()) {
         // Escape quotes in name and comments for CSV
         std::string name = loc.name;
         std::string comments = loc.comments;
@@ -278,7 +308,7 @@ bool MemoryLocationsManager::ExportToCSV(const std::string& filepath) {
     }
 
     file.close();
-    std::cout << "📊 Exported " << locations_.size() << " Memory Locations to CSV: " << filepath << std::endl;
+    std::cout << "📊 Exported " << locations().size() << " Memory Locations to CSV: " << filepath << std::endl;
     return true;
 }
 
@@ -304,8 +334,9 @@ double MemoryLocationsManager::TimecodeToSeconds(const std::string& timecode, do
 
 // Find location index by ID
 int MemoryLocationsManager::FindLocationIndex(int id) const {
-    for (size_t i = 0; i < locations_.size(); ++i) {
-        if (locations_[i].id == id) {
+    const auto& locs = locations();
+    for (size_t i = 0; i < locs.size(); ++i) {
+        if (locs[i].id == id) {
             return static_cast<int>(i);
         }
     }
@@ -329,6 +360,7 @@ void FSTP_ShutdownMemoryLocations() {
 }
 
 bool FSTP_AddMemoryLocationAtCurrentTime(int player_id, const char* name, const char* comments) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(player_id);
     double current_time = GetInstancePosition(player_id);
     if (current_time < 0) {
         return false;
@@ -348,6 +380,7 @@ bool FSTP_AddMemoryLocationAtCurrentTime(int player_id, const char* name, const 
 }
 
 bool FSTP_AddMemoryLocationWithID(int player_id, int id, const char* name, const char* comments) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(player_id);
     double current_time = GetInstancePosition(player_id);
     if (current_time < 0) {
         return false;
@@ -368,6 +401,7 @@ bool FSTP_AddMemoryLocationWithID(int player_id, int id, const char* name, const
 }
 
 bool FSTP_AddMemoryLocationWithTimecode(int player_id, int id, const char* name, const char* comments, double timecode_seconds) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(player_id);
     // Get real FPS from player
     double fps = GetInstanceVideoFPS(player_id);
     if (fps <= 0) fps = 25.0;  // fallback
@@ -385,6 +419,7 @@ bool FSTP_AddMemoryLocationWithTimecode(int player_id, int id, const char* name,
 bool FSTP_AddMemoryLocationWithZoom(int player_id, int id, const char* name, const char* comments,
                                      double timecode_seconds, bool recall_zoom,
                                      float zoom_factor, float zoom_center_x, float zoom_center_y) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(player_id);
     // Get real FPS from player
     double fps = GetInstanceVideoFPS(player_id);
     if (fps <= 0) fps = 25.0;  // fallback
@@ -411,16 +446,19 @@ bool FSTP_AddMemoryLocationWithZoom(int player_id, int id, const char* name, con
 }
 
 bool FSTP_RecallMemoryLocation(int id, int player_id) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(player_id);
     return FSTP::MemoryLocationsManager::GetInstance().RecallLocation(id, player_id);
 }
 
 int FSTP_GetMemoryLocationsCount() {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(GetActivePlayerID());
     return FSTP::MemoryLocationsManager::GetInstance().GetCount();
 }
 
 bool FSTP_GetMemoryLocationData(int index, FSTP_MemoryLocationData* out_data) {
     if (!out_data) return false;
 
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(GetActivePlayerID());
     const auto& locations = FSTP::MemoryLocationsManager::GetInstance().GetAllLocations();
     if (index < 0 || index >= static_cast<int>(locations.size())) {
         return false;
@@ -441,10 +479,12 @@ bool FSTP_GetMemoryLocationData(int index, FSTP_MemoryLocationData* out_data) {
 }
 
 bool FSTP_DeleteMemoryLocation(int id) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(GetActivePlayerID());
     return FSTP::MemoryLocationsManager::GetInstance().DeleteLocation(id);
 }
 
 bool FSTP_UpdateMemoryLocation(int id, const char* name, const char* comments) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(GetActivePlayerID());
     auto* loc = FSTP::MemoryLocationsManager::GetInstance().GetLocation(id);
     if (!loc) return false;
 
@@ -457,6 +497,7 @@ bool FSTP_UpdateMemoryLocation(int id, const char* name, const char* comments) {
 bool FSTP_UpdateMemoryLocationFull(int id, const char* name, const char* comments,
                                     double timecode_seconds, bool recall_zoom,
                                     float zoom_factor, float zoom_center_x, float zoom_center_y) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(GetActivePlayerID());
     auto* loc = FSTP::MemoryLocationsManager::GetInstance().GetLocation(id);
     if (!loc) return false;
 
@@ -480,14 +521,17 @@ bool FSTP_UpdateMemoryLocationFull(int id, const char* name, const char* comment
 }
 
 bool FSTP_SaveMemoryLocations(const char* filepath) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(GetActivePlayerID());
     return FSTP::MemoryLocationsManager::GetInstance().SaveToFile(filepath);
 }
 
 bool FSTP_LoadMemoryLocations(const char* filepath) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(GetActivePlayerID());
     return FSTP::MemoryLocationsManager::GetInstance().LoadFromFile(filepath);
 }
 
 bool FSTP_ExportMemoryLocationsToCSV(const char* filepath) {
+    FSTP::MemoryLocationsManager::GetInstance().SetActivePlayer(GetActivePlayerID());
     return FSTP::MemoryLocationsManager::GetInstance().ExportToCSV(filepath);
 }
 

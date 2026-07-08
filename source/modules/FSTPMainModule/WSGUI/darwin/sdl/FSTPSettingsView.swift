@@ -24,12 +24,20 @@ class SettingsViewModel: ObservableObject {
     // Developer/Debug Settings
     @Published var showDecoderStatus: Bool = false
 
+    // Presentation Settings
+    @Published var presentationOutputMode: Int = 0     // 0 = external display, 1 = separate window
+    @Published var presentationDisplayIndex: Int = -1  // -1 = auto (first external)
+    @Published var presentationFollowFocus: Bool = true
+    @Published var presentationPinnedPlayer: Int = 0
+
     // Power management
 
     // Available devices
     @Published var audioDevices: [(index: Int, name: String)] = []
     @Published var midiInputDevices: [String] = []
     @Published var midiOutputDevices: [String] = []
+    @Published var presentationDisplays: [(index: Int, name: String)] = []
+    @Published var presentationActivePlayers: [Int] = []
 
     let bufferSizes = [512, 1024, 2048, 4096]
     let ytDlpAvailable: Bool
@@ -55,6 +63,10 @@ class SettingsViewModel: ObservableObject {
             midiInputPort = Int(s.pointee.midi_input_port)
             midiOutputPort = Int(s.pointee.midi_output_port)
             showDecoderStatus = s.pointee.show_decoder_status != 0
+            presentationOutputMode = Int(s.pointee.presentation_output_mode)
+            presentationDisplayIndex = Int(s.pointee.presentation_display_index)
+            presentationFollowFocus = s.pointee.presentation_follow_focus != 0
+            presentationPinnedPlayer = Int(s.pointee.presentation_pinned_player)
         }
 
         if !ytDlpAvailable {
@@ -95,6 +107,20 @@ class SettingsViewModel: ObservableObject {
                 midiOutputDevices.append(String(cString: deviceName))
             }
         }
+
+        // Presentation displays (SDL indices — match the window code 1:1)
+        let displayCount = FSTP_GetPresentationDisplayCount()
+        presentationDisplays = []
+        for i in 0..<displayCount {
+            let name = FSTP_GetPresentationDisplayName(i).map { String(cString: $0) } ?? "Display"
+            presentationDisplays.append((index: Int(i), name: "Display \(i): \(name)"))
+        }
+
+        // Active players (for the pin picker)
+        var ids = [Int32](repeating: 0, count: 8)
+        var count: Int32 = 0
+        GetActiveInstanceIDs(&ids, &count)
+        presentationActivePlayers = (0..<Int(max(0, count))).map { Int(ids[$0]) }
     }
 
     func saveSettings() -> Bool {
@@ -120,6 +146,10 @@ class SettingsViewModel: ObservableObject {
         settings.pointee.midi_input_port = Int32(midiInputPort)
         settings.pointee.midi_output_port = Int32(midiOutputPort)
         settings.pointee.show_decoder_status = showDecoderStatus ? 1 : 0
+        settings.pointee.presentation_output_mode = Int32(presentationOutputMode)
+        settings.pointee.presentation_display_index = Int32(presentationDisplayIndex)
+        settings.pointee.presentation_follow_focus = presentationFollowFocus ? 1 : 0
+        settings.pointee.presentation_pinned_player = Int32(presentationPinnedPlayer)
 
         // Save to file
         SaveSettings()
@@ -130,6 +160,8 @@ class SettingsViewModel: ObservableObject {
         SetYTDLPExtensionEnabled(ytDlpEnabled ? 1 : 0)
         InitToolsMenu()
         SetBetacamEffectEnabled(betacamEffectEnabled ? 1 : 0)
+        // If presentation is running, move/retarget it live to match the new choice.
+        FSTP_ReapplyPresentationIfActive()
 
         return bufferSizeChanged
     }
@@ -275,6 +307,82 @@ struct VideoSyncSettingsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
+        .padding(20)
+    }
+}
+
+// MARK: - Presentation Settings Tab
+@available(macOS 13.0, *)
+struct PresentationSettingsView: View {
+    @ObservedObject var viewModel: SettingsViewModel
+
+    private var externalDisplays: [(index: Int, name: String)] {
+        viewModel.presentationDisplays.filter { $0.index >= 1 }
+    }
+
+    var body: some View {
+        Form {
+            Section(header: Text("Output").font(.headline)) {
+                Picker("Send picture to:", selection: $viewModel.presentationOutputMode) {
+                    Text("External display").tag(0)
+                    Text("Separate window").tag(1)
+                }
+                .pickerStyle(.segmented)
+
+                if viewModel.presentationOutputMode == 0 {
+                    Picker("Display:", selection: $viewModel.presentationDisplayIndex) {
+                        Text("Auto (first external)").tag(-1)
+                        ForEach(externalDisplays, id: \.index) { d in
+                            Text(d.name).tag(d.index)
+                        }
+                    }
+                    if externalDisplays.isEmpty {
+                        Text("No external display connected — presentation will open in a separate window until one is attached.")
+                            .font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    Text("A separate, movable window. Drag it to any screen, or share it in a video call.")
+                        .font(.caption).foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Section(header: Text("Source").font(.headline)) {
+                Picker("Driven by:", selection: $viewModel.presentationFollowFocus) {
+                    Text("Focused player").tag(true)
+                    Text("Pinned player").tag(false)
+                }
+                .pickerStyle(.segmented)
+
+                if !viewModel.presentationFollowFocus {
+                    Picker("Pin to:", selection: $viewModel.presentationPinnedPlayer) {
+                        if viewModel.presentationActivePlayers.isEmpty {
+                            Text("Player 1").tag(0)
+                        } else {
+                            ForEach(viewModel.presentationActivePlayers, id: \.self) { pid in
+                                Text("Player \(pid + 1)").tag(pid)
+                            }
+                        }
+                    }
+                }
+
+                Text(viewModel.presentationFollowFocus
+                     ? "The presentation screen follows whichever player window you’re working in."
+                     : "The presentation screen stays locked to one player, regardless of focus.")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section(header: Text("Clean output").font(.headline)) {
+                Text("The presentation screen shows only the picture — never the OSD, decoder indicators, or the cursor. (Betacam hardware-protection principle.)")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Toggle presentation with ⇧P, or Tools ▸ Presentation Mode.")
+                    .font(.caption).foregroundColor(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -545,6 +653,8 @@ struct ExtensionsSettingsView: View {
 enum SettingsPage: String, CaseIterable {
     case audio = "Audio"
     case videoSync = "Video & Sync"
+    case presentation = "Presentation"
+    case keyboard = "Keyboard"
     case midi = "MIDI"
     case cacheData = "Cache & Data"
     case extensions = "Extensions"
@@ -553,6 +663,8 @@ enum SettingsPage: String, CaseIterable {
         switch self {
         case .audio: return "speaker.wave.2.fill"
         case .videoSync: return "tv.fill"
+        case .presentation: return "rectangle.on.rectangle"
+        case .keyboard: return "keyboard"
         case .midi: return "pianokeys"
         case .cacheData: return "externaldrive.fill"
         case .extensions: return "puzzlepiece"
@@ -589,6 +701,10 @@ struct SettingsView: View {
                         AudioSettingsView(viewModel: viewModel)
                     case .videoSync:
                         VideoSyncSettingsView(viewModel: viewModel)
+                    case .presentation:
+                        PresentationSettingsView(viewModel: viewModel)
+                    case .keyboard:
+                        KeyboardSettingsView()
                     case .midi:
                         MIDISettingsView(viewModel: viewModel)
                     case .cacheData:
@@ -677,5 +793,200 @@ func ShowSwiftUISettingsDialog() {
         }
     } else {
         print("SwiftUI settings require macOS 13.0 Ventura or later")
+    }
+}
+
+// MARK: - Keyboard Shortcuts page
+@available(macOS 13.0, *)
+final class KeyboardSettingsModel: ObservableObject {
+    struct ActionItem: Identifiable {
+        let id: Int          // action_id
+        let name: String
+        let group: String
+        let editable: Bool
+        var keycode: Int
+        var mods: Int
+    }
+
+    @Published var items: [ActionItem] = []
+    @Published var capturingAction: Int? = nil
+    @Published var conflictMessage: String? = nil
+
+    private var monitor: Any?
+
+    init() { reload() }
+    deinit { stopCapture() }
+
+    func reload() {
+        var newItems: [ActionItem] = []
+        let n = Int(FSTP_KB_GetActionCount())
+        for i in 0..<n {
+            let aid = Int(FSTP_KB_GetActionIdByIndex(Int32(i)))
+            if aid == 0 { continue }
+            newItems.append(ActionItem(
+                id: aid,
+                name: String(cString: FSTP_KB_GetActionName(Int32(aid))),
+                group: String(cString: FSTP_KB_GetActionGroup(Int32(aid))),
+                editable: FSTP_KB_IsActionEditable(Int32(aid)) != 0,
+                keycode: Int(FSTP_KB_GetKeycode(Int32(aid))),
+                mods: Int(FSTP_KB_GetMods(Int32(aid)))
+            ))
+        }
+        items = newItems
+    }
+
+    var groups: [String] {
+        var seen: [String] = []
+        for it in items where !seen.contains(it.group) { seen.append(it.group) }
+        return seen
+    }
+
+    func items(in group: String) -> [ActionItem] { items.filter { $0.group == group } }
+
+    // Mac-style combo label, e.g. "⌃⇧K" or "Space".
+    func comboString(keycode: Int, mods: Int) -> String {
+        var s = ""
+        if mods & 2 != 0 { s += "⌃" }   // Control
+        if mods & 4 != 0 { s += "⌥" }   // Option
+        if mods & 1 != 0 { s += "⇧" }   // Shift
+        let nm = String(cString: FSTP_KB_GetKeyName(Int32(keycode)))
+        s += nm.isEmpty ? "—" : nm
+        return s
+    }
+
+    // MARK: live key capture
+    func startCapture(_ action: Int) {
+        stopCapture()
+        capturingAction = action
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            guard let self = self else { return event }
+            // Plain Escape cancels capture.
+            if event.keyCode == 53
+                && !event.modifierFlags.contains(.shift)
+                && !event.modifierFlags.contains(.control)
+                && !event.modifierFlags.contains(.option) {
+                self.stopCapture()
+                return nil
+            }
+            // ⌘ is reserved for menu shortcuts — abort rather than bind the bare key.
+            if event.modifierFlags.contains(.command) {
+                self.stopCapture()
+                return nil
+            }
+            let chars = event.charactersIgnoringModifiers ?? ""
+            let uni = chars.unicodeScalars.first.map { Int($0.value) } ?? 0
+            let code = Int(FSTP_KB_MacKeyToSDL(Int32(event.keyCode), Int32(uni)))
+            var mods = 0
+            if event.modifierFlags.contains(.shift)   { mods |= 1 }
+            if event.modifierFlags.contains(.control) { mods |= 2 }
+            if event.modifierFlags.contains(.option)  { mods |= 4 }
+            if code != 0 {
+                self.assign(action: action, keycode: code, mods: mods)
+            }
+            self.stopCapture()
+            return nil  // swallow the captured key
+        }
+    }
+
+    func stopCapture() {
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+        capturingAction = nil
+    }
+
+    private func assign(action: Int, keycode: Int, mods: Int) {
+        var conflict: Int32 = 0
+        let r = FSTP_KB_SetBinding(Int32(action), Int32(keycode), Int32(mods), &conflict)
+        if r == 0 {
+            FSTP_KB_Save()
+        } else if r == -1 {
+            let other = String(cString: FSTP_KB_GetActionName(conflict))
+            conflictMessage = "“\(comboString(keycode: keycode, mods: mods))” is already used by “\(other)”."
+        }
+        reload()
+    }
+
+    func resetDefaults() {
+        FSTP_KB_ResetToDefaults()
+        FSTP_KB_Save()
+        reload()
+    }
+}
+
+@available(macOS 13.0, *)
+struct KeyboardSettingsView: View {
+    @StateObject private var model = KeyboardSettingsModel()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Keyboard Shortcuts").font(.headline)
+                Text("Click a shortcut, then press the key (optionally with ⇧ ⌃ ⌥). Esc cancels. ⌘ and the modifier combos ⇧P, ⌥←/→, ⌘G, Shift+Backspace stay fixed.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 20).padding(.top, 18).padding(.bottom, 10)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    ForEach(model.groups, id: \.self) { group in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(group.uppercased())
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+
+                            ForEach(model.items(in: group)) { item in
+                                HStack {
+                                    Text(item.name)
+                                    Spacer()
+                                    if item.editable {
+                                        Button {
+                                            if model.capturingAction == item.id {
+                                                model.stopCapture()
+                                            } else {
+                                                model.startCapture(item.id)
+                                            }
+                                        } label: {
+                                            Text(model.capturingAction == item.id
+                                                 ? "Press a key…  (Esc)"
+                                                 : model.comboString(keycode: item.keycode, mods: item.mods))
+                                                .font(.system(.body, design: .monospaced))
+                                                .frame(minWidth: 150)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(model.capturingAction == item.id ? Color.accentColor : nil)
+                                    } else {
+                                        Text(model.comboString(keycode: item.keycode, mods: item.mods))
+                                            .font(.system(.body, design: .monospaced))
+                                            .foregroundStyle(.secondary)
+                                        Text("Fixed")
+                                            .font(.caption2)
+                                            .padding(.horizontal, 6).padding(.vertical, 2)
+                                            .background(Color.secondary.opacity(0.15))
+                                            .clipShape(Capsule())
+                                    }
+                                }
+                                .padding(.vertical, 1)
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 20).padding(.bottom, 16)
+            }
+
+            Divider()
+            HStack {
+                Button("Reset Shortcuts to Defaults") { model.resetDefaults() }
+                Spacer()
+            }
+            .padding(.horizontal, 20).padding(.vertical, 12)
+        }
+        .onDisappear { model.stopCapture() }
+        .alert("Shortcut in use", isPresented: Binding(
+            get: { model.conflictMessage != nil },
+            set: { if !$0 { model.conflictMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { model.conflictMessage = nil }
+        } message: {
+            Text(model.conflictMessage ?? "")
+        }
     }
 }

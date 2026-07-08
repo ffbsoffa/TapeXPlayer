@@ -1,6 +1,12 @@
 #include "FSTPRemote.h"
 #include "FSTPPlayerManager.h"
 #include <iostream>
+#if !defined(_WIN32) || defined(__MINGW32__)
+// POSIX thread-priority branch (see StartProcessingThread): on gcc/MinGW
+// <sched.h> came in transitively via <thread>, on clang/libc++ (CLANGARM64) it does not.
+#include <pthread.h>
+#include <sched.h>
+#endif
 #include <cstring>
 #include <algorithm>
 #include <cmath>
@@ -240,9 +246,11 @@ void FSTPRemote::StartProcessingThread() {
     m_thread_running = true;
     m_processing_thread = std::thread(&FSTPRemote::CommandProcessingThread, this);
 
-#if defined(_WIN32) && !defined(__MINGW32__)
+#if defined(_WIN32) && (!defined(__MINGW32__) || defined(_LIBCPP_VERSION))
+    // MSVC and MinGW+libc++ (CLANGARM64): native_handle() is a Windows HANDLE.
     SetThreadPriority(m_processing_thread.native_handle(), THREAD_PRIORITY_HIGHEST);
 #else
+    // POSIX and MinGW+libstdc++ (winpthreads): native_handle() is a pthread_t.
     struct sched_param param;
     param.sched_priority = sched_get_priority_max(SCHED_FIFO);
     pthread_setschedparam(m_processing_thread.native_handle(), SCHED_FIFO, &param);

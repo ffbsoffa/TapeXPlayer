@@ -1,4 +1,5 @@
 #include "FSTPLowResDecoder.h"
+#include "FSTPProxyConverter.h"
 
 #include "FSTPVideoFrame.h"
 #include "FSTPHardwareDetection.h"
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <limits>
 #include <iomanip>
+#include <fstream>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -35,6 +37,88 @@ namespace FSTP {
 // Debug control: set to true to enable verbose logging
 static constexpr bool ENABLE_LOWRES_DECODER_DEBUG = false;
 
+// ---------------------------------------------------------------------------
+// Proxy cache manifest — a tiny sidecar "<proxy>.meta" that pins each cached
+// proxy to the exact source it was built from (size + mtime). On a cache hit we
+// validate it before trusting the proxy, so a proxy left over from an older buggy
+// build (e.g. one that dropped frames) is rejected and regenerated instead of
+// silently desyncing playback. No manifest → treat as stale → regenerate.
+// ---------------------------------------------------------------------------
+namespace {
+
+fs::path ProxyManifestPath(const fs::path& proxyPath) {
+    return proxyPath.string() + ".meta";
+}
+
+// Seconds-since-epoch for the source file's last-write time (portable cache key).
+long long SourceMTimeSeconds(const std::string& source, std::error_code& ec) {
+    auto mt = fs::last_write_time(source, ec);
+    if (ec) return 0;
+    return std::chrono::duration_cast<std::chrono::seconds>(mt.time_since_epoch()).count();
+}
+
+void WriteProxyManifest(const fs::path& proxyPath, const std::string& source,
+                        double srcDuration, double srcFps) {
+    std::error_code ec;
+    auto sz   = fs::file_size(source, ec);
+    if (ec) return;
+    long long mt = SourceMTimeSeconds(source, ec);
+    if (ec) return;
+
+    std::ofstream f(ProxyManifestPath(proxyPath));
+    if (!f) return;
+    // Bump this whenever the manifest format OR the proxy encoding profile changes, so every
+    // cached proxy from an older profile is rebuilt:
+    //   2 = frame-exact ffmpeg/VideoToolbox path (build 1734, was gappy AVFoundation)
+    //   3 = proxy profile 432p @ ~2.5 kbps/kpx (was 480p @ 6×, too heavy to shuttle >16×)
+    //   4 = half-fps proxy for >45fps sources (50→25 etc.) — lighter encode + shuttle decode
+    //   5 = full-fps + short GOP=4 (seek-friendly); shuttle load shed via keyframe-only decode
+    //   6 = 540p @ ~4.5 kbps/kpx (sharper; Stage 2 seek-per-frame decouples quality from shuttle)
+    //   7 = 540p @ ~8 kbps/kpx (higher bitrate to kill blockiness; GOP=4 wants the headroom)
+    //   8 = anamorphic 4:3 pixel grid for wide sources (720×540 + DAR, ~25% fewer px → snappier)
+    f << "schema=8\n"
+      << "src_size="     << static_cast<long long>(sz) << "\n"
+      << "src_mtime="    << mt << "\n"
+      << "src_duration=" << srcDuration << "\n"
+      << "src_fps="      << srcFps << "\n";
+}
+
+// True only if the manifest exists, is current-schema, and matches the source's
+// current size + mtime. Any mismatch / missing file → false → regenerate.
+bool ValidateProxyManifest(const fs::path& proxyPath, const std::string& source) {
+    std::ifstream f(ProxyManifestPath(proxyPath));
+    if (!f) return false;
+
+    std::map<std::string, std::string> kv;
+    std::string line;
+    while (std::getline(f, line)) {
+        auto eq = line.find('=');
+        if (eq != std::string::npos) kv[line.substr(0, eq)] = line.substr(eq + 1);
+    }
+    if (kv["schema"] != "8") return false;   // older format/profile (gappy, 480p, half-fps, long-GOP, 432p, low-bitrate, square 540p) → rebuild
+
+    std::error_code ec;
+    auto sz = fs::file_size(source, ec);
+    if (ec) return false;
+    long long mt = SourceMTimeSeconds(source, ec);
+    if (ec) return false;
+
+    try {
+        if (std::stoll(kv["src_size"])  != static_cast<long long>(sz)) return false;
+        if (std::stoll(kv["src_mtime"]) != mt)                          return false;
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+} // anonymous namespace
+
+bool LowResDecoder::isCachedProxyValid(const std::string& proxyPath,
+                                       const std::string& sourceFilename) {
+    return ValidateProxyManifest(proxyPath, sourceFilename);
+}
+
 // Static variables for thread-local contexts (survive object lifetime)
 std::map<std::string, std::map<int, LowResDecoder::ThreadDecoderContext>> LowResDecoder::allThreadContexts_;
 
@@ -48,7 +132,14 @@ std::mutex LowResDecoder::frameCleanupMutex_;
 
 namespace {
 
-// Hardware format selector for macOS (VideoToolbox), Linux (VA-API) and Windows (D3D11VA)
+#ifdef _WIN32
+// Which Windows format was actually created: D3D11 (default) or DXVA2_VLD (fallback).
+// SelectHWFormat has no access to the thread context, so the choice is stored at
+// file scope; on one machine every context uses the same API.
+static AVPixelFormat g_win_hw_pix_fmt = AV_PIX_FMT_D3D11;
+#endif
+
+// Hardware format selector for macOS (VideoToolbox), Linux (VA-API) and Windows (D3D11VA/DXVA2)
 static enum AVPixelFormat SelectHWFormat(AVCodecContext* ctx, const AVPixelFormat* pix_fmts) {
     const enum AVPixelFormat* p;
     for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
@@ -57,100 +148,11 @@ static enum AVPixelFormat SelectHWFormat(AVCodecContext* ctx, const AVPixelForma
 #elif defined(__linux__)
         if (*p == AV_PIX_FMT_VAAPI)         return AV_PIX_FMT_VAAPI;
 #elif defined(_WIN32)
-        if (*p == AV_PIX_FMT_D3D11)         return AV_PIX_FMT_D3D11;
+        // D3D11 or DXVA2_VLD — whichever device was actually created (see init).
+        if (*p == g_win_hw_pix_fmt)         return *p;
 #endif
     }
     return AV_PIX_FMT_NONE;
-}
-
-#ifdef _WIN32
-// Runs a UTF-8 encoded command via CreateProcessW (Unicode-safe, bypasses cmd.exe ANSI).
-// lineCallback is called for each line of combined stdout+stderr output.
-// Returns the process exit code, or -1 on failure to launch.
-static int RunCommandW(const std::string& utf8Command,
-                       const std::function<void(const std::string&)>& lineCallback) {
-    // Convert UTF-8 command to wide string
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8Command.c_str(), -1, nullptr, 0);
-    if (wlen <= 0) return -1;
-    std::wstring wcmd(wlen - 1, 0);
-    MultiByteToWideChar(CP_UTF8, 0, utf8Command.c_str(), -1, &wcmd[0], wlen);
-
-    // Create a pipe: child writes stdout+stderr, parent reads
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.bInheritHandle = TRUE;
-    HANDLE hRead = nullptr, hWrite = nullptr;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return -1;
-    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);  // read end not inherited by child
-
-    STARTUPINFOW si{};
-    si.cb          = sizeof(STARTUPINFOW);
-    si.hStdOutput  = hWrite;
-    si.hStdError   = hWrite;  // merge stderr into same pipe
-    si.dwFlags     = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION pi{};
-    BOOL ok = CreateProcessW(
-        nullptr, &wcmd[0],        // exe from command line (mutable wide string required)
-        nullptr, nullptr,          // process/thread security attributes
-        TRUE,                      // inherit handles (for the pipe)
-        CREATE_NO_WINDOW,          // no console window popup
-        nullptr, nullptr,          // inherit environment and working directory
-        &si, &pi
-    );
-
-    CloseHandle(hWrite);  // parent must close its copy of the write end
-    if (!ok) {
-        CloseHandle(hRead);
-        return -1;
-    }
-
-    // Read output line by line and forward to callback
-    char buf[4096];
-    DWORD nRead;
-    std::string lineBuffer;
-    while (ReadFile(hRead, buf, sizeof(buf) - 1, &nRead, nullptr) && nRead > 0) {
-        buf[nRead] = '\0';
-        lineBuffer += buf;
-        size_t pos;
-        while ((pos = lineBuffer.find('\n')) != std::string::npos) {
-            lineCallback(lineBuffer.substr(0, pos));
-            lineBuffer.erase(0, pos + 1);
-        }
-    }
-    if (!lineBuffer.empty()) lineCallback(lineBuffer);  // flush last partial line
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode = static_cast<DWORD>(-1);
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-
-    CloseHandle(hRead);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return static_cast<int>(exitCode);
-}
-#endif
-
-static double QueryVideoDuration(const std::string& filename) {
-    std::string command = "ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"" + filename + "\"";
-    std::string result;
-
-#ifdef _WIN32
-    RunCommandW(command, [&](const std::string& line) { result += line; });
-#else
-    FILE* pipe = popen(command.c_str(), "r");
-    if (!pipe) return -1.0;
-    char buffer[128];
-    while (fgets(buffer, sizeof(buffer), pipe)) result += buffer;
-    pclose(pipe);
-#endif
-
-    try {
-        return std::stod(result);
-    } catch (...) {
-        return -1.0;
-    }
 }
 
 // OPTIMIZATION: Binary search for B-frame time matching
@@ -362,6 +364,25 @@ bool LowResDecoder::initialize() {
     }
 
     initialized_ = true;
+
+    // PRE-WARM the per-thread decode contexts up front, while nothing else is decoding.
+    // The manager uses contexts 0/1 and the display's on-demand decodeFrameNow uses 2/3; each does
+    // its OWN avformat_open_input (~70–300 ms, plus a VideoToolbox device) under the per-FILE mutex.
+    // Creating them LAZILY during playback let a shuttle→1× transition open the manager's contexts
+    // while the display's on-demand decode waited on the SAME file mutex → a visible freeze. Doing it
+    // here (once, at load, hidden in the proxy-ready wait) keeps every later context access on the
+    // cheap reuse path. useHardwareAccel=true matches decodeLowResRange.
+    // Must match the accel used by decodeLowResRange (the cached context keeps whatever the FIRST
+    // call created): software on macOS (low-latency small-proxy decode), HW elsewhere.
+#ifdef __APPLE__
+    constexpr bool kProxyHwAccel = false;
+#else
+    constexpr bool kProxyHwAccel = true;
+#endif
+    for (int tid : {0, 1, 2, 3}) {
+        getOrCreateThreadContext(tid, kProxyHwAccel);
+    }
+
     return true;
 }
 
@@ -625,10 +646,23 @@ LowResDecoder::ThreadDecoderContext* LowResDecoder::getOrCreateThreadContext(int
                     // Windows D3D11VA
                     ret = av_hwdevice_ctx_create(&ctx.hw_device_ctx, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
                     if (ret >= 0) {
+                        std::cout << "✅ [Thread " << threadId << "] D3D11VA HW accel enabled" << std::endl;
+                    } else {
+                        // DXVA2 fallback: old drivers and remote sessions where a D3D11
+                        // device won't create but DXVA2 (D3D9) still works.
+                        ret = av_hwdevice_ctx_create(&ctx.hw_device_ctx, AV_HWDEVICE_TYPE_DXVA2, nullptr, nullptr, 0);
+                        if (ret >= 0) {
+                            std::cout << "✅ [Thread " << threadId << "] DXVA2 fallback enabled (D3D11VA unavailable)" << std::endl;
+                        }
+                    }
+                    if (ret >= 0) {
+#ifdef _WIN32
+                        g_win_hw_pix_fmt = (((AVHWDeviceContext*)ctx.hw_device_ctx->data)->type == AV_HWDEVICE_TYPE_DXVA2)
+                                               ? AV_PIX_FMT_DXVA2_VLD : AV_PIX_FMT_D3D11;
+#endif
                         ctx.codecCtx->hw_device_ctx = av_buffer_ref(ctx.hw_device_ctx);
                         ctx.codecCtx->get_format = SelectHWFormat;
                         ctx.hw_accel_enabled = true;
-                        std::cout << "✅ [Thread " << threadId << "] D3D11VA HW accel enabled" << std::endl;
                     }
                 }
 
@@ -681,7 +715,9 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
                                       int highResStart,
                                       int highResEnd,
                                       bool skipHighResWindow,
-                                      bool isReverse) {
+                                      bool isReverse,
+                                      bool keyframesOnly,
+                                      int threadIdBase) {
     (void)highResStart;
     (void)highResEnd;
     (void)skipHighResWindow;
@@ -722,19 +758,19 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
     std::atomic<bool> success{true};
 
     auto decodeSegment = [&](int threadId, int threadStartFrame, int threadEndFrame) {
-        // Intel Celeron + PowerSaver + VA-API optimization:
-        // ALL threads use hardware acceleration for maximum performance
-        // PowerSaver + VA-API needs aggressive hardware usage to avoid dropout
-        // CPU fallback only if VA-API fails
-        bool useHardwareAccel = true; // Force hardware acceleration for all threads
-        
-        // ADDITIONAL: Intel Celeron optimization - reduce decoder overhead
-        // Use more aggressive settings for PowerSaver mode
-        if (isReverse) {
-            // REVERSE: Ultra-aggressive settings for Intel Celeron
-            // Reduce memory allocations and context switching
-            useHardwareAccel = true;
-        }
+#ifdef __APPLE__
+        // macOS: SOFTWARE-decode the small proxy. VideoToolbox HW decode of a 720×540/540p frame is
+        // dominated by the HW→system-memory transfer and the shared VT queue (it contends with the
+        // full-res 1080p V2 decoder) — measured ~20–40ms per frame on the display thread during
+        // shuttle. libavcodec software decode of such a small frame lands straight in system memory
+        // (~4ms here). The proxy↔full-res handoff already recreates the texture (resolutions differ),
+        // so the resulting NV12→yuv420p format change costs nothing extra.
+        bool useHardwareAccel = false;
+#else
+        // Weak Intel Celeron / VA-API targets need HW even for the small proxy.
+        bool useHardwareAccel = true;
+        if (isReverse) useHardwareAccel = true;
+#endif
         ThreadDecoderContext* ctx = getOrCreateThreadContext(threadId, useHardwareAccel);
 
         if (!ctx || !ctx->initialized) {
@@ -747,6 +783,12 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
         AVFormatContext* formatContext = ctx->formatCtx;
         AVCodecContext* codecContext = ctx->codecCtx;
         int videoStream = ctx->videoStreamIndex;
+
+        // SHUTTLE: at high speed decode ONLY keyframes (short GOP=4 → ~1/4 the frames). The
+        // displayed proxy frame steps to the nearest keyframe — imperceptible while shuttling —
+        // and per-second decode load stops scaling with speed. The context is reused across
+        // calls, so set it explicitly every time (DEFAULT for normal sequential decode).
+        codecContext->skip_frame = keyframesOnly ? AVDISCARD_NONKEY : AVDISCARD_DEFAULT;
 
         AVPacket* packet = av_packet_alloc();
         AVFrame* frame = av_frame_alloc();
@@ -1008,13 +1050,15 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
                         // ZERO-COPY: av_frame_ref instead of av_frame_clone (increment refcount, NOT data copy!)
                         auto t_before_ref = std::chrono::high_resolution_clock::now();
 
-                        // Handle hardware frames (VideoToolbox on macOS, VA-API on Linux)
+                        // Handle hardware frames (VideoToolbox on macOS, VA-API on Linux, D3D11 on Windows)
                         AVFrame* source_frame = frame;
                         AVFrame* temp_hw_frame = nullptr;
 
                         // Check for hardware frame formats
                         bool is_hw_frame = (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) ||
-                                          (frame->format == AV_PIX_FMT_VAAPI);
+                                          (frame->format == AV_PIX_FMT_VAAPI) ||
+                                          (frame->format == AV_PIX_FMT_D3D11) ||
+                                          (frame->format == AV_PIX_FMT_DXVA2_VLD);
 
                         if (is_hw_frame) {
                             auto t_before_hw_transfer = std::chrono::high_resolution_clock::now();
@@ -1032,7 +1076,9 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
                                 if (ENABLE_LOWRES_DECODER_DEBUG) {
                                     static int hw_transfer_log = 0;
                                     if (++hw_transfer_log % 100 == 1) {
-                                        const char* hw_name = (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) ? "VideoToolbox" : "VA-API";
+                                        const char* hw_name = (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) ? "VideoToolbox" :
+                                                              (frame->format == AV_PIX_FMT_D3D11)        ? "D3D11VA" :
+                                                              (frame->format == AV_PIX_FMT_DXVA2_VLD)    ? "DXVA2" : "VA-API";
                                         std::cout << "🎬 [LowResDecoder] " << hw_name << " frame transferred to CPU: "
                                                   << source_frame->width << "x" << source_frame->height
                                                   << ", format=" << source_frame->format << std::endl;
@@ -1526,8 +1572,8 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
 
             // STEP 1: Decode Part 3 (high priority - where playhead is)
             int part3Mid = part3Start + (endFrame - part3Start) / 2;
-            threads.emplace_back(decodeSegment, 0, part3Start, part3Mid);
-            threads.emplace_back(decodeSegment, 1, part3Mid + 1, endFrame);
+            threads.emplace_back(decodeSegment, threadIdBase + 0, part3Start, part3Mid);
+            threads.emplace_back(decodeSegment, threadIdBase + 1, part3Mid + 1, endFrame);
 
             // Wait for Part 3 to complete
             for (auto& t : threads) {
@@ -1536,8 +1582,8 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
             threads.clear();
 
             // STEP 2: Decode Part 1+2 (lower priority)
-            threads.emplace_back(decodeSegment, 0, startFrame, part1End);
-            threads.emplace_back(decodeSegment, 1, part1End + 1, part2End);
+            threads.emplace_back(decodeSegment, threadIdBase + 0, startFrame, part1End);
+            threads.emplace_back(decodeSegment, threadIdBase + 1, part1End + 1, part2End);
 
     } else {
         // ========== FORWARD: Normal decoding (works great) ==========
@@ -1549,7 +1595,7 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
             int threadEnd = (i == numThreads - 1) ? endFrame : std::min(endFrame, start + framesPerThread - 1);
             if (threadStart > threadEnd) break;
 
-            threads.emplace_back(decodeSegment, i, threadStart, threadEnd);
+            threads.emplace_back(decodeSegment, threadIdBase + i, threadStart, threadEnd);
             start = threadEnd + 1;
             if (start > endFrame) break;
         }
@@ -1589,46 +1635,93 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
         return false;
     }
 
-    // CRITICAL: ALWAYS analyze GOP regardless of resolution/codec
-    // When GOP > 100 ALWAYS create proxy with GOP=25 for responsive scrubbing
+    // Single file analysis pass: extract ALL metadata in one avformat_open_input.
+    // Previously two separate opens (GOP analysis + color/geometry). Now one open,
+    // one avformat_find_stream_info call, one sequential read for GOP packets.
+    // totalDuration is read from fmt->duration — no ffprobe subprocess needed.
     int max_gop_size = 0;
-    int width = 0;
-    int height = 0;
+    int width = 0, height = 0;
     bool is_h264 = false;
-    int64_t video_bitrate = 0;  // Video bitrate in bps
+    int64_t video_bitrate = 0;
+    double totalDuration = -1.0;
+
+    std::string cs_flag    = "bt709";
+    std::string prim_flag  = "bt709";
+    std::string trc_flag   = "bt709";
+    std::string range_flag = "tv";
+
+    int orig_width = 0, orig_height = 0;
+    AVRational orig_sar = {1, 1};
+    AVRational orig_dar = {16, 9};
+    double orig_fps = 0.0;
 
     {
         AVFormatContext* fmt = nullptr;
         if (avformat_open_input(&fmt, filename.c_str(), nullptr, nullptr) == 0 &&
             avformat_find_stream_info(fmt, nullptr) >= 0) {
+
+            if (fmt->duration > 0)
+                totalDuration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
+
             int vindex = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
             if (vindex >= 0) {
                 AVCodecParameters* cp = fmt->streams[vindex]->codecpar;
-                width = cp->width;
-                height = cp->height;
+                AVStream* stream      = fmt->streams[vindex];
+
+                width = orig_width = cp->width;
+                height = orig_height = cp->height;
                 is_h264 = (cp->codec_id == AV_CODEC_ID_H264);
 
-                // Get video bitrate (for detecting low-bitrate surveillance cameras)
                 video_bitrate = cp->bit_rate;
-                if (video_bitrate <= 0) {
-                    // Fallback: estimate from file size and duration
-                    if (fmt->duration > 0 && fmt->bit_rate > 0) {
-                        video_bitrate = fmt->bit_rate * 0.8;  // Assume 80% is video
-                    }
+                if (video_bitrate <= 0 && fmt->duration > 0 && fmt->bit_rate > 0)
+                    video_bitrate = static_cast<int64_t>(fmt->bit_rate * 0.8);
+
+                if (stream->r_frame_rate.den > 0)
+                    orig_fps = static_cast<double>(stream->r_frame_rate.num) / stream->r_frame_rate.den;
+
+                orig_sar = cp->sample_aspect_ratio;
+                if (orig_sar.num <= 0 || orig_sar.den <= 0) orig_sar = {1, 1};
+
+                orig_dar.num = orig_width * orig_sar.num;
+                orig_dar.den = orig_height * orig_sar.den;
+                int dar_gcd = 1;
+                for (int i = 1; i <= orig_dar.num && i <= orig_dar.den; ++i)
+                    if (orig_dar.num % i == 0 && orig_dar.den % i == 0) dar_gcd = i;
+                orig_dar.num /= dar_gcd;
+                orig_dar.den /= dar_gcd;
+
+                switch (cp->color_space) {
+                    case AVCOL_SPC_BT470BG:
+                    case AVCOL_SPC_SMPTE170M:  cs_flag = "bt470bg";  break;
+                    case AVCOL_SPC_BT709:       cs_flag = "bt709";    break;
+                    case AVCOL_SPC_BT2020_NCL:
+                    case AVCOL_SPC_BT2020_CL:   cs_flag = "bt2020nc"; break;
+                    default: break;
                 }
+                switch (cp->color_primaries) {
+                    case AVCOL_PRI_BT470BG:
+                    case AVCOL_PRI_SMPTE170M:  prim_flag = "bt470bg"; break;
+                    case AVCOL_PRI_BT709:       prim_flag = "bt709";   break;
+                    case AVCOL_PRI_BT2020:      prim_flag = "bt2020";  break;
+                    default: break;
+                }
+                switch (cp->color_trc) {
+                    case AVCOL_TRC_BT709:        trc_flag = "bt709";        break;
+                    case AVCOL_TRC_SMPTE170M:    trc_flag = "smpte170m";    break;
+                    case AVCOL_TRC_IEC61966_2_1: trc_flag = "iec61966-2-1"; break;
+                    case AVCOL_TRC_BT2020_10:
+                    case AVCOL_TRC_BT2020_12:    trc_flag = "bt2020-10";    break;
+                    default: break;
+                }
+                range_flag = (cp->color_range == AVCOL_RANGE_JPEG) ? "pc" : "tv";
 
-                // CRITICAL: Analyze GOP for ANY file
+                // GOP analysis: read first 1000 video packets
                 AVPacket* packet = av_packet_alloc();
-                int current_gop = 0;
-                int frames_analyzed = 0;
-                const int MAX_FRAMES_TO_ANALYZE = 1000; // Analyze first 1000 frames
-
-                while (frames_analyzed < MAX_FRAMES_TO_ANALYZE && av_read_frame(fmt, packet) >= 0) {
+                int current_gop = 0, frames_analyzed = 0;
+                while (frames_analyzed < 1000 && av_read_frame(fmt, packet) >= 0) {
                     if (packet->stream_index == vindex) {
                         if (packet->flags & AV_PKT_FLAG_KEY) {
-                            if (current_gop > 0) {
-                                max_gop_size = std::max(max_gop_size, current_gop);
-                            }
+                            if (current_gop > 0) max_gop_size = std::max(max_gop_size, current_gop);
                             current_gop = 0;
                         }
                         current_gop++;
@@ -1654,7 +1747,7 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
         // Continue creating proxy below
     } else if (max_gop_size > 50) {
         std::cout << "⚠️  [LowResDecoder] Large GOP detected (" << max_gop_size
-                  << " frames) - creating GOP=25 proxy for responsive scrubbing" << std::endl;
+                  << " frames) - creating short-GOP (GOP=4) proxy for responsive scrubbing" << std::endl;
         // Continue creating proxy below
     } else {
         // GOP is adequate (≤50) - check if we can use original
@@ -1699,187 +1792,21 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
     fs::path h264Path = cacheDir / (fileId + "_lowres.mp4");
 
     if (fs::exists(h264Path)) {
-        outputFilename = h264Path.string();
-        if (progressCallback) {
-            progressCallback(100);
-        }
-        std::cout << "✅ Using H.264 proxy (GPU): " << h264Path << std::endl;
-        return true;
-    }
-
-    double totalDuration = QueryVideoDuration(filename);
-
-    auto reportProgress = [&](int percent) {
-        static int lastReportedPercent = -1;
-        // Output progress only on 5% change to reduce spam
-        if (percent - lastReportedPercent >= 5 || percent == 0 || percent == 100) {
-            std::cout << "🎬 [Proxy] Creating GOP=25 proxy: " << percent << "%" << std::endl;
-            lastReportedPercent = percent;
-        }
-        if (progressCallback) {
-            progressCallback(percent);
-        }
-    };
-
-    reportProgress(0);
-
-    // Parse one output line from ffmpeg -progress pipe:1 and update progress bar
-    auto processLine = [&](const std::string& line) {
-        if (!progressCallback) return;
-        size_t timePos = line.find("out_time_ms=");
-        if (timePos == std::string::npos) return;
-        try {
-            int64_t time_us = std::stoll(line.substr(timePos + 12));
-            double currentTime = time_us / 1000000.0;
-            if (totalDuration > 0.0 && currentTime > 0.0) {
-                int percent = static_cast<int>((currentTime / totalDuration) * 100.0);
-                percent = std::max(0, std::min(100, percent));
-                reportProgress(percent);
+        if (ValidateProxyManifest(h264Path, filename)) {
+            outputFilename = h264Path.string();
+            if (progressCallback) {
+                progressCallback(100);
             }
-        } catch (...) {}
-    };
-
-    auto executeConversion = [&](const std::string& command, const fs::path& destination) -> bool {
-        int status = 0;
-
-#ifdef _WIN32
-        // Use CreateProcessW: handles Unicode paths natively, no cmd.exe ANSI conversion
-        status = RunCommandW(command, processLine);
-        if (status == -1) {
-            std::cerr << "[LowResDecoder] Failed to launch command (CreateProcessW): " << command << std::endl;
-            return false;
+            std::cout << "✅ Using H.264 proxy (GPU): " << h264Path << std::endl;
+            return true;
         }
-#else
-        FILE* pipe = popen(command.c_str(), "r");
-        if (!pipe) {
-            std::cerr << "[LowResDecoder] Failed to execute command: " << command << std::endl;
-            return false;
-        }
-        char buffer[512];
-        std::string lineBuffer;
-        while (fgets(buffer, sizeof(buffer), pipe)) {
-            lineBuffer += buffer;
-            size_t pos;
-            while ((pos = lineBuffer.find('\n')) != std::string::npos) {
-                processLine(lineBuffer.substr(0, pos));
-                lineBuffer.erase(0, pos + 1);
-            }
-        }
-        status = pclose(pipe);
-#endif
-
-        if (status != 0) {
-            std::cerr << "[LowResDecoder] FFmpeg command failed with status " << status << std::endl;
-            if (fs::exists(destination)) fs::remove(destination);
-            return false;
-        }
-
-        reportProgress(100);
-        return true;
-    };
-
-    // IMPORTANT: fix color matrix/range in proxy to match main stream (TV range, BT.709)
-    // Determine source color metadata via libav so proxy matches exactly
-    std::string cs_flag = "bt709";
-    std::string prim_flag = "bt709";
-    std::string trc_flag = "bt709";
-    std::string range_flag = "tv"; // limited by default
-
-    // OPTIMIZATION: Anamorphic proxy for 25% less pixels to decode
-    // Store original DAR in SAR to maintain correct aspect ratio
-    int orig_width = 0;
-    int orig_height = 0;
-    AVRational orig_sar = {1, 1};
-    AVRational orig_dar = {16, 9};  // Default 16:9
-
-    // Get original FPS for logging
-    double orig_fps = 0.0;
-
-    {
-        AVFormatContext* fmt = nullptr;
-        if (avformat_open_input(&fmt, filename.c_str(), nullptr, nullptr) == 0 &&
-            avformat_find_stream_info(fmt, nullptr) >= 0) {
-            int vindex = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-            if (vindex >= 0) {
-                AVCodecParameters* cp = fmt->streams[vindex]->codecpar;
-                AVStream* stream = fmt->streams[vindex];
-
-                // Get original FPS from r_frame_rate (more reliable than avg_frame_rate)
-                if (stream->r_frame_rate.den > 0) {
-                    orig_fps = static_cast<double>(stream->r_frame_rate.num) / stream->r_frame_rate.den;
-                }
-
-                // Capture original dimensions and aspect ratio
-                orig_width = cp->width;
-                orig_height = cp->height;
-                orig_sar = cp->sample_aspect_ratio;
-
-                // If SAR is invalid, assume square pixels
-                if (orig_sar.num <= 0 || orig_sar.den <= 0) {
-                    orig_sar = {1, 1};
-                }
-
-                // Calculate DAR = (width/height) × SAR
-                // Using rational math: DAR = (width × SAR.num) / (height × SAR.den)
-                orig_dar.num = orig_width * orig_sar.num;
-                orig_dar.den = orig_height * orig_sar.den;
-
-                // Simplify the rational using simple GCD
-                int dar_gcd = 1;
-                for (int i = 1; i <= orig_dar.num && i <= orig_dar.den; ++i) {
-                    if (orig_dar.num % i == 0 && orig_dar.den % i == 0) {
-                        dar_gcd = i;
-                    }
-                }
-                orig_dar.num /= dar_gcd;
-                orig_dar.den /= dar_gcd;
-                // colorspace
-                switch (cp->color_space) {
-                    case AVCOL_SPC_BT470BG:
-                    case AVCOL_SPC_SMPTE170M:
-                        cs_flag = "bt470bg"; break; // 601
-                    case AVCOL_SPC_BT709:
-                        cs_flag = "bt709"; break;
-                    case AVCOL_SPC_BT2020_NCL:
-                    case AVCOL_SPC_BT2020_CL:
-                        cs_flag = "bt2020nc"; break;
-                    default: break;
-                }
-                // primaries
-                switch (cp->color_primaries) {
-                    case AVCOL_PRI_BT470BG:
-                    case AVCOL_PRI_SMPTE170M:
-                        prim_flag = "bt470bg"; break;
-                    case AVCOL_PRI_BT709:
-                        prim_flag = "bt709"; break;
-                    case AVCOL_PRI_BT2020:
-                        prim_flag = "bt2020"; break;
-                    default: break;
-                }
-                // transfer
-                switch (cp->color_trc) {
-                    case AVCOL_TRC_BT709:
-                        trc_flag = "bt709"; break;
-                    case AVCOL_TRC_SMPTE170M:
-                        trc_flag = "smpte170m"; break;
-                    case AVCOL_TRC_IEC61966_2_1:
-                        trc_flag = "iec61966-2-1"; break; // sRGB
-                    case AVCOL_TRC_BT2020_10:
-                    case AVCOL_TRC_BT2020_12:
-                        trc_flag = "bt2020-10"; break;
-                    default: break;
-                }
-                // range
-                // CRITICAL: Use same range as original for identical brightness/contrast
-                // Most videos are in TV/limited range (16-235)
-                if (cp->color_range == AVCOL_RANGE_JPEG) {
-                    range_flag = "pc"; // full range (0-255)
-                } else {
-                    range_flag = "tv"; // limited range (16-235) - like original
-                }
-            }
-            avformat_close_input(&fmt);
-        }
+        // Stale / unverified proxy (older build, changed source, or missing manifest).
+        // Drop it and rebuild — never trust a proxy we can't pin to this exact source.
+        std::cout << "♻️  [Proxy] Cached proxy failed manifest check — regenerating: "
+                  << h264Path << std::endl;
+        std::error_code ec;
+        fs::remove(h264Path, ec);
+        fs::remove(ProxyManifestPath(h264Path), ec);
     }
 
     // Calculate proxy dimensions maintaining original aspect ratio
@@ -1894,16 +1821,29 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
     // - 1440×1080 SAR 1:1 (4:3) → 480×360 (normal)
     // - 1920×1080 SAR 32:27 (anamorphic) → calculated from DAR
 
-    // STANDARD MODE: 360p with square pixels
-    int proxy_height = 360;
+    // STANDARD MODE: 540p with square pixels. 540p is the sweet spot for resolution; blockiness is
+    // killed by a HIGHER bitrate (below), not more pixels. Resolution is decoupled from shuttle speed
+    // anyway — Stage 2 (seek-per-frame on demand) decodes only the ~60 shown frames/s at shuttle.
+    int proxy_height = 540;
     int proxy_width;
 
     // Calculate display aspect ratio (DAR) from original dimensions and SAR
     double dar = (static_cast<double>(orig_width) / static_cast<double>(orig_height)) *
                  (static_cast<double>(orig_sar.num) / static_cast<double>(orig_sar.den));
 
-    // Calculate proxy width to maintain DAR with square pixels
-    proxy_width = static_cast<int>(std::round(proxy_height * dar));
+    // ANAMORPHIC PROXY: for WIDE sources (DAR > 4:3) the proxy is squeezed horizontally onto a 4:3
+    // PIXEL grid (720×540) instead of square 16:9 (960×540) — ~25% fewer pixels → less decode work
+    // per frame → noticeably snappier scrubbing (the owner observed 4:3 material scrubs faster). The
+    // ORIGINAL DAR is written into the proxy stream (-aspect), and the whole display pipeline already
+    // honours frame SAR, so it's stretched back to the source aspect on screen. (4:3-or-narrower
+    // sources are already minimal as square pixels — left square.)
+    const double k43 = 4.0 / 3.0;
+    bool anamorphic = (dar > k43 + 1e-6);
+    if (anamorphic) {
+        proxy_width = static_cast<int>(std::round(proxy_height * k43));  // 720 → 4:3 pixel grid
+    } else {
+        proxy_width = static_cast<int>(std::round(proxy_height * dar));  // square pixels
+    }
 
     // Ensure even dimensions (required for H.264)
     if (proxy_width % 2 != 0) proxy_width++;
@@ -1912,54 +1852,36 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
               << " (SAR " << orig_sar.num << ":" << orig_sar.den
               << " → DAR " << orig_dar.num << ":" << orig_dar.den << ")" << std::endl;
     std::cout << "📐 [Proxy] Target: " << proxy_width << "x" << proxy_height
-              << " (360p square pixels, DAR " << std::fixed << std::setprecision(2) << dar << ":1, GOP=25)" << std::endl;
+              << (anamorphic ? " (4:3 anamorphic px → stretched to " : " (square px, displays ")
+              << orig_dar.num << ":" << orig_dar.den << ", GOP=4, 50fps)" << std::endl;
 
-    // H.264 generation ONLY (hardware decoding VideoToolbox)
-    // CRITICAL: Fix GOP=25 for responsive reverse playback!
-    // Use Baseline profile WITHOUT B-frames for fastest decode (matches working 50fps proxy)
-    std::string x264_params = "colorprimaries=" + prim_flag + ":transfer=" + trc_flag + ":colormatrix=" +
-                              (cs_flag == "bt2020nc" ? std::string("bt2020nc") : cs_flag) +
-                              (range_flag == "pc" ? ":fullrange=on" : ":fullrange=off") +
-                              ":keyint=25:min-keyint=25";  // GOP=25, no B-frames for simplicity
+    // Hand off to ProxyConverter — it owns all FFmpeg subprocess logic.
+    ProxyConverter::Params params;
+    params.inputFilename   = filename;
+    params.outputPath      = h264Path;
+    params.proxyWidth      = proxy_width;
+    params.proxyHeight     = proxy_height;
+    params.proxyDarNum     = orig_dar.num;   // display aspect = source DAR (stretches anamorphic px)
+    params.proxyDarDen     = orig_dar.den;
+    params.colorSpace      = cs_flag;
+    params.colorPrimaries  = prim_flag;
+    params.colorTrc        = trc_flag;
+    params.colorRange      = range_flag;
+    params.totalDuration   = totalDuration;
+    params.sourceFps       = orig_fps;
 
-    // Build filter chain: scale with square pixels, convert to yuv420p
-    std::string vfilter = "scale=" + std::to_string(proxy_width) + ":" + std::to_string(proxy_height) +
-                          ",format=yuv420p";
+    // FULL fps proxy (no more half-fps): smooth playback feel is restored. The shuttle decode
+    // load is now shed differently — at high speed the proxy decoder skips to keyframes only
+    // (short GOP=4 → decodes ~1/4 of frames), so frames-decoded-per-second stays low without
+    // dropping the proxy's temporal resolution at normal speed. params.proxyFps stays 0.
 
-    // AUDIO: Copy audio stream if exists, otherwise create silent track
-    // This allows proxy to be used standalone (without original file)
-    // -progress pipe:1: Output progress to stdout for parsing (out_time_ms format)
-    // CRITICAL FIX: On macOS, use AudioToolbox AAC decoder for AAC input (handles AAC-ELD)
-#ifdef __APPLE__
-    std::string audio_decoder = "-c:a aac_at";  // AudioToolbox AAC decoder on macOS
-#else
-    std::string audio_decoder = "";  // Use default decoder on other platforms
-#endif
+    params.progressCallback = progressCallback;
 
-#ifdef _WIN32
-    // On Windows: CreateProcessW handles stdout+stderr via pipe — no shell, no "2>&1" needed
-    std::string h264Command = "ffmpeg " + audio_decoder + " -nostdin -y -progress pipe:1 -i \"" + filename +
-                              "\" -vf \"" + vfilter + "\" -colorspace " + cs_flag +
-                              " -color_primaries " + prim_flag + " -color_trc " + trc_flag +
-                              " -color_range " + range_flag +
-                              " -c:v libx264 -profile:v baseline -preset medium -g 25 -b:v 600k -x264-params \"" +
-                              x264_params + "\" -c:a aac -b:a 128k \"" + h264Path.string() + "\"";
-#else
-    // On Mac/Linux: popen() uses a shell, "2>&1" merges stderr into stdout for progress parsing
-    std::string h264Command = "ffmpeg " + audio_decoder + " -nostdin -y -progress pipe:1 -i \"" + filename +
-                              "\" -vf \"" + vfilter + "\" -colorspace " + cs_flag +
-                              " -color_primaries " + prim_flag + " -color_trc " + trc_flag +
-                              " -color_range " + range_flag +
-                              " -c:v libx264 -profile:v baseline -preset medium -g 25 -b:v 600k -x264-params \"" +
-                              x264_params + "\" -c:a aac -b:a 128k \"" + h264Path.string() + "\" 2>&1";
-#endif
-
-    std::cout << "🎬 [Proxy] Starting conversion with GOP=25 for responsive scrubbing..." << std::endl;
-    std::cout << "    Duration: " << std::fixed << std::setprecision(1) << totalDuration << "s" << std::endl;
-
-    if (executeConversion(h264Command, h264Path)) {
+    if (ProxyConverter::ConvertParallel(params)) {
+        // Pin the proxy to this exact source so future cache hits can be trusted.
+        WriteProxyManifest(h264Path, filename, totalDuration, orig_fps);
         outputFilename = h264Path.string();
-        std::cout << "✅ [Proxy] Generated H.264 GOP=25 proxy: " << h264Path << std::endl;
+        std::cout << "✅ [Proxy] Generated H.264 GOP=4 50fps proxy: " << h264Path << std::endl;
         return true;
     }
 

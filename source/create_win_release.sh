@@ -174,7 +174,7 @@ Professional Video Player for Windows
 Windows 10 or later required (x86_64)
 
 ================================================================================
-QUICK INSTALL / БЫСТРАЯ УСТАНОВКА
+QUICK INSTALL
 ================================================================================
 
 Option 1 — PowerShell installer (recommended):
@@ -190,7 +190,7 @@ Option 3 — One-line install from web (PowerShell):
   iwr -useb https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/main/source/install.ps1 | iex
 
 ================================================================================
-SYSTEM REQUIREMENTS / СИСТЕМНЫЕ ТРЕБОВАНИЯ
+SYSTEM REQUIREMENTS
 ================================================================================
 
 • Windows 10 (version 1903+) or Windows 11
@@ -199,7 +199,7 @@ SYSTEM REQUIREMENTS / СИСТЕМНЫЕ ТРЕБОВАНИЯ
 • DirectX 11 compatible GPU
 
 ================================================================================
-INCLUDED LIBRARIES / ВСТРОЕННЫЕ БИБЛИОТЕКИ
+INCLUDED LIBRARIES
 ================================================================================
 
 All runtime libraries are included in this package:
@@ -215,7 +215,7 @@ IMPORTANT: FFmpeg is dynamically linked in compliance with LGPL.
 You may replace the bundled FFmpeg DLLs with your own compiled version.
 
 ================================================================================
-SUPPORTED FORMATS / ПОДДЕРЖИВАЕМЫЕ ФОРМАТЫ
+SUPPORTED FORMATS
 ================================================================================
 
 Video: MP4, MOV, AVI, MKV, H.264, H.265/HEVC, ProRes, DNxHD, and all
@@ -224,7 +224,7 @@ Video: MP4, MOV, AVI, MKV, H.264, H.265/HEVC, ProRes, DNxHD, and all
 Audio: MP3, WAV, FLAC, AAC, M4A, OGG, multi-channel audio.
 
 ================================================================================
-FEATURES / ВОЗМОЖНОСТИ
+FEATURES
 ================================================================================
 
 • Frame-accurate video playback
@@ -239,7 +239,7 @@ FEATURES / ВОЗМОЖНОСТИ
 • VU meters for audio level monitoring
 
 ================================================================================
-SHORTCUTS / ГОРЯЧИЕ КЛАВИШИ
+SHORTCUTS
 ================================================================================
 
 Space          Play/Pause
@@ -261,7 +261,7 @@ Ctrl+Shift+M   Memory Locations
 Ctrl+Q         Quit
 
 ================================================================================
-TROUBLESHOOTING / РЕШЕНИЕ ПРОБЛЕМ
+TROUBLESHOOTING
 ================================================================================
 
 Q: "Windows protected your PC" (SmartScreen warning)
@@ -284,14 +284,14 @@ A: Settings (Ctrl+,) → MIDI tab → Enable MIDI Controller → select ports.
    Supports: Mackie HUI / X-Touch One
 
 ================================================================================
-LINKS / ССЫЛКИ
+LINKS
 ================================================================================
 
 • GitHub:    https://github.com/ffbsoffa/TapeXPlayer
 • Issues:    https://github.com/ffbsoffa/TapeXPlayer/issues
 
 ================================================================================
-LICENSE / ЛИЦЕНЗИЯ
+LICENSE
 ================================================================================
 
 TapeXPlayer is open source. See LICENSE in the repository.

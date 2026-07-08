@@ -66,7 +66,10 @@ LowCachedDecoderManager::LowCachedDecoderManager(const std::string& lowResFilena
         int dummyHighStart = 0;
         int dummyHighEnd = -1;
         bool isReverse = isReverse_.load();
-        decoder_->decodeLowResRange(frameIndex_, startFrame, endFrame, dummyHighStart, dummyHighEnd, false, isReverse);
+        // Stage-1 keyframe-only-at-shuttle was REVERTED: sparse fill + the display's empty-slot
+        // fallback produced visible jumps above the threshold. Full decode here; the real shuttle
+        // fix is Stage-2 seek-per-frame (decode the exact displayed frame).
+        decoder_->decodeLowResRange(frameIndex_, startFrame, endFrame, dummyHighStart, dummyHighEnd, false, isReverse, false);
         loadedSegments_.insert(initialSegment);
         lastLowResUpdateTime_ = std::chrono::steady_clock::now();
     }
@@ -113,6 +116,36 @@ void LowCachedDecoderManager::stop() {
 
 void LowCachedDecoderManager::notifyFrameChange() {
     cv_.notify_one();
+}
+
+bool LowCachedDecoderManager::decodeFrameNow(int frame) {
+    if (!decoder_ || frameIndex_.empty()) return false;
+
+    int idx = frame;
+    if (isHalfFps_) idx = idx / 2;
+    if (idx < 0 || idx >= static_cast<int>(frameIndex_.size())) return false;
+
+    // Skip if this slot already holds a decoded proxy frame (cheap non-blocking peek).
+    {
+        std::unique_lock<std::mutex> lk(frameIndex_[idx].mutex, std::try_to_lock);
+        if (lk.owns_lock() &&
+            frameIndex_[idx].type == FSTP::FrameInfo::LOW_RES &&
+            frameIndex_[idx].low_res_frame && frameIndex_[idx].low_res_frame->data[0]) {
+            return true;
+        }
+    }
+
+    // Decode exactly this frame (GOP-aware seek to its keyframe + decode forward). No high-res
+    // window (0,-1), full decode (keyframesOnly=false). Runs on the caller's thread.
+    // threadIdBase=2 → uses decode contexts 2/3, NEVER 0/1 — so this on-demand decode can run
+    // concurrently with the manager's segment decode (contexts 0/1) without sharing an
+    // AVCodecContext (that sharing tripped libavcodec's frame->private_ref assertion → crash).
+    //
+    // isReverse=FALSE always: for a single frame there is no decode-order to optimise, and the
+    // reverse "3-part" split degenerates a 1-frame range into [N, N-1] → seek finds no timestamp
+    // → falls back to "decode from beginning of stream" (huge) + VideoToolbox -12909 errors →
+    // dropped frames on reverse shuttle. Just decode the one frame forward from its keyframe.
+    return decoder_->decodeLowResRange(frameIndex_, idx, idx, 0, -1, false, /*isReverse=*/false, false, /*threadIdBase=*/2);
 }
 
 void LowCachedDecoderManager::decodingLoop() {
@@ -241,25 +274,48 @@ void LowCachedDecoderManager::decodingLoop() {
             continue;
         }
 
+        // STAGE 2: across the WHOLE shuttle range (≥2× — same point where full-res hands off to
+        // the proxy) the display decodes exactly the shown frame on demand (decodeFrameNow), so
+        // skip segment PREFETCH here. Threshold matches the on-demand gate in DisplayFrame so there
+        // is only ONE seam, and it coincides with the existing full-res↔proxy handoff at 2× — no
+        // separate mid-shuttle (was 12×) seam that froze on deceleration. We don't unload here;
+        // the manager resumes full prefetch + cleanup once speed drops below 2×.
+        if (currentRate >= 2.0) {
+            previousPlaybackRate_ = currentRate;
+            previousIsReverse_ = isReverse_.load();
+            continue;
+        }
+
         int currentSegment = current / segmentSize_;
         int numSegmentsTotal = (frameIndex_.size() + segmentSize_ - 1) / segmentSize_;
         bool segmentChanged = (currentSegment != previousSegment_);
         bool directionChanged = (isReverse_.load() != previousIsReverse_);
 
+        // Just dropped out of shuttle (≥2× → <2×)? The manager skipped all prefetch during the
+        // shuttle, and the position jumped far, so a naive ±1 window would BURST up to 3 segments
+        // (3×750 = 2250 frames) of proxy decode at once — that CPU spike (alongside the full-res V2
+        // re-decode) is the hitch felt when stopping a fast rewind onto pause. Load ONLY the current
+        // segment on that first resume frame (the on-demand decodeFrameNow already supplies the exact
+        // displayed frame + neighbours); the ±1 segments fill lazily as the user scrubs into them.
+        bool justLeftShuttle = (previousPlaybackRate_ >= 2.0 && currentRate < 2.0);
+
         if (segmentChanged || directionChanged) {
             // SIMPLE SLIDING WINDOW APPROACH
             // Decode segments around current position regardless of direction
-            // Window size: ±1 segment (total 3 segments: before, current, after)
+            // Window size: ±1 segment (total 3 segments: before, current, after) — but only the
+            // current segment right after leaving shuttle (see justLeftShuttle above).
 
             std::set<int> targetSegments;
 
             // Always keep current segment + neighbors
             targetSegments.insert(currentSegment);
-            if (currentSegment > 0) {
-                targetSegments.insert(currentSegment - 1);  // Previous segment
-            }
-            if (currentSegment < numSegmentsTotal - 1) {
-                targetSegments.insert(currentSegment + 1);  // Next segment
+            if (!justLeftShuttle) {
+                if (currentSegment > 0) {
+                    targetSegments.insert(currentSegment - 1);  // Previous segment
+                }
+                if (currentSegment < numSegmentsTotal - 1) {
+                    targetSegments.insert(currentSegment + 1);  // Next segment
+                }
             }
 
             if (directionChanged) {
@@ -364,9 +420,11 @@ void LowCachedDecoderManager::loadSegment(int segmentIndex) {
     int highResStart = std::max(0, current - highResHalf);
     int highResEnd = std::min(static_cast<int>(frameIndex_.size()) - 1, current + highResHalf);
 
-    // Pass isReverse to decoder for prioritized decoding
+    // Pass isReverse to decoder for prioritized decoding.
+    // keyframesOnly=false: Stage-1 keyframe-skip reverted (caused jumps via sparse fill); the
+    // real shuttle fix is Stage-2 seek-per-frame.
     bool isReverse = isReverse_.load();
-    bool ok = decoder_->decodeLowResRange(frameIndex_, startFrame, endFrame, highResStart, highResEnd, false, isReverse);
+    bool ok = decoder_->decodeLowResRange(frameIndex_, startFrame, endFrame, highResStart, highResEnd, false, isReverse, false);
     if (ok) {
         std::lock_guard<std::mutex> lock(mtx_);
         loadedSegments_.insert(segmentIndex);

@@ -51,6 +51,11 @@ public:
     // Notify the manager about a potential seek or change in current frame
     void notifyFrameChange();
 
+    // STAGE 2 (shuttle seek-per-frame): decode exactly one frame on the CALLING thread, into the
+    // shared index. Used by the display at high speed where segment prefetch is skipped — gives a
+    // "tape head" response (decode only what's shown, ~1-2ms on GOP=4). No-op if already decoded.
+    bool decodeFrameNow(int frame);
+
     // Adaptive segment sizing based on GOP structure
     void setSegmentSizeFromGOP(int gopSize);
     static int calculateOptimalSegmentSize(int gopSize); 

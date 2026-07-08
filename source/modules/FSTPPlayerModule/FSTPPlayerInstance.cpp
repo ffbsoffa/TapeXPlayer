@@ -83,7 +83,7 @@ void FSTPPlayerInstance::Shutdown() {
     std::cout << "Player instance shutdown complete" << std::endl;
 }
 
-int FSTPPlayerInstance::LoadFile(const std::string& filepath) {
+int FSTPPlayerInstance::LoadFile(const std::string& filepath, double resume_position) {
     if (!m_initialized) {
         std::cerr << "Player instance not initialized" << std::endl;
         return -1;
@@ -95,12 +95,21 @@ int FSTPPlayerInstance::LoadFile(const std::string& filepath) {
         UnloadFile();
     }
 
-    if (!m_audio_module->LoadFile(filepath)) {
+    if (!m_audio_module->LoadFile(filepath, resume_position)) {
         std::cerr << "Failed to load file into audio module: " << filepath << std::endl;
         return -3;
     }
 
-    if (m_video_module && !m_video_module->LoadFile(filepath)) {
+    // Use the actual audio position as initial_time for the video module.
+    // DecodePriorityZone may clamp resume_position if it is near the end of the file,
+    // so the audio head may land earlier than the requested resume_position.
+    // Passing the raw audio position keeps video in sync with where audio actually starts.
+    double actual_initial_time = 0.0;
+    if (resume_position > 0.0) {
+        actual_initial_time = m_audio_module->GetPosition() - m_audio_module->GetTimecodeOffset();
+    }
+
+    if (m_video_module && !m_video_module->LoadFile(filepath, actual_initial_time)) {
         std::cerr << "Warning: Failed to load file into video module (continuing audio-only): " << filepath << std::endl;
     } else if (m_video_module) {
         std::cout << "🎥 [VIDEO] Video file loaded successfully!" << std::endl;
@@ -126,6 +135,15 @@ void FSTPPlayerInstance::UnloadFile() {
     }
 
     std::cout << "Unloading video file from instance: " << m_file_path << std::endl;
+
+    // Save resume position BEFORE Stop() — Stop() resets playback_position to 0
+    if (m_audio_module && m_audio_module->IsLoaded() && !m_file_path.empty()) {
+        double raw_pos = m_audio_module->GetPosition() - m_audio_module->GetTimecodeOffset();
+        if (raw_pos > 1.0) {
+            std::cout << "[RESUME] Saving position " << raw_pos << "s for: " << m_file_path << std::endl;
+            SaveResumePosition(m_file_path.c_str(), raw_pos);
+        }
+    }
 
     // Stop playback
     if (m_audio_module && m_audio_module->IsPlaying()) {
@@ -202,6 +220,15 @@ int FSTPPlayerInstance::Stop() {
 
     std::cout << "Stopping playback..." << std::endl;
 
+    // Save resume position BEFORE audio Stop() — Stop() resets playback_position to 0
+    if (!m_file_path.empty()) {
+        double raw_pos = m_audio_module->GetPosition() - m_audio_module->GetTimecodeOffset();
+        if (raw_pos > 1.0) {
+            std::cout << "[RESUME] Saving position " << raw_pos << "s on Stop() for: " << m_file_path << std::endl;
+            SaveResumePosition(m_file_path.c_str(), raw_pos);
+        }
+    }
+
     if (m_audio_module->Stop()) {
         std::cout << "Playback stopped successfully" << std::endl;
         return 0;
@@ -246,6 +273,15 @@ int FSTPPlayerInstance::SetSpeed(double speed) {
         return -2;
     }
 
+    // TAPE THREADING: while the proxy is still converting in the background, the transport
+    // is limited to ≤1× — the full-res V2 decoder reads the original forward, but shuttle
+    // needs the GOP=4 proxy. Like a real deck: no shuttle until the tape is threaded.
+    if (speed > 1.0 && m_video_module && m_video_module->IsLoaded() &&
+        !m_video_module->IsShuttleReady()) {
+        std::cout << "[THREADING] Shuttle not ready — clamping speed " << speed << "x → 1x" << std::endl;
+        speed = 1.0;
+    }
+
     static double last_logged_speed = std::numeric_limits<double>::quiet_NaN();
     bool should_log = std::isnan(last_logged_speed) || std::abs(last_logged_speed - speed) >= 0.5;
     if (should_log) {
@@ -277,6 +313,13 @@ int FSTPPlayerInstance::SetSpeedInstant(double speed) {
         return -2;
     }
 
+    // TAPE THREADING: same ≤1× clamp as SetSpeed (see comment there)
+    if (speed > 1.0 && m_video_module && m_video_module->IsLoaded() &&
+        !m_video_module->IsShuttleReady()) {
+        std::cout << "[THREADING] Shuttle not ready — clamping instant speed " << speed << "x → 1x" << std::endl;
+        speed = 1.0;
+    }
+
     m_audio_module->SetSpeedInstant(speed);
 
     // CRITICAL: Also notify video module to enable Full-Res decoder optimization
@@ -292,6 +335,13 @@ int FSTPPlayerInstance::SetReverse(bool reverse) {
         std::cerr << "Player instance not ready for reverse change" << std::endl;
         return -1;
     }
+    // TAPE THREADING: reverse needs the proxy (V2 streams the original forward only);
+    // ignore the request until the background conversion publishes the proxy decoder.
+    if (reverse && m_video_module && m_video_module->IsLoaded() &&
+        !m_video_module->IsShuttleReady()) {
+        std::cout << "[THREADING] Shuttle not ready — reverse ignored" << std::endl;
+        return 0;
+    }
     // Audio module runs direction-change sequencer; video module follows immediately
     // (video will reflect new direction via IsReverse() once sequencer flips the flag)
     m_audio_module->SetReverse(reverse);
@@ -306,11 +356,25 @@ int FSTPPlayerInstance::SetReverseInstant(bool reverse) {
         std::cerr << "Player instance not ready for instant reverse change" << std::endl;
         return -1;
     }
+    // TAPE THREADING: same reverse gate as SetReverse (see comment there)
+    if (reverse && m_video_module && m_video_module->IsLoaded() &&
+        !m_video_module->IsShuttleReady()) {
+        std::cout << "[THREADING] Shuttle not ready — instant reverse ignored" << std::endl;
+        return 0;
+    }
     m_audio_module->SetReverseInstant(reverse);
     if (m_video_module) {
         m_video_module->SetReverse(reverse);
     }
     return 0;
+}
+
+void FSTPPlayerInstance::SetBackgrounded(bool backgrounded) {
+    // Resource courtesy: a backgrounded (unfocused, not-simultaneously-needed) instance frees its
+    // heavy full-res decoder. Pure video-side; audio/playback state untouched.
+    if (m_video_module) {
+        m_video_module->SetBackgrounded(backgrounded);
+    }
 }
 
 // === State Retrieval Methods ===
@@ -327,6 +391,13 @@ double FSTPPlayerInstance::GetDuration() const {
         return 0.0;
     }
     return m_audio_module->GetDuration();
+}
+
+double FSTPPlayerInstance::GetTimecodeOffset() const {
+    if (!m_initialized || !m_file_loaded || !m_audio_module) {
+        return 0.0;
+    }
+    return m_audio_module->GetTimecodeOffset();
 }
 
 bool FSTPPlayerInstance::IsPlaying() const {

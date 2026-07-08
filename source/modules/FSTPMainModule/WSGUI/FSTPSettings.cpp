@@ -6,6 +6,7 @@
 #include <vector>
 #include <set>
 #include <unordered_map>
+#include <atomic>
 #include <algorithm>
 #include <string>
 #include <cstdio>
@@ -23,6 +24,7 @@
 // Global settings structure
 static FSTPSettings g_settings;
 static bool g_settings_initialized = false;
+static std::atomic<bool> g_settings_shutting_down{false};
 
 // Path to settings file (will be set during initialization)
 static std::string g_settings_path;
@@ -79,10 +81,19 @@ void ResetSettingsToDefault() {
     // Developer/Debug settings
     g_settings.show_decoder_status = 0;       // Hidden by default (debug feature)
 
+    // Presentation mode settings
+    g_settings.presentation_display_index = -1; // -1 = auto (first external display)
+    g_settings.presentation_output_mode   = 0;  // 0 = external display (with windowed fallback)
+    g_settings.presentation_follow_focus  = 1;  // follow the focused player by default
+    g_settings.presentation_pinned_player = 0;  // used only when follow_focus == 0
+
+    // Onboarding / first-run
+    g_settings.welcome_version = 0;             // 0 = welcome screen never shown
 }
 
 // Initialize settings system
 int InitSettings() {
+    if (g_settings_shutting_down) return 0; // don't re-init during shutdown
     if (g_settings_initialized) {
         return 0; // Already initialized
     }
@@ -107,6 +118,7 @@ int InitSettings() {
 
 // Shutdown settings system
 void ShutdownSettings() {
+    g_settings_shutting_down = true; // block re-init from background threads
     if (g_settings_initialized) {
         SaveSettings(); // Automatic save on exit
         g_settings_initialized = false;
@@ -163,6 +175,10 @@ int SaveSettings() {
     // Video settings
     file << "[Video]\n";
     file << "betacam_effect_enabled=" << g_settings.betacam_effect_enabled << "\n";
+    file << "presentation_display=" << g_settings.presentation_display_index << "\n";
+    file << "presentation_output_mode=" << g_settings.presentation_output_mode << "\n";
+    file << "presentation_follow_focus=" << g_settings.presentation_follow_focus << "\n";
+    file << "presentation_pinned_player=" << g_settings.presentation_pinned_player << "\n";
     file << "\n";
 
     file << "[Extensions]\n";
@@ -179,6 +195,11 @@ int SaveSettings() {
     // Developer/Debug settings
     file << "[Debug]\n";
     file << "show_decoder_status=" << g_settings.show_decoder_status << "\n";
+    file << "\n";
+
+    // UI / onboarding
+    file << "[UI]\n";
+    file << "welcome_version=" << g_settings.welcome_version << "\n";
 
     file.close();
     std::cout << "Settings saved to: " << g_settings_path << std::endl;
@@ -231,6 +252,10 @@ int LoadSettings() {
         }
         else if (current_section == "Video") {
             if (key == "betacam_effect_enabled") g_settings.betacam_effect_enabled = std::stoi(value);
+            else if (key == "presentation_display") g_settings.presentation_display_index = std::stoi(value);
+            else if (key == "presentation_output_mode") g_settings.presentation_output_mode = std::stoi(value);
+            else if (key == "presentation_follow_focus") g_settings.presentation_follow_focus = std::stoi(value);
+            else if (key == "presentation_pinned_player") g_settings.presentation_pinned_player = std::stoi(value);
         }
         else if (current_section == "Extensions") {
             if (key == "yt_dlp_enabled") g_settings.yt_dlp_extension_enabled = std::stoi(value);
@@ -242,6 +267,9 @@ int LoadSettings() {
         }
         else if (current_section == "Debug") {
             if (key == "show_decoder_status") g_settings.show_decoder_status = std::stoi(value);
+        }
+        else if (current_section == "UI") {
+            if (key == "welcome_version") g_settings.welcome_version = std::stoi(value);
         }
     }
 
@@ -379,6 +407,144 @@ int GetShowDecoderStatus() {
     }
     return g_settings.show_decoder_status;
 }
+
+int GetPresentationDisplayIndex() {
+    if (!g_settings_initialized) InitSettings();
+    return g_settings.presentation_display_index;
+}
+
+void SetPresentationDisplayIndex(int idx) {
+    if (!g_settings_initialized) InitSettings();
+    g_settings.presentation_display_index = idx;
+    SaveSettings();
+}
+
+int GetPresentationOutputMode() {
+    if (!g_settings_initialized) InitSettings();
+    return g_settings.presentation_output_mode;
+}
+
+void SetPresentationOutputMode(int mode) {
+    if (!g_settings_initialized) InitSettings();
+    g_settings.presentation_output_mode = mode;
+    SaveSettings();
+}
+
+int GetPresentationFollowFocus() {
+    if (!g_settings_initialized) InitSettings();
+    return g_settings.presentation_follow_focus;
+}
+
+void SetPresentationFollowFocus(int follow) {
+    if (!g_settings_initialized) InitSettings();
+    g_settings.presentation_follow_focus = follow;
+    SaveSettings();
+}
+
+int GetPresentationPinnedPlayer() {
+    if (!g_settings_initialized) InitSettings();
+    return g_settings.presentation_pinned_player;
+}
+
+void SetPresentationPinnedPlayer(int player_id) {
+    if (!g_settings_initialized) InitSettings();
+    g_settings.presentation_pinned_player = player_id;
+    SaveSettings();
+}
+
+int GetWelcomeVersion() {
+    if (!g_settings_initialized) InitSettings();
+    return g_settings.welcome_version;
+}
+
+void SetWelcomeVersion(int version) {
+    if (!g_settings_initialized) InitSettings();
+    g_settings.welcome_version = version;
+    SaveSettings();
+}
+
+// ============================================================
+// Resume positions — persist last playback position per file
+// ============================================================
+
+static std::string GetResumeFilePath() {
+#ifdef __APPLE__
+    const char* home = getenv("HOME");
+    if (home) return std::string(home) + "/Library/Preferences/com.tapexplayer.resume";
+#elif defined(_WIN32)
+    const char* appdata = getenv("APPDATA");
+    if (appdata) return std::string(appdata) + "/TapeXPlayer/resume.ini";
+#else
+    const char* home = getenv("HOME");
+    if (home) return std::string(home) + "/.config/tapexplayer/resume";
+#endif
+    return "./tapexplayer_resume.ini";
+}
+
+// In-memory cache: filepath → position_seconds
+static std::unordered_map<std::string, double>& GetResumeCache() {
+    // Allocated with `new` (intentionally never deleted) so it is never
+    // registered with atexit and survives past static destructor phase.
+    // Without this, the map can be destroyed before global player instances,
+    // causing a crash when UnloadFile() calls SaveResumePosition() at exit.
+    static std::unordered_map<std::string, double>* cache =
+        new std::unordered_map<std::string, double>();
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        std::ifstream f(GetResumeFilePath());
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            size_t eq = line.rfind('=');  // rfind: filepath may contain '='
+            if (eq == std::string::npos) continue;
+            std::string key = line.substr(0, eq);
+            try { (*cache)[key] = std::stod(line.substr(eq + 1)); }
+            catch (...) {}
+        }
+    }
+    return *cache;
+}
+
+static void FlushResumeCache() {
+    std::string path = GetResumeFilePath();
+    {
+        std::error_code ec;
+        auto dir = std::filesystem::path(path).parent_path();
+        if (!dir.empty()) std::filesystem::create_directories(dir, ec);
+    }
+    std::ofstream f(path);
+    if (!f.is_open()) return;
+    f << "# TapeXPlayer Resume Positions\n";
+    constexpr size_t MAX_ENTRIES = 200;
+    auto& cache = GetResumeCache();
+    size_t count = 0;
+    for (auto it = cache.begin(); it != cache.end() && count < MAX_ENTRIES; ++it, ++count) {
+        f << it->first << "=" << std::fixed << it->second << "\n";
+    }
+}
+
+void SaveResumePosition(const char* filepath, double position_seconds) {
+    if (!filepath || position_seconds < 1.0) return;  // ignore trivial positions
+    GetResumeCache()[filepath] = position_seconds;
+    FlushResumeCache();
+}
+
+double LoadResumePosition(const char* filepath) {
+    if (!filepath) return -1.0;
+    auto& cache = GetResumeCache();
+    auto it = cache.find(std::string(filepath));
+    if (it != cache.end()) return it->second;
+    return -1.0;
+}
+
+void ClearResumePosition(const char* filepath) {
+    if (!filepath) return;
+    GetResumeCache().erase(std::string(filepath));
+    FlushResumeCache();
+}
+
+// ============================================================
 
 namespace {
 namespace fs = std::filesystem;

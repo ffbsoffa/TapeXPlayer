@@ -23,12 +23,13 @@ public:
     static constexpr int kMaxPlayers = 5;
 
     struct PlaybackMetrics {
-        double playback_rate = 1.0;     // Signed playback rate (negative for reverse)
-        double position_seconds = 0.0;  // Current playback time
-        double duration_seconds = 0.0;  // Total duration of clip
-        double frame_rate = 25.0;       // Source frame rate (used for timing)
-        bool   is_reverse = false;      // Convenience flag for consumers
-        bool   frame_aligned = false;   // Audio snapped to frame boundary — stripe gone, render clean frame
+        double playback_rate = 1.0;          // Signed playback rate (negative for reverse)
+        double position_seconds = 0.0;       // Current playback time (includes timecode offset)
+        double duration_seconds = 0.0;       // Total duration of clip (does NOT include timecode offset)
+        double timecode_offset_seconds = 0.0;// Timecode start offset; subtract from position for file-relative time
+        double frame_rate = 25.0;            // Source frame rate (used for timing)
+        bool   is_reverse = false;           // Convenience flag for consumers
+        bool   frame_aligned = false;        // Audio snapped to frame boundary — stripe gone, render clean frame
     };
 
     struct FrameContext {
@@ -37,6 +38,8 @@ public:
         int    height = 0;
         int    frame_number = 0;
         bool   new_frame = false;   // true when a new decoded frame was submitted
+        bool   edge_fade = false;   // apply soft L/R border (after compositing, under the stripe)
+        bool   smear = false;       // apply horizontal analog smear (after compositing too)
 
         uint8_t* planes[3] = {nullptr, nullptr, nullptr};
         int      linesize[3] = {0, 0, 0};
@@ -75,6 +78,35 @@ public:
 
     void UpdatePlaybackMetrics(int player_id, const PlaybackMetrics& metrics);
     void ResetPlayer(int player_id);
+
+    // Kind of dropout burst: Gentle = soft thin form (resume-from-pause); Alternating =
+    // aggressive ↔ light each time (proxy↔full-res switches).
+    enum class DropoutKind : int { Gentle = 1, Alternating = 2 };
+
+    // Fire a one-shot dropout-compensation burst (resume-from-pause key, proxy↔full-res switch).
+    // Sets a one-shot flag (carrying the kind) consumed on the effect thread inside ApplyPixelFX.
+    void RequestDropoutBurst(int player_id, DropoutKind kind = DropoutKind::Alternating);
+
+    // True while a dropout burst is queued or still playing — lets the manager run the effect
+    // even at 1× (where it is otherwise gated off) so dropouts show at normal speed too.
+    bool HasPendingDropout(int player_id) const;
+
+    // Soft left/right edge fade (border darkening) on the luma plane. Exposed so the manager
+    // applies it on EVERY frame (incl. 1×), not only when the gated stripe effect runs — so
+    // the soft border doesn't snap sharp at normal speed. Width scales with resolution.
+    void ApplyEdgeFade(uint8_t* y_plane, int pitch, int width, int height, uint32_t format);
+
+    // Subtle horizontal analog smear (one-pole IIR per row; luma light, chroma stronger,
+    // scales with resolution). Exposed like ApplyEdgeFade so it can run post-composite (so
+    // slow-mo compositing doesn't wipe it) and at 1× via the manager.
+    void ApplyAnalogSmear(uint8_t* y_plane, int y_pitch,
+                          uint8_t* u_plane, uint8_t* v_plane, int u_pitch, int v_pitch,
+                          int width, int height, uint32_t format);
+
+    // Modest vertical luma soften (3-tap blur, blended back toward the original).
+    // Runs AFTER the grey stripe/dropout bands are composited so their hard
+    // horizontal edges read as soft SD, not razor-sharp digital. Luma only.
+    void ApplySoftEdges(uint8_t* y_plane, int y_pitch, int width, int height, uint32_t format);
 
     /**
      * Mutates the provided YUV planes in-place to mimic rewind artefacts.
@@ -208,6 +240,10 @@ private:
         bool last_new_frame = false;
         double cycle_offset = 0.0;
         std::mt19937 rng;
+        // Fast xorshift32 state for per-pixel noise. mt19937 is too heavy to call
+        // per pixel in the noise/snow/satellite loops; this gives cheap uniform noise
+        // that is visually indistinguishable. Seeded from rng in the constructor.
+        uint32_t xrng = 0x2545F491u;
 
         // Jitter control
         double jitter_phase = 0.0;
@@ -235,9 +271,27 @@ private:
         double prev_scroll_phase = 0.0;
         double smoothed_scroll_phase = 0.0;
 
+        // Wall-clock comb glide (shuttle): the visible stripe comb drifts at a constant
+        // rate in stripe-periods/second, accumulated from real elapsed time so it is
+        // independent of display refresh, content fps, scrub speed and resolution — kills
+        // the strobe/beat at integer speeds (3×, 10×, …).
+        double shuttle_comb_phase = 0.0;                          // scroll_phase accumulator [0,1)
+        std::chrono::steady_clock::time_point shuttle_comb_last_t{};
+        bool shuttle_comb_init = false;                           // false until first dt sample
+
         // Grey zone offset from center (persists during pause, changes rarely)
         double grey_zone_offset = 0.0;   // -0.2 to +0.2 (fraction of stripe height)
         bool was_slow_motion = false;    // To detect entering slow motion/pause
+
+        // === DOC (dropout-compensation) transient burst ===
+        // Line-repeat "reconstruction" of weak/lost signal, triggered on transport upsets
+        // (abrupt shuttle→stop = heavy bands; exit from pause = light frequent lines).
+        std::chrono::steady_clock::time_point doc_start;       // when the current burst began
+        int  doc_duration_ms = 0;                              // burst lifetime (wall clock)
+        bool doc_heavy = false;                                // true = aggressive bands; false = thin
+        bool doc_exit_heavy = true;                            // alternates heavy/light on switches
+        bool doc_gentle = false;                               // true = soft form (pause-exit)
+        int  doc_request = 0;                                  // one-shot kind (0 none / 1 gentle / 2 alt)
 
         // Compositing direction tracking - prevents visual "flip" on rapid direction changes
         // Only updates when a new frame actually arrives, not on playback_rate sign change
@@ -288,6 +342,8 @@ private:
     PlayerState& GetPlayerState(int player_id);
     const PlayerState& GetPlayerState(int player_id) const;
 
-    // Update hsync effect state based on playback rate (1.5x-2.2x triggers hsync loss)
-    void UpdateHsyncEffect(PlayerState& state, double abs_playback_rate, double fps);
+    // Update hsync effect state based on playback rate (1.5x-2.2x triggers hsync loss).
+    // allow_new_triggers=false lets a running animation finish but prevents new ones.
+    void UpdateHsyncEffect(PlayerState& state, double abs_playback_rate, double fps,
+                           bool allow_new_triggers = true);
 };

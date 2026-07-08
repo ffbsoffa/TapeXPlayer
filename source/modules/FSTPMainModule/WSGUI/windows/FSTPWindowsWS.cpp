@@ -3,6 +3,7 @@
 #include <SDL.h>
 #include <SDL_syswm.h>
 #include <windows.h>
+#include <mmsystem.h>
 #include <commdlg.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -23,6 +24,7 @@
 #include "../FSTPPixelBufferManager.h"
 #include "../FSTPKeyboard.h"
 #include "../FSTPMemoryLocations.h"
+#include "../FSTPWelcomeScreen.h"
 #include "FSTPWindowsWS.h"
 #include "FSTPSettingsDialog.h"
 #include "FSTPMemoryLocationsWindow.h"
@@ -692,10 +694,21 @@ int RunMainUILoop() {
         LoadFileFromPath(g_initial_file_to_load, 0);
     }
 
+    // First-run onboarding: show the Welcome overlay once per FSTP_WELCOME_VERSION.
+    if (GetWelcomeVersion() < FSTP_WELCOME_VERSION) {
+        FSTPWelcome_Show();
+        SetWelcomeVersion(FSTP_WELCOME_VERSION);
+    }
+
     // Main event loop
     bool running = true;
     SDL_Event event;
     std::thread cleanup_thread;
+
+    // Set Windows timer resolution to 1ms so SDL_WaitEventTimeout is accurate.
+    // Without this, Windows rounds delays to its default 15.6ms tick, making the
+    // event loop run at ~32Hz instead of 60Hz and causing mouse shuttle sluggishness.
+    timeBeginPeriod(1);
 
     while (running) {
         // Render frame from main thread (SDL context requirement)
@@ -747,54 +760,63 @@ int RunMainUILoop() {
             break;
         }
 
-        // Process SDL events (non-blocking)
-        while (SDL_PollEvent(&event)) {
-            // Intercept exit events and trigger graceful shutdown
-            if (event.type == SDL_QUIT) {
-                std::cout << "[EXIT] SDL_QUIT received - requesting asynchronous shutdown" << std::endl;
-                g_shutdownRequested.store(true);
-                break;
-            }
+        // Adaptive timeout: 1ms during mouse shuttle for fast response, 16ms otherwise.
+        // SDL_WaitEventTimeout wakes immediately on any event, then drains all pending
+        // events — eliminating the fixed SDL_Delay(16) overhead during active shuttle.
+        int timeout_ms = IsMouseShuttleActive() ? 1 : 16;
+        if (SDL_WaitEventTimeout(&event, timeout_ms)) {
+            do {
+                // Welcome overlay (first-run) intercepts its own clicks/keys — and
+                // Esc to dismiss — before the loop treats Esc as "quit".
+                if (FSTPWelcome_HandleEvent(&event)) { continue; }
 
-            // Check for window close event
-            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) {
-                std::cout << "[EXIT] Window close requested - requesting asynchronous shutdown" << std::endl;
-                g_shutdownRequested.store(true);
-                break;
-            }
-
-            // Check for ESC and Ctrl+Q BEFORE keyboard handler
-            if (event.type == SDL_KEYDOWN) {
-                if (event.key.keysym.sym == SDLK_ESCAPE) {
-                    std::cout << "[EXIT] ESC pressed - requesting asynchronous shutdown" << std::endl;
+                // Intercept exit events and trigger graceful shutdown
+                if (event.type == SDL_QUIT) {
+                    std::cout << "[EXIT] SDL_QUIT received - requesting asynchronous shutdown" << std::endl;
                     g_shutdownRequested.store(true);
                     break;
                 }
-                if (event.key.keysym.sym == SDLK_q && (event.key.keysym.mod & KMOD_CTRL)) {
-                    std::cout << "[EXIT] Ctrl+Q pressed - requesting asynchronous shutdown" << std::endl;
+
+                // Check for window close event
+                if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) {
+                    std::cout << "[EXIT] Window close requested - requesting asynchronous shutdown" << std::endl;
                     g_shutdownRequested.store(true);
                     break;
                 }
-            }
 
-            // Skip other event handling if we're shutting down
-            if (g_shutdownRequested.load()) break;
-
-            // Handle mouse events
-            if (event.type == SDL_MOUSEBUTTONDOWN) {
-                if (event.button.button == SDL_BUTTON_RIGHT) {
-                    // Right click shows context menu
-                    std::cout << "Right mouse button clicked, showing context menu..." << std::endl;
-                    ShowWin32ContextMenu();
-                    continue;
+                // Check for ESC and Ctrl+Q BEFORE keyboard handler
+                if (event.type == SDL_KEYDOWN) {
+                    if (event.key.keysym.sym == SDLK_ESCAPE) {
+                        std::cout << "[EXIT] ESC pressed - requesting asynchronous shutdown" << std::endl;
+                        g_shutdownRequested.store(true);
+                        break;
+                    }
+                    if (event.key.keysym.sym == SDLK_q && (event.key.keysym.mod & KMOD_CTRL)) {
+                        std::cout << "[EXIT] Ctrl+Q pressed - requesting asynchronous shutdown" << std::endl;
+                        g_shutdownRequested.store(true);
+                        break;
+                    }
                 }
-            }
 
-            // Pass events to window manager
-            HandleWindowEvents(&event);
+                // Skip other event handling if we're shutting down
+                if (g_shutdownRequested.load()) break;
 
-            // Process keyboard events for player control
-            HandleKeyboardEvents(event);
+                // Handle mouse events
+                if (event.type == SDL_MOUSEBUTTONDOWN) {
+                    if (event.button.button == SDL_BUTTON_RIGHT) {
+                        // Right click shows context menu
+                        std::cout << "Right mouse button clicked, showing context menu..." << std::endl;
+                        ShowWin32ContextMenu();
+                        continue;
+                    }
+                }
+
+                // Pass events to window manager
+                HandleWindowEvents(&event);
+
+                // Process keyboard events for player control
+                HandleKeyboardEvents(event);
+            } while (SDL_PollEvent(&event));
         }
 
         // Process Win32 message pump (required for Win32 dialogs and system integration)
@@ -803,10 +825,9 @@ int RunMainUILoop() {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
-
-        // Small delay to limit FPS
-        SDL_Delay(16); // ~60 FPS
     }
+
+    timeEndPeriod(1);
 
     std::cout << "Shutting down gracefully..." << std::endl;
 

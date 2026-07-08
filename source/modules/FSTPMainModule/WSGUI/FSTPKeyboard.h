@@ -7,7 +7,6 @@
 extern "C" {
 #endif
 
-// 1@01>B:0 A>1KB89 :;0280BC@K 8 A8AB5<K
 bool HandleKeyboardEvents(SDL_Event& event);
 void HandleNativeEvents();
 
@@ -18,6 +17,9 @@ void StopMouseShuttle();
 
 // Zoom Panning (for improved FPS during zoom movement)
 bool IsZoomPanningActive();
+
+// Mouse Shuttle state (for adaptive event loop timing)
+bool IsMouseShuttleActive();
 
 // Function declaration for window event handling
 void HandleWindowEvents(SDL_Event* event);

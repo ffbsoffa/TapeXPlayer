@@ -37,7 +37,7 @@ struct StreamFrame {
 
 class FSTPFullResDecoderV2 {
 public:
-    explicit FSTPFullResDecoderV2(const std::string& sourceFilename);
+    explicit FSTPFullResDecoderV2(const std::string& sourceFilename, double initial_time = 0.0);
     ~FSTPFullResDecoderV2();
 
     // Initialization
@@ -49,6 +49,17 @@ public:
 
     // Get frame for given time (or nullptr if not in buffer)
     std::shared_ptr<AVFrame> GetFrameForTime(double time_seconds);
+
+    // Get a CONSISTENT N-1 / N / N+1 triplet in one atomic buffer read for Betacam compositing.
+    // `now` is the buffered frame nearest now_time; `prev`/`next` are its IMMEDIATE buffer
+    // neighbours — and since the buffer holds contiguous decoded frames, those are exactly the
+    // N-1 / N+1 pictures. This replaces three independent time-queries (which, with the per-call
+    // cache + nearest matching, could return a mismatched triplet → seam spike on each new frame).
+    // Any of the three may be null at a buffer edge.
+    void GetFrameTriplet(double now_time,
+                         std::shared_ptr<AVFrame>& prev,
+                         std::shared_ptr<AVFrame>& now,
+                         std::shared_ptr<AVFrame>& next);
 
     // Get actual timestamp of last frame returned by GetFrameForTime (-1 if none)
     double GetLastFrameTime() const {
@@ -139,8 +150,14 @@ private:
     std::condition_variable cv_;
     std::mutex cv_mutex_;
 
+    // Adaptive buffer windows (calculated based on FPS)
+    // High FPS (>=50): larger windows to handle frame density
+    // Low FPS (<50): standard windows
     double buffer_window_ahead_ = 3.0;  // Decode at least 3.0 sec ahead
     double buffer_window_behind_ = 2.0; // Keep 2.0 sec behind (DO NOT aggressively remove frames!)
+    
+    // FPS-adaptive helper
+    void UpdateBufferWindowsForFPS();
 };
 
 #endif // FSTP_FULL_RES_DECODER_V2_H

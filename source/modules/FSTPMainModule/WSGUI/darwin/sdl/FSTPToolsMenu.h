@@ -22,8 +22,16 @@ void CopyScreenshotToClipboard();
 // Show Memory Locations window
 void ShowMemoryLocations();
 
-// Create new Memory Location (called from hotkeys)
+// Create new Memory Location (called from hotkeys) — opens naming dialog
 void CreateMemoryLocationAtCurrentTime();
+
+// Instantly create an auto-named Memory Location on the focused player (no dialog).
+// Pro Tools "Auto-Name Memory Locations" style — the fast path bound to Enter.
+void CreateMemoryLocationInstant();
+
+// Reload the Memory Locations window's table if it is open (after a keyboard
+// create/delete or a focus change, so it reflects the focused player's set).
+void RefreshMemoryLocationsWindowIfOpen();
 
 // Check if text field is active (for player key blocking)
 bool IsTextFieldActive();
@@ -33,6 +41,11 @@ bool IsMemoryLocationsWindowActive();
 
 // Check if Memory Location dialog is open (for player key blocking)
 bool IsMemoryLocationDialogActive();
+
+// Presentation mode
+void ShowPresentationMode();
+void TogglePresentationMode();
+bool IsPresentationModeActive();
 
 #ifdef __cplusplus
 }

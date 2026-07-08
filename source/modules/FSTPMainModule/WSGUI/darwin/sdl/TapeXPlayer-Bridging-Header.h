@@ -38,6 +38,11 @@ void GetActiveInstanceIDs(int* instance_ids, int* count);
 int IsPlayerInstanceActive(int instance_id);
 int IsVideoLoadedInInstance(int instance_id);
 
+// Presentation mode bridge (Settings UI)
+int FSTP_GetPresentationDisplayCount(void);
+const char* FSTP_GetPresentationDisplayName(int idx);
+void FSTP_ReapplyPresentationIfActive(void);
+
 // Inspector API - File Properties
 const char* GetInstanceFilePath(int instance_id);
 const char* GetInstanceFileName(int instance_id);
@@ -76,6 +81,34 @@ typedef struct {
 _Bool FSTP_GetMemoryLocationData(int index, FSTP_MemoryLocationData* out_data);
 void OnMemoryLocationDialogClosedCallback(void);
 void ShowSwiftUIMemoryLocationDialogEdit(int player_id, double current_time, int location_id);
+
+// Memory Locations window (SwiftUI) — actions used by the list view
+int GetActivePlayerID(void);
+_Bool FSTP_RecallMemoryLocation(int id, int player_id);
+_Bool FSTP_DeleteMemoryLocation(int id);
+_Bool FSTP_ExportMemoryLocationsToCSV(const char* filepath);
+_Bool FSTP_LoadMemoryLocations(const char* filepath);
+void CreateMemoryLocationAtCurrentTime(void);
+
+// Keyboard bindings (Settings ▸ Keyboard)
+#define FSTP_MOD_SHIFT 1
+#define FSTP_MOD_CTRL  2
+#define FSTP_MOD_ALT   4
+int  FSTP_KB_GetActionCount(void);
+int  FSTP_KB_GetActionIdByIndex(int index);
+const char* FSTP_KB_GetActionName(int action_id);
+const char* FSTP_KB_GetActionGroup(int action_id);
+int  FSTP_KB_IsActionEditable(int action_id);
+int  FSTP_KB_GetKeycode(int action_id);
+int  FSTP_KB_GetMods(int action_id);
+int  FSTP_KB_GetDefaultKeycode(int action_id);
+int  FSTP_KB_GetDefaultMods(int action_id);
+const char* FSTP_KB_GetKeyName(int keycode);
+int  FSTP_KB_SetBinding(int action_id, int keycode, int mods, int* out_conflict_action);
+void FSTP_KB_ResetToDefaults(void);
+int  FSTP_KB_MacKeyToSDL(int mac_keycode, int unicode_char);
+void FSTP_KB_Save(void);
+void FSTP_KB_Load(void);
 
 // Zoom API
 typedef struct {

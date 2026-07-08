@@ -92,6 +92,29 @@ private:
     std::array<FSTPBetacamEffect::PlaybackMetrics, MAX_PLAYERS> m_playback_metrics{};
     std::array<EffectScratch, MAX_PLAYERS> m_effect_scratch{};
     std::array<int, MAX_PLAYERS> m_last_effect_frame{};
+    std::array<int, MAX_PLAYERS> m_last_full_res{};   // last frame proxy(≤480)/full-res(>480), -1=unknown
+    std::array<int, MAX_PLAYERS> m_last_shuttle{};    // last frame shuttle(≥2×)/not, -1=unknown
+
+    // --- Film grain: subtle chroma + lighter luma noise over the whole displayed image ---
+    // Precomputed soft (bilinear) grain tile, sized from a 576p base; added in one cheap pass
+    // at texture-update rate (no per-pixel RNG per frame → minimal CPU).
+    struct GrainTile {
+        int width = 0, height = 0;        // frame dims this tile was built for
+        int lumaW = 0, lumaH = 0;         // luma tile dims (frame + pad)
+        int chromaW = 0, chromaH = 0;     // chroma tile dims (half + pad)
+        std::vector<int8_t> luma;         // signed luma grain, lumaW*lumaH
+        std::vector<int8_t> chromaUV;     // interleaved U,V signed grain, chromaW*chromaH*2
+    };
+    std::array<GrainTile, MAX_PLAYERS> m_grain{};
+    std::array<uint32_t, MAX_PLAYERS> m_grain_phase{};  // xorshift phase for per-frame scroll offset
+    bool m_grain_enabled = true;
+    bool m_edgefade_enabled = true;   // soft L/R border on every frame (incl. 1×)
+    bool m_smear_enabled = true;      // subtle horizontal analog smear (limited bandwidth)
+    void EnsureGrainTile(int player_id, int width, int height);
+    void ApplyFilmGrain(int player_id, uint8_t* y_plane, int y_pitch,
+                        uint8_t* u_plane, uint8_t* v_plane, int u_pitch, int v_pitch,
+                        int width, int height, uint32_t format);
+    // (ApplyAnalogSmear moved to FSTPBetacamEffect — must run post-composite.)
 
 public:
     FSTPPixelBufferManager();
@@ -169,6 +192,39 @@ public:
      * @brief Check if Betacam effect is enabled.
      */
     bool IsBetacamEffectEnabled() const { return m_betacam_effect.IsEnabled(); }
+
+    // Always-on baseline Betacam elements (analog smear + soft L/R edge fade). These are normally
+    // applied inside ApplyPixelFX (via FrameContext.smear / .edge_fade); presentation output reads
+    // these flags to mirror them, and uses ApplyBaselineSmearEdgeFade() when the per-speed effect
+    // did not run (e.g. at 1×) so the presentation screen carries the FULL Betacam look.
+    bool IsSmearEnabled() const { return m_smear_enabled; }
+    bool IsEdgeFadeEnabled() const { return m_edgefade_enabled; }
+    void ApplyBaselineSmearEdgeFade(uint8_t* y, int y_pitch, uint8_t* u, uint8_t* v,
+                                    int u_pitch, int v_pitch, int width, int height, Uint32 format);
+
+    /**
+     * @brief Fire a one-shot Betacam dropout-compensation burst (resume-from-pause = gentle form).
+     */
+    void TriggerDropoutBurst(int player_id) {
+        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Gentle);
+    }
+
+    /**
+     * @brief True while a dropout burst is queued/active — render loop uses this to bypass
+     *        the FPS-saving throttles so the dropout shows smoothly (even at 1×).
+     */
+    bool HasPendingDropout(int player_id) const { return m_betacam_effect.HasPendingDropout(player_id); }
+
+    /**
+     * @brief True when film grain is being applied — the render loop uses this to run at full
+     *        rate so the grain animates at ~60fps instead of the 25fps timestamp adaptation.
+     */
+    bool IsFilmGrainActive() const { return m_grain_enabled && m_betacam_effect.IsEnabled(); }
+
+    /**
+     * @brief Expose Betacam pixel effect for external rendering (e.g. presentation mode).
+     */
+    bool ApplyPixelFX(int player_id, FSTPBetacamEffect::FrameContext& ctx);
 
     /**
      * @brief Apply render-time jitter adjustments for Betacam effect.

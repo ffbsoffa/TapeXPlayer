@@ -2,6 +2,8 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <uxtheme.h>
+#include <dwmapi.h>
 #include <iostream>
 #include <string>
 #include <cmath>
@@ -9,6 +11,8 @@
 #include "FSTPMemoryLocationsWindow.h"
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 #define IDI_APPICON 101
 
@@ -20,21 +24,55 @@ extern "C" double GetInstanceVideoFPS(int player_id);
 // Global window state
 static HWND g_memory_window = NULL;
 static HWND g_listview = NULL;
+static HWND g_subtitle_label = NULL;   // "Player N · X markers" (as on macOS)
 static UINT_PTR g_refresh_timer = 0;
+
+// ── Styling in the spirit of FSTPSettingsDialog: Segoe UI, white content, grey
+//    hints, a divider above the bottom bar. Without this the window looked like
+//    Win95: DEFAULT_GUI_FONT + gridlines + a sunken 3D border.
+static HFONT g_mlFontNormal = NULL;
+static HFONT g_mlFontSmall  = NULL;
+static HBRUSH g_mlBgBrush   = NULL;
+static const COLORREF ML_CLR_BG      = RGB(255, 255, 255);
+static const COLORREF ML_CLR_TEXT    = RGB(30, 30, 30);
+static const COLORREF ML_CLR_HINT    = RGB(120, 120, 120);
+static const COLORREF ML_CLR_DIVIDER = RGB(220, 220, 220);
+static const int ML_HEADER_H = 34;   // subtitle strip above the table
+static const int ML_FOOTER_H = 46;   // bottom bar with buttons
 
 // Control IDs
 #define IDC_LISTVIEW       2001
 #define IDC_EXPORT_BTN     2002
 #define IDC_INFO_LABEL     2003
+#define IDC_IMPORT_BTN     2004
+#define IDC_SUBTITLE_LABEL 2005
 #define IDM_TIMER_REFRESH  3001
 
-// ListView columns
+// ListView columns (mirror the macOS table: # / Timecode / Name / Comments)
 enum {
     COL_ID = 0,
     COL_TIMECODE,
     COL_NAME,
+    COL_COMMENTS,
     NUM_COLS
 };
+
+// Fonts/brush are created lazily: the add-marker dialog can open from the
+// keyboard (Enter) before the main Memory Locations window.
+static void EnsureMLFontsAndBrush() {
+    if (!g_mlFontNormal) {
+        HDC screen = GetDC(NULL);
+        int dpiY = GetDeviceCaps(screen, LOGPIXELSY);
+        ReleaseDC(NULL, screen);
+        g_mlFontNormal = CreateFontW(-MulDiv(10, dpiY, 72), 0, 0, 0, FW_NORMAL,
+            FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        g_mlFontSmall = CreateFontW(-MulDiv(9, dpiY, 72), 0, 0, 0, FW_NORMAL,
+            FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    }
+    if (!g_mlBgBrush) g_mlBgBrush = CreateSolidBrush(ML_CLR_BG);
+}
 
 // Helper: Convert UTF-8 to wide string
 static std::wstring Utf8ToWide(const char* utf8) {
@@ -62,6 +100,20 @@ static void RefreshMemoryLocationsTable() {
 
     int count = FSTP_GetMemoryLocationsCount();
 
+    // Subtitle: player + count (also the empty-state hint).
+    if (g_subtitle_label) {
+        wchar_t sub[160];
+        if (count == 0) {
+            swprintf(sub, 160, L"No markers — press Enter during playback to add one");
+        } else {
+            int player = GetActivePlayerID();
+            swprintf(sub, 160, L"Player %d  ·  %d %s",
+                     (player >= 0 ? player + 1 : 1), count,
+                     count == 1 ? L"marker" : L"markers");
+        }
+        SetWindowTextW(g_subtitle_label, sub);
+    }
+
     for (int i = 0; i < count; i++) {
         FSTP_MemoryLocationData data;
         if (FSTP_GetMemoryLocationData(i, &data)) {
@@ -86,6 +138,12 @@ static void RefreshMemoryLocationsTable() {
             std::wstring name = Utf8ToWide(data.name);
             lvi.iSubItem = COL_NAME;
             lvi.pszText = (LPWSTR)name.c_str();
+            SendMessageW(g_listview, LVM_SETITEMW, 0, (LPARAM)&lvi);
+
+            // Comments
+            std::wstring comments = Utf8ToWide(data.comments);
+            lvi.iSubItem = COL_COMMENTS;
+            lvi.pszText = (LPWSTR)comments.c_str();
             SendMessageW(g_listview, LVM_SETITEMW, 0, (LPARAM)&lvi);
         }
     }
@@ -125,6 +183,24 @@ static void OnExportToCSV() {
     }
 }
 
+// Import from a Memory Locations file
+static void OnImport() {
+    wchar_t filepath[MAX_PATH] = L"";
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_memory_window;
+    ofn.lpstrFilter = L"Memory Locations (*.csv;*.json;*.txt)\0*.csv;*.json;*.txt\0All Files\0*.*\0";
+    ofn.lpstrFile = filepath;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"Import Memory Locations";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (GetOpenFileNameW(&ofn)) {
+        std::string utf8_path = WideToUtf8(filepath);
+        FSTP_LoadMemoryLocations(utf8_path.c_str());
+        RefreshMemoryLocationsTable();
+    }
+}
+
 // Get location ID from a specific ListView row (by index, not selection state)
 static int GetLocationIDFromRow(int row) {
     if (row < 0 || !g_listview) return -1;
@@ -145,20 +221,51 @@ static LRESULT CALLBACK MemoryLocationsProc(HWND hwnd, UINT msg, WPARAM wParam, 
         case WM_SIZE: {
             int width = LOWORD(lParam);
             int height = HIWORD(lParam);
-            // Resize ListView to fill window (leaving space for bottom bar)
-            if (g_listview) {
-                SetWindowPos(g_listview, NULL, 0, 0, width, height - 40, SWP_NOZORDER);
+            // Subtitle on top, table in the middle, button bar at the bottom.
+            if (g_subtitle_label) {
+                SetWindowPos(g_subtitle_label, NULL, 12, 9, width - 24, 18, SWP_NOZORDER);
             }
-            // Reposition bottom bar controls
+            if (g_listview) {
+                SetWindowPos(g_listview, NULL, 0, ML_HEADER_H,
+                             width, height - ML_HEADER_H - ML_FOOTER_H, SWP_NOZORDER);
+            }
             HWND hExport = GetDlgItem(hwnd, IDC_EXPORT_BTN);
             if (hExport) {
-                SetWindowPos(hExport, NULL, width - 140, height - 35, 130, 28, SWP_NOZORDER);
+                SetWindowPos(hExport, NULL, width - 142, height - ML_FOOTER_H + 9, 130, 28, SWP_NOZORDER);
+            }
+            HWND hImport = GetDlgItem(hwnd, IDC_IMPORT_BTN);
+            if (hImport) {
+                SetWindowPos(hImport, NULL, width - 282, height - ML_FOOTER_H + 9, 130, 28, SWP_NOZORDER);
             }
             HWND hInfo = GetDlgItem(hwnd, IDC_INFO_LABEL);
             if (hInfo) {
-                SetWindowPos(hInfo, NULL, 5, height - 30, width - 160, 20, SWP_NOZORDER);
+                SetWindowPos(hInfo, NULL, 12, height - ML_FOOTER_H + 14, width - 300, 18, SWP_NOZORDER);
             }
+            InvalidateRect(hwnd, NULL, TRUE);
             return 0;
+        }
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            // Thin divider above the bottom bar (like CLR_DIVIDER in Settings).
+            RECT div = { 0, rc.bottom - ML_FOOTER_H, rc.right, rc.bottom - ML_FOOTER_H + 1 };
+            HBRUSH divBrush = CreateSolidBrush(ML_CLR_DIVIDER);
+            FillRect(hdc, &div, divBrush);
+            DeleteObject(divBrush);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_CTLCOLORSTATIC: {
+            // White background under statics; subtitle and hint are grey.
+            HDC hdc = (HDC)wParam;
+            SetBkColor(hdc, ML_CLR_BG);
+            SetTextColor(hdc, ((HWND)lParam == g_subtitle_label) ? ML_CLR_TEXT : ML_CLR_HINT);
+            if (!g_mlBgBrush) g_mlBgBrush = CreateSolidBrush(ML_CLR_BG);
+            return (LRESULT)g_mlBgBrush;
         }
 
         case WM_TIMER:
@@ -220,8 +327,9 @@ static LRESULT CALLBACK MemoryLocationsProc(HWND hwnd, UINT msg, WPARAM wParam, 
         }
 
         case WM_COMMAND:
-            if (LOWORD(wParam) == IDC_EXPORT_BTN && HIWORD(wParam) == BN_CLICKED) {
-                OnExportToCSV();
+            if (HIWORD(wParam) == BN_CLICKED) {
+                if (LOWORD(wParam) == IDC_EXPORT_BTN) OnExportToCSV();
+                else if (LOWORD(wParam) == IDC_IMPORT_BTN) OnImport();
             }
             break;
 
@@ -237,6 +345,7 @@ static LRESULT CALLBACK MemoryLocationsProc(HWND hwnd, UINT msg, WPARAM wParam, 
             }
             g_memory_window = NULL;
             g_listview = NULL;
+            g_subtitle_label = NULL;
             return 0;
     }
 
@@ -249,6 +358,9 @@ static void CreateMemoryLocationsWindow() {
 
     std::cout << "Creating Memory Locations window..." << std::endl;
 
+    // Segoe UI fonts (like FSTPSettingsDialog) — instead of DEFAULT_GUI_FONT
+    EnsureMLFontsAndBrush();
+
     // Register window class
     static bool class_registered = false;
     if (!class_registered) {
@@ -259,7 +371,7 @@ static void CreateMemoryLocationsWindow() {
         wc.hInstance = hInst;
         wc.lpszClassName = L"FSTPMemoryLocationsClass";
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hbrBackground = g_mlBgBrush;  // white content instead of grey COLOR_BTNFACE
         wc.hIcon   = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
                                        IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
         wc.hIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
@@ -275,7 +387,7 @@ static void CreateMemoryLocationsWindow() {
         L"Memory Locations",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        700, 400,
+        720, 430,
         NULL, NULL,
         GetModuleHandle(NULL), NULL
     );
@@ -285,26 +397,36 @@ static void CreateMemoryLocationsWindow() {
         return;
     }
 
-    HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-
     // Initialize Common Controls
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
     icex.dwICC = ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icex);
 
-    // Create ListView
+    // Subtitle above the table ("Player N · X markers")
+    g_subtitle_label = CreateWindowExW(0, L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
+        12, 9, 690, 18,
+        g_memory_window, (HMENU)IDC_SUBTITLE_LABEL, NULL, NULL);
+    SendMessage(g_subtitle_label, WM_SETFONT, (WPARAM)g_mlFontNormal, TRUE);
+
+    // Create ListView — flat, no 3D border or gridlines, with the Explorer theme
     g_listview = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
+        0,
         WC_LISTVIEWW, L"",
         WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-        0, 0, 700, 360,
+        0, ML_HEADER_H, 720, 430 - ML_HEADER_H - ML_FOOTER_H,
         g_memory_window,
         (HMENU)IDC_LISTVIEW,
         GetModuleHandle(NULL), NULL
     );
-    SendMessage(g_listview, WM_SETFONT, (WPARAM)hFont, TRUE);
-    ListView_SetExtendedListViewStyle(g_listview, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    SendMessage(g_listview, WM_SETFONT, (WPARAM)g_mlFontNormal, TRUE);
+    ListView_SetExtendedListViewStyle(g_listview,
+        LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    SetWindowTheme(g_listview, L"Explorer", NULL);  // modern row selection
+    ListView_SetBkColor(g_listview, ML_CLR_BG);
+    ListView_SetTextBkColor(g_listview, ML_CLR_BG);
+    ListView_SetTextColor(g_listview, ML_CLR_TEXT);
 
     // Add columns
     LVCOLUMNW lvc = {};
@@ -321,25 +443,36 @@ static void CreateMemoryLocationsWindow() {
     lvc.pszText = (LPWSTR)L"Timecode";
     SendMessageW(g_listview, LVM_INSERTCOLUMNW, COL_TIMECODE, (LPARAM)&lvc);
 
-    // Name column (auto-expand)
-    lvc.cx = 500;
+    // Name column
+    lvc.cx = 200;
     lvc.pszText = (LPWSTR)L"Name";
     SendMessageW(g_listview, LVM_INSERTCOLUMNW, COL_NAME, (LPARAM)&lvc);
 
-    // Bottom bar: Export button
+    // Comments column
+    lvc.cx = 300;
+    lvc.pszText = (LPWSTR)L"Comments";
+    SendMessageW(g_listview, LVM_INSERTCOLUMNW, COL_COMMENTS, (LPARAM)&lvc);
+
+    // Bottom bar: Import + Export buttons
     HWND hExport = CreateWindowExW(0, L"BUTTON", L"Export to CSV",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        560, 365, 130, 28,
+        578, 393, 130, 28,
         g_memory_window, (HMENU)IDC_EXPORT_BTN, NULL, NULL);
-    SendMessage(hExport, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessage(hExport, WM_SETFONT, (WPARAM)g_mlFontNormal, TRUE);
 
-    // Info label
+    HWND hImport = CreateWindowExW(0, L"BUTTON", L"Import…",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        438, 393, 130, 28,
+        g_memory_window, (HMENU)IDC_IMPORT_BTN, NULL, NULL);
+    SendMessage(hImport, WM_SETFONT, (WPARAM)g_mlFontNormal, TRUE);
+
+    // Info label (grey hint in the bottom bar)
     HWND hInfo = CreateWindowExW(0, L"STATIC",
-        L"Double-click: Recall | Ctrl+Click: Edit | Alt+Click: Delete",
-        WS_CHILD | WS_VISIBLE,
-        5, 370, 550, 20,
+        L"Double-click: Recall   ·   Ctrl+Click: Edit   ·   Alt+Click: Delete",
+        WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
+        12, 398, 410, 18,
         g_memory_window, (HMENU)IDC_INFO_LABEL, NULL, NULL);
-    SendMessage(hInfo, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessage(hInfo, WM_SETFONT, (WPARAM)g_mlFontSmall, TRUE);
 
     // Start auto-refresh timer (100ms interval, like macOS/Linux)
     g_refresh_timer = SetTimer(g_memory_window, IDM_TIMER_REFRESH, 100, NULL);
@@ -351,6 +484,13 @@ static void CreateMemoryLocationsWindow() {
 void ShowWin32MemoryLocationsWindow() {
     std::cout << "ShowWin32MemoryLocationsWindow called" << std::endl;
 
+    // Don't create the window without a loaded file: markers are tied to the
+    // material, an empty window is just confusing.
+    if (!FSTP_IsAnyPlayerActive()) {
+        std::cout << "Memory Locations: no file loaded, window not shown" << std::endl;
+        return;
+    }
+
     // Initialize Memory Locations system
     FSTP_InitMemoryLocations();
 
@@ -358,6 +498,20 @@ void ShowWin32MemoryLocationsWindow() {
     if (!g_memory_window) {
         CreateMemoryLocationsWindow();
     }
+
+    // Dark title bar following the system theme — same trick as FSTPSettingsDialog.
+    BOOL darkMode = FALSE;
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD val = 1, sz = sizeof(val);
+        RegQueryValueExW(hKey, L"AppsUseLightTheme", nullptr, nullptr, (LPBYTE)&val, &sz);
+        RegCloseKey(hKey);
+        darkMode = (val == 0) ? TRUE : FALSE;
+    }
+    DwmSetWindowAttribute(g_memory_window, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
+                          &darkMode, sizeof(darkMode));
 
     // Show window
     ShowWindow(g_memory_window, SW_SHOW);
@@ -411,6 +565,15 @@ static AddEditDialogState g_edit_state;
 // Add/Edit dialog procedure
 static LRESULT CALLBACK AddEditDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_CTLCOLORSTATIC: {
+            // White background under labels — consistent with Settings and the main window.
+            HDC hdc = (HDC)wParam;
+            SetBkColor(hdc, ML_CLR_BG);
+            SetTextColor(hdc, ML_CLR_TEXT);
+            if (!g_mlBgBrush) g_mlBgBrush = CreateSolidBrush(ML_CLR_BG);
+            return (LRESULT)g_mlBgBrush;
+        }
+
         case WM_COMMAND: {
             int id = LOWORD(wParam);
 
@@ -540,6 +703,7 @@ static void ShowAddEditMemoryLocationDialog(int player_id, int location_id, doub
     }
 
     // Register window class
+    EnsureMLFontsAndBrush();
     static bool class_registered = false;
     if (!class_registered) {
         HINSTANCE hInst = GetModuleHandle(NULL);
@@ -549,7 +713,7 @@ static void ShowAddEditMemoryLocationDialog(int player_id, int location_id, doub
         wc.hInstance = hInst;
         wc.lpszClassName = L"FSTPMemLocEditClass";
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hbrBackground = g_mlBgBrush;  // white, Settings style
         wc.hIcon   = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
                                        IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
         wc.hIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APPICON),
@@ -572,7 +736,7 @@ static void ShowAddEditMemoryLocationDialog(int player_id, int location_id, doub
 
     if (!hwnd) return;
 
-    HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HFONT hFont = g_mlFontNormal;  // Segoe UI, not DEFAULT_GUI_FONT
     int y = 15;
 
     // Number/ID field

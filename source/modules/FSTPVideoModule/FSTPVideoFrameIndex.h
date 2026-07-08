@@ -6,6 +6,7 @@
 #include <mutex>
 #include <thread>
 #include <future>
+#include <memory>  // std::shared_ptr — libc++ (clang) does not pull it in transitively
 
 extern "C" {
 #include <libavformat/avformat.h>

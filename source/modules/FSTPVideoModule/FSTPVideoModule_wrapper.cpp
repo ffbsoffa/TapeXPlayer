@@ -22,6 +22,7 @@
 #include <utility>
 #include <map>
 #include <mutex>
+#include <thread>
 
 extern "C" {
 #include <libswscale/swscale.h>
@@ -32,14 +33,24 @@ extern "C" {
 extern FSTPHardwareDetection* g_hardware_detection;
 
 // Global registry for video module instances (for frame update notifications)
-static std::map<int, FSTPVideoModuleWrapper*> g_video_instances;
-static std::mutex g_instances_mutex;
+// Heap-allocated to prevent static destruction order fiasco:
+// LowCachedDecoderManager decode threads may still be running when static
+// globals are destroyed during program exit, causing "mutex lock failed: EINVAL".
+static std::map<int, FSTPVideoModuleWrapper*>& GetVideoInstances() {
+    static std::map<int, FSTPVideoModuleWrapper*>* instances =
+        new std::map<int, FSTPVideoModuleWrapper*>();
+    return *instances;
+}
+static std::mutex& GetInstancesMutex() {
+    static std::mutex* mtx = new std::mutex();
+    return *mtx;
+}
 
 // Global function to notify video module about frame update
 void NotifyVideoFrameUpdate(int instance_id) {
-    std::lock_guard<std::mutex> lock(g_instances_mutex);
-    auto it = g_video_instances.find(instance_id);
-    if (it != g_video_instances.end() && it->second) {
+    std::lock_guard<std::mutex> lock(GetInstancesMutex());
+    auto it = GetVideoInstances().find(instance_id);
+    if (it != GetVideoInstances().end() && it->second) {
         it->second->RequestFrameUpdate();
     }
 }
@@ -72,8 +83,8 @@ FSTPVideoModuleWrapper::FSTPVideoModuleWrapper()
 FSTPVideoModuleWrapper::~FSTPVideoModuleWrapper() {
     // Unregister from global instance map
     if (m_instance_id >= 0) {
-        std::lock_guard<std::mutex> lock(g_instances_mutex);
-        g_video_instances.erase(m_instance_id);
+        std::lock_guard<std::mutex> lock(GetInstancesMutex());
+        GetVideoInstances().erase(m_instance_id);
     }
 
     if (m_initialized) {
@@ -103,11 +114,11 @@ void FSTPVideoModuleWrapper::Shutdown() {
     m_initialized = false;
 }
 
-bool FSTPVideoModuleWrapper::EnsureProxy(const std::string& filepath, const std::function<void(int)>& progressCallback) {
+FSTPVideoModuleWrapper::ProxyState FSTPVideoModuleWrapper::ProbeProxy(const std::string& filepath) {
     fs::path sourcePath(filepath);
     if (!fs::exists(sourcePath)) {
         std::cerr << "[VIDEO] Source file does not exist: " << filepath << std::endl;
-        return false;
+        return ProxyState::Error;
     }
 
     // Check resolution, codec and GOP of original video
@@ -179,22 +190,41 @@ bool FSTPVideoModuleWrapper::EnsureProxy(const std::string& filepath, const std:
             std::cout << "[VIDEO] Found existing proxy (original): " << m_proxy_path << std::endl;
         }
 
-        if (progressCallback) {
-            progressCallback(100);
-        }
-        return true;
+        return ProxyState::Ready;
     }
 
     // Normal logic - proxy conversion
     m_use_original_as_proxy = false;
 
-    // Check if proxy already exists
+    // Check if proxy already exists — but only trust it if its manifest still matches the
+    // source. A bare existence check reused stale/gappy proxies from older builds (the gaps
+    // showed as "empty slots" and jumped on playback). Invalid → delete and regenerate.
     if (fs::exists(m_proxy_path)) {
-        std::cout << "[VIDEO] Found existing proxy: " << m_proxy_path << std::endl;
-        if (progressCallback) {
-            progressCallback(100);
+        if (FSTP::LowResDecoder::isCachedProxyValid(m_proxy_path, filepath)) {
+            std::cout << "[VIDEO] Found existing proxy: " << m_proxy_path << std::endl;
+            return ProxyState::Ready;
         }
-        return true;
+        std::cout << "♻️  [VIDEO] Cached proxy failed manifest check — regenerating: "
+                  << m_proxy_path << std::endl;
+        std::error_code ec;
+        fs::remove(m_proxy_path, ec);
+        fs::remove(m_proxy_path + ".meta", ec);
+    }
+
+    return ProxyState::NeedsConversion;
+}
+
+// Blocking probe + convert. Only used when instant start is impossible (no V2 decoder on this
+// hardware profile) — the normal path defers the conversion to BackgroundProxyConversion.
+bool FSTPVideoModuleWrapper::EnsureProxy(const std::string& filepath, const std::function<void(int)>& progressCallback) {
+    switch (ProbeProxy(filepath)) {
+        case ProxyState::Ready:
+            if (progressCallback) progressCallback(100);
+            return true;
+        case ProxyState::Error:
+            return false;
+        case ProxyState::NeedsConversion:
+            break;
     }
 
     std::cout << "[VIDEO] Proxy not found. Converting " << filepath << " -> " << m_proxy_path << std::endl;
@@ -209,13 +239,73 @@ bool FSTPVideoModuleWrapper::EnsureProxy(const std::string& filepath, const std:
     return true;
 }
 
-bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
+// TAPE THREADING: runs on a detached thread. Converts the proxy, then — if the instance
+// still exists and hasn't loaded a different file since (generation check) — publishes the
+// proxy decoder. Deliberately static and without `this`: the wrapper may be unloaded,
+// reloaded or destroyed while ffmpeg runs; the instance registry + load generation decide
+// whether the result is still wanted. A dropped result is not wasted — the converted proxy
+// stays in the cache and the next open of this file picks it up instantly.
+void FSTPVideoModuleWrapper::BackgroundProxyConversion(int instance_id, uint32_t generation,
+                                                       std::string filepath) {
+    std::cout << "[VIDEO] 🧵 Background proxy conversion started (instance " << instance_id
+              << "): " << filepath << std::endl;
+
+    auto progress = [instance_id](int percent) {
+        UpdateOSDProxyThreading(instance_id, percent);
+    };
+
+    std::string generatedProxy;
+    bool converted = FSTP::LowResDecoder::convertToLowRes(filepath, generatedProxy, progress);
+
+    // Publication (or disposal) happens under the registry mutex: UnloadFile bumps the
+    // generation under this same mutex, so a stale conversion can never install itself
+    // into a wrapper that has moved on to another file.
+    std::lock_guard<std::mutex> lock(GetInstancesMutex());
+    UpdateOSDProxyThreading(instance_id, -1);
+
+    auto it = GetVideoInstances().find(instance_id);
+    if (it == GetVideoInstances().end() || !it->second) {
+        std::cout << "[VIDEO] 🧵 Instance " << instance_id << " gone — dropping proxy result" << std::endl;
+        return;
+    }
+    FSTPVideoModuleWrapper* self = it->second;
+    if (self->m_load_generation.load() != generation) {
+        std::cout << "[VIDEO] 🧵 Load generation changed — dropping proxy result" << std::endl;
+        return;
+    }
+    if (!converted) {
+        std::cerr << "[VIDEO] 🧵 Background proxy conversion FAILED — staying on full-res decoder "
+                     "(shuttle remains limited)" << std::endl;
+        return;
+    }
+
+    self->m_proxy_path = generatedProxy;
+    if (!self->SetupProxyDecoder()) {
+        std::cerr << "[VIDEO] 🧵 Proxy decoder setup failed after conversion — staying on full-res" << std::endl;
+        return;
+    }
+    self->m_proxy_ready.store(true, std::memory_order_release);
+    self->RequestFrameUpdate();
+    std::cout << "[VIDEO] 🧵 ✅ Tape threaded — proxy decoder online, shuttle unlocked (instance "
+              << instance_id << ")" << std::endl;
+}
+
+bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath, double initial_time) {
     if (!m_initialized) {
         std::cerr << "[VIDEO] Module not initialized." << std::endl;
         return false;
     }
 
     const int osdPlayerId = (m_instance_id >= 0 ? m_instance_id : 0);
+
+    // Proxy↔original frame offset is now structurally 0: the proxy is frame-exact and Stage-2
+    // on-demand decode shows the EXACT current frame. Force offset 0 and mark "calibrated" so the
+    // old luma-signature auto-calibration never runs — it could mis-lock ±1 (especially when V2 was
+    // shown a frame off via the loose sync tolerance) and that lock was the proxy→full-res shift.
+    m_proxy_frame_offset.store(0);
+    m_proxy_offset_calibrated = true;   // disabled: offset is exact by construction
+    m_proxy_calib_candidate = 99;
+    m_proxy_calib_count = 0;
 
     // If file already loaded - set reload flag
     if (m_loaded) {
@@ -233,29 +323,16 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
     }
 
     m_current_file = filepath;
+    // Fresh load: no proxy decoder published yet (UnloadFile also clears this; the first
+    // load and failed-load retries land here without an unload).
+    m_proxy_ready.store(false, std::memory_order_release);
 
-    // Phase 1: Proxy conversion (0-50%)
-    SetPlayerLoadingStatus(osdPlayerId, "proxy");
-    SetPlayerLoadingProgress(osdPlayerId, 0);  // Ensure 0% at start
+    // Phase 1: Indexing (0-25%) — built from the ORIGINAL file, no proxy required.
+    // (Used to run AFTER the proxy conversion; moved first so playback can start
+    // before the proxy exists — see TAPE THREADING below.)
+    SetPlayerLoadingStatus(osdPlayerId, "indexing");
+    SetPlayerLoadingProgress(osdPlayerId, 0);
     UpdateOSDLoadingProgress(osdPlayerId, 0);
-
-    auto proxyProgress = [playerId = osdPlayerId](int percent) {
-        int scaledPercent = percent / 2;  // 0-100 -> 0-50
-        SetPlayerLoadingProgress(playerId, scaledPercent);
-        UpdateOSDLoadingProgress(playerId, scaledPercent);
-    };
-
-    if (!EnsureProxy(filepath, proxyProgress)) {
-        SetPlayerLoadingProgress(osdPlayerId, 0);
-        SetPlayerLoadingState(osdPlayerId, false);
-        m_file_reloading.store(false);
-        return false;
-    }
-
-    // Phase 2: Indexing (50-75%)
-    SetPlayerLoadingStatus(osdPlayerId, "indexing");  // FIX: Set status "indexing"
-    SetPlayerLoadingProgress(osdPlayerId, 50);
-    UpdateOSDLoadingProgress(osdPlayerId, 50);
 
     if (!m_frame_index) {
         m_frame_index = std::make_unique<FSTPSimpleVideoIndex>();
@@ -270,39 +347,8 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
         return false;
     }
 
-    SetPlayerLoadingProgress(osdPlayerId, 75);
-    UpdateOSDLoadingProgress(osdPlayerId, 75);
-
-    // HALF-FPS PROXY DETECTION: Check if proxy is 30fps from 60fps original
-    // Compare original FPS (from m_frame_index) with proxy FPS (from m_proxy_path)
-    double original_fps = m_frame_index->GetFrameRate();
-    m_is_half_fps_proxy = false;
-
-    if (!m_use_original_as_proxy && !m_proxy_path.empty()) {
-        // Open proxy file to check its FPS
-        AVFormatContext* proxy_fmt = nullptr;
-        if (avformat_open_input(&proxy_fmt, m_proxy_path.c_str(), nullptr, nullptr) == 0) {
-            if (avformat_find_stream_info(proxy_fmt, nullptr) >= 0) {
-                int video_stream_idx = av_find_best_stream(proxy_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-                if (video_stream_idx >= 0) {
-                    AVStream* stream = proxy_fmt->streams[video_stream_idx];
-                    if (stream->r_frame_rate.den > 0) {
-                        double proxy_fps = static_cast<double>(stream->r_frame_rate.num) / stream->r_frame_rate.den;
-
-                        // Detect half-FPS: original 55-65fps, proxy 25-35fps (accounting for variations)
-                        if (original_fps >= 55.0 && original_fps <= 65.0 &&
-                            proxy_fps >= 25.0 && proxy_fps <= 35.0) {
-                            m_is_half_fps_proxy = true;
-                            std::cout << "🎯 [HALF-FPS PROXY] Detected: original " << std::fixed << std::setprecision(2)
-                                      << original_fps << " fps, proxy " << proxy_fps << " fps" << std::endl;
-                            std::cout << "                     Creating separate half-size index to avoid EMPTY slots" << std::endl;
-                        }
-                    }
-                }
-            }
-            avformat_close_input(&proxy_fmt);
-        }
-    }
+    SetPlayerLoadingProgress(osdPlayerId, 25);
+    UpdateOSDLoadingProgress(osdPlayerId, 25);
 
     // CRITICAL: Initialize m_frames pointer if needed (leak on exit acceptable)
     if (!m_frames) {
@@ -312,18 +358,7 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
     m_frames->clear();
     m_frames->resize(m_frame_index->GetTotalFrames());
 
-    // HALF-FPS PROXY: Create separate index with half size
-    if (m_is_half_fps_proxy) {
-        if (!m_half_fps_frames) {
-            m_half_fps_frames = new std::vector<FSTP::FrameInfo>();
-        }
-        size_t half_size = (m_frame_index->GetTotalFrames() + 1) / 2; // Round up
-        m_half_fps_frames->clear();
-        m_half_fps_frames->resize(half_size);
-        std::cout << "🎯 [HALF-FPS INDEX] Created " << half_size << " slots (main index: "
-                  << m_frames->size() << " slots)" << std::endl;
-    }
-    
+
     // Initialize time_ms and keyframe info from original video index for seeking reference
     // LowResDecoder will update time_ms with actual proxy file timing during decode
     for (size_t i = 0; i < m_frames->size(); ++i) {
@@ -349,31 +384,6 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
         }
     }
 
-    // HALF-FPS PROXY: Initialize half-fps index with every second frame's metadata
-    if (m_is_half_fps_proxy && m_half_fps_frames) {
-        for (size_t i = 0; i < m_half_fps_frames->size(); ++i) {
-            // Map half-fps index to original: i → 2*i
-            size_t orig_idx = i * 2;
-            if (orig_idx < m_frames->size()) {
-                const SimpleFrameInfo* frame_info = m_frame_index->GetFrameInfo(static_cast<int>(orig_idx));
-                if (frame_info) {
-                    (*m_half_fps_frames)[i].time_ms = static_cast<int64_t>(std::round(frame_info->time_seconds * 1000.0));
-                    (*m_half_fps_frames)[i].is_keyframe = frame_info->is_keyframe;
-
-                    static int half_debug = 0;
-                    if (half_debug++ < 5) {
-                        std::cout << "🎯 [HALF-FPS INIT] Slot " << i << " (from orig " << orig_idx << "): time_ms="
-                                  << (*m_half_fps_frames)[i].time_ms
-                                  << (frame_info->is_keyframe ? " [KEYFRAME]" : "") << std::endl;
-                    }
-                } else {
-                    (*m_half_fps_frames)[i].time_ms = -1;
-                    (*m_half_fps_frames)[i].is_keyframe = false;
-                }
-            }
-        }
-    }
-
     m_current_index.store(0);
 
     m_duration.store(m_frame_index->GetDuration());
@@ -382,12 +392,51 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
     m_video_width = m_frame_index->GetWidth();
     m_video_height = m_frame_index->GetHeight();
 
-    // Phase 3: Initialize decoders (75-100%) - THREADING
-    SetPlayerLoadingStatus(osdPlayerId, "threading");
-    SetPlayerLoadingProgress(osdPlayerId, 75);
-    UpdateOSDLoadingProgress(osdPlayerId, 75);
+    // Phase 2: Proxy probe (cheap — GOP scan / cache check, never a transcode).
+    // TAPE THREADING: when a full conversion is needed and the full-res V2 decoder is
+    // available, don't block on it — playback starts from the ORIGINAL right away and
+    // BackgroundProxyConversion publishes the proxy decoder when the tape is "threaded".
+    SetPlayerLoadingStatus(osdPlayerId, "proxy");
+    ProxyState proxy_state = ProbeProxy(filepath);
+    if (proxy_state == ProxyState::Error) {
+        SetPlayerLoadingProgress(osdPlayerId, 0);
+        SetPlayerLoadingState(osdPlayerId, false);
+        m_file_reloading.store(false);
+        return false;
+    }
 
-    if (!InitializeDecoders()) {
+    bool defer_proxy = false;
+    if (proxy_state == ProxyState::NeedsConversion) {
+        // On this CPU profile the V2 decoder is skipped entirely — without a proxy there
+        // would be no picture at all, so keep the old blocking conversion (25-60%).
+        bool v2_unavailable = (g_hardware_detection &&
+                               g_hardware_detection->GetCPUInfo().is_pentium_gold_7505);
+        if (v2_unavailable) {
+            auto proxyProgress = [playerId = osdPlayerId](int percent) {
+                int scaled = 25 + percent * 35 / 100;
+                SetPlayerLoadingProgress(playerId, scaled);
+                UpdateOSDLoadingProgress(playerId, scaled);
+            };
+            if (!EnsureProxy(filepath, proxyProgress)) {
+                SetPlayerLoadingProgress(osdPlayerId, 0);
+                SetPlayerLoadingState(osdPlayerId, false);
+                m_file_reloading.store(false);
+                return false;
+            }
+        } else {
+            defer_proxy = true;
+            std::cout << "[VIDEO] 🧵 TAPE THREADING: instant start from original, "
+                         "proxy conversion deferred to background" << std::endl;
+        }
+    }
+
+    SetPlayerLoadingProgress(osdPlayerId, 60);
+    UpdateOSDLoadingProgress(osdPlayerId, 60);
+
+    // Phase 3: Initialize decoders (60-100%) - THREADING
+    SetPlayerLoadingStatus(osdPlayerId, "threading");
+
+    if (!InitializeDecoders(initial_time, !defer_proxy)) {
         SetPlayerLoadingState(osdPlayerId, false);
         SetPlayerLoadingProgress(osdPlayerId, 0);
         m_file_reloading.store(false);
@@ -404,16 +453,38 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath) {
 
     SetPlayerLoadingProgress(osdPlayerId, 100);
     UpdateOSDLoadingProgress(osdPlayerId, 100);
-    SetPlayerLoadingState(osdPlayerId, false);
-    UpdateOSDDisplayMode(osdPlayerId, OSD_MODE_NORMAL);
 
     // Reset reload flag after successful loading
     m_file_reloading.store(false);
 
-    // Test display immediately after loading
-    std::cout << "[VIDEO] Testing immediate display of frame 0..." << std::endl;
-    DisplayFrame(0);
-    
+    // Submit the new clip's first frame to the pixel buffer BEFORE clearing the loading state.
+    // While loading, the window render blanks the video (clears to black, skips the texture), so
+    // doing this first closes the gap where the render would otherwise briefly reveal the PREVIOUS
+    // clip's last frame — still sitting in the pixel buffer / window texture — before frame 0 of the
+    // new clip arrives. (Previously the loading state was cleared first, exposing that stale frame.)
+    if (initial_time > 0.0 && m_frame_index) {
+        int initial_frame = m_frame_index->FindFrameByTime(initial_time);
+        initial_frame = std::max(0, std::min(initial_frame, static_cast<int>(m_frames->size()) - 1));
+        std::cout << "[VIDEO] Initial display at " << initial_time << "s (frame " << initial_frame << ")" << std::endl;
+        DisplayFrame(initial_frame);
+    } else {
+        std::cout << "[VIDEO] Testing immediate display of frame 0..." << std::endl;
+        DisplayFrame(0);
+    }
+
+    // First frame of the new clip is now in the buffer — reveal the video.
+    SetPlayerLoadingState(osdPlayerId, false);
+    UpdateOSDDisplayMode(osdPlayerId, OSD_MODE_NORMAL);
+
+    // TAPE THREADING: kick off the background conversion AFTER the video is revealed.
+    // The thread is detached — it must not reference `this` directly; it re-finds the
+    // instance through the registry (and the load generation) when it finishes.
+    if (defer_proxy) {
+        UpdateOSDProxyThreading(osdPlayerId, 0);
+        std::thread(&FSTPVideoModuleWrapper::BackgroundProxyConversion,
+                    m_instance_id, m_load_generation.load(), filepath).detach();
+    }
+
     return true;
 }
 
@@ -448,6 +519,28 @@ void FSTPVideoModuleWrapper::UnloadFile() {
     // CORRECT ORDER:
     //   1. Free AVFrames first
     //   2. Then ShutdownDecoders() - safe to destroy contexts
+
+    // STEP -1 (TAPE THREADING): retire any in-flight background proxy conversion FIRST.
+    // The generation bump under the registry mutex guarantees that a conversion finishing
+    // right now either publishes before we proceed (and is torn down normally below) or
+    // sees the stale generation and drops its result. After this block no new proxy
+    // decoder can appear during the teardown.
+    {
+        std::lock_guard<std::mutex> reg_lock(GetInstancesMutex());
+        m_load_generation.fetch_add(1);
+        m_proxy_ready.store(false, std::memory_order_release);
+    }
+    UpdateOSDProxyThreading(osdPlayerId, -1);
+
+    // STEP 0: Stop the decoder THREADS before touching m_frames. The proxy manager thread and the
+    // display's on-demand decode (decodeFrameNow) both write into m_frames; if they run while the
+    // cleanup below resets/clears it, that's a use-after-free → segfault (seen when switching to a
+    // different clip). stop() joins the manager thread (and aborts a mid-decode via requestStop), so
+    // after this no one else touches m_frames. Contexts stay ALIVE here — the AVFrames still
+    // reference them; they're destroyed later in ShutdownDecoders, AFTER the frames are freed.
+    m_decoders_active.store(false);
+    if (m_low_cached_manager) m_low_cached_manager->stop();
+    if (m_full_res_decoder)   m_full_res_decoder->RequestStop();
 
     // STEP 1: Free AVFrames first (while decoder contexts are still valid)
     // CAREFUL GRADUAL CLEANUP: Clean frames in small batches with pauses
@@ -570,17 +663,68 @@ void FSTPVideoModuleWrapper::UnloadFile() {
     }
 }
 
-bool FSTPVideoModuleWrapper::InitializeDecoders() {
-    std::cout << "[VIDEO] InitializeDecoders: Using LowCachedDecoderManager (the proven solution)" << std::endl;
+// Proxy-side decoder setup shared by the synchronous load path and the background
+// conversion completion. Precondition: m_frame_index built, m_frames initialized from it,
+// m_proxy_path points at a usable proxy. Does NOT publish m_proxy_ready — the caller does.
+bool FSTPVideoModuleWrapper::SetupProxyDecoder() {
+    // HALF-FPS PROXY DETECTION: Check if proxy is 30fps from 60fps original.
+    // (Moved out of LoadFile: on the instant-start path the proxy file only exists
+    // once the background conversion finishes.)
+    double original_fps = m_frame_index ? m_frame_index->GetFrameRate() : 0.0;
+    m_is_half_fps_proxy = false;
 
-    const int osdPlayerId = (m_instance_id >= 0 ? m_instance_id : 0);
+    if (!m_use_original_as_proxy && !m_proxy_path.empty()) {
+        AVFormatContext* proxy_fmt = nullptr;
+        if (avformat_open_input(&proxy_fmt, m_proxy_path.c_str(), nullptr, nullptr) == 0) {
+            if (avformat_find_stream_info(proxy_fmt, nullptr) >= 0) {
+                int video_stream_idx = av_find_best_stream(proxy_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                if (video_stream_idx >= 0) {
+                    AVStream* stream = proxy_fmt->streams[video_stream_idx];
+                    if (stream->r_frame_rate.den > 0) {
+                        double proxy_fps = static_cast<double>(stream->r_frame_rate.num) / stream->r_frame_rate.den;
 
-    // Progress: 75% → 85% (Low-res decoder setup)
-    SetPlayerLoadingProgress(osdPlayerId, 78);
-    UpdateOSDLoadingProgress(osdPlayerId, 78);
+                        // Detect half-FPS by the ~2:1 ratio (covers 50→25 AND 60→30, 59.94→29.97).
+                        double fps_ratio = (proxy_fps > 0.1) ? (original_fps / proxy_fps) : 0.0;
+                        if (original_fps > 45.0 && fps_ratio > 1.7 && fps_ratio < 2.3) {
+                            m_is_half_fps_proxy = true;
+                            std::cout << "🎯 [HALF-FPS PROXY] Detected: original " << std::fixed << std::setprecision(2)
+                                      << original_fps << " fps, proxy " << proxy_fps << " fps" << std::endl;
+                        }
+                    }
+                }
+            }
+            avformat_close_input(&proxy_fmt);
+        }
+    }
+
+    // HALF-FPS PROXY: Create separate half-size index and fill it with every second
+    // frame's metadata (mapping: half-fps slot i ← original frame 2*i).
+    if (m_is_half_fps_proxy) {
+        if (!m_half_fps_frames) {
+            m_half_fps_frames = new std::vector<FSTP::FrameInfo>();
+        }
+        size_t half_size = (m_frames->size() + 1) / 2; // Round up
+        m_half_fps_frames->clear();
+        m_half_fps_frames->resize(half_size);
+        std::cout << "🎯 [HALF-FPS INDEX] Created " << half_size << " slots (main index: "
+                  << m_frames->size() << " slots)" << std::endl;
+
+        for (size_t i = 0; i < m_half_fps_frames->size(); ++i) {
+            size_t orig_idx = i * 2;
+            if (orig_idx < m_frames->size()) {
+                const SimpleFrameInfo* frame_info = m_frame_index->GetFrameInfo(static_cast<int>(orig_idx));
+                if (frame_info) {
+                    (*m_half_fps_frames)[i].time_ms = static_cast<int64_t>(std::round(frame_info->time_seconds * 1000.0));
+                    (*m_half_fps_frames)[i].is_keyframe = frame_info->is_keyframe;
+                } else {
+                    (*m_half_fps_frames)[i].time_ms = -1;
+                    (*m_half_fps_frames)[i].is_keyframe = false;
+                }
+            }
+        }
+    }
 
     // Use the working LowCachedDecoderManager from old code
-    // HALF-FPS PROXY: Use separate index if available
     try {
         std::vector<FSTP::FrameInfo>& frame_index_ref = m_is_half_fps_proxy ? *m_half_fps_frames : *m_frames;
 
@@ -606,9 +750,6 @@ bool FSTPVideoModuleWrapper::InitializeDecoders() {
         return false;
     }
 
-    SetPlayerLoadingProgress(osdPlayerId, 82);
-    UpdateOSDLoadingProgress(osdPlayerId, 82);
-
     // ADAPTIVE SEGMENT SIZING: Use GOP information from index
     // This optimizes performance for videos with different GOP structures (GOP 25, GOP 300, etc.)
     // Strategy: Use 2× GOP size for optimal balance between CPU and responsiveness
@@ -624,6 +765,29 @@ bool FSTPVideoModuleWrapper::InitializeDecoders() {
 
     if (m_low_cached_manager) {
         m_low_cached_manager->run();
+    }
+
+    return true;
+}
+
+bool FSTPVideoModuleWrapper::InitializeDecoders(double initial_time, bool with_proxy) {
+    std::cout << "[VIDEO] InitializeDecoders: Using LowCachedDecoderManager (the proven solution)" << std::endl;
+
+    const int osdPlayerId = (m_instance_id >= 0 ? m_instance_id : 0);
+
+    // Progress: 60% → 85% (Low-res decoder setup)
+    SetPlayerLoadingProgress(osdPlayerId, 78);
+    UpdateOSDLoadingProgress(osdPlayerId, 78);
+
+    if (with_proxy) {
+        if (!SetupProxyDecoder()) {
+            return false;
+        }
+        // Same-thread publication; the release store pairs with ProxyManager()'s acquire.
+        m_proxy_ready.store(true, std::memory_order_release);
+    } else {
+        std::cout << "[VIDEO] 🧵 Proxy decoder deferred — transport limited to pause/forward ≤1× "
+                     "until the background conversion completes" << std::endl;
     }
 
     SetPlayerLoadingProgress(osdPlayerId, 88);
@@ -645,7 +809,7 @@ bool FSTPVideoModuleWrapper::InitializeDecoders() {
         UpdateOSDLoadingProgress(osdPlayerId, 92);
 
         try {
-            m_full_res_decoder = std::make_unique<FSTPFullResDecoderV2>(m_current_file);
+            m_full_res_decoder = std::make_unique<FSTPFullResDecoderV2>(m_current_file, initial_time);
 
             if (m_full_res_decoder && m_full_res_decoder->IsInitialized()) {
                  std::cout << "✅ [VIDEO] FSTPFullResDecoderV2 initialized successfully" << std::endl;
@@ -696,8 +860,10 @@ void FSTPVideoModuleWrapper::ShutdownDecoders() {
 
 void FSTPVideoModuleWrapper::NotifyDecodersOfFrameChange(int frame_number) {
     m_current_index.store(frame_number);
-    if (m_low_cached_manager) {
-        m_low_cached_manager->notifyFrameChange();
+    // ProxyManager() (not the raw pointer): during tape threading the manager is published
+    // from the background thread; the acquire-gated accessor makes that publication safe.
+    if (auto* proxy_mgr = ProxyManager()) {
+        proxy_mgr->notifyFrameChange();
     }
     // V2: Streaming decoder updates itself based on current time
     // No need to notify frame change
@@ -753,6 +919,26 @@ void FSTPVideoModuleWrapper::SetSpeed(double speed) {
 
 void FSTPVideoModuleWrapper::SetSpeedInstant(double speed) {
     SetSpeed(speed);
+}
+
+void FSTPVideoModuleWrapper::SetBackgrounded(bool backgrounded) {
+    if (backgrounded == m_backgrounded.load()) return;
+    m_backgrounded.store(backgrounded);
+
+    if (!m_full_res_decoder) return;
+    if (backgrounded) {
+        // Idle the full-res V2 thread and DROP its 1080p frame buffer to free RAM — the window keeps
+        // showing the cached still texture (the instance is paused/settled), so V2 isn't needed.
+        std::cout << "💤 [BACKGROUND] Player " << m_instance_id
+                  << ": freeing full-res V2 buffer (backgrounded)" << std::endl;
+        m_full_res_decoder->RequestStop();
+        m_full_res_decoder->ClearBuffer();
+    } else {
+        // Refocused — resume V2; it rebuilds its buffer (proxy bridges the brief catch-up).
+        std::cout << "☀️ [BACKGROUND] Player " << m_instance_id
+                  << ": resuming full-res V2 (foregrounded)" << std::endl;
+        m_full_res_decoder->ClearStopRequest();
+    }
 }
 
 void FSTPVideoModuleWrapper::SetReverse(bool reverse) {
@@ -937,8 +1123,8 @@ void FSTPVideoModuleWrapper::SetInstanceID(int instance_id) {
 
     // Register in global instance map for frame update notifications
     if (instance_id >= 0) {
-        std::lock_guard<std::mutex> lock(g_instances_mutex);
-        g_video_instances[instance_id] = this;
+        std::lock_guard<std::mutex> lock(GetInstancesMutex());
+        GetVideoInstances()[instance_id] = this;
     }
 }
 
@@ -951,6 +1137,36 @@ void FSTPVideoModuleWrapper::RequestFrameUpdate() {
     m_last_displayed_frame = -1; // Invalidate cache to force re-render
     // Also trigger render update
     RequestForceRender();
+}
+
+// Convert an AVFrame to YUV420P if it's not already in a directly supported format.
+// Used to normalize adjacent (prev/next) frames before passing to the Betacam compositor,
+// which expects 8-bit planar YUV matching the current frame's format.
+static std::shared_ptr<AVFrame> ConvertFrameToYUV420P(const std::shared_ptr<AVFrame>& src) {
+    if (!src) return nullptr;
+    AVPixelFormat fmt = static_cast<AVPixelFormat>(src->format);
+    if (fmt == AV_PIX_FMT_YUV420P || fmt == AV_PIX_FMT_YUVJ420P || fmt == AV_PIX_FMT_NV12) {
+        return src; // already in a supported 8-bit format
+    }
+    SwsContext* ctx = sws_getContext(src->width, src->height, fmt,
+                                     src->width, src->height, AV_PIX_FMT_YUV420P,
+                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!ctx) return nullptr;
+    AVFrame* dst = av_frame_alloc();
+    if (!dst) { sws_freeContext(ctx); return nullptr; }
+    dst->format = AV_PIX_FMT_YUV420P;
+    dst->width  = src->width;
+    dst->height = src->height;
+    if (av_frame_get_buffer(dst, 32) < 0) {
+        av_frame_free(&dst);
+        sws_freeContext(ctx);
+        return nullptr;
+    }
+    sws_scale(ctx, src->data, src->linesize, 0, src->height, dst->data, dst->linesize);
+    av_frame_copy_props(dst, src.get());
+    dst->pts = src->pts;
+    sws_freeContext(ctx);
+    return std::shared_ptr<AVFrame>(dst, [](AVFrame* f){ av_frame_free(&f); });
 }
 
 bool FSTPVideoModuleWrapper::SubmitFrameToTexture(const std::shared_ptr<AVFrame>& frame,
@@ -985,6 +1201,7 @@ bool FSTPVideoModuleWrapper::SubmitFrameToTexture(const std::shared_ptr<AVFrame>
     bool supported_format = (src_format == AV_PIX_FMT_YUV420P ||
                              src_format == AV_PIX_FMT_YUVJ420P ||
                              src_format == AV_PIX_FMT_NV12);
+    bool format_was_native = supported_format; // track before potential conversion
 
     if (!supported_format) {
         SwsContext* convert_ctx = sws_getContext(
@@ -1054,10 +1271,17 @@ bool FSTPVideoModuleWrapper::SubmitFrameToTexture(const std::shared_ptr<AVFrame>
 
         FSTP_UpdatePlayerColorMetadata(m_instance_id, cs, rg, pr, tr);
 
+        // Adjacent frames must be in the same 8-bit YUV format as frame_to_submit.
+        // If the original frame needed format conversion (e.g. ProRes 10-bit yuv422p10le),
+        // adjacent frames from the same decoder have the same raw format and must also
+        // be converted — otherwise the Betacam compositor reads 10-bit data as 8-bit.
+        std::shared_ptr<AVFrame> adj_prev = format_was_native ? prev_frame : ConvertFrameToYUV420P(prev_frame);
+        std::shared_ptr<AVFrame> adj_next = format_was_native ? next_frame : ConvertFrameToYUV420P(next_frame);
+
         // ZERO-COPY: Send shared_ptr directly to pixel buffer manager
         // No memcpy! Only increment refcount on AVFrame
         // Also pass adjacent frames for Betacam slow-motion compositing
-        SubmitAVFrame(m_instance_id, frame_to_submit, timestamp, frame_number, prev_frame, next_frame);
+        SubmitAVFrame(m_instance_id, frame_to_submit, timestamp, frame_number, adj_prev, adj_next);
 
         if (ENABLE_VIDEO_DEBUG) {
             static int zero_copy_log = 0;
@@ -1153,12 +1377,18 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         return;
     }
 
+    // TAPE THREADING: all proxy-side state (manager, half-fps flag + vector) is published
+    // together by the background conversion; the acquire load in ProxyManager() is the gate.
+    // While it returns null (proxy still converting), this function runs V2-only.
+    FSTP::LowCachedDecoderManager* proxy_mgr = ProxyManager();
+    const bool half_fps_active = (proxy_mgr != nullptr) && m_is_half_fps_proxy;
+
     // HALF-FPS PROXY: Map original frame index to half-fps index
     // Example: original frames 0,1,2,3,4,5... → half-fps frames 0,0,1,1,2,2...
     int actual_index = clamped;
     std::vector<FSTP::FrameInfo>* frame_vector = m_frames;
 
-    if (m_is_half_fps_proxy && m_half_fps_frames) {
+    if (half_fps_active && m_half_fps_frames) {
         actual_index = clamped / 2; // Integer division maps pairs to same index
         frame_vector = m_half_fps_frames;
 
@@ -1188,27 +1418,52 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     auto t_after_checks = std::chrono::high_resolution_clock::now();
     total_checks_us += std::chrono::duration_cast<std::chrono::microseconds>(t_after_checks - t_df_start).count();
 
+    // STAGE 2 (shuttle seek-per-frame): decode exactly this displayed frame on demand — the "tape
+    // head" reads what's under it now (decode = display rate, not speed). Done BEFORE any per-slot
+    // lock below to avoid self-deadlock with the decoder's per-slot lock. GOP=4 → ~1-2ms; no-op if
+    // already decoded.
+    //
+    // Active down to a low speed (not just ≥2×): below 2× the proxy is the FALLBACK while the
+    // full-res V2 decoder catches up after the shuttle's big seek (~370ms). Without this bridge the
+    // picture froze crossing 2× and through zero on deceleration. The "already decoded" peek makes
+    // this nearly free where the manager's prefetch already filled the slot (<2×); it only fills the
+    // gaps V2/manager haven't yet. Below ~0.25× we're effectively paused — V2 owns the still frame.
+    // No speed gate: keep slot[clamped] filled at ALL times (incl. PAUSE) so the proxy is always
+    // a ready fallback. Without this, a seek-then-pause showed a stale "sticky" frame while V2
+    // rebuilt its buffer (its big seek clears it), then snapped to the right frame — the reported
+    // "one frame, then a closer one". The "already decoded" peek makes steady-state nearly free
+    // (the manager's prefetch usually already filled the slot below 2×); on-demand only fills the
+    // gaps after a seek. Decode contexts 2/3 keep it off the manager's 0/1 and full-res's own.
+    if (proxy_mgr && m_decoders_active.load()) {
+        proxy_mgr->decodeFrameNow(clamped);
+
+        // Betacam SLOW-MO compositing reads the N-1 and N+1 NEIGHBOURS, so when the proxy is the
+        // base right after a shuttle seek those neighbour slots must be present too (otherwise the
+        // adjacent read picks up a stale slot → N+1 spike). But this only matters in SLOW MOTION
+        // (<0.9×) — at 1× there is no compositing, so the triplet there was pure wasted work that
+        // tripled the on-demand decode and stalled the display thread (~50ms blocks at 1×). Gate it
+        // to slow-mo only.
+        double sp_now = m_audio_module ? std::abs(m_audio_module->GetActualSpeed()) : 0.0;
+        if (sp_now < 0.9) {
+            proxy_mgr->decodeFrameNow(clamped - 1);  // bounds-checked + no-op if decoded
+            proxy_mgr->decodeFrameNow(clamped + 1);
+        }
+    }
+
     FSTP::FrameInfo& info = (*frame_vector)[actual_index];
     std::shared_ptr<AVFrame> frame;
 
-    // CRITICAL: Use DECODED time (info.time_ms) if available,
-    // otherwise fallback to calculated time from SimpleIndex
-    // This eliminates frame drift when seeking (problem "2 frames forward")
-    double timestamp = frame_info->time_seconds;  // Fallback
-    if (info.time_ms >= 0) {
-        timestamp = info.time_ms / 1000.0;  // Use REAL DECODED time
+    // Whether the displayed frame came from the full-res V2 decoder (the ground truth used
+    // by the proxy-offset auto-calibration further down).
+    bool shown_is_v2 = false;
 
-        if (ENABLE_VIDEO_DEBUG) {
-            static int time_source_log = 0;
-            if (time_source_log++ < 10) {
-                double diff_ms = (frame_info->time_seconds - timestamp) * 1000.0;
-                std::cout << "🎯 [TIME SOURCE] Frame " << clamped
-                          << ": Using DECODED time=" << timestamp << "s"
-                          << " (SimpleIndex would be " << frame_info->time_seconds << "s"
-                          << ", diff=" << diff_ms << "ms)" << std::endl;
-            }
-        }
-    }
+    // Use the NOMINAL time of frame `clamped` (frame_number/fps from SimpleIndex) for the V2
+    // query — the SAME reference the V2 sync-check validates against, and the same the proxy is
+    // addressed by (index). Previously the query used the proxy's DECODED time (info.time_ms) but
+    // validated against nominal — a sub-frame mismatch let V2 return clamped±1 → the residual
+    // proxy→full-res shift in motion. That info.time_ms path was a workaround for the OLD lagged
+    // proxy ("2 frames forward"); the proxy is frame-exact now, so nominal is authoritative.
+    double timestamp = frame_info->time_seconds;
 
     // V2: Try streaming full-res decoder at slow speeds (≤1x including pause)
     // Get actual playback speed from audio module (not target speed)
@@ -1247,9 +1502,11 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         bool same_timestamp = (std::abs(timestamp - m_v2_cached_timestamp) < ONE_FRAME_S * 0.5);
         if (actual_speed < 0.05 && same_timestamp && m_v2_cached_frame) {
             frame = m_v2_cached_frame;
+            shown_is_v2 = true;
         } else {
             // Get shared_ptr copy from buffer (safe - extends frame lifetime)
             frame = m_full_res_decoder->GetFrameForTime(timestamp);
+            bool v2_held = false;   // true if we held the last full-res frame (anti-flicker)
             if (frame) {
                 // SYNC CHECK: Reject V2 frame if too far from requested timestamp.
                 // Prevents visible frame jump (proxy→full-res) after seek/shuttle.
@@ -1261,21 +1518,53 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                     // PTS bases (systematic offset of up to 1 frame), so comparing against
                     // proxy PTS causes systematic V2 rejection → visible "frame deviation".
                     double nominal_time = frame_info->time_seconds;
-                    // Tolerance = 0.5 frame: tight enough to reject N+1 for N/fps (1 frame off),
-                    // loose enough to accept V2 during the post-seek buffer fill transient.
-                    // Using nominal_time (N/fps) instead of proxy PTS avoids systematic rejection
-                    // when proxy and original have different PTS bases (offset up to ~0.5 frame).
-                    double half_frame = (m_frame_rate > 0.0) ? (0.5 / m_frame_rate) : 0.02;
+                    
+                    // EXACT handoff: accept the V2 (full-res) frame only when it is the SAME frame
+                    // the proxy is showing (within ½ frame). The proxy shows EXACTLY frame `clamped`
+                    // (Stage-2 on-demand), so a looser tol let V2 come up 1 frame off → the visible
+                    // proxy→full-res shift. The anti-flicker hold below keeps the last full-res frame
+                    // during V2 catch-up instead of flickering, so a tight tol no longer causes the
+                    // flicker that the old 1.5-frame value was working around.
+                    double frame_tolerance_frames = 0.5;
+                    double half_frame = (m_frame_rate > 0.0) ? (frame_tolerance_frames / m_frame_rate) : 0.02;
+                    
                     if (std::fabs(v2_actual_time - nominal_time) > half_frame) {
-                        // V2 is off by more than 0.5 frame — keep proxy until V2 catches up
-                        frame = nullptr;
-                        m_v2_cached_frame = nullptr;
-                        m_v2_cached_timestamp = -1.0;
+                        // DIAGNOSTICS: Log rejections to understand sync issues
+                        static int reject_log = 0;
+                        if (++reject_log % 30 == 1) {  // Log every 30 rejections
+                            double diff_ms = std::fabs(v2_actual_time - nominal_time) * 1000.0;
+                            double tol_ms = half_frame * 1000.0;
+                            std::cout << "⚠️  [VIDEO] V2 frame off: diff=" << std::fixed << std::setprecision(2)
+                                      << diff_ms << "ms > tol=" << tol_ms << "ms"
+                                      << " (fps=" << std::setprecision(1) << m_frame_rate
+                                      << ", tolerance=" << frame_tolerance_frames << " frames)"
+                                      << std::defaultfloat << std::endl;
+                        }
+                        // ANTI-FLICKER: while V2 catches up (a frame or two), keep showing the last
+                        // accepted full-res frame instead of dropping to the softer proxy — toggling
+                        // full-res↔proxy every frame is very visible (worsened by the 432p/half-fps
+                        // proxy). Only a large gap (a real seek) falls through to the proxy. The cache
+                        // timestamp is NOT refreshed while holding, so the window stays anchored to the
+                        // last genuine V2 frame and a truly stuck V2 still yields to the proxy.
+                        double holdWindow = 6.0 / (m_frame_rate > 0.0 ? m_frame_rate : 25.0);
+                        if (m_v2_cached_frame && m_v2_cached_timestamp >= 0.0 &&
+                            std::abs(timestamp - m_v2_cached_timestamp) < holdWindow) {
+                            frame = m_v2_cached_frame;
+                            v2_held = true;
+                            shown_is_v2 = true;
+                        } else {
+                            frame = nullptr;
+                            m_v2_cached_frame = nullptr;
+                            m_v2_cached_timestamp = -1.0;
+                        }
                     }
                 }
-                if (frame) {
+                // Cache only genuinely-accepted V2 frames (not held ones), so the hold window
+                // stays anchored to the last real V2 hit.
+                if (frame && !v2_held) {
                     m_v2_cached_frame = frame;
                     m_v2_cached_timestamp = timestamp;
+                    shown_is_v2 = true;
                 }
             }
         }
@@ -1362,49 +1651,67 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             }
         }
         // PRIORITY 2: Low-res proxy frame (always available)
-        else if (!frame && info.low_res_frame) {
-            // CRITICAL: ALWAYS check PTS before using low_res_frame
-            // This prevents jittering when fast-rewinding 24-32x
-            bool is_seek_mode = false;
-            int frame_jump = abs(clamped - m_last_good_frame_number);
-            if (m_last_good_frame_number >= 0 && frame_jump > 30) {
-                is_seek_mode = true;
+        // Read the proxy from the auto-calibrated slot (actual_index + offset): proxy content
+        // can lag its index by an integer on some sources, so the correct picture for logical
+        // frame N lives at slot N+offset. offset==0 → original behaviour (use the locked info).
+        else if (!frame) {
+            const int proxy_off = m_proxy_frame_offset.load();
+            int pidx = actual_index + proxy_off;
+            pidx = std::max(0, std::min(pidx, static_cast<int>(frame_vector->size()) - 1));
+
+            std::shared_ptr<AVFrame> proxyFrame;
+            if (proxy_off == 0) {
+                proxyFrame = info.low_res_frame;          // same slot — already locked above
+            } else {
+                // Different slot → grab its frame under try_lock; the shared_ptr copy keeps it
+                // alive after the lock is released (no nested-lock lifetime issue).
+                std::unique_lock<std::mutex> off_lock((*frame_vector)[pidx].mutex, std::try_to_lock);
+                if (off_lock.owns_lock()) proxyFrame = (*frame_vector)[pidx].low_res_frame;
             }
 
-            bool pts_valid = true;
-            // ALWAYS check PTS (not only when seeking!)
-            double frame_time = -1.0;
-            if (info.low_res_frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-                if (info.time_base.den > 0) {
-                    frame_time = info.low_res_frame->best_effort_timestamp * av_q2d(info.time_base);
+            if (proxyFrame && proxyFrame->data[0]) {
+                // CRITICAL: ALWAYS check PTS before using the proxy frame (prevents jitter on
+                // fast rewind 24-32x).
+                bool is_seek_mode = false;
+                int frame_jump = abs(clamped - m_last_good_frame_number);
+                if (m_last_good_frame_number >= 0 && frame_jump > 30) {
+                    is_seek_mode = true;
                 }
-            } else if (info.low_res_frame->pts != AV_NOPTS_VALUE) {
-                if (info.time_base.den > 0) {
-                    frame_time = info.low_res_frame->pts * av_q2d(info.time_base);
-                }
-            }
 
-            if (frame_time >= 0.0) {
-                double time_diff = fabs(frame_time - timestamp);
-                // Strict check: ±0.1s when seeking, ±0.5s when playing
-                double max_diff = is_seek_mode ? 0.1 : 0.5;
-                if (time_diff > max_diff) {
-                    pts_valid = false;
-                    if (debug_call_count <= 5) {
-                        std::cout << "⚠️  [PTS CHECK] Frame " << clamped << " has time "
-                                  << std::fixed << std::setprecision(3) << frame_time << "s"
-                                  << " but requested " << timestamp << "s (diff=" << (time_diff * 1000.0) << "ms > "
-                                  << (max_diff * 1000.0) << "ms)"
-                                  << " - SKIP to avoid jitter!" << std::endl;
+                bool pts_valid = true;
+                double frame_time = -1.0;
+                if (proxyFrame->best_effort_timestamp != AV_NOPTS_VALUE && info.time_base.den > 0) {
+                    frame_time = proxyFrame->best_effort_timestamp * av_q2d(info.time_base);
+                } else if (proxyFrame->pts != AV_NOPTS_VALUE && info.time_base.den > 0) {
+                    frame_time = proxyFrame->pts * av_q2d(info.time_base);
+                }
+
+                if (frame_time >= 0.0) {
+                    // The offset shifts the proxy frame's own PTS by |offset| frames vs the
+                    // requested time, so widen the tolerance by that much (otherwise the
+                    // correct shifted frame would be wrongly rejected).
+                    double one_frame = (m_frame_rate > 0.0) ? (1.0 / m_frame_rate) : 0.04;
+                    double off_secs = std::abs(proxy_off) * one_frame;
+                    double time_diff = fabs(frame_time - timestamp);
+                    double max_diff = (is_seek_mode ? 0.1 : 0.5) + off_secs;
+                    if (time_diff > max_diff) {
+                        pts_valid = false;
+                        if (debug_call_count <= 5) {
+                            std::cout << "⚠️  [PTS CHECK] Frame " << clamped << " has time "
+                                      << std::fixed << std::setprecision(3) << frame_time << "s"
+                                      << " but requested " << timestamp << "s (diff=" << (time_diff * 1000.0) << "ms > "
+                                      << (max_diff * 1000.0) << "ms) - SKIP to avoid jitter!" << std::endl;
+                        }
                     }
                 }
-            }
 
-            if (pts_valid) {
-                frame = info.low_res_frame;
-                if (debug_call_count <= 5) {
-                    std::cout << "[VIDEO] Using low_res_frame (proxy) for frame " << clamped
-                              << ", resolution=" << frame->width << "x" << frame->height << std::endl;
+                if (pts_valid) {
+                    frame = proxyFrame;
+                    if (debug_call_count <= 5) {
+                        std::cout << "[VIDEO] Using low_res_frame (proxy) for frame " << clamped
+                                  << " (slot " << pidx << ", offset " << proxy_off << ")"
+                                  << ", resolution=" << frame->width << "x" << frame->height << std::endl;
+                    }
                 }
             }
         }
@@ -1435,8 +1742,8 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             if (m_last_good_frame_number >= 0 && frame_distance > 30) {
                 is_seek = true;
                 // Wake up background thread to prioritize this segment
-                if (m_low_cached_manager) {
-                    m_low_cached_manager->notifyFrameChange();
+                if (proxy_mgr) {
+                    proxy_mgr->notifyFrameChange();
                 }
             }
 
@@ -1458,6 +1765,12 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             int found_idx = -1;
             int search_radius = is_seek ? 256 : 64; // Allow wider search when seeking to find ANY frame
 
+            // Apply the calibrated proxy offset so the freeze/fallback frame stays aligned with
+            // PRIORITY 2. Without this the offset correction is "lost" during post-seek decode
+            // gaps → the proxy→full-res +1 jump returns until the exact frame finishes decoding
+            // (which is exactly the "temporary" behaviour after a seek).
+            const int proxyOff = m_proxy_frame_offset.load();
+
             // Exponential backward search (prefer backward - more likely to be decoded)
             // Try: -1, -2, -4, -8, -16, -32, -64
             // CRITICAL: Use try_lock to avoid deadlock with UnloadFile during file reload
@@ -1465,7 +1778,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                 // Check file_reloading before each lock attempt to avoid race with UnloadFile
                 if (m_file_reloading.load()) break;
 
-                int search_idx = actual_index - step;
+                int search_idx = actual_index + proxyOff - step;
                 if (search_idx >= 0 && search_idx < static_cast<int>(frame_vector->size())) {
                     // Use try_lock to avoid blocking if UnloadFile is clearing this frame
                     std::unique_lock<std::mutex> search_lock((*frame_vector)[search_idx].mutex, std::try_to_lock);
@@ -1492,7 +1805,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                     // Check file_reloading before each lock attempt
                     if (m_file_reloading.load()) break;
 
-                    int search_idx = actual_index + step;
+                    int search_idx = actual_index + proxyOff + step;
                     if (search_idx >= 0 && search_idx < static_cast<int>(frame_vector->size())) {
                         std::unique_lock<std::mutex> search_lock((*frame_vector)[search_idx].mutex, std::try_to_lock);
                         if (!search_lock.owns_lock()) continue;  // Skip if can't get lock
@@ -1520,8 +1833,8 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                     // Check file_reloading before each lock attempt
                     if (m_file_reloading.load()) break;
 
-                    int search_idx = actual_index - offset;
-                    if (search_idx < static_cast<int>(frame_vector->size())) {
+                    int search_idx = actual_index + proxyOff - offset;
+                    if (search_idx >= 0 && search_idx < static_cast<int>(frame_vector->size())) {
                         std::unique_lock<std::mutex> search_lock((*frame_vector)[search_idx].mutex, std::try_to_lock);
                         if (!search_lock.owns_lock()) continue;  // Skip if can't get lock
 
@@ -1634,7 +1947,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
 
                 // HALF-FPS AWARE: Calculate last good frame index in current coordinate space
                 int last_good_idx = m_last_good_frame_number;
-                if (m_is_half_fps_proxy && m_half_fps_frames) {
+                if (half_fps_active && m_half_fps_frames) {
                     last_good_idx = m_last_good_frame_number / 2;
                 }
 
@@ -1683,6 +1996,83 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         return;
     }
 
+    // === Proxy↔original frame-offset auto-calibration ===
+    // The proxy's content can lag its index by an integer on some sources (e.g. start_time!=0
+    // makes AVAssetReader insert a gap-fill frame), which showed as a 1-frame jump at the
+    // proxy→full-res handoff. While the full-res V2 frame is on screen (ground truth) at
+    // <=1.5x, compare its 4x4 luma "shape" (per-cell mean minus the global mean — robust to
+    // resolution and to a constant brightness offset, sensitive to motion) against
+    // proxy[N-1..N+1]. Once a clear-motion frame makes the match unambiguous, lock the integer
+    // offset; it is then applied wherever proxy frames are read (PRIORITY 2 + Betacam
+    // neighbours). The whole computation is skipped after calibration.
+    if (shown_is_v2 && !m_proxy_offset_calibrated) {
+        double sp_l = m_audio_module ? m_audio_module->GetActualSpeed() : 0.0;
+        if (std::abs(sp_l) <= 1.5) {
+            auto shapeSig = [](const std::shared_ptr<AVFrame>& f, double out[16]) -> bool {
+                for (int i = 0; i < 16; ++i) out[i] = 0.0;
+                if (!f || !f->data[0] || f->width <= 0 || f->height <= 0) return false;
+                const uint8_t* y = f->data[0]; int pitch = f->linesize[0];
+                long cellSum[16] = {0}; int cellCnt[16] = {0};
+                for (int yy = 0; yy < f->height; yy += 2) {
+                    int cy = (yy * 4) / f->height; if (cy > 3) cy = 3;
+                    const uint8_t* row = y + static_cast<size_t>(yy) * pitch;
+                    for (int xx = 0; xx < f->width; xx += 2) {
+                        int cx = (xx * 4) / f->width; if (cx > 3) cx = 3;
+                        cellSum[cy * 4 + cx] += row[xx]; cellCnt[cy * 4 + cx]++;
+                    }
+                }
+                double g = 0.0; int gc = 0;
+                for (int i = 0; i < 16; ++i) if (cellCnt[i] > 0) { out[i] = (double)cellSum[i] / cellCnt[i]; g += out[i]; gc++; }
+                g /= (gc > 0 ? gc : 1);
+                for (int i = 0; i < 16; ++i) out[i] -= g;   // remove global brightness offset
+                return true;
+            };
+            auto sigDist = [](const double a[16], const double b[16]) {
+                double d = 0.0; for (int i = 0; i < 16; ++i) d += std::abs(a[i] - b[i]); return d;
+            };
+            double sv2[16]; bool okv2 = shapeSig(frame, sv2);
+            double dist[3] = {-1.0, -1.0, -1.0};
+            for (int k = -1; k <= 1; ++k) {
+                int idx = actual_index + k;
+                if (okv2 && idx >= 0 && idx < static_cast<int>(frame_vector->size())) {
+                    std::unique_lock<std::mutex> lk((*frame_vector)[idx].mutex, std::try_to_lock);
+                    if (lk.owns_lock()) {
+                        double sp[16];
+                        if (shapeSig((*frame_vector)[idx].low_res_frame, sp)) dist[k + 1] = sigDist(sv2, sp);
+                    }
+                }
+            }
+            int bestk = 99; double bd = 1e18;
+            for (int k = -1; k <= 1; ++k) if (dist[k + 1] >= 0.0 && dist[k + 1] < bd) { bd = dist[k + 1]; bestk = k; }
+
+            // Lock the offset once a clear-motion frame makes the winner unambiguous;
+            // consensus guards against a single noisy frame mis-calibrating.
+            if (bestk != 99 && dist[0] >= 0.0 && dist[1] >= 0.0 && dist[2] >= 0.0) {
+                double second = 1e18;
+                for (int k = -1; k <= 1; ++k) { if (k != bestk && dist[k + 1] < second) second = dist[k + 1]; }
+                // Decisive = real motion + clear winner (skips static/ambiguous frames).
+                bool decisive = (second > bd * 1.6) && ((second - bd) > 3.0);
+                // Very strong = unambiguous motion → safe to lock from a single frame, so even
+                // the FIRST proxy→full-res handoff is clean (no "first jerk" before calibration).
+                bool veryStrong = (second > bd * 3.0) && ((second - bd) > 10.0);
+                if (decisive) {
+                    if (bestk == m_proxy_calib_candidate) {
+                        m_proxy_calib_count++;
+                    } else {
+                        m_proxy_calib_candidate = bestk;
+                        m_proxy_calib_count = 1;
+                    }
+                    int needed = veryStrong ? 1 : 2;   // instant on clear motion, else confirm with 2
+                    if (m_proxy_calib_count >= needed) {
+                        m_proxy_frame_offset.store(bestk);
+                        m_proxy_offset_calibrated = true;
+                        std::cout << "🎯 [PROXY CALIB] Locked proxy frame offset = " << bestk << std::endl;
+                    }
+                }
+            }
+        }
+    }
+
     // DEBUG: Log final frame resolution before submission
     static int submit_counter = 0;
     submit_counter++;
@@ -1701,6 +2091,27 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     std::shared_ptr<AVFrame> prev_frame = nullptr;
     std::shared_ptr<AVFrame> next_frame = nullptr;
 
+    // Reset the adjacent-frame sticky cache up-front when the displayed frame changed, when the
+    // SOURCE changed (proxy↔full-res), or during reload. Doing it BEFORE the fetch lets us skip the
+    // decoder query while a frame is held (pause / slow-mo on the same frame). The source check is
+    // CRITICAL: on a held frame (clamped unchanged) the proxy→full-res handoff kept serving the
+    // stale PROXY neighbours to a full-res base — 540p prev/next under a 1080p now → the N+1 spike.
+    if (m_file_reloading.load()) {
+        m_cached_adjacent_frame_number = -1;
+        m_cached_next_adjacent = nullptr;
+        m_cached_prev_adjacent = nullptr;
+    } else if (clamped != m_cached_adjacent_frame_number || shown_is_v2 != m_cached_adjacent_was_v2) {
+        m_cached_adjacent_frame_number = clamped;
+        m_cached_adjacent_was_v2 = shown_is_v2;
+        m_cached_next_adjacent = nullptr;
+        m_cached_prev_adjacent = nullptr;
+    }
+
+    // Only query the decoder while the cache for this frame is still incomplete.
+    // Once both N-1 and N+1 are cached, repeated calls on a held frame reuse them
+    // instead of hammering GetFrameForTime / try_lock every render frame.
+    bool adjacent_cache_incomplete = !m_cached_prev_adjacent || !m_cached_next_adjacent;
+
     // Only fetch adjacent frames when at slow speed (compositing is needed)
     // NOTE: Uses try_lock to avoid deadlock with UnloadFile during file reload
     double actual_speed_for_adjacent = 0.0;
@@ -1708,40 +2119,38 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         actual_speed_for_adjacent = m_audio_module->GetActualSpeed();
     }
 
-    if (actual_speed_for_adjacent <= 1.0 && !m_file_reloading.load()) {
+    if (actual_speed_for_adjacent <= 1.0 && !m_file_reloading.load() && adjacent_cache_incomplete) {
         // Calculate frame duration for adjacent timestamp calculation
         double fps = (m_frame_rate > 0) ? m_frame_rate : 25.0;
         double frame_duration = 1.0 / fps;
 
-        // Check if current frame came from full-res decoder (high resolution)
-        bool using_full_res = frame && (frame->height > 480);
+        // Source the adjacent frames from the SAME decoder that produced the base frame. Use the
+        // explicit shown_is_v2 flag — NOT a height threshold: the proxy is now 540p (>480), so the
+        // old `height > 480` test mis-classified a PROXY base as full-res and fetched V2 neighbours
+        // for it. Right after a shuttle seek (V2 buffer still rebuilding) those V2 neighbours were
+        // missing/wrong → the N+1 spike exactly at the proxy→full-res transition.
+        bool using_full_res = shown_is_v2;
 
         if (using_full_res && m_full_res_decoder && m_decoders_active.load() && !m_file_reloading.load()) {
-            // FULL-RES MODE: Get adjacent frames from full-res decoder
-            // Use GetFrameForTime with adjacent timestamps
-            // Skip if file is reloading to avoid potential blocking
+            // FULL-RES MODE: get the N-1/N/N+1 triplet in ONE atomic buffer read. The neighbours are
+            // the decoder buffer's immediate contiguous frames around `now` — a guaranteed-consistent
+            // triplet, unlike three separate time-queries (which, via the per-call cache + nearest
+            // match, could return a mismatched set → the seam spike on each new frame).
             try {
-                double prev_time = timestamp - frame_duration;
-                double next_time = timestamp + frame_duration;
-
-                if (prev_time >= 0 && !m_file_reloading.load()) {
-                    prev_frame = m_full_res_decoder->GetFrameForTime(prev_time);
-                }
                 if (!m_file_reloading.load()) {
-                    next_frame = m_full_res_decoder->GetFrameForTime(next_time);
+                    std::shared_ptr<AVFrame> triplet_now;
+                    m_full_res_decoder->GetFrameTriplet(timestamp, prev_frame, triplet_now, next_frame);
                 }
 
-                // Validate: adjacent frames must be different from current
-                if (prev_frame && frame) {
-                    // Check if it's actually a different frame (compare PTS or data ptr)
-                    if (prev_frame.get() == frame.get() || prev_frame->data[0] == frame->data[0]) {
-                        prev_frame = nullptr;  // Same frame, not useful for compositing
-                    }
+                // Guard against a buffer-edge duplicate (compositing a copy of the current frame
+                // would do nothing useful and can shimmer).
+                if (prev_frame && frame &&
+                    (prev_frame.get() == frame.get() || prev_frame->data[0] == frame->data[0])) {
+                    prev_frame = nullptr;
                 }
-                if (next_frame && frame) {
-                    if (next_frame.get() == frame.get() || next_frame->data[0] == frame->data[0]) {
-                        next_frame = nullptr;
-                    }
+                if (next_frame && frame &&
+                    (next_frame.get() == frame.get() || next_frame->data[0] == frame->data[0])) {
+                    next_frame = nullptr;
                 }
             } catch (...) {
                 prev_frame = nullptr;
@@ -1752,8 +2161,11 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             // CRITICAL: Use try_lock to avoid deadlock with UnloadFile
             // If mutex is held by UnloadFile, we just skip the adjacent frame
             try {
+                // Apply the same calibrated proxy offset so the Betacam compositing neighbours
+                // are the correct pictures (slot N+offset holds logical frame N).
+                const int proxy_off_adj = m_proxy_frame_offset.load();
                 // Get previous frame (N-1)
-                int prev_idx = actual_index - 1;
+                int prev_idx = actual_index + proxy_off_adj - 1;
                 if (prev_idx >= 0 && prev_idx < static_cast<int>(frame_vector->size()) && !m_file_reloading.load()) {
                     std::unique_lock<std::mutex> prev_lock((*frame_vector)[prev_idx].mutex, std::try_to_lock);
                     if (prev_lock.owns_lock()) {
@@ -1766,7 +2178,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                 }
 
                 // Get next frame (N+1) - use try_lock to avoid blocking
-                int next_idx = actual_index + 1;
+                int next_idx = actual_index + proxy_off_adj + 1;
                 if (next_idx >= 0 && next_idx < static_cast<int>(frame_vector->size()) && !m_file_reloading.load()) {
                     std::unique_lock<std::mutex> next_lock((*frame_vector)[next_idx].mutex, std::try_to_lock);
                     if (next_lock.owns_lock()) {
@@ -1784,25 +2196,15 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         }
     }
 
-    // Adjacent-frame sticky cache: prevents compositing flicker when try_to_lock fails.
-    // When the decoder thread briefly holds the frame mutex, try_to_lock returns nullptr.
-    // Keep the last valid N-1/N+1 per frame-number and use them as fallback.
-    // During file reload: always invalidate to avoid using stale frames from previous file.
-    if (m_file_reloading.load()) {
-        m_cached_adjacent_frame_number = -1;
-        m_cached_next_adjacent = nullptr;
-        m_cached_prev_adjacent = nullptr;
-    } else {
-        if (clamped != m_cached_adjacent_frame_number) {
-            // New video frame — reset cache (prev/next will differ)
-            m_cached_adjacent_frame_number = clamped;
-            m_cached_next_adjacent = nullptr;
-            m_cached_prev_adjacent = nullptr;
-        }
-        // Update cache with any freshly obtained frames
+    // Adjacent-frame sticky cache update (the per-frame reset is handled above,
+    // before the fetch). Store any freshly obtained frames, then fall back to the
+    // cache for any we couldn't obtain this call — whether because try_to_lock lost
+    // the race with the decoder thread, or because the fetch was skipped entirely
+    // (cache already complete for this held frame). This keeps compositing stable
+    // and prevents flicker while eliminating redundant decoder queries.
+    if (!m_file_reloading.load()) {
         if (next_frame) m_cached_next_adjacent = next_frame;
         if (prev_frame) m_cached_prev_adjacent = prev_frame;
-        // Fall back to cache for frames we couldn't obtain this call
         if (!next_frame) next_frame = m_cached_next_adjacent;
         if (!prev_frame) prev_frame = m_cached_prev_adjacent;
     }

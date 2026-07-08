@@ -49,6 +49,8 @@ int FindInstanceByFilePath(const char* filepath);
 int PlayInstance(int instance_id);
 int PauseInstance(int instance_id);
 int StopInstance(int instance_id);
+// Resource courtesy: free (backgrounded=1) / restore (0) an unfocused instance's full-res decoder.
+void SetInstanceBackgrounded(int instance_id, int backgrounded);
 int SeekInstance(int instance_id, double position);
 
 // === Speed and Direction Control ===
@@ -60,6 +62,7 @@ int SetInstanceReverseInstant(int instance_id, bool reverse);  // For Mouse Shut
 // === Instance State Retrieval ===
 double GetInstancePosition(int instance_id);
 double GetInstanceDuration(int instance_id);
+double GetInstanceTimecodeOffset(int instance_id);
 int IsInstancePlaying(int instance_id);
 double GetInstanceSpeed(int instance_id);           // Target speed
 double GetInstanceActualSpeed(int instance_id);     // Actual animated speed

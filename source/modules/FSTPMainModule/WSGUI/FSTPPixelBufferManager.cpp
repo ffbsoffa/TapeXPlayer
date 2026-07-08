@@ -24,6 +24,9 @@ FSTPPixelBufferManager::FSTPPixelBufferManager() {
         m_buffer_ready[i].store(false);
         m_use_yuv_mode[i] = false;
         m_last_effect_frame[i] = -1;
+        m_last_full_res[i] = -1;
+        m_last_shuttle[i] = -1;
+        m_grain_phase[i] = 0x9E3779B9u ^ (static_cast<uint32_t>(i) * 2654435761u);
         m_playback_metrics[i] = {};
     }
 
@@ -271,6 +274,23 @@ bool FSTPPixelBufferManager::ApplyRenderJitter(int player_id,
     return m_betacam_effect.ApplyRenderJitter(player_id, render_ctx);
 }
 
+bool FSTPPixelBufferManager::ApplyPixelFX(int player_id, FSTPBetacamEffect::FrameContext& ctx) {
+    if (!ValidatePlayerID(player_id)) {
+        return false;
+    }
+    return m_betacam_effect.ApplyPixelFX(player_id, ctx);
+}
+
+void FSTPPixelBufferManager::ApplyBaselineSmearEdgeFade(uint8_t* y, int y_pitch, uint8_t* u, uint8_t* v,
+                                                        int u_pitch, int v_pitch, int width, int height,
+                                                        Uint32 format) {
+    if (!y) return;
+    if (m_smear_enabled)
+        m_betacam_effect.ApplyAnalogSmear(y, y_pitch, u, v, u_pitch, v_pitch, width, height, format);
+    if (m_edgefade_enabled)
+        m_betacam_effect.ApplyEdgeFade(y, y_pitch, width, height, format);
+}
+
 bool FSTPPixelBufferManager::RenderWithHsync(int player_id, SDL_Renderer* renderer, SDL_Texture* texture,
                                               int texture_width, int texture_height, const SDL_Rect& dest_rect) {
     if (!ValidatePlayerID(player_id)) {
@@ -278,6 +298,129 @@ bool FSTPPixelBufferManager::RenderWithHsync(int player_id, SDL_Renderer* render
     }
     return m_betacam_effect.RenderWithHsync(player_id, renderer, texture, texture_width, texture_height, dest_rect);
 }
+
+namespace {
+// Build a soft (bilinear-upsampled) signed noise field into a strided int8 buffer.
+// cell = grain particle size in px; amp = peak amplitude. One-time cost per resolution.
+void BuildSoftNoise(int8_t* dst, int stride, int W, int H, int cell, double amp, uint32_t seed) {
+    if (W <= 0 || H <= 0) return;
+    if (cell < 1) cell = 1;
+    int gw = W / cell + 2;
+    int gh = H / cell + 2;
+    std::vector<float> grid(static_cast<size_t>(gw) * gh);
+    uint32_t s = seed | 1u;
+    auto rnd = [&]() -> float {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        return (static_cast<float>(s) * (1.0f / 4294967295.0f)) * 2.0f - 1.0f;  // [-1,1]
+    };
+    for (auto& v : grid) v = rnd() * static_cast<float>(amp);
+    for (int y = 0; y < H; ++y) {
+        int gy = y / cell;
+        float fy = static_cast<float>(y - gy * cell) / static_cast<float>(cell);
+        const float* r0 = &grid[static_cast<size_t>(gy) * gw];
+        const float* r1 = &grid[static_cast<size_t>(gy + 1) * gw];
+        for (int x = 0; x < W; ++x) {
+            int gx = x / cell;
+            float fx = static_cast<float>(x - gx * cell) / static_cast<float>(cell);
+            float top = r0[gx] + (r0[gx + 1] - r0[gx]) * fx;
+            float bot = r1[gx] + (r1[gx + 1] - r1[gx]) * fx;
+            float val = top + (bot - top) * fy;
+            int iv = static_cast<int>(std::lround(val));
+            if (iv > 127) iv = 127; else if (iv < -127) iv = -127;
+            dst[static_cast<size_t>(y * W + x) * stride] = static_cast<int8_t>(iv);
+        }
+    }
+}
+} // namespace
+
+void FSTPPixelBufferManager::EnsureGrainTile(int player_id, int width, int height) {
+    if (player_id < 0 || player_id >= MAX_PLAYERS || width <= 0 || height <= 0) return;
+    GrainTile& g = m_grain[player_id];
+    if (g.width == width && g.height == height && !g.luma.empty()) return;  // already built
+
+    g.width = width; g.height = height;
+    const int PAD = 32;                 // per-frame scroll headroom
+    const double lumaAmp   = 2.0;       // luma grain (toned back down a touch)
+    const double chromaAmp = 5.0;       // chroma grain (less than 8, still clearly visible)
+    int cell  = std::max(1, static_cast<int>(std::lround(height / 576.0)));  // grain size from 576p base
+    int ccell = std::max(1, cell);
+
+    g.lumaW = width + PAD;
+    g.lumaH = height + PAD;
+    g.luma.assign(static_cast<size_t>(g.lumaW) * g.lumaH, 0);
+    BuildSoftNoise(g.luma.data(), 1, g.lumaW, g.lumaH, cell, lumaAmp,
+                   0x00C0FFEEu ^ (static_cast<uint32_t>(player_id) * 2654435761u));
+
+    int cw = width / 2, ch = height / 2;
+    g.chromaW = cw + PAD;
+    g.chromaH = ch + PAD;
+    g.chromaUV.assign(static_cast<size_t>(g.chromaW) * g.chromaH * 2, 0);
+    // interleaved U,V grain (stride 2), independent seeds
+    BuildSoftNoise(g.chromaUV.data(),     2, g.chromaW, g.chromaH, ccell, chromaAmp,
+                   0x0BADC0DEu ^ (static_cast<uint32_t>(player_id) * 40503u));
+    BuildSoftNoise(g.chromaUV.data() + 1, 2, g.chromaW, g.chromaH, ccell, chromaAmp,
+                   0x5EED1234u ^ (static_cast<uint32_t>(player_id) * 2246822519u));
+}
+
+void FSTPPixelBufferManager::ApplyFilmGrain(int player_id, uint8_t* y_plane, int y_pitch,
+        uint8_t* u_plane, uint8_t* v_plane, int u_pitch, int v_pitch,
+        int width, int height, uint32_t format) {
+    if (player_id < 0 || player_id >= MAX_PLAYERS || !y_plane || width <= 0 || height <= 0) return;
+    GrainTile& g = m_grain[player_id];
+    if (g.luma.empty() || g.width != width || g.height != height) return;
+
+    const int PAD = 32;
+    uint32_t s = m_grain_phase[player_id];
+    auto nextOff = [&](int range) -> int {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        return static_cast<int>(s % static_cast<uint32_t>(range));
+    };
+    int oxL = nextOff(PAD), oyL = nextOff(PAD);
+
+    // Luma (lighter grain)
+    for (int yy = 0; yy < height; ++yy) {
+        uint8_t* row = y_plane + static_cast<size_t>(yy) * y_pitch;
+        const int8_t* grow = g.luma.data() + (static_cast<size_t>(yy + oyL) * g.lumaW + oxL);
+        for (int xx = 0; xx < width; ++xx) {
+            int val = row[xx] + grow[xx];
+            row[xx] = static_cast<uint8_t>(val < 0 ? 0 : (val > 255 ? 255 : val));
+        }
+    }
+
+    int cw = width / 2, ch = height / 2;
+    if (cw <= 0 || ch <= 0) { m_grain_phase[player_id] = s; return; }
+    int oxC = nextOff(PAD), oyC = nextOff(PAD);
+
+    if (format == SDL_PIXELFORMAT_NV12 && u_plane) {
+        for (int yy = 0; yy < ch; ++yy) {
+            uint8_t* row = u_plane + static_cast<size_t>(yy) * u_pitch;  // interleaved UV
+            const int8_t* grow = g.chromaUV.data() + (static_cast<size_t>(yy + oyC) * g.chromaW + oxC) * 2;
+            for (int xx = 0; xx < cw; ++xx) {
+                int uu = row[xx * 2]     + grow[xx * 2];
+                int vv = row[xx * 2 + 1] + grow[xx * 2 + 1];
+                row[xx * 2]     = static_cast<uint8_t>(uu < 0 ? 0 : (uu > 255 ? 255 : uu));
+                row[xx * 2 + 1] = static_cast<uint8_t>(vv < 0 ? 0 : (vv > 255 ? 255 : vv));
+            }
+        }
+    } else if ((format == SDL_PIXELFORMAT_IYUV || format == SDL_PIXELFORMAT_YV12) && u_plane && v_plane) {
+        for (int yy = 0; yy < ch; ++yy) {
+            uint8_t* urow = u_plane + static_cast<size_t>(yy) * u_pitch;
+            uint8_t* vrow = v_plane + static_cast<size_t>(yy) * v_pitch;
+            const int8_t* grow = g.chromaUV.data() + (static_cast<size_t>(yy + oyC) * g.chromaW + oxC) * 2;
+            for (int xx = 0; xx < cw; ++xx) {
+                int uu = urow[xx] + grow[xx * 2];
+                int vv = vrow[xx] + grow[xx * 2 + 1];
+                urow[xx] = static_cast<uint8_t>(uu < 0 ? 0 : (uu > 255 ? 255 : uu));
+                vrow[xx] = static_cast<uint8_t>(vv < 0 ? 0 : (vv > 255 ? 255 : vv));
+            }
+        }
+    }
+    m_grain_phase[player_id] = s;
+}
+
+// ApplyAnalogSmear moved to FSTPBetacamEffect — it must run post-composite (so slow-mo
+// compositing doesn't wipe it). The manager calls m_betacam_effect.ApplyAnalogSmear() for
+// the 1× path and passes frame_ctx.smear for the effect-active path.
 
 SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Renderer* renderer, const PixelBuffer* buffer,
                                                           SDL_Texture* existing_texture) {
@@ -397,13 +540,45 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                     double abs_rate = std::abs(metrics.playback_rate);
                     bool speed_in_effect_range = (abs_rate < 0.9 || abs_rate >= 1.2) ||
                                                  (abs_rate >= 0.9 && abs_rate <= 1.1 && metrics.is_reverse);
-                    bool candidate_effect = speed_in_effect_range &&
-                                             (metrics.position_seconds > 0.1) &&
+
+                    // EXPERIMENT: fire a DOC dropout on proxy↔full-res source switches. Detect
+                    // here — the manager sees every frame's resolution even at 1×, where the
+                    // effect is otherwise gated off — by the height crossing the proxy/full-res
+                    // boundary (proxy ≤480p, full-res >480p). Only at the flip; settled → nothing.
+                    int is_full_res = (buffer->height > 480) ? 1 : 0;
+                    if (m_last_full_res[player_id] >= 0 && is_full_res != m_last_full_res[player_id]) {
+                        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Alternating);
+                    }
+                    m_last_full_res[player_id] = is_full_res;
+
+                    // Start a touch EARLIER than the actual resolution flip: the full-res decoder
+                    // is stopped/resumed at the 2× boundary, so the proxy↔full-res switch happens
+                    // around there. Firing on the speed crossing 2× (either direction) makes the
+                    // dropout lead the visible switch slightly → a more graceful transition.
+                    int is_shuttle = (abs_rate >= 2.0) ? 1 : 0;
+                    if (m_last_shuttle[player_id] >= 0 && is_shuttle != m_last_shuttle[player_id]) {
+                        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Alternating);
+                    }
+                    m_last_shuttle[player_id] = is_shuttle;
+
+                    // Run the effect even at 1× while a DOC burst is queued/active, so dropouts
+                    // are visible at normal speed too (otherwise speed_in_effect_range gates it off).
+                    bool has_dropout = m_betacam_effect.HasPendingDropout(player_id);
+
+                    // position_seconds includes timecode_offset; duration_seconds is raw clip length.
+                    // Use file-relative position for boundary checks so videos with large
+                    // timecode offsets (e.g. 01:00:00:00) don't falsely appear past-end.
+                    double file_position = metrics.position_seconds - metrics.timecode_offset_seconds;
+                    bool candidate_effect = (speed_in_effect_range || has_dropout) &&
+                                             (file_position > 0.1) &&
                                              ((metrics.duration_seconds <= 0.0) ||
-                                              ((metrics.duration_seconds - metrics.position_seconds) > 0.1)) &&
+                                              ((metrics.duration_seconds - file_position) > 0.1)) &&
                                              buffer->width > 0 && buffer->height > 0;
 
-                    if (candidate_effect) {
+                    // Build a writable scratch when the Betacam effect is active OR film grain
+                    // is on (grain must touch the whole image at every speed, incl. 1×).
+                    bool want_scratch = (candidate_effect || m_grain_enabled || m_edgefade_enabled || m_smear_enabled);
+                    if (want_scratch) {
                         bool have_planes = true;
                         if (buffer->format == SDL_PIXELFORMAT_NV12) {
                             have_planes = (u_plane != nullptr && u_pitch > 0);
@@ -453,26 +628,71 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                                 scratch.plane2.clear();
                             }
 
-                            FSTPBetacamEffect::FrameContext frame_ctx;
-                            frame_ctx.pixel_format = buffer->format;
-                            frame_ctx.width = buffer->width;
-                            frame_ctx.height = buffer->height;
-                            frame_ctx.frame_number = buffer->frame_number;
-                            frame_ctx.new_frame = (m_last_effect_frame[player_id] != buffer->frame_number);
-                            frame_ctx.planes[0] = scratch.plane0.data();
-                            frame_ctx.linesize[0] = y_pitch;
-                            frame_ctx.planes[1] = scratch.plane1.empty() ? nullptr : scratch.plane1.data();
-                            frame_ctx.linesize[1] = u_pitch;
-                            frame_ctx.planes[2] = scratch.plane2.empty() ? nullptr : scratch.plane2.data();
-                            frame_ctx.linesize[2] = v_pitch;
-                            frame_ctx.source_frame = buffer->av_frame.get();
+                            uint8_t* su0 = scratch.plane1.empty() ? nullptr : scratch.plane1.data();
+                            uint8_t* sv0 = scratch.plane2.empty() ? nullptr : scratch.plane2.data();
 
-                            // Adjacent frames for Betacam slow-motion compositing
-                            // Provided by decoder: prev_frame (N-1) and next_frame (N+1)
-                            frame_ctx.prev_source_frame = buffer->prev_frame.get();
-                            frame_ctx.next_source_frame = buffer->next_frame.get();
+                            bool fx_applied = false;
+                            if (candidate_effect) {
+                                FSTPBetacamEffect::FrameContext frame_ctx;
+                                frame_ctx.pixel_format = buffer->format;
+                                frame_ctx.width = buffer->width;
+                                frame_ctx.height = buffer->height;
+                                frame_ctx.frame_number = buffer->frame_number;
+                                frame_ctx.new_frame = (m_last_effect_frame[player_id] != buffer->frame_number);
+                                frame_ctx.planes[0] = scratch.plane0.data();
+                                frame_ctx.linesize[0] = y_pitch;
+                                frame_ctx.planes[1] = scratch.plane1.empty() ? nullptr : scratch.plane1.data();
+                                frame_ctx.linesize[1] = u_pitch;
+                                frame_ctx.planes[2] = scratch.plane2.empty() ? nullptr : scratch.plane2.data();
+                                frame_ctx.linesize[2] = v_pitch;
+                                frame_ctx.source_frame = buffer->av_frame.get();
 
-                            if (m_betacam_effect.ApplyPixelFX(player_id, frame_ctx)) {
+                                // Adjacent frames for Betacam slow-motion compositing
+                                // Provided by decoder: prev_frame (N-1) and next_frame (N+1)
+                                frame_ctx.prev_source_frame = buffer->prev_frame.get();
+                                frame_ctx.next_source_frame = buffer->next_frame.get();
+                                // Smear + edge fade applied INSIDE the effect (after compositing,
+                                // under the stripe): fixes both the left-edge flicker and the smear
+                                // being wiped by slow-mo compositing.
+                                frame_ctx.smear     = m_smear_enabled;
+                                frame_ctx.edge_fade = m_edgefade_enabled;
+
+                                fx_applied = m_betacam_effect.ApplyPixelFX(player_id, frame_ctx);
+                                m_last_effect_frame[player_id] = buffer->frame_number;
+
+                                // Post-effect SD softness: gently blur the hard horizontal
+                                // edges of the grey Betacam bands (drawn crisp inside the
+                                // effect). Only on effect frames (slow/shuttle/pause) — clean
+                                // 1× playback stays sharp for frame-accurate analysis.
+                                if (fx_applied) {
+                                    m_betacam_effect.ApplySoftEdges(scratch.plane0.data(), y_pitch,
+                                                                    buffer->width, buffer->height, buffer->format);
+                                }
+                            } else {
+                                // No effect this frame (e.g. 1×) → apply smear + soft border here.
+                                if (m_smear_enabled) {
+                                    m_betacam_effect.ApplyAnalogSmear(scratch.plane0.data(), y_pitch,
+                                                                      su0, sv0, u_pitch, v_pitch,
+                                                                      buffer->width, buffer->height, buffer->format);
+                                }
+                                if (m_edgefade_enabled) {
+                                    m_betacam_effect.ApplyEdgeFade(scratch.plane0.data(), y_pitch,
+                                                                   buffer->width, buffer->height, buffer->format);
+                                }
+                            }
+
+                            // FINAL LAYER: subtle film grain over EVERYTHING (image + effect).
+                            // Soft chroma noise + lighter luma noise, grain sized from a 576p base.
+                            if (m_grain_enabled) {
+                                EnsureGrainTile(player_id, buffer->width, buffer->height);
+                                ApplyFilmGrain(player_id, scratch.plane0.data(), y_pitch,
+                                               su0, sv0, u_pitch, v_pitch,
+                                               buffer->width, buffer->height, buffer->format);
+                            }
+
+                            // Point output at the scratch when it was actually modified (effect,
+                            // smear, edge fade and/or grain); otherwise keep the zero-copy source.
+                            if (fx_applied || m_grain_enabled || m_edgefade_enabled || m_smear_enabled) {
                                 y_plane = scratch.plane0.data();
                                 if (buffer->format == SDL_PIXELFORMAT_IYUV ||
                                     buffer->format == SDL_PIXELFORMAT_YV12) {
@@ -483,7 +703,6 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                                     v_plane = nullptr;
                                 }
                             }
-                            m_last_effect_frame[player_id] = buffer->frame_number;
                         }
                     }
                 }

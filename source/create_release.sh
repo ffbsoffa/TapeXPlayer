@@ -60,39 +60,39 @@ macOS 13.0 Ventura or later required
 Universal Binary (Intel + Apple Silicon)
 
 ================================================================================
-INSTALLATION / УСТАНОВКА
+INSTALLATION
 ================================================================================
 
-macOS помечает файлы, скачанные с GitHub, атрибутом карантина.
-Перед первым запуском его нужно снять одним из способов ниже.
+macOS flags files downloaded from GitHub with a quarantine attribute.
+Clear it before the first launch using one of the methods below.
 
 ================================================================================
-СПОСОБ 1 — Terminal
+METHOD 1 — Terminal
 ================================================================================
 
-1. Распакуйте ZIP архив
-2. Откройте Terminal (⌘+Space → "Terminal")
-3. Выполните команды:
+1. Unpack the ZIP archive
+2. Open Terminal (⌘+Space → "Terminal")
+3. Run:
 
    cd ~/Downloads/TapeXPlayer-${CODENAME}-build${BUILD}
    xattr -cr .
    cp -R TapeXPlayer.app /Applications/
 
-4. Запускайте из Launchpad или /Applications
+4. Launch from Launchpad or /Applications
 
 ================================================================================
-СПОСОБ 2 — System Settings
+METHOD 2 — System Settings
 ================================================================================
 
-1. Распакуйте ZIP и переместите TapeXPlayer.app в /Applications
-2. Запустите TapeXPlayer.app двойным кликом
-3. macOS покажет: "cannot be opened because the developer cannot be verified"
-4. Откройте: System Settings → Privacy & Security
-5. Нажмите "Open Anyway" рядом с TapeXPlayer
-6. Подтвердите запуск в появившемся диалоге
+1. Unpack the ZIP and move TapeXPlayer.app to /Applications
+2. Double-click TapeXPlayer.app
+3. macOS will show: "cannot be opened because the developer cannot be verified"
+4. Open: System Settings → Privacy & Security
+5. Click "Open Anyway" next to TapeXPlayer
+6. Confirm launch in the dialog that appears
 
 ================================================================================
-SYSTEM REQUIREMENTS / СИСТЕМНЫЕ ТРЕБОВАНИЯ
+SYSTEM REQUIREMENTS
 ================================================================================
 
 • macOS 13.0 Ventura or later
@@ -101,78 +101,78 @@ SYSTEM REQUIREMENTS / СИСТЕМНЫЕ ТРЕБОВАНИЯ
 • Metal-capable GPU
 
 ================================================================================
-SUPPORTED FORMATS / ПОДДЕРЖИВАЕМЫЕ ФОРМАТЫ
+SUPPORTED FORMATS
 ================================================================================
 
-Видео / Video:
+Video:
   • MP4, MOV, AVI, MKV
   • H.264, H.265/HEVC, ProRes, DNxHD
-  • Все форматы поддерживаемые FFmpeg
+  • All formats supported by FFmpeg
 
-Аудио / Audio:
+Audio:
   • MP3, WAV, FLAC, AAC, M4A, OGG
   • Multi-channel audio support
 
 ================================================================================
-FEATURES / ВОЗМОЖНОСТИ
+FEATURES
 ================================================================================
 
-Воспроизведение / Playback:
+Playback:
   • Professional frame-accurate video playback
   • Hardware acceleration (VideoToolbox, Metal, FFmpeg)
   • Variable speed: 0.1x - 32x (forward/reverse)
   • Low-resolution proxy caching for smooth scrubbing
   • Multiple player instances support
 
-Управление / Control:
+Control:
   • Timecode-based seeking (HH:MM:SS:FF)
   • Mouse shuttle control (Shift+Ctrl+Drag)
   • Real-time zoom and pan with mouse
   • Memory Locations for quick navigation
   • MIDI controller support (Mackie HUI / X-Touch One)
 
-Аудио / Audio:
+Audio:
   • Configurable audio device and buffer size
   • Master volume control
   • VU meters for audio level monitoring
   • Multi-channel audio support
 
-Настройки / Settings (Cmd+,):
+Settings (Cmd+,):
   • Audio: Device selection, buffer size, master volume
   • Video & Sync: Frame offset (-10 to +10 frames)
   • MIDI: Enable/disable, input/output port selection
   • Auto-freeze inactive players (resource management)
 
-Дополнительно / Additional:
+Additional:
   • Screenshot capture with timecode overlay (Cmd+C)
   • Inspector window for file information
   • Native macOS menu integration
   • SwiftUI-based About and Settings dialogs
 
 ================================================================================
-SHORTCUTS / ГОРЯЧИЕ КЛАВИШИ
+SHORTCUTS
 ================================================================================
 
-Воспроизведение / Playback:
+Playback:
   Space          Play/Pause (smart logic)
   P              Play
   S              Stop
   R              Reverse toggle
 
-Скорость / Speed:
+Speed:
   ↑ / ↓          Speed step up/down (1x→3x→10x→18x→24x→32x)
   1              Set speed to 1x
   2              Set speed to 3x
   + / -          Fine speed adjustment
 
-Навигация / Navigation:
+Navigation:
   ← / →          Seek -10s / +10s (Shift: -1min / +1min)
   Home / End     Go to start / end
   Cmd+G          Timecode seek mode
   NumPad *       Timecode seek mode
   Return         Create Memory Location
 
-Зум / Zoom:
+Zoom:
   Cmd+Z          Zoom In
   Shift+Z        Zoom Out
   X              Reset Zoom
@@ -180,7 +180,7 @@ SHORTCUTS / ГОРЯЧИЕ КЛАВИШИ
   Mouse Wheel    Zoom in/out
   Shift+Alt+Drag Pan zoom area
 
-Файл и окна / File & Windows:
+File & Windows:
   Cmd+O          Open file
   Shift+Cmd+O    Open in new instance
   Cmd+N          New window
@@ -188,7 +188,7 @@ SHORTCUTS / ГОРЯЧИЕ КЛАВИШИ
   Cmd+W          Close window
   Cmd+M          Minimize window
 
-Инструменты / Tools:
+Tools:
   Cmd+C          Take screenshot
   Cmd+,          Settings (Preferences)
   Cmd+I          Show inspector
@@ -197,42 +197,41 @@ SHORTCUTS / ГОРЯЧИЕ КЛАВИШИ
   I              Show info (console)
   Cmd+Q          Quit
 
-Full shortcuts reference: см. FSTPKeyboard.cpp в репозитории
+Full shortcuts reference: see FSTPKeyboard.cpp in the repository
 
 ================================================================================
-TROUBLESHOOTING / РЕШЕНИЕ ПРОБЛЕМ
+TROUBLESHOOTING
 ================================================================================
 
 Q: "TapeXPlayer cannot be opened because the developer cannot be verified"
-A: Выполните: cd ~/Downloads/TapeXPlayer-${CODENAME}-build${BUILD} && xattr -cr .
+A: Run: cd ~/Downloads/TapeXPlayer-${CODENAME}-build${BUILD} && xattr -cr .
 
-Q: Приложение не запускается после установки
-A: Убедитесь что выполнили xattr -cr перед первым запуском
+Q: The app won't launch after installation
+A: Make sure you ran xattr -cr before the first launch
 
-Q: Видео не воспроизводится
-A: Проверьте поддержку кодека. Приложение поддерживает все стандартные
-   форматы через FFmpeg.
+Q: Video won't play
+A: Check codec support. The app supports all standard formats via FFmpeg.
 
-Q: Низкая производительность
-A: Откройте Settings → Video & Sync и настройте параметры. Приложение
-   автоматически создаёт low-resolution proxy для плавного скроббинга.
+Q: Poor performance
+A: Open Settings → Video & Sync and adjust the parameters. The app
+   automatically builds a low-resolution proxy for smooth scrubbing.
 
-Q: Как подключить MIDI контроллер?
-A: 1. Откройте Settings (Cmd+,) → вкладка MIDI
-   2. Установите галочку "Enable MIDI Controller"
-   3. Выберите Input/Output порты для вашего устройства
-   4. Поддерживается: Mackie HUI / X-Touch One
-   5. Настройте контроллер в режим HUI/Mackie
+Q: How do I connect a MIDI controller?
+A: 1. Open Settings (Cmd+,) → MIDI tab
+   2. Check "Enable MIDI Controller"
+   3. Select the Input/Output ports for your device
+   4. Supported: Mackie HUI / X-Touch One
+   5. Set your controller to HUI/Mackie mode
 
-Q: Как настроить синхронизацию видео с внешним монитором?
+Q: How do I sync video with an external monitor?
 A: Settings → Video & Sync → Frame Offset
-   Используйте -10 to +10 frames для компенсации задержки монитора
+   Use -10 to +10 frames to compensate for monitor latency
 
-Q: Изменил Buffer Size в настройках, но эффекта нет
-A: Изменения размера аудио буфера требуют перезапуска приложения
+Q: I changed Buffer Size in settings but nothing happened
+A: Audio buffer size changes require an application restart
 
 ================================================================================
-LINKS / ССЫЛКИ
+LINKS
 ================================================================================
 
 • GitHub: https://github.com/ffbsoffa/tapexplayer
@@ -241,10 +240,10 @@ LINKS / ССЫЛКИ
 • Keyboard shortcuts: source/modules/FSTPMainModule/WSGUI/FSTPKeyboard.cpp
 
 ================================================================================
-LICENSE / ЛИЦЕНЗИЯ
+LICENSE
 ================================================================================
 
-Open Source - см. LICENSE файл в репозитории
+Open Source - see the LICENSE file in the repository
 
 ================================================================================
                         Thank you for using TapeXPlayer!

@@ -6,10 +6,14 @@
 #include "FSTPSettings.h"
 #include "FSTPZoom.h"
 #include "FSTPKeyboard.h"
+#include "FSTPWelcomeScreen.h"
+#include "FSTPSubtitles.h"
+#include "FSTPLuaExtension.h"
 #include "../FSTPPlayerModule/FSTPPlayerManager.h"
 #include "../FSTPAudioModule/FSTPAudioModule_API.h"
 #include "../FSTPAudioModule/FSTPAudioModule_wrapper.h"
 #include <iostream>
+#include <iomanip>
 #include <cstring>
 #include <mutex>
 #include <chrono>
@@ -19,7 +23,13 @@
 
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#include "darwin/sdl/FSTPToolsMenu.h"  // RefreshMemoryLocationsWindowIfOpen()
 #endif
+
+extern "C" {
+#include <libavutil/frame.h>
+}
+
 
 // Global counter of skipped texture updates (for adaptive FPS)
 std::atomic<int> g_texture_skip_counter{0};
@@ -76,6 +86,33 @@ static bool g_window_manager_initialized = false;
 
 // Global pixel buffer manager
 static std::unique_ptr<FSTPPixelBufferManager> g_pixel_buffer_manager;
+
+// Presentation mode: external display output (separate YUV renderer for separate SDL_Renderer)
+static struct {
+    SDL_Window*   window   = nullptr;
+    SDL_Renderer* renderer = nullptr;
+    int  linked_player_id  = -1;
+    bool active  = false;
+    bool enabled = false;
+    double last_timestamp = -1.0;
+    bool pending_renderer = false;
+    FSTPYUVRenderer* yuv_renderer = nullptr;
+    int    yuv_w   = 0;
+    int    yuv_h   = 0;
+    Uint32 yuv_fmt = 0;
+    // Output target + focus behaviour (mirrors Settings; see CreatePresentationWindow).
+    bool follow_focus  = true;   // true = follow focused player; false = pinned
+    int  pinned_player = 0;      // player id used when follow_focus == false
+    int  output_mode   = 0;      // 0 = external display, 1 = separate window
+    int  display_index = -1;     // chosen external display (for re-apply)
+    bool windowed      = false;  // true = separate window (cursor allowed on chrome)
+    Uint32 window_id   = 0;      // for ENTER/LEAVE cursor handling
+} g_presentation;
+
+// Serialises the render thread's presentation block against ClosePresentationWindow /
+// CreatePresentationWindow (main thread). Without it, tearing the renderer/window/yuv_renderer
+// down (e.g. Shift+P close) while the render thread is mid-blit is a use-after-free → segfault.
+static std::mutex g_presentation_mutex;
 
 int InitWindowManager() {
     if (g_window_manager_initialized) {
@@ -156,6 +193,9 @@ void ShutdownWindowManager() {
             FSTPCloseWindow(i);
         }
     }
+
+    // Close presentation window
+    ClosePresentationWindow();
 
     g_window_manager_initialized = false;
     std::cout << "Window manager shutdown complete" << std::endl;
@@ -466,6 +506,16 @@ static void HandleAutoFreezeOnFocusChange(int focused_window_index, bool gained_
     if (gained_focus) {
         int active_player_id = g_windows[focused_window_index].player_instance_id;
 
+        // Resource courtesy: free the heavy full-res decoder of UNFOCUSED instances — UNLESS a
+        // presentation/conference window is up. There the operator switches focus to drive the big
+        // screen, so BOTH materials must stay instantly ready (no cold-start when cutting to them).
+        bool keep_all_ready = IsPresentationWindowActive();
+
+        // The newly-focused instance becomes the foreground one — restore its full-res decoder.
+        if (active_player_id >= 0 && IsPlayerInstanceActive(active_player_id)) {
+            SetInstanceBackgrounded(active_player_id, 0);
+        }
+
         for (int i = 0; i < MAX_WINDOWS; i++) {
             if (g_windows[i].is_active && i != focused_window_index) {
                 int player_id = g_windows[i].player_instance_id;
@@ -479,6 +529,10 @@ static void HandleAutoFreezeOnFocusChange(int focused_window_index, bool gained_
                                       << " frozen (active: Player " << active_player_id << ")" << std::endl;
                         }
                     }
+                    // Free its full-res decoder (keeps the cached still frame) unless presenting.
+                    if (!keep_all_ready) {
+                        SetInstanceBackgrounded(player_id, 1);
+                    }
                 }
             }
         }
@@ -487,6 +541,17 @@ static void HandleAutoFreezeOnFocusChange(int focused_window_index, bool gained_
 
 void HandleWindowEvents(SDL_Event* event) {
     if (event->type == SDL_WINDOWEVENT) {
+        // Presentation window: keep the surface clean — hide the cursor while the pointer is over
+        // the video (the Betacam hardware-protection principle: nothing but picture on the output),
+        // restore it on leave. SDL cursor visibility is global, so this is safe (pointer is over
+        // exactly one window at a time).
+        if (g_presentation.active && g_presentation.window_id != 0 &&
+            event->window.windowID == g_presentation.window_id) {
+            if (event->window.event == SDL_WINDOWEVENT_ENTER)      SDL_ShowCursor(SDL_DISABLE);
+            else if (event->window.event == SDL_WINDOWEVENT_LEAVE) SDL_ShowCursor(SDL_ENABLE);
+            return;
+        }
+
         FSTPWindow* window = GetWindowBySDLID(event->window.windowID);
         if (window == nullptr) {
             return;
@@ -535,6 +600,11 @@ void HandleWindowEvents(SDL_Event* event) {
                         break;
                     }
                 }
+#ifdef __APPLE__
+                // Memory Locations are per-instance — refresh the open window so it
+                // shows the newly focused player's marker set.
+                RefreshMemoryLocationsWindowIfOpen();
+#endif
                 break;
 
             case SDL_WINDOWEVENT_FOCUS_LOST:
@@ -646,6 +716,17 @@ void RenderAllWindows() {
                 UpdateVideoFrameForPlayer(player_id);
             }
 
+            // While a Betacam dropout burst is showing, bypass the FPS-saving throttles below
+            // (settled-pause skip + timestamp-skip) so the dropout re-applies and animates at
+            // full render rate instead of the ~25fps adaptation. Until dropouts disappear.
+            bool dropout_active = (player_id >= 0 && g_pixel_buffer_manager &&
+                                   g_pixel_buffer_manager->HasPendingDropout(player_id));
+            // Film grain animates at full render rate (~60fps) during playback: re-apply every
+            // render frame. The settled-pause throttle below still applies, so a fully-still
+            // pause stays cheap.
+            bool grain_active = (player_id >= 0 && g_pixel_buffer_manager &&
+                                 g_pixel_buffer_manager->IsFilmGrainActive());
+
             // SETTLED PAUSE THROTTLE: when frame is aligned, betacam stripe gone,
             // and zoom is not active — throttle full render cycle to ~5fps.
             // SDL events and menus are processed independently on all platforms.
@@ -656,7 +737,7 @@ void RenderAllWindows() {
                                g_windows[i].last_frame_aligned &&
                                g_windows[i].betacam_hold_frames == 0;
 
-                if (settled && !zoom_active) {
+                if (settled && !zoom_active && !dropout_active) {
                     uint64_t now_ms = static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -692,6 +773,7 @@ void RenderAllWindows() {
                 playback_metrics.is_reverse = is_reverse_playback;
                 playback_metrics.position_seconds = GetInstancePosition(player_id);
                 playback_metrics.duration_seconds = GetInstanceDuration(player_id);
+                playback_metrics.timecode_offset_seconds = GetInstanceTimecodeOffset(player_id);
                 playback_metrics.frame_rate = GetInstanceVideoFPS(player_id);
 
                 double absPlaybackRate = std::fabs(playback_metrics.playback_rate);
@@ -737,6 +819,16 @@ void RenderAllWindows() {
                     bool betacam_speed = (absPlaybackRate < 0.9 || absPlaybackRate > 1.1);
                     bool pause_settled = is_pure_pause && frame_aligned && g_windows[i].betacam_hold_frames == 0;
                     if (betacam_speed && !pause_settled) {
+                        need_update = true;
+                    }
+                    // Dropout burst: force re-apply every render frame so it animates at full
+                    // rate (CreateOrUpdateTexture re-runs the effect), bypassing the 25fps skip.
+                    if (dropout_active) {
+                        need_update = true;
+                    }
+                    // Film grain: re-apply every render frame so it shimmers at ~60fps (the
+                    // grain pass re-rolls each call). Settled-still pause already skipped above.
+                    if (grain_active) {
                         need_update = true;
                     }
 
@@ -912,6 +1004,32 @@ void RenderAllWindows() {
 
             // 3.5. MENU BAR removed - using GTK context menu instead
 
+            // 3.55. SUBTITLES (first extension) — cross-platform SDL overlay,
+            //       synced to the player position. No-op when disabled / no track.
+            if (player_id >= 0 && FSTPSubtitles_IsEnabled() && IsPlayerInstanceActive(player_id)) {
+                int sub_w = 0, sub_h = 0;
+                SDL_GetRendererOutputSize(renderer, &sub_w, &sub_h);
+                FSTPSubtitles_Render(renderer, player_id, GetInstancePosition(player_id), sub_w, sub_h);
+            }
+
+            // 3.57. LUA EXTENSIONS — per-frame draw callbacks (script overlays).
+            //        Cheap no-op when no lua extension is loaded.
+            {
+                int lua_w = 0, lua_h = 0;
+                SDL_GetRendererOutputSize(renderer, &lua_w, &lua_h);
+                double lua_t = (player_id >= 0 && IsPlayerInstanceActive(player_id))
+                                   ? GetInstancePosition(player_id) : 0.0;
+                FSTPLua_Render(renderer, player_id, lua_t, lua_w, lua_h);
+            }
+
+            // 3.6. WELCOME OVERLAY (first-run onboarding) — cross-platform SDL,
+            //      drawn on top of everything. No-op unless active.
+            if (FSTPWelcome_IsActive()) {
+                int welcome_w = 0, welcome_h = 0;
+                SDL_GetRendererOutputSize(renderer, &welcome_w, &welcome_h);
+                FSTPWelcome_Render(renderer, welcome_w, welcome_h);
+            }
+
             // 4. Final Present
             auto t_before_present = std::chrono::high_resolution_clock::now();
 
@@ -926,6 +1044,197 @@ void RenderAllWindows() {
 
             perf_sample_count.fetch_add(1);
             // ============================================================
+        }
+    }
+
+    // ========================================================================
+    // PRESENTATION MODE: Separate YUV renderer — CLEAN output only (no OSD / indicators / cursor).
+    // ========================================================================
+    // Hold the presentation lock for the whole block (active-check + render) so the main thread
+    // can't destroy the renderer/window mid-blit (Shift+P close). This is the last thing in
+    // RenderAllWindows, so the guard releases at function return.
+    std::lock_guard<std::mutex> _pres_lock(g_presentation_mutex);
+    // Source selection: in follow-focus mode, whichever player window has focus drives the output
+    // (hold the last one when focus leaves to another app); in pinned mode, a fixed player drives it.
+    if (g_presentation.active && g_presentation.enabled) {
+        if (g_presentation.follow_focus) {
+            int focused = GetActivePlayerID();
+            if (focused >= 0) g_presentation.linked_player_id = focused;
+        } else {
+            g_presentation.linked_player_id = g_presentation.pinned_player;
+        }
+    }
+
+    if (g_presentation.active && g_presentation.enabled && g_presentation.linked_player_id >= 0) {
+        int player_id = g_presentation.linked_player_id;
+
+        if (!IsPlayerInstanceActive(player_id)) {
+            // Render thread must NOT call SDL_DestroyWindow (requires main thread).
+            // Just detach and go black; main thread will destroy via ClosePresentationWindow().
+            if (g_presentation.renderer) {
+                SDL_SetRenderDrawColor(g_presentation.renderer, 0, 0, 0, 255);
+                SDL_RenderClear(g_presentation.renderer);
+                SDL_RenderPresent(g_presentation.renderer);
+            }
+            g_presentation.active           = false;
+            g_presentation.linked_player_id = -1;
+        } else if (g_presentation.renderer) {
+            const FSTPPixelBufferManager::PixelBuffer* pb =
+                g_pixel_buffer_manager ? g_pixel_buffer_manager->GetPixelBuffer(player_id) : nullptr;
+
+            if (!pb || !pb->is_valid || !pb->av_frame || pb->width <= 0) {
+                // No frame yet — black screen
+                SDL_SetRenderDrawColor(g_presentation.renderer, 0, 0, 0, 255);
+                SDL_RenderClear(g_presentation.renderer);
+                SDL_RenderPresent(g_presentation.renderer);
+            } else {
+                SDL_Renderer* renderer = g_presentation.renderer;
+                AVFrame* f = pb->av_frame.get();
+
+                // SDL format from AVFrame format
+                bool is_nv12 = (f->format == AV_PIX_FMT_NV12 || f->format == AV_PIX_FMT_NV21);
+                Uint32 sdl_fmt = is_nv12 ? SDL_PIXELFORMAT_NV12 : SDL_PIXELFORMAT_IYUV;
+
+                // (Re)create YUV renderer when resolution or format changes
+                bool needs_yuv = !g_presentation.yuv_renderer ||
+                                 g_presentation.yuv_w   != pb->width  ||
+                                 g_presentation.yuv_h   != pb->height ||
+                                 g_presentation.yuv_fmt != sdl_fmt;
+                if (needs_yuv) {
+                    if (g_presentation.yuv_renderer) {
+                        g_presentation.yuv_renderer->Cleanup();
+                        delete g_presentation.yuv_renderer;
+                        g_presentation.yuv_renderer = nullptr;
+                    }
+                    g_presentation.yuv_renderer = new FSTPYUVRenderer();
+                    if (!g_presentation.yuv_renderer->Initialize(renderer, pb->width, pb->height, sdl_fmt)) {
+                        std::cerr << "❌ [PRESENTATION] YUV renderer init failed" << std::endl;
+                        delete g_presentation.yuv_renderer;
+                        g_presentation.yuv_renderer = nullptr;
+                    } else {
+                        g_presentation.yuv_w   = pb->width;
+                        g_presentation.yuv_h   = pb->height;
+                        g_presentation.yuv_fmt = sdl_fmt;
+                        std::cout << "📺 [PRESENTATION] YUV renderer ready: "
+                                  << pb->width << "x" << pb->height
+                                  << (is_nv12 ? " NV12" : " IYUV") << std::endl;
+                    }
+                }
+                if (!g_presentation.yuv_renderer) goto pres_done;
+
+                // Copy YUV planes to scratch and apply Betacam pixel effects.
+                // new_frame=false: re-apply current state without advancing it —
+                // state was already advanced by the main window this frame.
+                {
+                    static std::vector<uint8_t> scratch_y, scratch_uv, scratch_v;
+                    int y_pitch  = f->linesize[0];
+                    int uv_pitch = f->linesize[1];
+                    int v_pitch  = f->linesize[2];
+                    int chroma_h = pb->height / 2;
+
+                    scratch_y.resize(static_cast<size_t>(y_pitch)  * pb->height);
+                    scratch_uv.resize(static_cast<size_t>(uv_pitch) * chroma_h);
+                    if (!is_nv12)
+                        scratch_v.resize(static_cast<size_t>(v_pitch) * chroma_h);
+
+                    for (int row = 0; row < pb->height; ++row)
+                        std::memcpy(scratch_y.data()  + row * y_pitch,
+                                    f->data[0] + row * f->linesize[0], y_pitch);
+                    for (int row = 0; row < chroma_h; ++row)
+                        std::memcpy(scratch_uv.data() + row * uv_pitch,
+                                    f->data[1] + row * f->linesize[1], uv_pitch);
+                    if (!is_nv12)
+                        for (int row = 0; row < chroma_h; ++row)
+                            std::memcpy(scratch_v.data() + row * v_pitch,
+                                        f->data[2] + row * f->linesize[2], v_pitch);
+
+                    if (g_pixel_buffer_manager) {
+                        FSTPBetacamEffect::FrameContext ctx;
+                        ctx.pixel_format      = sdl_fmt;
+                        ctx.width             = pb->width;
+                        ctx.height            = pb->height;
+                        ctx.frame_number      = pb->frame_number;
+                        ctx.new_frame         = false; // mirror: don't advance state
+                        ctx.planes[0]         = scratch_y.data();
+                        ctx.linesize[0]       = y_pitch;
+                        ctx.planes[1]         = scratch_uv.data();
+                        ctx.linesize[1]       = uv_pitch;
+                        ctx.planes[2]         = is_nv12 ? nullptr : scratch_v.data();
+                        ctx.linesize[2]       = is_nv12 ? 0 : v_pitch;
+                        ctx.source_frame      = f;
+                        ctx.prev_source_frame = pb->prev_frame ? pb->prev_frame.get() : nullptr;
+                        ctx.next_source_frame = pb->next_frame ? pb->next_frame.get() : nullptr;
+                        // Mirror the always-on baseline Betacam elements the main window applies
+                        // (these were missing on the presentation output → "not all elements
+                        // transferred"): analog smear + soft L/R edge fade.
+                        ctx.smear     = g_pixel_buffer_manager->IsSmearEnabled();
+                        ctx.edge_fade = g_pixel_buffer_manager->IsEdgeFadeEnabled();
+                        bool fx = g_pixel_buffer_manager->ApplyPixelFX(player_id, ctx);
+                        if (!fx) {
+                            // No per-speed effect this frame (e.g. 1×) — apply smear + soft border
+                            // directly, exactly as the main window does, so the presentation screen
+                            // carries the full Betacam look.
+                            g_pixel_buffer_manager->ApplyBaselineSmearEdgeFade(
+                                scratch_y.data(), y_pitch,
+                                scratch_uv.data(), is_nv12 ? nullptr : scratch_v.data(),
+                                uv_pitch, is_nv12 ? 0 : v_pitch,
+                                pb->width, pb->height, sdl_fmt);
+                        }
+                    }
+
+                    YUVPlanes planes;
+                    planes.width       = pb->width;
+                    planes.height      = pb->height;
+                    planes.y_plane     = scratch_y.data();
+                    planes.y_pitch     = y_pitch;
+                    planes.u_plane     = scratch_uv.data();
+                    planes.u_pitch     = uv_pitch;
+                    planes.v_plane     = is_nv12 ? nullptr : scratch_v.data();
+                    planes.v_pitch     = is_nv12 ? 0 : v_pitch;
+                    planes.is_full_range = (f->color_range == AVCOL_RANGE_JPEG);
+                    planes.format      = f->format;
+                    g_presentation.yuv_renderer->UpdateYUVTexture(planes);
+                }
+
+                // Render with Betacam geometry effects (jitter, HSync).
+                // new_frame=false: mirror current state without advancing.
+                {
+                    SDL_Texture* tex = g_presentation.yuv_renderer->GetTexture();
+                    int win_w, win_h;
+                    SDL_GetWindowSize(g_presentation.window, &win_w, &win_h);
+
+                    int disp_w = pb->width, disp_h = pb->height;
+                    if (pb->sar_num > 0 && pb->sar_den > 0)
+                        disp_w = static_cast<int>(pb->width *
+                            static_cast<double>(pb->sar_num) / pb->sar_den);
+
+                    SDL_Rect dst = ComputeAspectFitRect(disp_w, disp_h, win_w, win_h);
+
+                    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+                    SDL_RenderClear(renderer);
+
+                    bool hsync_applied = false;
+                    if (g_pixel_buffer_manager) {
+                        FSTPBetacamEffect::RenderContext rctx;
+                        rctx.dest_rect           = &dst;
+                        rctx.window_width        = win_w;
+                        rctx.window_height       = win_h;
+                        rctx.target_aspect_ratio = disp_h > 0
+                            ? static_cast<float>(disp_w) / disp_h : 1.0f;
+                        rctx.frame_number        = pb->frame_number;
+                        rctx.new_frame           = false; // mirror: don't advance state
+                        g_pixel_buffer_manager->ApplyRenderJitter(player_id, rctx);
+                        hsync_applied = g_pixel_buffer_manager->RenderWithHsync(
+                            player_id, renderer, tex, pb->width, pb->height, dst);
+                    }
+                    if (!hsync_applied)
+                        SDL_RenderCopy(renderer, tex, nullptr, &dst);
+
+                    SDL_RenderPresent(renderer);
+                    g_presentation.last_timestamp = pb->timestamp;
+                }
+            }
+            pres_done:;
         }
     }
 }
@@ -1147,3 +1456,193 @@ void UpdateWindowTitle(int window_index, int instance_id, const char* filename) 
 #endif
     }
 }
+
+// ============================================================================
+// PRESENTATION MODE API
+// ============================================================================
+
+bool CreatePresentationWindow(int player_id, int output_mode, int display_index) {
+    if (g_presentation.active) {
+        ClosePresentationWindow();
+    }
+
+    int display_count = SDL_GetNumVideoDisplays();
+
+    // Decide the actual target. External mode needs a second display; if none is connected we
+    // gracefully fall back to a separate window instead of erroring out (so single-screen
+    // presenters / conferences with screen-share still work).
+    bool windowed = (output_mode == 1) || (display_count <= 1);
+
+    int    target_display = -1;
+    int    win_x, win_y, win_w, win_h;
+    Uint32 win_flags;
+
+    if (windowed) {
+        // Separate, movable/resizable window centred on the main display. Drag it to any screen.
+        target_display = -1;
+        win_x = SDL_WINDOWPOS_CENTERED;
+        win_y = SDL_WINDOWPOS_CENTERED;
+        win_w = 1280;
+        win_h = 720;
+        // No SDL_WINDOW_ALLOW_HIGHDPI — match the main player windows. With HIGHDPI the Metal
+        // drawable is 2× the window points on Retina, but the video is sized from SDL_GetWindowSize
+        // (points), so it would render into a fraction of the drawable and look soft/low-res.
+        win_flags = SDL_WINDOW_RESIZABLE;
+    } else {
+        target_display = (display_index < 0 || display_index >= display_count) ? 1 : display_index;
+        SDL_Rect db;
+        SDL_GetDisplayBounds(target_display, &db);
+        win_x = db.x; win_y = db.y; win_w = db.w; win_h = db.h;
+        // Borderless covering the external display (no fullscreen = no Mission Control Space).
+        win_flags = SDL_WINDOW_BORDERLESS;
+    }
+
+    g_presentation.window = SDL_CreateWindow(
+        "TapeXPlayer — Presentation",
+        win_x, win_y, win_w, win_h, win_flags);
+
+    if (!g_presentation.window) {
+        std::cerr << "❌ [PRESENTATION] Failed to create window: " << SDL_GetError() << std::endl;
+        return false;
+    }
+
+    SDL_RaiseWindow(g_presentation.window);
+
+    // Create renderer on main thread — REQUIRED for Metal (CAMetalLayer must be
+    // set up on main thread, same as all other windows in this app).
+    // The render thread will USE this renderer, which Metal supports.
+    // VSync enabled (same as main windows): SDL_RenderSetVSync sets
+    // CAMetalLayer.displaySyncEnabled=YES — non-blocking, prevents tearing.
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
+    g_presentation.renderer = CreateRendererWithVSync(
+        g_presentation.window, -1, SDL_RENDERER_ACCELERATED);
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, nullptr);
+
+    if (!g_presentation.renderer) {
+        std::cerr << "❌ [PRESENTATION] Failed to create renderer: " << SDL_GetError() << std::endl;
+        SDL_DestroyWindow(g_presentation.window);
+        g_presentation.window = nullptr;
+        return false;
+    }
+
+    SDL_RendererInfo info;
+    SDL_GetRendererInfo(g_presentation.renderer, &info);
+    std::cout << "✅ [PRESENTATION] Renderer created on main thread: " << info.name << std::endl;
+
+    // Output target + focus behaviour (focus/pin read from Settings).
+    g_presentation.follow_focus  = GetPresentationFollowFocus() != 0;
+    g_presentation.pinned_player  = GetPresentationPinnedPlayer();
+    g_presentation.output_mode    = windowed ? 1 : 0;
+    g_presentation.display_index  = target_display;
+    g_presentation.windowed       = windowed;
+    g_presentation.window_id       = SDL_GetWindowID(g_presentation.window);
+
+    // active must be set AFTER renderer is ready — render thread checks active first.
+    // Initial linked player: explicit arg wins; otherwise follow-focus starts unbound (-1) and
+    // pinned starts on the pinned player.
+    g_presentation.linked_player_id =
+        (player_id >= 0) ? player_id
+                         : (g_presentation.follow_focus ? -1 : g_presentation.pinned_player);
+    g_presentation.pending_renderer = false;
+    g_presentation.last_timestamp = -1.0;
+    g_presentation.enabled = true;
+    g_presentation.active = true;  // SET LAST — render thread starts using from here
+
+    std::cout << "✅ [PRESENTATION] "
+              << (windowed ? "Windowed output" : ("External display " + std::to_string(target_display)))
+              << " ready for player " << player_id
+              << (g_presentation.follow_focus ? " (follow focus)" : " (pinned)") << std::endl;
+
+    return true;
+}
+
+void ClosePresentationWindow() {
+    // Serialise against the render thread's presentation block (see g_presentation_mutex): wait until
+    // it is not mid-blit before destroying the renderer/window/yuv_renderer.
+    std::lock_guard<std::mutex> _pres_lock(g_presentation_mutex);
+
+    // Allow call even when active=false (render thread may have cleared it already)
+    if (!g_presentation.active && !g_presentation.renderer && !g_presentation.window)
+        return;
+
+    // YUV renderer doesn't need main thread
+    if (g_presentation.yuv_renderer) {
+        g_presentation.yuv_renderer->Cleanup();
+        delete g_presentation.yuv_renderer;
+        g_presentation.yuv_renderer = nullptr;
+        g_presentation.yuv_w   = 0;
+        g_presentation.yuv_h   = 0;
+        g_presentation.yuv_fmt = 0;
+    }
+
+    // Set active=false BEFORE SDL cleanup so the render thread
+    // stops using these resources immediately (no race)
+    g_presentation.active           = false;
+    g_presentation.linked_player_id = -1;
+    g_presentation.last_timestamp   = -1.0;
+    g_presentation.pending_renderer = false;
+    g_presentation.window_id        = 0;
+    // Restore the cursor in case it was hidden while the pointer was over the presentation window
+    // when it closed (no LEAVE event fires on destroy).
+    SDL_ShowCursor(SDL_ENABLE);
+
+    // Capture pointers — ownership transfers to the cleanup block
+    SDL_Renderer* r = g_presentation.renderer;
+    SDL_Window*   w = g_presentation.window;
+    g_presentation.renderer = nullptr;
+    g_presentation.window   = nullptr;
+
+    // ClosePresentationWindow() must always be called from the main thread.
+    // (menu callbacks, StopAutonomousRendering — all main thread)
+    // Render thread only sets active=false; it never calls this function.
+    if (r) SDL_DestroyRenderer(r);
+    if (w) SDL_DestroyWindow(w);
+    std::cout << "✅ [PRESENTATION] Window closed" << std::endl;
+}
+
+bool IsPresentationWindowActive() {
+    return g_presentation.active;
+}
+
+void SetPresentationModeEnabled(bool enabled) {
+    g_presentation.enabled = enabled;
+    std::cout << (enabled ? "✅" : "⚠️") << " [PRESENTATION] Mode "
+              << (enabled ? "ENABLED" : "DISABLED") << std::endl;
+}
+
+bool IsPresentationModeEnabled() {
+    return g_presentation.enabled;
+}
+
+void SetPresentationFollow(bool follow_focus, int pinned_player) {
+    g_presentation.follow_focus  = follow_focus;
+    g_presentation.pinned_player = pinned_player;
+    if (!follow_focus) g_presentation.linked_player_id = pinned_player;
+}
+
+// ---- C bridge for the Settings UI -------------------------------------------------------------
+extern "C" {
+
+int FSTP_GetPresentationDisplayCount(void) {
+    int n = SDL_GetNumVideoDisplays();
+    return (n < 0) ? 0 : n;
+}
+
+const char* FSTP_GetPresentationDisplayName(int idx) {
+    const char* name = SDL_GetDisplayName(idx);
+    return name ? name : "Display";
+}
+
+void FSTP_ReapplyPresentationIfActive(void) {
+    // Always refresh the follow/pin behaviour so the next activation honours the latest Settings.
+    g_presentation.follow_focus  = GetPresentationFollowFocus() != 0;
+    g_presentation.pinned_player = GetPresentationPinnedPlayer();
+    if (!g_presentation.active) return;
+
+    // Active → rebuild the output target from current Settings (display / output mode), keeping the
+    // same linked player so the picture continues where possible. Main thread only (Settings save).
+    int player = g_presentation.linked_player_id;
+    CreatePresentationWindow(player, GetPresentationOutputMode(), GetPresentationDisplayIndex());
+}
+
+} // extern "C"
