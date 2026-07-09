@@ -1,0 +1,12 @@
+# Keep shell scripts and the makefile LF-only so they run under MSYS2/bash on
+# Windows CI. Without this, git's autocrlf could rewrite them to CRLF and break
+# the build (bash chokes on \r).
+*.sh        text eol=lf
+makefile    text eol=lf
+Makefile    text eol=lf
+*.bash      text eol=lf
+
+# Windows-native scripts stay CRLF.
+*.ps1       text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf

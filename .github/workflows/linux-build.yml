@@ -1,0 +1,63 @@
+name: Linux x64 build
+
+# Build TapeXPlayer for Linux on a GitHub-hosted ubuntu runner.
+# Produces the raw binary and a .deb package as downloadable artifacts.
+# Mirrors windows-build.yml in shape; Linux distributes via .deb (system deps),
+# so there is no library-bundling step.
+
+on:
+  push:
+    branches: [ stable, unstable, main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ stable, unstable, main, master ]
+  workflow_dispatch:        # lets you run it manually from the Actions tab
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # Dev packages mirror the makefile's LIBS + create_deb.sh's Depends.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential make pkg-config file dpkg-dev \
+            libsdl2-dev libsdl2-ttf-dev portaudio19-dev \
+            libavformat-dev libavcodec-dev libavfilter-dev libavutil-dev libswscale-dev \
+            libssl-dev librtmidi-dev libgtk-3-dev libva-dev
+
+      - name: Show toolchain
+        run: |
+          g++ --version | head -1
+          make --version | head -1
+
+      - name: Build
+        working-directory: source
+        run: make -j"$(nproc)"
+
+      - name: Create .deb package
+        working-directory: source
+        run: bash create_deb.sh || echo "deb packaging skipped/failed (non-fatal)"
+
+      - name: Verify build output
+        run: |
+          ls -la builds/binaries/ || true
+          test -f builds/binaries/TapeXPlayer_linux
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TapeXPlayer-linux-x64
+          path: builds/binaries/TapeXPlayer_linux
+          if-no-files-found: error
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TapeXPlayer-linux-deb
+          path: builds/binaries/deb/*.deb
+          if-no-files-found: ignore

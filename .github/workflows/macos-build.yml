@@ -1,0 +1,78 @@
+name: macOS build
+
+# Build a UNIVERSAL TapeXPlayer.app (arm64 + x86_64) on a macos-15 runner.
+# The runner is Apple Silicon (arm64 deps in /opt/homebrew); we add an x86_64
+# Homebrew in /usr/local via Rosetta so `make bundle-universal` can build both
+# slices and lipo them together — exactly the makefile's own universal flow.
+# NOTE: macOS runner minutes bill ~10x and this does two full builds. Trim the
+# trigger to workflow_dispatch only if it's too costly.
+
+on:
+  push:
+    branches: [ stable, unstable, main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ stable, unstable, main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15        # Apple Silicon; Xcode 16+ so Apple clang accepts -std=c++23
+    env:
+      # openssl@3 is keg-only; cover BOTH arch prefixes so each sub-build finds
+      # -lssl/-lcrypto (arm64 from /opt/homebrew, x86_64 from /usr/local).
+      LIBRARY_PATH: /opt/homebrew/opt/openssl@3/lib:/usr/local/opt/openssl@3/lib
+      CPATH: /opt/homebrew/opt/openssl@3/include:/usr/local/opt/openssl@3/include
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        # The makefile hardcodes -std=c++23; older Apple clang only knows c++2b.
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+
+      - name: Install Rosetta (needed to run the x86_64 Homebrew)
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Install arm64 dependencies (/opt/homebrew)
+        run: brew install sdl2 sdl2_ttf portaudio ffmpeg openssl@3 rtmidi
+
+      - name: Install x86_64 Homebrew + dependencies (/usr/local)
+        run: |
+          arch -x86_64 /bin/bash -c \
+            'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+          arch -x86_64 /usr/local/bin/brew install sdl2 sdl2_ttf portaudio ffmpeg openssl@3 rtmidi
+
+      - name: Show toolchain
+        run: |
+          clang --version | head -1
+          swiftc --version | head -1
+
+      - name: Build universal .app (arm64 + x86_64)
+        working-directory: source
+        run: make -j"$(sysctl -n hw.ncpu)" bundle-universal SKIP_INSTALL=1
+
+      - name: Verify universal binary
+        run: |
+          BIN=builds/TapeXPlayer.app/Contents/MacOS/TapeXPlayer
+          lipo -info "$BIN"
+          lipo -info "$BIN" | grep -q arm64
+          lipo -info "$BIN" | grep -q x86_64
+
+      - name: Zip .app
+        working-directory: builds
+        run: ditto -c -k --keepParent TapeXPlayer.app TapeXPlayer-mac-universal.zip
+
+      - name: Upload .app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TapeXPlayer-mac-universal
+          path: builds/TapeXPlayer-mac-universal.zip
+          if-no-files-found: error
+
+      - name: Upload universal binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TapeXPlayer-mac-universal-bin
+          path: builds/TapeXPlayer.app/Contents/MacOS/TapeXPlayer
+          if-no-files-found: ignore

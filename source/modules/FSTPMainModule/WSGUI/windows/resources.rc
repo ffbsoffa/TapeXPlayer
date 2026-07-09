@@ -1,0 +1,6 @@
+// Embed application manifest for ComCtl32 v6 (visual styles)
+// 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST
+1 24 "../resources/TapeXPlayer.manifest"
+
+// Application icon (used for window title bar and About dialog)
+101 ICON "../resources/TapeXPlayer.ico"

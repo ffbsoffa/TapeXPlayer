@@ -1,0 +1,22 @@
+# TapeXPlayer extension manifest — EXAMPLE
+#
+# Drop a folder like this into the  extensions/  directory next to the
+# executable (or point FSTP_EXT_DIR at a directory of such folders). The player
+# discovers it on startup and lists it in Settings ▸ Extensions.
+#
+# This example declares a Lua extension. When the build has Lua (macOS:
+# `brew install lua`), an enabled type=lua extension is loaded at startup and its
+# main.lua runs. The format is intentionally trivial so a human or an AI can
+# author one. The player looks for extensions next to the executable, or in the
+# directory named by the FSTP_EXT_DIR environment variable.
+
+id          = example-clock-overlay
+name        = Clock Overlay (example)
+version     = 0.1.0
+author      = TapeXPlayer
+description = Draws a small running clock overlay. Demonstrates the Lua host API.
+type        = lua
+entry       = main.lua
+# Disabled by default: this demo overlay printed status text (LUA + timecode,
+# frame/fps) over the video for everyone. Enable it in Settings > Extensions.
+enabled     = false

@@ -1,0 +1,91 @@
+name: Windows x64 build
+
+# Build TapeXPlayer.exe on a GitHub-hosted windows-latest runner using MSYS2/MinGW64.
+# Produces a self-contained bundle (exe + DLLs) as a downloadable artifact, and —
+# when triggered by a version tag (v*) — attaches the release zip to a GitHub Release.
+
+on:
+  push:
+    branches: [ stable, unstable, main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ stable, unstable, main, master ]
+  workflow_dispatch:        # lets you run it manually from the Actions tab
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}    # every run: step executes inside the MSYS2 MINGW64 login shell
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (MINGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          # Package list mirrors the makefile's LIBS + toolchain.
+          install: >-
+            make
+            zip
+            git
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-SDL2_ttf
+            mingw-w64-x86_64-portaudio
+            mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-rtmidi
+            mingw-w64-x86_64-nsis
+
+      - name: Show toolchain
+        run: |
+          echo "MSYSTEM=$MSYSTEM  PREFIX=$MSYSTEM_PREFIX"
+          g++ --version | head -1
+          make --version | head -1
+
+      - name: Build
+        working-directory: source
+        run: make -j2
+
+      - name: Bundle DLLs
+        working-directory: source
+        run: ./bundle_dlls.sh
+
+      - name: Create release zip
+        working-directory: source
+        run: ./create_win_release.sh || echo "release script skipped/failed (non-fatal)"
+
+      - name: Build NSIS installer
+        working-directory: source
+        run: ./create_win_installer.sh x64
+
+      - name: Verify build output
+        run: |
+          ls -la builds/binaries/ || true
+          ls -la builds/win-bundle/ || true
+          test -f builds/win-bundle/TapeXPlayer.exe
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TapeXPlayer-win-x64
+          path: builds/win-bundle/
+          if-no-files-found: error
+
+      - name: Upload release zip + installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TapeXPlayer-win-release
+          path: |
+            builds/*.zip
+            builds/TapeXPlayer-Setup-*.exe
+          if-no-files-found: ignore
+
+      # No GitHub Release is created or modified by this workflow.
+      # The zip and NSIS installer are available as downloadable artifacts above
+      # (Actions run page -> Artifacts). Publish releases manually when ready.

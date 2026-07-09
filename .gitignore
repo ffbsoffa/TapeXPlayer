@@ -1,0 +1,33 @@
+# ── macOS ─────────────────────────────────────────────
+.DS_Store
+
+# ── Build artefacts ──────────────────────────────────
+builds/
+*.o
+*.a
+
+# ── Backups ──────────────────────────────────────────
+backup/
+
+# ── Test / sample media (kept out of the repo) ───────
+*.mp4
+*.webm
+debug.srt
+
+# ── Docs site (kept local, not tracked in git) ───────
+docs/
+
+# ── Local dev helpers & editor config ────────────────
+.vscode/
+.gdbinit
+run_local.sh
+run_tapexplayer.sh
+run_tapexplayer_systemd.sh
+run_gdb.sh
+notes_02062026
+
+# ── Personal C++ study exercises ─────────────────────
+study/
+
+# ── Claude Code local study guide (kept local) ───────
+CLAUDE.md

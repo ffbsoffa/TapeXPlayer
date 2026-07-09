@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=TapeXPlayer
+GenericName=Video Player
+Comment=Professional frame-accurate video player
+Exec=/usr/bin/tapexplayer %F
+Icon=tapexplayer
+Terminal=false
+Categories=AudioVideo;Video;Player;
+MimeType=video/mp4;video/x-matroska;video/x-msvideo;video/quicktime;video/webm;video/x-m4v;audio/mpeg;audio/x-wav;audio/flac;audio/aac;
+Keywords=video;player;media;playback;
+StartupNotify=false
+StartupWMClass=TapeXPlayer
