@@ -191,6 +191,7 @@ extern "C" {
     #include <libavformat/avformat.h>
     #include <libavutil/opt.h>
     #include <libavutil/channel_layout.h>
+    #include <libswresample/swresample.h>   // sample-rate conversion when device rejects file rate
 }
 
 // ── Windows low-latency device selection ────────────────────────────────────────
@@ -300,10 +301,21 @@ public:
     std::string temp_filename;
 
     // File information
+    // sample_rate is the rate of the DECODED buffer (mmap_buffer) and the basis for ALL
+    // sample<->second math. It normally equals the file's rate, but when the output device
+    // rejects that rate we resample on decode and set sample_rate to the device rate so the
+    // whole pipeline stays self-consistent. file_sample_rate keeps the original for logging.
     int sample_rate = 0;
+    int file_sample_rate = 0;      // original rate reported by the file, pre-resample
     int channels = 0;
     double duration = 0.0;
     std::string codec_name;
+
+    // Sample-rate conversion (only allocated when device won't take the file's rate).
+    // When needs_resample is true the decode loop routes every frame through swr_ctx
+    // (which also does sample-format -> S16), bypassing the fast hand-rolled paths.
+    SwrContext* swr_ctx = nullptr;
+    bool needs_resample = false;
 
     // Timecode offset from file metadata (e.g. QuickTime shows 10:00:00:00)
     double timecode_offset_seconds = 0.0;
@@ -457,6 +469,48 @@ public:
         return true;
     }
     
+    // Decide what sample rate the decoded buffer / output stream will use for a file whose
+    // native rate is file_rate. Returns file_rate when the preferred output device can play it
+    // (the common, zero-cost case), otherwise the device's defaultSampleRate so we can resample
+    // into a rate the hardware accepts. This is what lets a 44.1k file play on a device that
+    // only opens at 48k (and vice-versa) instead of failing with paInvalidSampleRate (-9997).
+    int NegotiateOutputSampleRate(int file_rate, int ch) {
+        if (file_rate <= 0) return file_rate;
+
+        PaDeviceIndex dev = ResolvePreferredOutputDevice();
+        if (dev == paNoDevice) return file_rate;  // let the open path report the real failure
+
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(dev);
+        if (!info) return file_rate;
+
+        PaStreamParameters test{};
+        test.device = dev;
+        test.channelCount = std::min(ch, info->maxOutputChannels);
+        test.sampleFormat = paInt16;
+        test.suggestedLatency = info->defaultLowOutputLatency;
+        test.hostApiSpecificStreamInfo = nullptr;
+
+        // Ask PortAudio (without opening) whether the device supports the file's rate.
+        if (Pa_IsFormatSupported(nullptr, &test, static_cast<double>(file_rate)) == paFormatIsSupported) {
+            return file_rate;  // native rate works — no resampling needed
+        }
+
+        int dev_rate = static_cast<int>(info->defaultSampleRate);
+        if (dev_rate <= 0) dev_rate = 48000;  // sane default if the device doesn't report one
+
+        // Confirm the device rate is actually openable; if even that is refused, keep the file
+        // rate and let the Pa_OpenStream fallback below make a last attempt.
+        if (Pa_IsFormatSupported(nullptr, &test, static_cast<double>(dev_rate)) != paFormatIsSupported) {
+            std::cout << "⚠️  [AUDIO] Neither " << file_rate << "Hz nor device rate " << dev_rate
+                      << "Hz reported as supported; will try anyway at file rate" << std::endl;
+            return file_rate;
+        }
+
+        std::cout << "🎚️  [AUDIO] Negotiated output rate " << dev_rate << "Hz (file is "
+                  << file_rate << "Hz) on device: " << info->name << std::endl;
+        return dev_rate;
+    }
+
     bool StartPermanentAudioStream() {
         // FIXED: removed global limit that blocked 4+ players
         // Each player should be able to create its own audio stream
@@ -543,6 +597,18 @@ public:
             err = Pa_OpenStream(&pa_stream, nullptr, &outputParameters, sample_rate, frames_per_buffer,
                                paClipOff, AudioCallback, this);
             std::cout << "PortAudio: Pa_OpenStream completed with code: " << err << std::endl;
+
+            // Safety net: NegotiateOutputSampleRate() should already have picked a rate the device
+            // accepts, so this rarely fires. If it still rejects the rate (e.g. exclusive-mode
+            // device, or a driver that lies to Pa_IsFormatSupported), the buffer is already decoded
+            // at `sample_rate`, so we can't switch rates without wrong-pitch playback. Report the
+            // -9997 clearly instead of failing into silent mode with a cryptic code.
+            if (err == paInvalidSampleRate) {
+                std::cout << "⚠️  [AUDIO] Device rejected " << sample_rate
+                          << "Hz (paInvalidSampleRate/-9997) at open time despite negotiation. "
+                          << "Audio will be silent for this file — try a different output device."
+                          << std::endl;
+            }
         } catch (...) {
             std::cout << "PortAudio: EXCEPTION in Pa_OpenStream!" << std::endl;
             return false;
@@ -1372,6 +1438,7 @@ public:
         StopPlayback();
         CleanupMmap();
         sample_rate = 0;
+        file_sample_rate = 0;
         channels = 0;
         duration = 0.0;
         timecode_offset_seconds = 0.0;
@@ -1784,8 +1851,19 @@ private:
         }
 
         const AVCodecParameters* codecpar = format_ctx->streams[audio_stream_index]->codecpar;
-        sample_rate = codecpar->sample_rate;
+        file_sample_rate = codecpar->sample_rate;
         channels = codecpar->ch_layout.nb_channels;
+
+        // Decide the rate the DECODED buffer will hold. If the chosen output device can play
+        // the file's native rate we keep it (fast path, no resampling). If not, we fall back
+        // to a device-friendly rate and flag the decode loop to resample into it. Doing this
+        // BEFORE decoding means the buffer is written at the final rate — no rewrite later.
+        sample_rate = NegotiateOutputSampleRate(file_sample_rate, channels);
+        needs_resample = (sample_rate != file_sample_rate);
+        if (needs_resample) {
+            std::cout << "🎚️  [AUDIO] Device won't accept " << file_sample_rate
+                      << "Hz — resampling to " << sample_rate << "Hz on decode" << std::endl;
+        }
 
         // Detect PCM audio to optimize fast buffer size
         reduce_fast_buffer_for_pcm = false;
@@ -1810,6 +1888,13 @@ private:
                 break;
             default:
                 break;
+        }
+
+        // The raw-packet PCM fast path (DecodePCMFast) copies bytes at the file's rate and does
+        // NO sample-rate conversion, so it can't be used when we need to resample. Force the
+        // codec path (DecodeToBuffer), which routes frames through swr_ctx.
+        if (needs_resample) {
+            reduce_fast_buffer_for_pcm = false;
         }
 
         if (format_ctx->duration != AV_NOPTS_VALUE) {
@@ -1927,6 +2012,13 @@ private:
         }
         // File already unlinked in CreateMmapBuffer()
         temp_filename.clear();
+
+        // Release the resampler (if the previous file needed one) so the next file re-negotiates
+        // its own rate and re-inits swr from that file's actual layout/format.
+        if (swr_ctx) {
+            swr_free(&swr_ctx);
+        }
+        needs_resample = false;
     }
 
     bool DecodeFullFile(const std::string& filepath) {
@@ -2321,6 +2413,53 @@ private:
                     int samples_per_channel = frame->nb_samples;
                     int frame_channels = frame->ch_layout.nb_channels;
                     size_t total_frame_samples = samples_per_channel * frame_channels;
+
+                    // RESAMPLE PATH: when the device won't take the file's rate, run every frame
+                    // through libswresample (rate + format -> interleaved S16 at `sample_rate`),
+                    // bypassing the fast hand-rolled paths below. Only taken when needs_resample
+                    // is set, so the common no-resample case keeps its NEON fast paths intact.
+                    if (needs_resample) {
+                        if (!swr_ctx) {
+                            // Lazy-init from the first frame's actual layout/format.
+                            swr_ctx = swr_alloc();
+                            av_opt_set_chlayout(swr_ctx, "in_chlayout",  &frame->ch_layout, 0);
+                            av_opt_set_chlayout(swr_ctx, "out_chlayout", &frame->ch_layout, 0);
+                            av_opt_set_int(swr_ctx, "in_sample_rate",  file_sample_rate, 0);
+                            av_opt_set_int(swr_ctx, "out_sample_rate", sample_rate, 0);
+                            av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt",  codec_ctx->sample_fmt, 0);
+                            av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
+                            if (swr_init(swr_ctx) < 0) {
+                                std::cout << "❌ [AUDIO] swr_init failed — cannot resample" << std::endl;
+                                swr_free(&swr_ctx);
+                                av_packet_unref(packet);
+                                break;
+                            }
+                        }
+
+                        // Worst-case output frame count (rate-up rounds up; +256 slack for the
+                        // resampler's internal delay line flushing a few extra samples).
+                        int max_out = static_cast<int>(
+                            av_rescale_rnd(samples_per_channel, sample_rate, file_sample_rate, AV_ROUND_UP)) + 256;
+                        size_t remaining_frames = (max_samples - current_sample) / frame_channels;
+                        if (max_out > static_cast<int>(remaining_frames))
+                            max_out = static_cast<int>(remaining_frames);
+
+                        if (max_out > 0) {
+                            uint8_t* out_ptr = reinterpret_cast<uint8_t*>(&mmap_buffer[write_offset]);
+                            const uint8_t** in_data = const_cast<const uint8_t**>(frame->data);
+                            int out_frames = swr_convert(swr_ctx, &out_ptr, max_out,
+                                                         in_data, samples_per_channel);
+                            if (out_frames > 0) {
+                                size_t produced = static_cast<size_t>(out_frames) * frame_channels;
+                                write_offset   += produced;
+                                current_sample += produced;
+                                if (is_background && start_sample > 0) {
+                                    decoded_samples.store(start_sample + current_sample);
+                                }
+                            }
+                        }
+                        continue;  // frame handled by the resampler
+                    }
 
                     // OPTIMIZATION 1: Direct PCM S16 copy path (no conversion needed)
                     if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_S16) {

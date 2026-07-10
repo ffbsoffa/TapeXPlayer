@@ -112,7 +112,7 @@ ifneq (,$(findstring _NT,$(UNAME_S)))
     # called, and CreateDXGIFactory (the only dxgi function used) is loaded at runtime via
     # LoadLibrary in FSTPHardwareDetection.cpp. Static-linking them adds a load-time import that
     # prevents the exe from starting on a bare Windows 7 SP1 without the DirectX Platform Update.
-    LIBS = -lmingw32 -lSDL2main -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavfilter -lavutil -lswscale \
+    LIBS = -lmingw32 -lSDL2main -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample \
            -lssl -lcrypto -lrtmidi \
            -lwinmm -lole32 -lgdi32 -lcomdlg32 -lcomctl32 -lshell32 -lshlwapi -luuid -luxtheme -ldwmapi
     
@@ -184,7 +184,7 @@ ifeq ($(UNAME_S),Linux)
 
     # Library flags
     LIBS = -lSDL2 -lSDL2_ttf -lportaudio \
-           -lavformat -lavcodec -lavfilter -lavutil -lswscale \
+           -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample \
            -lssl -lcrypto -lrtmidi \
            -lpthread -ldl -lm \
            $(GTK_LIBS)
@@ -212,7 +212,7 @@ else
     SWIFTFLAGS = -target $(SWIFT_TARGET) -import-objc-header modules/FSTPMainModule/WSGUI/darwin/sdl/TapeXPlayer-Bridging-Header.h -parse-as-library
     SDL_PATH = $(HOMEBREW_PATH)
     INCLUDES = -I$(SDL_PATH)/include -Imodules/FSTPMainModule -Imodules/FSTPMainModule/WSGUI -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule -Imodules/FSTPAudioModule
-    LIBS = -L$(SDL_PATH)/lib -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavfilter -lavutil -lswscale -lssl -lcrypto -lrtmidi -framework Cocoa -framework CoreFoundation -framework CoreVideo -framework UniformTypeIdentifiers -framework VideoToolbox -framework IOKit -framework QuartzCore -framework CoreMIDI -framework AVFoundation -framework CoreMedia
+    LIBS = -L$(SDL_PATH)/lib -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample -lssl -lcrypto -lrtmidi -framework Cocoa -framework CoreFoundation -framework CoreVideo -framework UniformTypeIdentifiers -framework VideoToolbox -framework IOKit -framework QuartzCore -framework CoreMIDI -framework AVFoundation -framework CoreMedia
     # Optional Lua for the extension executor. Linked only when pkg-config finds a
     # 'lua' package (e.g. `brew install lua`); otherwise the build proceeds with the
     # executor stubbed out (FSTP_HAVE_LUA undefined), so it never breaks a build.
