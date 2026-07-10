@@ -754,6 +754,12 @@ public:
                 bool new_direction = pending_reverse_value.load();
                 double saved_target = target_playback_speed.load();
 
+                // TIMING PROBE: whole reversal sequence. Designed ≈ ramp-down (variable,
+                // ~0.85^n decay) + 150ms hold + 200ms ramp-up. The two fixed parts alone
+                // are 350ms; if ACTUAL >> that on Windows the sleep_for granularity is
+                // stretching every 5ms step. Logged once per reversal.
+                auto dir_t0 = std::chrono::steady_clock::now();
+
                 // Phase 1: Soft ramp down (gentle exponential decay, 0.85 factor)
                 while (playback_speed.load() > 0.01 && !should_exit_smooth_speed.load()) {
                     double spd = playback_speed.load() * 0.85;
@@ -795,6 +801,11 @@ public:
                 }
                 playback_speed.store(saved_target);
                 calculate_and_set_volume(saved_target);
+
+                auto dir_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - dir_t0).count();
+                std::cout << "🎵 [DIR CHANGE] designed ~350ms+ (rampdown + 150ms hold + "
+                          << "200ms rampup), ACTUAL " << dir_ms << "ms" << std::endl;
                 continue;
             }
             // === END DIRECTION CHANGE SEQUENCER ===
@@ -849,6 +860,12 @@ public:
                 const int step_ms = 2;      // interval step 2ms
                 const int steps = smooth_ms / step_ms;
 
+                // TIMING PROBE: mouse-shuttle micro-smoothing. Designed for smooth_ms.
+                // This fires on every shuttle nudge, so a stretch here is what makes the
+                // shuttle feel laggy directly (not just the play/pause ease). Logged once
+                // per nudge.
+                auto shuttle_t0 = std::chrono::steady_clock::now();
+
                 for (int s = 1; s <= steps; ++s) {
                     double t = static_cast<double>(s) / steps;
                     // Simple linear interpolation is enough for small duration
@@ -858,6 +875,11 @@ public:
                     if (should_exit_smooth_speed.load()) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
                 }
+
+                auto shuttle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - shuttle_t0).count();
+                std::cout << "🎵 [SHUTTLE] designed " << smooth_ms << "ms (" << steps
+                          << " x " << step_ms << "ms), ACTUAL " << shuttle_ms << "ms" << std::endl;
 
                 // Ensure exact target hit
                 playback_speed.store(snap_target);
@@ -886,8 +908,15 @@ public:
                 const int step_ms = 5;
                 const int steps = brake_ms / step_ms;
 
+                // TIMING PROBE: tape-pause brake (Betacam servo). Designed for brake_ms
+                // (speed-dependent). This is the deceleration the user watches on every
+                // stop; if ACTUAL >> brake_ms the "settle" drags. May exit early if the
+                // user resumes — the log notes when it ran full length. Logged once per stop.
+                auto brake_t0 = std::chrono::steady_clock::now();
+                bool brake_full = true;
+
                 for (int s = 1; s <= steps && !should_exit_smooth_speed.load(); ++s) {
-                    if (target_playback_speed.load() != 0.0) break;  // User resumed playback
+                    if (target_playback_speed.load() != 0.0) { brake_full = false; break; }  // User resumed playback
                     double t = static_cast<double>(s) / steps;
                     double new_speed = current * (1.0 - t) * (1.0 - t);
                     if (new_speed < 0.003) new_speed = 0.0;
@@ -897,6 +926,12 @@ public:
                 }
                 playback_speed.store(0.0);
                 calculate_and_set_volume(0.0);
+
+                auto brake_ms_actual = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - brake_t0).count();
+                std::cout << "🎵 [PAUSE BRAKE] designed " << brake_ms << "ms (" << steps
+                          << " x " << step_ms << "ms), ACTUAL " << brake_ms_actual << "ms"
+                          << (brake_full ? "" : " (interrupted)") << std::endl;
                 continue;
             }
 
