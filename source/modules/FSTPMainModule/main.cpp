@@ -11,6 +11,7 @@
 #ifdef _WIN32
     #define PLATFORM_WINDOWS
     #include <windows.h>
+    #include <mmsystem.h>   // timeBeginPeriod (process-wide 1ms timer resolution)
     #include <commdlg.h>
     #include "WSGUI/windows/FSTPWindowsWS.h"
 #elif defined(__linux__)
@@ -72,6 +73,17 @@ int main(int argc, char* argv[]) {
     #endif
 
     #ifdef _WIN32
+    // Request 1ms timer resolution for the WHOLE process, at the very start —
+    // before the audio/render threads exist. Windows' default timer tick is
+    // ~15.6ms, so std::this_thread::sleep_for(2ms) in the audio module's
+    // smooth-speed / elastic-ease animation (FSTPAudioModule_wrapper.cpp) would
+    // sleep ~15ms instead, stretching a 250ms ease into ~1.9s — exactly why the
+    // tape-transport ramp animations looked far slower on Windows than macOS.
+    // The event loop also calls timeBeginPeriod(1), but that happens later; doing
+    // it here guarantees accuracy for the first play/pause too. Paired with
+    // timeEndPeriod(1) at shutdown below.
+    timeBeginPeriod(1);
+
     // On Windows the binary is built with -mwindows (no console by default).
     // Pass --debug on the command line to open a debug console window that
     // captures all stdout/stderr output (std::cout, std::cerr, printf).
@@ -181,6 +193,10 @@ int main(int argc, char* argv[]) {
 
     Pa_Terminate();
     CleanupHardwareDetection();
+
+    #ifdef _WIN32
+    timeEndPeriod(1);  // pair the process-wide timeBeginPeriod(1) from startup
+    #endif
 
     return result;
 }
