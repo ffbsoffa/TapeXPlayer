@@ -140,7 +140,13 @@ private:
     // NOTE: Only CPU frames (YUV420P) use pool.
     // HW frames (NV12) can't use pool because av_frame_copy() fails with NV12.
     // av_frame_clone() for HW frames is already efficient (zero-copy via refcounting).
-    std::unique_ptr<AVFramePool> frame_pool_;
+    //
+    // shared_ptr (not unique_ptr) so a decoded frame's shared_ptr<AVFrame> deleter can hold a
+    // weak_ptr to the pool. When this decoder is destroyed on a file switch, any frames still
+    // held elsewhere (e.g. the pixel buffer's last displayed frame) see an EXPIRED weak_ptr and
+    // free themselves directly instead of calling Release() on a destroyed pool — which locked a
+    // destroyed mutex and aborted with "mutex lock failed: Invalid argument".
+    std::shared_ptr<AVFramePool> frame_pool_;
 };
 
 } // namespace FSTP

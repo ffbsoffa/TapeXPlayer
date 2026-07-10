@@ -244,7 +244,7 @@ LowResDecoder::LowResDecoder(const std::string& lowResFilename)
                 // At 60fps @ 32× reverse = 1920 frames/sec:
                 // - CPU frames with pool: ~0 MB/sec overhead (buffer reuse)
                 // - HW frames with clone: minimal overhead (ref counting, not actual copy)
-                frame_pool_ = std::make_unique<AVFramePool>(width_, height_, pixFmt_, 120);
+                frame_pool_ = std::make_shared<AVFramePool>(width_, height_, pixFmt_, 120);
 
                 std::cout << "🏊 [LowResDecoder] Created frame pool for "
                           << av_get_pix_fmt_name(pixFmt_) << " (120 frames)" << std::endl;
@@ -1359,19 +1359,23 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
                                 // - Cloned frames → av_frame_free (standard cleanup)
 
                                 if (from_pool) {
-                                    // FAST PATH: Frame from pool → return to correct pool
-                                    // CRITICAL: Capture selected_pool (not frame_pool_!) so HW frames
-                                    // return to hw_frame_pool_ and CPU frames to frame_pool_
-                                    AVFramePool* pool_ptr = selected_pool;
+                                    // FAST PATH: Frame from pool → return to correct pool.
+                                    // Capture a WEAK_PTR to the pool (not a raw pointer): if this
+                                    // decoder is destroyed on a file switch while a frame is still
+                                    // held (e.g. the pixel buffer's last displayed frame), the weak
+                                    // ptr is EXPIRED, so we free the frame directly instead of
+                                    // calling Release() on a destroyed pool (which locked a
+                                    // destroyed mutex → "mutex lock failed: Invalid argument" abort).
+                                    std::weak_ptr<AVFramePool> weak_pool = frame_pool_;
 
                                     frameIndex[targetFrameIndex].low_res_frame = std::shared_ptr<AVFrame>(
                                         ref_frame,
-                                        [pool_ptr](AVFrame* f) {
-                                            if (pool_ptr) {
-                                                pool_ptr->Release(f);
+                                        [weak_pool](AVFrame* f) {
+                                            if (auto pool = weak_pool.lock()) {
+                                                // Pool still alive — safe to return the frame to it.
+                                                pool->Release(f);
                                             } else {
-                                                // Fallback if pool destroyed (shutdown scenario)
-                                                // CRITICAL: Direct free without mutex - mutex may be invalid during shutdown
+                                                // Pool already destroyed — free directly, no mutex.
                                                 av_frame_free(&f);
                                             }
                                         }

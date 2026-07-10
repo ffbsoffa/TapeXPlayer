@@ -662,6 +662,17 @@ public:
     void Cleanup() {
         StopSmoothSpeedChange();
 
+        // CRITICAL: join the background decode thread BEFORE any CleanupMmap() below.
+        // CleanupMmap frees swr_ctx and unmaps mmap_buffer, both of which the decode thread
+        // touches (swr_convert into mmap_buffer). Unlike UnloadFile(), this path used to skip
+        // the join → use-after-free / data race when a resampling file was still decoding at
+        // teardown (crash switching a 44.1k-resampled file to another file).
+        if (background_decode_thread.joinable()) {
+            should_stop_background_decode.store(true);
+            background_decode_thread.join();
+        }
+        background_decode_running.store(false);
+
         // CRITICAL FIX: Skip Pa_CloseStream() during destructor cleanup
         // Problem: Heap corruption from video av_frame_ref() causes PipeWire's malloc_trim() to crash
         // When Pa_CloseStream() → pw_impl_node_destroy() → malloc_trim(), it crashes on corrupted heap
@@ -1215,6 +1226,20 @@ public:
 
     bool LoadFile(const std::string& filepath, double resume_position = 0.0) {
         std::cout << "FSTPAudioModuleImpl::LoadFile called with: " << filepath << std::endl;
+
+        // Self-clean any resampler left over from a previous file, so a load is safe regardless
+        // of caller ordering. Guarantees the background decode thread is stopped first (it may be
+        // inside swr_convert), then frees the old swr_ctx so AnalyzeFile/the decode loop re-init
+        // a fresh one for THIS file's rates instead of reusing a stale (wrong-rate) context.
+        if (background_decode_thread.joinable()) {
+            should_stop_background_decode.store(true);
+            background_decode_thread.join();
+        }
+        background_decode_running.store(false);
+        if (swr_ctx) {
+            swr_free(&swr_ctx);
+        }
+        needs_resample = false;
 
         // Reset elastic ease flags for new file
         first_play_after_load.store(true);
@@ -2406,6 +2431,10 @@ private:
                 }
 
                 while (ret >= 0 && current_sample < max_samples) {
+                    // Also honour the stop flag INSIDE the inner receive loop so a background
+                    // decode can't stay pinned in swr_convert while teardown waits to free swr_ctx.
+                    if (is_background && should_stop_background_decode.load()) break;
+
                     ret = avcodec_receive_frame(codec_ctx, frame);
                     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
                     if (ret < 0) break;
@@ -2420,13 +2449,16 @@ private:
                     // is set, so the common no-resample case keeps its NEON fast paths intact.
                     if (needs_resample) {
                         if (!swr_ctx) {
-                            // Lazy-init from the first frame's actual layout/format.
+                            // Lazy-init from the first frame's actual layout/format. Use the
+                            // FRAME's format (what frame->data actually holds), not codec_ctx's,
+                            // so a decoder that reports a different/late sample_fmt can't make
+                            // swr_convert misread the buffer.
                             swr_ctx = swr_alloc();
                             av_opt_set_chlayout(swr_ctx, "in_chlayout",  &frame->ch_layout, 0);
                             av_opt_set_chlayout(swr_ctx, "out_chlayout", &frame->ch_layout, 0);
                             av_opt_set_int(swr_ctx, "in_sample_rate",  file_sample_rate, 0);
                             av_opt_set_int(swr_ctx, "out_sample_rate", sample_rate, 0);
-                            av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt",  codec_ctx->sample_fmt, 0);
+                            av_opt_set_sample_fmt(swr_ctx, "in_sample_fmt",  static_cast<AVSampleFormat>(frame->format), 0);
                             av_opt_set_sample_fmt(swr_ctx, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
                             if (swr_init(swr_ctx) < 0) {
                                 std::cout << "❌ [AUDIO] swr_init failed — cannot resample" << std::endl;
