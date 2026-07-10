@@ -54,7 +54,21 @@ static std::atomic<bool> g_renderThreadRunning{false};
 // Set while the window is in a live move/resize loop (WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE). D3D11 is
 // far less forgiving than Metal about presenting during a swapchain resize, so the render thread
 // pauses while this is true.
+//
+// CRITICAL: these WM_*SIZEMOVE messages are SENT (not posted), so Windows delivers them straight to
+// the window's WndProc — they never appear in the thread message queue that PeekMessage/SDL's pump
+// drain. So we observe them via an HWND SUBCLASS (SetWindowSubclass below), which IS invoked for
+// sent messages. The old code toggled this flag from the PeekMessage loop, where the messages never
+// arrive → the flag stayed false → the render thread kept calling SDL_RenderPresent while SDL
+// resized the D3D11 swapchain on the event thread → concurrent ResizeBuffers+Present on the
+// non-thread-safe D3D11 context → 0xC0000005 crash on resize (macOS/Metal tolerates this; D3D11
+// does not — a classic macOS-first-port gap).
 static std::atomic<bool> g_isLiveResizing{false};
+
+// Set by the render thread once it has OBSERVED g_isLiveResizing and parked itself (i.e. it is NOT
+// inside SDL_RenderPresent). The resize-enter handler waits for this ack before letting the modal
+// resize loop proceed, so an in-flight present can't overlap the swapchain resize.
+static std::atomic<bool> g_renderPausedAck{false};
 
 // Asynchronous shutdown variables (same as Linux/macOS)
 static std::atomic<bool> g_shutdownRequested{false};
@@ -133,10 +147,14 @@ void StartAutonomousRendering() {
         while (g_renderThreadRunning.load()) {
             // Pause presenting during a live window move/resize — D3D11 swapchain resize and a
             // concurrent Present don't mix. The event thread drives the resize; we idle briefly.
+            // Publish g_renderPausedAck so the resize-enter handler knows we're parked OUTSIDE
+            // SDL_RenderPresent before it lets the swapchain resize begin.
             if (g_isLiveResizing.load()) {
+                g_renderPausedAck.store(true);
                 std::this_thread::sleep_for(std::chrono::milliseconds(4));
                 continue;
             }
+            g_renderPausedAck.store(false);
             // AutoRenderFrame → RenderAllWindows takes g_render_mutex and (with VSync on) blocks in
             // SDL_RenderPresent until vblank, so this loop self-paces to the refresh rate.
             AutoRenderFrame();
@@ -154,6 +172,59 @@ void StopAutonomousRendering() {
         std::cout << "[RENDER THREAD] Windows render thread joined" << std::endl;
     }
     g_renderingActive = false;
+}
+
+// HWND subclass that brackets the live move/resize loop. Runs INSIDE the window's WndProc, so it
+// sees WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE (sent messages the PeekMessage pump never receives) as well
+// as the maximize/snap path (WM_SIZE with SIZE_MAXIMIZED/RESTORED, which have no ENTERSIZEMOVE
+// bracket). While bracketed, g_isLiveResizing pauses the render thread so it can't Present into a
+// swapchain SDL is resizing on this same thread.
+static LRESULT CALLBACK ResizeSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                           UINT_PTR /*uIdSubclass*/, DWORD_PTR /*dwRefData*/) {
+    switch (msg) {
+        case WM_ENTERSIZEMOVE:
+            g_isLiveResizing.store(true);
+            // Wait (bounded) until the render thread confirms it has parked OUTSIDE
+            // SDL_RenderPresent, so no present overlaps the swapchain resize about to start.
+            for (int i = 0; i < 100 && !g_renderPausedAck.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            break;
+        case WM_EXITSIZEMOVE:
+            g_isLiveResizing.store(false);
+            break;
+        case WM_SIZE:
+            // Maximize / restore / snap change size WITHOUT an ENTERSIZEMOVE..EXITSIZEMOVE bracket.
+            // Pause for this single message so the implicit swapchain resize inside DefWindowProc
+            // doesn't race the render thread. (A live drag sends many WM_SIZE inside the bracket;
+            // those are already covered by g_isLiveResizing staying true across them.)
+            if (!g_isLiveResizing.load() &&
+                (wParam == SIZE_MAXIMIZED || wParam == SIZE_RESTORED)) {
+                g_isLiveResizing.store(true);
+                for (int i = 0; i < 100 && !g_renderPausedAck.load(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                LRESULT r = DefSubclassProc(hwnd, msg, wParam, lParam);
+                g_isLiveResizing.store(false);
+                return r;
+            }
+            break;
+        default:
+            break;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+// Install the resize subclass on the SDL window's HWND. Safe to call once after the HWND exists.
+static void InstallResizeSubclass(HWND hwnd) {
+    if (!hwnd) return;
+    if (SetWindowSubclass(hwnd, ResizeSubclassProc, 1 /*id*/, 0 /*refdata*/)) {
+        std::cout << "[RESIZE] Installed live-resize subclass — render thread will pause during "
+                     "swapchain resize (fixes D3D11 resize crash)" << std::endl;
+    } else {
+        std::cout << "[RESIZE] WARNING: SetWindowSubclass failed; resize crash guard inactive"
+                  << std::endl;
+    }
 }
 
 // RAII guard to ensure dialog flag is always reset
@@ -781,6 +852,10 @@ int RunMainUILoop() {
     g_main_hwnd = GetHWNDFromSDLWindow(main_window->window);
     if (g_main_hwnd) {
         std::cout << "Native HWND obtained: " << g_main_hwnd << std::endl;
+        // Bracket live resize/move (and maximize/snap) so the render thread pauses presenting while
+        // SDL resizes the D3D11 swapchain — otherwise concurrent Present+ResizeBuffers crashes.
+        // Must be installed before StartAutonomousRendering() so the guard is live from frame one.
+        InstallResizeSubclass(g_main_hwnd);
     }
 
     // Initialize settings system
@@ -939,17 +1014,11 @@ int RunMainUILoop() {
         }
 
         // Process Win32 message pump (required for Win32 dialogs and system integration).
-        // Also watch for the modal move/resize loop: WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE brackets a
-        // live drag during which D3D11 must not present (swapchain resize). We pause the render
-        // thread for that span via g_isLiveResizing. (During the modal loop Windows runs its own
-        // internal message loop, so WM_EXITSIZEMOVE reliably clears the flag when the drag ends.)
+        // NOTE: the live move/resize bracket (WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE) is handled by the
+        // HWND subclass ResizeSubclassProc, NOT here — those are SENT messages that never reach this
+        // queued PeekMessage loop. (This is exactly the bug that caused the D3D11 resize crash.)
         MSG msg;
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_ENTERSIZEMOVE) {
-                g_isLiveResizing = true;
-            } else if (msg.message == WM_EXITSIZEMOVE) {
-                g_isLiveResizing = false;
-            }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
@@ -958,6 +1027,12 @@ int RunMainUILoop() {
     timeEndPeriod(1);
 
     std::cout << "Shutting down gracefully..." << std::endl;
+
+    // Remove the resize subclass before tearing down the window so the proc can't fire on a
+    // half-destroyed window. (No-op if it was never installed.)
+    if (g_main_hwnd) {
+        RemoveWindowSubclass(g_main_hwnd, ResizeSubclassProc, 1);
+    }
 
     // Step 0: Stop the render thread FIRST and join it. This guarantees no rendering touches a
     // player/renderer while the cleanup thread destroys them below, and that the renderer is idle
