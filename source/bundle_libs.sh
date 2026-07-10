@@ -153,6 +153,38 @@ for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
 done
 echo "   Inter-library references patched: $PATCHED_COUNT"
 
+# ── Safety assertion: the app is SDL2-only ───────────────────────────────────
+# Homebrew has been migrating sdl2_ttf/ffmpeg to link SDL3. If any of that leaks
+# into the bundle (or the main binary), the shipped .app crashes at launch with
+# an SDL3-not-found error. Fail the bundling step rather than ship a crasher.
+echo ""
+echo "🔎 Verifying no SDL3 contamination in the bundle..."
+SDL3_HITS=0
+if otool -L "$EXECUTABLE" 2>/dev/null | grep -qi 'libSDL3'; then
+    echo "   ❌ main binary links libSDL3:"
+    otool -L "$EXECUTABLE" | grep -i sdl || true
+    SDL3_HITS=$((SDL3_HITS + 1))
+fi
+for dylib in "$FRAMEWORKS_DIR"/*.dylib; do
+    [ -f "$dylib" ] || continue
+    if otool -L "$dylib" 2>/dev/null | grep -qi 'libSDL3'; then
+        echo "   ❌ $(basename "$dylib") links libSDL3"
+        SDL3_HITS=$((SDL3_HITS + 1))
+    fi
+done
+# Also catch a stray libSDL3 dylib copied into Frameworks.
+if ls "$FRAMEWORKS_DIR"/libSDL3* >/dev/null 2>&1; then
+    echo "   ❌ libSDL3 dylib present in Frameworks: $(ls "$FRAMEWORKS_DIR"/libSDL3*)"
+    SDL3_HITS=$((SDL3_HITS + 1))
+fi
+if [ "$SDL3_HITS" -ne 0 ]; then
+    echo ""
+    echo "❌  SDL3 contamination detected ($SDL3_HITS). This app is SDL2-only."
+    echo "    Fix the Homebrew deps (see .github/workflows/macos-build.yml guard)."
+    exit 1
+fi
+echo "   ✅ Bundle is SDL2-clean."
+
 # Count copied libraries
 LIB_COUNT=$(find "$FRAMEWORKS_DIR" -name "*.dylib" 2>/dev/null | wc -l | tr -d ' ')
 

@@ -301,6 +301,22 @@ int CreateNewWindow(const char* title, int width, int height) {
             SDL_SetHint(SDL_HINT_RENDER_DRIVER, "");  // Reset hint
             renderer = CreateRendererWithVSync(window, -1, SDL_RENDERER_SOFTWARE);
         }
+    #elif defined(_WIN32)
+        // On Windows: use Direct3D11 explicitly. Without this, the code fell
+        // through to the macOS "metal" hint (no Metal on Windows), SDL failed to
+        // create that renderer, and dropped to the generic fallback below —
+        // typically Direct3D9 or even software, which makes shuttle/playback
+        // sluggish. D3D11 is what FSTPWindowsWS.cpp already assumes for resize.
+        std::cout << "🔧 [RENDERER] Trying Direct3D11 (Windows)..." << std::endl;
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
+        SDL_SetHint(SDL_HINT_RENDER_VSYNC, "0");
+        renderer = CreateRendererWithVSync(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+
+        if (!renderer) {
+            std::cout << "⚠️  Direct3D11 failed, trying Direct3D (9)..." << std::endl;
+            SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d");
+            renderer = CreateRendererWithVSync(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        }
     #else
         // On macOS: use Metal
         SDL_SetHint(SDL_HINT_RENDER_DRIVER, "metal");
