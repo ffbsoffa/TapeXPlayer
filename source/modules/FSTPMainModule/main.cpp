@@ -40,6 +40,9 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <cstdio>    // freopen / freopen_s / setvbuf (for --log)
+#include <cstdlib>   // getenv (for --log)
+#include <cstring>   // strcmp
 #include "main.h"
 #include "../FSTPPlayerModule/FSTPPlayerManager.h"
 #include "../FSTPVideoModule/FSTPHardwareDetection.h"
@@ -92,11 +95,49 @@ int main(int argc, char* argv[]) {
     }
     #endif
 
+    // --log : mirror all stdout/stderr to TapeXPlayer_log.txt on the Desktop, so a
+    // bug report is one flag away with no manual copy/paste from the console. Uses
+    // freopen so it also captures C-runtime / ffmpeg / SDL output, not just std::cout.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--log") == 0) {
+            std::string desktop;
+            #ifdef _WIN32
+                // %USERPROFILE%\Desktop
+                if (const char* up = std::getenv("USERPROFILE"))
+                    desktop = std::string(up) + "\\Desktop\\TapeXPlayer_log.txt";
+                else
+                    desktop = "TapeXPlayer_log.txt";
+            #else
+                // ~/Desktop on macOS and Linux
+                if (const char* home = std::getenv("HOME"))
+                    desktop = std::string(home) + "/Desktop/TapeXPlayer_log.txt";
+                else
+                    desktop = "TapeXPlayer_log.txt";
+            #endif
+
+            #ifdef _WIN32
+                FILE* lf = nullptr;
+                freopen_s(&lf, desktop.c_str(), "w", stdout);
+                freopen_s(&lf, desktop.c_str(), "a", stderr);
+            #else
+                freopen(desktop.c_str(), "w", stdout);
+                freopen(desktop.c_str(), "a", stderr);
+            #endif
+            std::cout.clear();
+            std::cerr.clear();
+            // Unbuffered so the log is complete even if the app is force-quit mid-run.
+            std::setvbuf(stdout, nullptr, _IONBF, 0);
+            std::cout << "[LOG] Writing session log to: " << desktop << std::endl;
+            break;
+        }
+    }
+
     std::cout << "=== TapeXPlayer 2026 - Initialization ===" << std::endl;
 
     // Check for file argument (skip --debug flag)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--debug") == 0) continue;
+        if (strcmp(argv[i], "--log") == 0) continue;
         std::cout << "📂 File argument detected: " << argv[i] << std::endl;
         SetInitialFileToLoad(argv[i]);
         break;
