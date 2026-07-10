@@ -894,23 +894,25 @@ void FSTPVideoModuleWrapper::SetSpeed(double speed) {
     // At any speed > 1x, only low-res preview is shown, so full-res wastes CPU/memory
     // Freeing these resources allows low-res decoder to keep up at 24x
     if (m_full_res_decoder) {
-        static bool full_res_stopped = false;
+        // Per-instance state (was a function-level static shared across ALL
+        // players — a latent multi-window bug). Hysteresis avoids thrashing the
+        // full-res decoder near the threshold: stop at >=2.0x, resume only once
+        // speed drops back to <=1.5x. Without the dead-band, tiny speed jitter
+        // around 2x toggled the decoder every event, which forced the frame
+        // source to flip proxy<->full-res and recreate the YUV texture each time
+        // — cheap on Metal, very expensive on Windows/D3D11 (the scrub lag).
         double abs_speed = std::abs(speed);
+        constexpr double STOP_THRESHOLD   = 2.0;
+        constexpr double RESUME_THRESHOLD = 1.5;
 
-        if (abs_speed >= 2.0) {
-            // Fast playback: stop full-res decoder to free resources
-            if (!full_res_stopped) {
-                std::cout << "⚡ [SPEED OPT] Speed >= 2x (" << abs_speed << "x), stopping Full-Res decoder to free resources" << std::endl;
-                m_full_res_decoder->RequestStop();
-                full_res_stopped = true;
-            }
-        } else {
-            // Normal playback: resume full-res decoder
-            if (full_res_stopped) {
-                std::cout << "✅ [SPEED OPT] Speed < 2x (" << abs_speed << "x), resuming Full-Res decoder" << std::endl;
-                m_full_res_decoder->ClearStopRequest();
-                full_res_stopped = false;
-            }
+        if (!m_full_res_stopped && abs_speed >= STOP_THRESHOLD) {
+            std::cout << "⚡ [SPEED OPT] Speed >= 2x (" << abs_speed << "x), stopping Full-Res decoder to free resources" << std::endl;
+            m_full_res_decoder->RequestStop();
+            m_full_res_stopped = true;
+        } else if (m_full_res_stopped && abs_speed <= RESUME_THRESHOLD) {
+            std::cout << "✅ [SPEED OPT] Speed <= 1.5x (" << abs_speed << "x), resuming Full-Res decoder" << std::endl;
+            m_full_res_decoder->ClearStopRequest();
+            m_full_res_stopped = false;
         }
     }
 

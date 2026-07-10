@@ -83,6 +83,7 @@ private:
 
     std::unique_ptr<FSTP::LowCachedDecoderManager> m_low_cached_manager;
     std::unique_ptr<FSTPFullResDecoderV2> m_full_res_decoder;  // V2: Streaming decoder
+    bool m_full_res_stopped = false;  // SPEED OPT state (per-instance; hysteresis in SetSpeed)
 
     // Pause-frame cache: avoid re-querying decoder when position hasn't changed
     std::shared_ptr<AVFrame> m_v2_cached_frame;

@@ -120,7 +120,16 @@ void StartAutonomousRendering() {
     g_renderThreadRunning = true;
 
     g_renderThread = std::thread([]() {
-        std::cout << "[RENDER THREAD] Windows render thread started (VSync-paced)" << std::endl;
+        // Raise the render thread's priority so the OS scheduler doesn't let other
+        // threads preempt it between vblanks. macOS runs this thread at
+        // QOS_CLASS_USER_INTERACTIVE (FSTPDarwinWS.mm) for <0.5ms jitter; on Windows
+        // the plain std::thread ran at NORMAL priority, so during mouse-shuttle the
+        // frame that reflects the new scrub position could be delayed behind other
+        // work — the UI lagged the cursor. TIME_CRITICAL matches macOS's intent
+        // (kernel32 only, no extra link deps like avrt/MMCSS).
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+
+        std::cout << "[RENDER THREAD] Windows render thread started (VSync-paced, TIME_CRITICAL)" << std::endl;
         while (g_renderThreadRunning.load()) {
             // Pause presenting during a live window move/resize — D3D11 swapchain resize and a
             // concurrent Present don't mix. The event thread drives the resize; we idle briefly.
