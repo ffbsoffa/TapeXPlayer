@@ -809,8 +809,11 @@ public:
                 const int step_ms = 2;               // 2ms interval for smooth animation
                 const int steps = elastic_duration_ms / step_ms;
 
-               // std::cout << "🎵 [ELASTIC EASE] Starting elastic ease-out from " << start_rate
-               //           << "x to " << snap_target << "x over " << elastic_duration_ms << "ms" << std::endl;
+                // TIMING PROBE: measure how long the ease ACTUALLY takes. It is
+                // designed for elastic_duration_ms; if the wall-clock is much
+                // larger (user reports ~1s vs 250ms on Windows), the sleep_for
+                // granularity — not the code — is the culprit. Logged once.
+                auto ease_t0 = std::chrono::steady_clock::now();
 
                 for (int s = 1; s <= steps; ++s) {
                     double t = static_cast<double>(s) / steps;  // Progress from 0.0 to 1.0
@@ -821,6 +824,12 @@ public:
                     if (should_exit_smooth_speed.load()) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
                 }
+
+                auto ease_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - ease_t0).count();
+                std::cout << "🎵 [ELASTIC EASE] designed " << elastic_duration_ms
+                          << "ms (" << steps << " x " << step_ms << "ms), ACTUAL "
+                          << ease_ms << "ms" << std::endl;
 
                 // Ensure exact target hit (1.0x)
                 playback_speed.store(snap_target);
