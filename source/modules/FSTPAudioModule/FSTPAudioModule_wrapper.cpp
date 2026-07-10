@@ -16,6 +16,39 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+namespace {
+// Precise, drift-free sleep to an ABSOLUTE deadline.
+//
+// Why this exists: the tape-transport animations step in 2–5ms increments and
+// self-time with sleep_for. On macOS a sleep_for(2ms) overshoots by only ~15%.
+// On Windows std::this_thread::sleep_for is quantised to the system timer tick
+// (~15.6ms by default), and even timeBeginPeriod(1) doesn't reliably lift it for
+// the MinGW sleep path — so every 2ms step actually slept ~15ms and a 250ms
+// elastic ease stretched to ~1943ms (measured 7.8×). See the timing probes.
+//
+// The fix: don't sleep a fixed DELTA per step, sleep until an absolute clock
+// deadline computed from the animation's start. We coarse-sleep for most of the
+// remaining time (giving the CPU back), then spin the last ~2ms so the total
+// duration lands on target regardless of the OS tick granularity. Because each
+// step targets start + n·step (not "previous wake + step"), jitter cannot
+// accumulate — the animation always finishes on time.
+inline void precise_sleep_until(std::chrono::steady_clock::time_point deadline) {
+    for (;;) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return;
+        auto remaining = deadline - now;
+        // Coarse-sleep only while comfortably far from the deadline, then busy-wait
+        // the tail. 2ms slack safely absorbs a worst-case ~15.6ms tick overshoot's
+        // effect on total duration (we re-check against the absolute deadline).
+        if (remaining > std::chrono::milliseconds(2)) {
+            std::this_thread::sleep_for(remaining - std::chrono::milliseconds(2));
+        } else {
+            std::this_thread::yield();  // release the core but keep re-checking
+        }
+    }
+}
+} // namespace
+
 // NEON SIMD for Apple Silicon optimization
 #if defined(__aarch64__) || defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -760,44 +793,50 @@ public:
                 // stretching every 5ms step. Logged once per reversal.
                 auto dir_t0 = std::chrono::steady_clock::now();
 
-                // Phase 1: Soft ramp down (gentle exponential decay, 0.85 factor)
+                // Phase 1: Soft ramp down (gentle exponential decay, 0.85 factor).
+                // Variable step count, so anchor each step to a running deadline.
+                auto p1_anchor = dir_t0;
                 while (playback_speed.load() > 0.01 && !should_exit_smooth_speed.load()) {
                     double spd = playback_speed.load() * 0.85;
                     if (spd < 0.01) spd = 0.0;
                     playback_speed.store(spd);
                     calculate_and_set_volume(spd);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    p1_anchor += std::chrono::milliseconds(5);
+                    precise_sleep_until(p1_anchor);
                 }
                 playback_speed.store(0.0);
                 calculate_and_set_volume(0.0);
 
                 if (should_exit_smooth_speed.load()) continue;
 
-                // Phase 2: Hold at 0 for 150ms, flip direction at midpoint (75ms)
+                // Phase 2: Hold at 0 for 150ms, flip direction at midpoint (75ms).
+                // Anchor both halves to an absolute timeline so the hold is exact.
                 const int hold_ms = 150;
                 const int half_ms = hold_ms / 2;
+                auto p2_t0 = std::chrono::steady_clock::now();
 
-                for (int i = 0; i < half_ms && !should_exit_smooth_speed.load(); i += 5)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                if (!should_exit_smooth_speed.load())
+                    precise_sleep_until(p2_t0 + std::chrono::milliseconds(half_ms));
 
                 // Flip direction — visible to all readers via IsReverse()
                 is_reverse.store(new_direction);
 
-                for (int i = 0; i < (hold_ms - half_ms) && !should_exit_smooth_speed.load(); i += 5)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                if (!should_exit_smooth_speed.load())
+                    precise_sleep_until(p2_t0 + std::chrono::milliseconds(hold_ms));
 
                 if (should_exit_smooth_speed.load()) continue;
 
                 // Phase 3: Ramp up back to saved target (cubic ease-out, ~200ms)
                 target_playback_speed.store(saved_target);
                 const int ramp_steps = 40;  // 40 × 5ms = 200ms
+                auto p3_t0 = std::chrono::steady_clock::now();
                 for (int s = 1; s <= ramp_steps && !should_exit_smooth_speed.load(); ++s) {
                     double t = static_cast<double>(s) / ramp_steps;
                     double eased = 1.0 - std::pow(1.0 - t, 3.0);  // Cubic ease-out
                     double rate = eased * saved_target;
                     playback_speed.store(rate);
                     calculate_and_set_volume(rate);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    precise_sleep_until(p3_t0 + std::chrono::milliseconds(s * 5));
                 }
                 playback_speed.store(saved_target);
                 calculate_and_set_volume(saved_target);
@@ -833,7 +872,8 @@ public:
                     playback_speed.store(rate);
                     calculate_and_set_volume(rate);
                     if (should_exit_smooth_speed.load()) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+                    // Absolute deadline for step s (drift-free, tick-independent)
+                    precise_sleep_until(ease_t0 + std::chrono::milliseconds(s * step_ms));
                 }
 
                 auto ease_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -873,7 +913,8 @@ public:
                     playback_speed.store(rate);
                     calculate_and_set_volume(rate);
                     if (should_exit_smooth_speed.load()) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+                    // Absolute deadline for step s (drift-free, tick-independent)
+                    precise_sleep_until(shuttle_t0 + std::chrono::milliseconds(s * step_ms));
                 }
 
                 auto shuttle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -922,7 +963,8 @@ public:
                     if (new_speed < 0.003) new_speed = 0.0;
                     playback_speed.store(new_speed);
                     calculate_and_set_volume(new_speed);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+                    // Absolute deadline for step s (drift-free, tick-independent)
+                    precise_sleep_until(brake_t0 + std::chrono::milliseconds(s * step_ms));
                 }
                 playback_speed.store(0.0);
                 calculate_and_set_volume(0.0);
@@ -1060,6 +1102,7 @@ public:
                                 double start_samples = current_pos_samples;
                                 double target_samples = target_time_sec * sample_rate * channels;
 
+                                auto align_t0 = std::chrono::steady_clock::now();
                                 for (int s = 1; s <= align_steps; ++s) {
                                     // Check if still paused
                                     if (target_playback_speed.load() != 0.0 || should_exit_smooth_speed.load()) {
@@ -1072,7 +1115,8 @@ public:
                                     double new_samples = start_samples + (target_samples - start_samples) * eased_t;
                                     playback_position.store(new_samples);
 
-                                    std::this_thread::sleep_for(std::chrono::milliseconds(align_step_ms));
+                                    // Absolute deadline (drift-free, tick-independent)
+                                    precise_sleep_until(align_t0 + std::chrono::milliseconds(s * align_step_ms));
                                 }
 
                                 // Ensure exact target
@@ -1093,7 +1137,13 @@ public:
                 }
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+            // Tick this dispatch iteration for exactly `interval` ms. The ease-out
+            // applies a fixed FRACTION of the remaining diff per iteration, so what
+            // matters is that each iteration lasts its `interval` — not the coarse
+            // ~15.6ms Windows tick that std::this_thread::sleep_for would impose,
+            // which is what made continuous play/shuttle tracking feel ~8× slow.
+            precise_sleep_until(std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(interval));
         }
     }
 
