@@ -93,7 +93,7 @@ static int RunCommandWin(const std::string& utf8Command,
 
 // Encode pipeline modes, tried in order: FullVT → AME → Software (macOS)
 // or HWDecode → Software (Windows/Linux).
-enum class EncodeMode { FullVT, AME, Software, HWDecode };
+enum class EncodeMode { FullVT, AME, Software, HWDecode, NVENC };
 
 // Build video filter + encoder flags for the chosen mode.
 //
@@ -150,6 +150,26 @@ static std::string BuildEncodeFlags(const ProxyConverter::Params& p, EncodeMode 
             " -g 4 -b:v " + bv + " -allow_sw 1 -realtime 1"
             " -an";
     }
+#elif defined(_WIN32)
+    if (mode == EncodeMode::NVENC) {
+        // Windows GPU encode path (mirrors macOS AME): GPU decode (d3d11va, added
+        // in BuildCommand) → CPU neighbour scale → h264_nvenc (NVIDIA hardware
+        // encoder). Encoding proxies on the NVENC chip instead of libx264 frees
+        // the CPU and is much faster on NVIDIA GPUs. Falls back to HWDecode/Software
+        // automatically if this ffmpeg run exits non-zero (caller retries).
+        // p010le/yuv420p: nvenc wants a supported input format after CPU download.
+        std::string vfilter = "scale=" + w + ":" + h + ":flags=neighbor,format=yuv420p";
+        return
+            " -vf \""            + vfilter + "\""
+            " -colorspace "      + p.colorSpace     +
+            " -color_primaries " + p.colorPrimaries +
+            " -color_trc "       + p.colorTrc       +
+            " -color_range "     + p.colorRange     +
+            " -c:v h264_nvenc -profile:v baseline -preset p1 -tune ll"
+            " -g 4 -b:v " + bv +
+            " -an";
+    }
+    (void)mode;
 #else
     (void)mode;
 #endif
@@ -185,6 +205,15 @@ static bool HWDecodeUsable() {
     const FSTPGPUInfo& gpu = g_hardware_detection->GetGPUInfo();
     return gpu.HasAnyHWAccel() && gpu.hw_decode_score >= 50.0;
 }
+
+#if defined(_WIN32)
+// Windows: is the NVIDIA hardware encoder (NVENC) available for proxy encode?
+// Detected once at startup (FSTPHardwareDetection, VendorId on Windows).
+static bool NVENCUsable() {
+    if (!g_hardware_detection) return false;
+    return g_hardware_detection->GetGPUInfo().nvenc_available;
+}
+#endif
 #endif
 
 // Build a full FFmpeg command for one segment (or the whole file if ss<0).
@@ -209,9 +238,9 @@ static std::string BuildCommand(const ProxyConverter::Params& p,
         cmd << " -hwaccel videotoolbox -hwaccel_output_format videotoolbox_vld";
     }
 #elif defined(_WIN32)
-    if (mode == EncodeMode::HWDecode) {
+    if (mode == EncodeMode::HWDecode || mode == EncodeMode::NVENC) {
         // GPU decode on input; without -hwaccel_output_format frames are
-        // automatically downloaded to CPU memory for scale/libx264 below.
+        // automatically downloaded to CPU memory for scale/libx264/nvenc below.
         cmd << " -hwaccel d3d11va";
     }
 #elif defined(__linux__)
@@ -530,6 +559,18 @@ bool ProxyConverter::ConvertSingle(const Params& params)
     // 1. AME: software decode + neighbour scale → h264_videotoolbox (AME chip). Fastest good path.
     if (tryMode(EncodeMode::AME, "AME (sw decode + VideoToolbox)")) return true;
     std::cerr << "[ProxyConverter] AME failed, falling back to libx264..." << std::endl;
+#endif
+
+#if defined(_WIN32)
+    // Windows fastest path: GPU decode (d3d11va) → CPU scale → h264_nvenc (NVIDIA
+    // hardware encoder). Mirrors macOS's AME path — encode runs on the NVENC chip
+    // instead of libx264, freeing the CPU and cutting proxy-build time on NVIDIA
+    // GPUs. If NVENC isn't present or this run fails, we fall through to HWDecode
+    // (libx264) then Software below — full compatibility preserved.
+    if (NVENCUsable()) {
+        if (tryMode(EncodeMode::NVENC, "d3d11va decode + NVENC")) return true;
+        std::cerr << "[ProxyConverter] NVENC failed, falling back to libx264..." << std::endl;
+    }
 #endif
 
 #if !defined(__APPLE__)
