@@ -2311,7 +2311,37 @@ void FSTPVideoModuleWrapper::UpdateVideoFrame() {
     if (betacam_speed_range) {
         bool is_pure_pause = (abs_speed < 0.05);
         if (!is_pure_pause) {
-            // Slow motion or shuttle: stripe always active, force every frame
+            // Slow motion or shuttle: re-render continuously so the Betacam stripe animates and the
+            // proxy steps, even when the audio frame index hasn't advanced. This forced re-render
+            // runs once per PRESENT, so it scales with display refresh — on a 165 Hz panel it fired
+            // 2.75× as often as on 60 Hz, and each present also pays the megacommit's on-demand
+            // proxy decode (decodeFrameNow + per-slot lock) → visible drops on high-refresh screens
+            // (reported by a 165 Hz user, effect on OR off). Cap it to 60 fps by wall clock: ~60
+            // proxy frames/sec during a scrub is visually identical and the stripe animates just as
+            // smoothly, at a fraction of the cost.
+            //
+            // Render is vblank-locked, so on a panel whose refresh isn't a multiple of 60 (165 Hz)
+            // we can only skip WHOLE presents. Advancing the deadline by one 60 Hz period (instead
+            // of resetting it to "now") makes the long-run count land on exactly 60 renders/sec:
+            // the skips alternate 2/3 vblanks (≈82/≈55 fps instantaneous) and average to 60. Panels
+            // at 60/120/144 Hz render on every Nth present cleanly; a small tolerance keeps 60 Hz
+            // itself rendering every present despite present-time jitter. An explicit force
+            // (segment-decode ready, already in `force_update`) is never throttled away.
+            constexpr double kTargetFrameMs   = 1000.0 / 60.0;  // 16.667 ms → 60 fps
+            constexpr double kJitterToleranceMs = 2.0;          // don't let jitter halve a 60 Hz panel
+            auto now = std::chrono::steady_clock::now();
+            double since_ms =
+                std::chrono::duration<double, std::milli>(now - m_last_shuttle_render).count();
+            if (!force_update && since_ms + kJitterToleranceMs < kTargetFrameMs) {
+                return;  // too soon since the last shuttle render — skip this present entirely
+            }
+            if (since_ms > kTargetFrameMs * 4.0) {
+                // Big gap (just entered shuttle, or was idle): resync to avoid a catch-up burst.
+                m_last_shuttle_render = now;
+            } else {
+                // Advance by a whole 60 Hz period so the average stays exactly 60 fps.
+                m_last_shuttle_render += std::chrono::microseconds(16667);
+            }
             force_update = true;
         } else {
             // Pure pause: force until audio aligns to frame boundary (stripe disappears).

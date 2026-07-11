@@ -4,6 +4,7 @@
 #include <memory>
 #include <atomic>
 #include <vector>
+#include <chrono>
 
 #include "FSTPFrameConverter.h"
 #include "FSTPVideoFrame.h"
@@ -47,6 +48,13 @@ private:
     mutable int m_last_displayed_frame = -1;
     mutable std::atomic<bool> m_force_frame_update{false}; // Force update after segment decode
     mutable bool m_last_frame_aligned = false; // Previous IsFrameAligned() for transition detection
+    // Phase-accumulator deadline for the shuttle/slow-mo forced re-render (see UpdateVideoFrame).
+    // During shuttle we re-render every present to animate the Betacam stripe and step the proxy;
+    // that scales with display refresh, so on a 165 Hz panel it ran 2.75× more often than on 60 Hz
+    // — and each present now also does an on-demand proxy decode (decodeFrameNow). Advancing this by
+    // one 60 Hz period per render (not resetting to "now") caps the long-run rate to exactly 60 fps
+    // on any panel — visually identical during a scrub, at a fraction of the high-refresh cost.
+    mutable std::chrono::steady_clock::time_point m_last_shuttle_render{};
 
     std::unique_ptr<FSTPSimpleVideoIndex> m_frame_index;
     // CRITICAL FIX: Use raw pointer to prevent destructor cleanup
