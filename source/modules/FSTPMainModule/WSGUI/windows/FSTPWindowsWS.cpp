@@ -980,11 +980,19 @@ int RunMainUILoop() {
                     break;
                 }
 
-                // Check for window close event
+                // Window close: only the MAIN window (index 0) closing quits the app. Closing a
+                // SECONDARY window — another player instance — must close JUST that window, which
+                // HandleWindowEvents (below) does (stop player + FSTPCloseWindow). Before this, ANY
+                // window's close set g_shutdownRequested, so closing instance #2 tore down every
+                // instance (the bug macOS never had — there a window close never quits the app).
                 if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE) {
-                    std::cout << "[EXIT] Window close requested - requesting asynchronous shutdown" << std::endl;
-                    g_shutdownRequested.store(true);
-                    break;
+                    FSTPWindow* mainw = GetMainWindow();
+                    if (mainw && event.window.windowID == mainw->window_id) {
+                        std::cout << "[EXIT] Main window close requested - requesting asynchronous shutdown" << std::endl;
+                        g_shutdownRequested.store(true);
+                        break;
+                    }
+                    // Secondary window: fall through to HandleWindowEvents, which closes only it.
                 }
 
                 // Check for ESC and Ctrl+Q BEFORE keyboard handler
