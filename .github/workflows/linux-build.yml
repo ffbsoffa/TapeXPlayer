@@ -37,7 +37,7 @@ jobs:
 
       - name: Build
         working-directory: source
-        run: make -j"$(nproc)"
+        run: make -j"$(nproc)" FREEZE_BUILD_NUMBER=1   # pin to committed .build_number (same on every platform)
 
       - name: Create .deb package
         working-directory: source

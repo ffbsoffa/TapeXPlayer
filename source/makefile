@@ -33,7 +33,13 @@ BUILD_NUMBER_FILE = .build_number
 # case-pattern closes the function prematurely.  Use $(filter ...) in Make itself
 # to produce a plain "1" or "0" flag, then use a simple if/else in the shell.
 _BUILD_GOALS     := $(or $(MAKECMDGOALS),all)
-_SHOULD_INCREMENT := $(if $(filter all rebuild,$(_BUILD_GOALS)),1,0)
+# FREEZE_BUILD_NUMBER=1 pins the build number to the committed .build_number (no auto-increment).
+# CI passes it on ALL platforms so every platform stamps the SAME, deterministic number — the
+# committed value IS the release number. (Previously `make`/`make all` on Win/Linux incremented
+# while macOS `bundle-universal` did not, so one commit shipped as three different builds, and the
+# committed number never advanced → every CI run produced the same "1851".) Bump .build_number by
+# hand when cutting a release. Plain local `make` still auto-increments for day-to-day dev.
+_SHOULD_INCREMENT := $(if $(FREEZE_BUILD_NUMBER),0,$(if $(filter all rebuild,$(_BUILD_GOALS)),1,0))
 
 BUILD_NUMBER := $(shell \
 	CURRENT=$$(cat $(BUILD_NUMBER_FILE) 2>/dev/null || echo "852"); \
