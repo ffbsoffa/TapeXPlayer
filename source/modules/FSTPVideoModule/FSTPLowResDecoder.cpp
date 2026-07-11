@@ -371,10 +371,10 @@ bool LowResDecoder::initialize() {
     // Creating them LAZILY during playback let a shuttle→1× transition open the manager's contexts
     // while the display's on-demand decode waited on the SAME file mutex → a visible freeze. Doing it
     // here (once, at load, hidden in the proxy-ready wait) keeps every later context access on the
-    // cheap reuse path. useHardwareAccel=true matches decodeLowResRange.
-    // Must match the accel used by decodeLowResRange (the cached context keeps whatever the FIRST
-    // call created): software on macOS (low-latency small-proxy decode), HW elsewhere.
-#ifdef __APPLE__
+    // cheap reuse path. Must match the accel used by decodeLowResRange (the cached context keeps
+    // whatever the FIRST call created): SOFTWARE on macOS and Windows (small-proxy HW decode is
+    // readback-bound — see decodeLowResRange), HW only on Linux/VA-API for now.
+#if defined(__APPLE__) || defined(_WIN32)
     constexpr bool kProxyHwAccel = false;
 #else
     constexpr bool kProxyHwAccel = true;
@@ -758,16 +758,17 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
     std::atomic<bool> success{true};
 
     auto decodeSegment = [&](int threadId, int threadStartFrame, int threadEndFrame) {
-#ifdef __APPLE__
-        // macOS: SOFTWARE-decode the small proxy. VideoToolbox HW decode of a 720×540/540p frame is
-        // dominated by the HW→system-memory transfer and the shared VT queue (it contends with the
-        // full-res 1080p V2 decoder) — measured ~20–40ms per frame on the display thread during
-        // shuttle. libavcodec software decode of such a small frame lands straight in system memory
-        // (~4ms here). The proxy↔full-res handoff already recreates the texture (resolutions differ),
-        // so the resulting NV12→yuv420p format change costs nothing extra.
+#if defined(__APPLE__) || defined(_WIN32)
+        // macOS + Windows: SOFTWARE-decode the small proxy. HW decode (VideoToolbox / D3D11VA) of a
+        // 720×540/540p frame is dominated by the HW→system-memory readback (av_hwframe_transfer_data,
+        // ~20–40ms/frame) plus, on macOS, the shared VT queue contending with the full-res 1080p V2
+        // decoder — versus ~4ms for a libavcodec software decode that lands straight in system memory.
+        // The on-demand shuttle model pays this cost on (nearly) every shown frame, so on a high-refresh
+        // panel the readback starves the decode and the picture stutters (Windows 165 Hz report). The
+        // proxy↔full-res handoff already recreates the texture, so the NV12→yuv420p change costs nothing.
         bool useHardwareAccel = false;
 #else
-        // Weak Intel Celeron / VA-API targets need HW even for the small proxy.
+        // Linux / VA-API: keep HW for now (weak Intel Celeron / VA-API targets; readback issue unverified there).
         bool useHardwareAccel = true;
         if (isReverse) useHardwareAccel = true;
 #endif
