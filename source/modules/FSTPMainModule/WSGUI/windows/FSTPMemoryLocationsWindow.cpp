@@ -40,6 +40,15 @@ static const COLORREF ML_CLR_DIVIDER = RGB(220, 220, 220);
 static const int ML_HEADER_H = 34;   // subtitle strip above the table
 static const int ML_FOOTER_H = 46;   // bottom bar with buttons
 
+// ── DPI scaling ──────────────────────────────────────────────────────────────
+// The add/edit dialog is hand-laid-out in logical (96-DPI) pixels. The fonts already
+// scale with DPI (CreateFontW via -MulDiv(pt, dpiY, 72)); the GEOMETRY must scale by the
+// same factor or, at 125%/150%, the larger text clips its fixed boxes and rows overlap —
+// exactly what FSTPSettingsDialog fixes with its Dpi() helper. Captured in
+// EnsureMLFontsAndBrush() so both the fonts and this factor come from the same LOGPIXELSY.
+static double g_mlDpiScale = 1.0;
+static inline int MlDpi(int logical) { return (int)(logical * g_mlDpiScale + 0.5); }
+
 // Control IDs
 #define IDC_LISTVIEW       2001
 #define IDC_EXPORT_BTN     2002
@@ -60,10 +69,12 @@ enum {
 // Fonts/brush are created lazily: the add-marker dialog can open from the
 // keyboard (Enter) before the main Memory Locations window.
 static void EnsureMLFontsAndBrush() {
+    HDC screen = GetDC(NULL);
+    int dpiY = GetDeviceCaps(screen, LOGPIXELSY);
+    ReleaseDC(NULL, screen);
+    if (dpiY <= 0) dpiY = 96;
+    g_mlDpiScale = dpiY / 96.0;   // keep geometry in step with the DPI-scaled fonts below
     if (!g_mlFontNormal) {
-        HDC screen = GetDC(NULL);
-        int dpiY = GetDeviceCaps(screen, LOGPIXELSY);
-        ReleaseDC(NULL, screen);
         g_mlFontNormal = CreateFontW(-MulDiv(10, dpiY, 72), 0, 0, 0, FW_NORMAL,
             FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
@@ -565,8 +576,10 @@ static AddEditDialogState g_edit_state;
 // Add/Edit dialog procedure
 static LRESULT CALLBACK AddEditDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-        case WM_CTLCOLORSTATIC: {
-            // White background under labels — consistent with Settings and the main window.
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLOREDIT: {
+            // White background + dark text under labels and edit fields — consistent with
+            // Settings and the main window (no Win95 grey).
             HDC hdc = (HDC)wParam;
             SetBkColor(hdc, ML_CLR_BG);
             SetTextColor(hdc, ML_CLR_TEXT);
@@ -722,105 +735,150 @@ static void ShowAddEditMemoryLocationDialog(int player_id, int location_id, doub
         class_registered = true;
     }
 
-    // Create dialog window
+    // ── Layout: logical (96-DPI) px; every coordinate goes through MlDpi() so the geometry
+    //    scales with the DPI-scaled Segoe UI fonts (mirrors FSTPSettingsDialog's Dpi() model). ──
+    const int MARGIN    = 16;
+    const int LABEL_X   = 16,  LABEL_W = 90;
+    const int FIELD_X   = 112, FIELD_W = 384;
+    const int ID_W      = 70,  TC_W    = 130;
+    const int ROW       = 30;            // advance per single-line row
+    const int EDIT_H    = 23,  LABEL_H = 20;
+    const int COMMENT_H = 108;
+    const int BTN_W     = 88,  BTN_H = 28, BTN_GAP = 8;
+    const int CLIENT_W  = 512;
+
+    // Walk the rows once (same sequence as the layout below) to get the content height —
+    // it differs between add and edit mode — so the window is sized to fit exactly.
+    int ly = MARGIN;
+    ly += ROW;                    // Number / ID
+    ly += ROW;                    // Timecode
+    ly += ROW;                    // Name
+    ly += COMMENT_H + 14;         // Comments (multiline)
+    if (is_add_mode) ly += ROW;   // Recall-zoom checkbox
+    ly += 10;                     // gap before the button row
+    const int BUTTONS_Y = ly;
+    const int CLIENT_H  = BUTTONS_Y + BTN_H + MARGIN;
+
+    // Size the window to that client area (DPI-scaled) and centre it on the Memory Locations
+    // window, or the screen if the dialog was opened from the keyboard before that window exists.
+    const DWORD style   = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    const DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;  // CONTROLPARENT: IsDialogMessageW does Tab
+    RECT wr = { 0, 0, MlDpi(CLIENT_W), MlDpi(CLIENT_H) };
+    AdjustWindowRectEx(&wr, style & ~WS_VISIBLE, FALSE, exStyle);
+    int win_w = wr.right - wr.left;
+    int win_h = wr.bottom - wr.top;
+
+    RECT pr;
+    if (!(g_memory_window && GetWindowRect(g_memory_window, &pr))) {
+        pr.left = 0; pr.top = 0;
+        pr.right  = GetSystemMetrics(SM_CXSCREEN);
+        pr.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+    int win_x = pr.left + ((pr.right - pr.left) - win_w) / 2;
+    int win_y = pr.top  + ((pr.bottom - pr.top) - win_h) / 2;
+
     HWND hwnd = CreateWindowExW(
-        WS_EX_DLGMODALFRAME,
-        L"FSTPMemLocEditClass",
+        exStyle, L"FSTPMemLocEditClass",
         is_add_mode ? L"New Memory Location" : L"Edit Memory Location",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        500, 400,
-        g_memory_window, NULL,
-        GetModuleHandle(NULL), NULL
-    );
+        style, win_x, win_y, win_w, win_h,
+        g_memory_window, NULL, GetModuleHandle(NULL), NULL);
 
     if (!hwnd) return;
 
     HFONT hFont = g_mlFontNormal;  // Segoe UI, not DEFAULT_GUI_FONT
-    int y = 15;
+    HWND h;
+    ly = MARGIN;
 
-    // Number/ID field
-    HWND h = CreateWindowExW(0, L"STATIC", is_add_mode ? L"Number:" : L"ID:",
-        WS_CHILD | WS_VISIBLE, 15, y, 80, 20, hwnd, (HMENU)IDC_LOC_ID_LABEL, NULL, NULL);
+    // Number/ID: label + editable number (add) or read-only value (edit)
+    h = CreateWindowExW(0, L"STATIC", is_add_mode ? L"Number:" : L"ID:", WS_CHILD | WS_VISIBLE,
+        MlDpi(LABEL_X), MlDpi(ly + 3), MlDpi(LABEL_W), MlDpi(LABEL_H),
+        hwnd, (HMENU)IDC_LOC_ID_LABEL, NULL, NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-    if (is_add_mode) {
+    {
         wchar_t id_buf[16];
         swprintf(id_buf, 16, L"%d", g_edit_state.data.id);
-        h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", id_buf,
-            WS_CHILD | WS_VISIBLE | ES_NUMBER,
-            100, y, 80, 22, hwnd, (HMENU)IDC_LOC_ID, NULL, NULL);
-        SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
-    } else {
-        wchar_t id_buf[16];
-        swprintf(id_buf, 16, L"%d", g_edit_state.data.id);
-        h = CreateWindowExW(0, L"STATIC", id_buf,
-            WS_CHILD | WS_VISIBLE, 100, y, 80, 20, hwnd, (HMENU)IDC_LOC_ID, NULL, NULL);
+        if (is_add_mode) {
+            h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", id_buf,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER,
+                MlDpi(FIELD_X), MlDpi(ly), MlDpi(ID_W), MlDpi(EDIT_H),
+                hwnd, (HMENU)IDC_LOC_ID, NULL, NULL);
+        } else {
+            h = CreateWindowExW(0, L"STATIC", id_buf, WS_CHILD | WS_VISIBLE,
+                MlDpi(FIELD_X), MlDpi(ly + 3), MlDpi(ID_W), MlDpi(LABEL_H),
+                hwnd, (HMENU)IDC_LOC_ID, NULL, NULL);
+        }
         SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
     }
-    y += 30;
+    ly += ROW;
 
-    // Timecode field
-    h = CreateWindowExW(0, L"STATIC", L"Timecode:",
-        WS_CHILD | WS_VISIBLE, 15, y, 80, 20, hwnd, (HMENU)IDC_LOC_TC_LABEL, NULL, NULL);
+    // Timecode
+    h = CreateWindowExW(0, L"STATIC", L"Timecode:", WS_CHILD | WS_VISIBLE,
+        MlDpi(LABEL_X), MlDpi(ly + 3), MlDpi(LABEL_W), MlDpi(LABEL_H),
+        hwnd, (HMENU)IDC_LOC_TC_LABEL, NULL, NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
-
     std::wstring tc_wide = Utf8ToWide(g_edit_state.data.timecode_display);
     if (is_add_mode) {
         h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", tc_wide.c_str(),
-            WS_CHILD | WS_VISIBLE,
-            100, y, 120, 22, hwnd, (HMENU)IDC_LOC_TC, NULL, NULL);
-        SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            MlDpi(FIELD_X), MlDpi(ly), MlDpi(TC_W), MlDpi(EDIT_H),
+            hwnd, (HMENU)IDC_LOC_TC, NULL, NULL);
     } else {
-        h = CreateWindowExW(0, L"STATIC", tc_wide.c_str(),
-            WS_CHILD | WS_VISIBLE, 100, y, 120, 20, hwnd, (HMENU)IDC_LOC_TC, NULL, NULL);
-        SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
+        h = CreateWindowExW(0, L"STATIC", tc_wide.c_str(), WS_CHILD | WS_VISIBLE,
+            MlDpi(FIELD_X), MlDpi(ly + 3), MlDpi(TC_W), MlDpi(LABEL_H),
+            hwnd, (HMENU)IDC_LOC_TC, NULL, NULL);
     }
-    y += 30;
+    SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
+    ly += ROW;
 
     // Name
-    h = CreateWindowExW(0, L"STATIC", L"Name:",
-        WS_CHILD | WS_VISIBLE, 15, y, 80, 20, hwnd, (HMENU)IDC_LOC_NAME_LABEL, NULL, NULL);
+    h = CreateWindowExW(0, L"STATIC", L"Name:", WS_CHILD | WS_VISIBLE,
+        MlDpi(LABEL_X), MlDpi(ly + 3), MlDpi(LABEL_W), MlDpi(LABEL_H),
+        hwnd, (HMENU)IDC_LOC_NAME_LABEL, NULL, NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
-
     std::wstring name_wide = Utf8ToWide(g_edit_state.data.name);
     h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", name_wide.c_str(),
-        WS_CHILD | WS_VISIBLE,
-        100, y, 370, 22, hwnd, (HMENU)IDC_LOC_NAME, NULL, NULL);
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        MlDpi(FIELD_X), MlDpi(ly), MlDpi(FIELD_W), MlDpi(EDIT_H),
+        hwnd, (HMENU)IDC_LOC_NAME, NULL, NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
-    y += 30;
+    ly += ROW;
 
-    // Comments
-    h = CreateWindowExW(0, L"STATIC", L"Comments:",
-        WS_CHILD | WS_VISIBLE, 15, y, 80, 20, hwnd, (HMENU)IDC_LOC_COMMENT_LBL, NULL, NULL);
+    // Comments (multiline)
+    h = CreateWindowExW(0, L"STATIC", L"Comments:", WS_CHILD | WS_VISIBLE,
+        MlDpi(LABEL_X), MlDpi(ly + 3), MlDpi(LABEL_W), MlDpi(LABEL_H),
+        hwnd, (HMENU)IDC_LOC_COMMENT_LBL, NULL, NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
-
     std::wstring comments_wide = Utf8ToWide(g_edit_state.data.comments);
     h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", comments_wide.c_str(),
-        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL,
-        100, y, 370, 120, hwnd, (HMENU)IDC_LOC_COMMENT, NULL, NULL);
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL,
+        MlDpi(FIELD_X), MlDpi(ly), MlDpi(FIELD_W), MlDpi(COMMENT_H),
+        hwnd, (HMENU)IDC_LOC_COMMENT, NULL, NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
-    y += 130;
+    ly += COMMENT_H + 14;
 
-    // Recall zoom checkbox (only in add mode)
+    // Recall zoom checkbox (add mode only)
     if (is_add_mode) {
         h = CreateWindowExW(0, L"BUTTON", L"Recall zoom settings",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            15, y, 250, 20, hwnd, (HMENU)IDC_LOC_ZOOM_CHECK, NULL, NULL);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            MlDpi(LABEL_X), MlDpi(ly), MlDpi(260), MlDpi(LABEL_H),
+            hwnd, (HMENU)IDC_LOC_ZOOM_CHECK, NULL, NULL);
         SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
-        y += 30;
+        ly += ROW;
     }
 
-    // Buttons
-    y = 330;
+    // Buttons — right-aligned on the button row
+    const int cancel_x = CLIENT_W - MARGIN - BTN_W;
+    const int ok_x     = cancel_x - BTN_GAP - BTN_W;
     h = CreateWindowExW(0, L"BUTTON", is_add_mode ? L"Add" : L"Save",
-        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        290, y, 90, 28, hwnd, (HMENU)IDC_LOC_OK, NULL, NULL);
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        MlDpi(ok_x), MlDpi(BUTTONS_Y), MlDpi(BTN_W), MlDpi(BTN_H),
+        hwnd, (HMENU)IDC_LOC_OK, NULL, NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     h = CreateWindowExW(0, L"BUTTON", L"Cancel",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        390, y, 90, 28, hwnd, (HMENU)IDC_LOC_CANCEL, NULL, NULL);
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        MlDpi(cancel_x), MlDpi(BUTTONS_Y), MlDpi(BTN_W), MlDpi(BTN_H),
+        hwnd, (HMENU)IDC_LOC_CANCEL, NULL, NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     // Focus name field
@@ -828,6 +886,30 @@ static void ShowAddEditMemoryLocationDialog(int player_id, int location_id, doub
 
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
+
+    // Modal keyboard navigation — the Settings dialog's mechanism: a nested GetMessageW loop that
+    // routes messages through IsDialogMessageW, which gives Tab (move between fields), Enter
+    // (default button = Add/Save; a newline inside the ES_WANTRETURN comments box, as expected) and
+    // Esc (Cancel). Before this the dialog was modeless and none of those keys worked. The owner is
+    // disabled so it's truly modal; the loop exits when the dialog is destroyed (OK/Cancel/close).
+    HWND owner = g_memory_window;
+    if (owner) EnableWindow(owner, FALSE);
+    MSG msg;
+    while (IsWindow(hwnd)) {
+        if (!GetMessageW(&msg, nullptr, 0, 0)) {
+            // WM_QUIT arrived while we're nested — re-post it so the app's outer loop quits too.
+            PostQuitMessage((int)msg.wParam);
+            break;
+        }
+        if (!IsDialogMessageW(hwnd, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    if (owner) {
+        EnableWindow(owner, TRUE);
+        SetActiveWindow(owner);
+    }
 }
 
 // C API: Show unified Add/Edit dialog for Memory Locations
