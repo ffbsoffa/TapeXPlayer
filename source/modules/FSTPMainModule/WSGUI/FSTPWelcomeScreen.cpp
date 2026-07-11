@@ -61,12 +61,10 @@ std::vector<CtrlRow> controlRows() {
         { mod + " O",              "welcome.act_open" },
         { mod + "+Shift+O",        "welcome.act_open_new" },
         { "Space",                 "welcome.act_playpause" },
-        { "S",                     "welcome.act_stop" },
         { "Left / Right",          "welcome.act_direction" },
-        { "R",                     "welcome.act_reverse" },
         { "Shift + Left / Right",  "welcome.act_seek" },
-        { "- / +",                 "welcome.act_speed" },
-        { "1",                     "welcome.act_normal" },
+        { "Up / Down",             "welcome.act_speed" },
+        { "Shift+Ctrl+Click",      "welcome.act_shuttle" },
         { "F",                     "welcome.act_fullscreen" },
         { "C",                     "welcome.act_subs" },
         { mod + " Q / Esc",        "welcome.act_quit" },
@@ -119,16 +117,16 @@ void initOnce() {
     FSTP_LangRegisterDefault("welcome.act_open", "Open / load a file");
     FSTP_LangRegisterDefault("welcome.act_open_new", "Open in a new instance");
     FSTP_LangRegisterDefault("welcome.act_playpause", "Play / Pause");
-    FSTP_LangRegisterDefault("welcome.act_stop", "Stop");
     FSTP_LangRegisterDefault("welcome.act_direction", "Play backward / forward");
-    FSTP_LangRegisterDefault("welcome.act_reverse", "Reverse playback");
     FSTP_LangRegisterDefault("welcome.act_seek", "Jump back / forward 60 s");
     FSTP_LangRegisterDefault("welcome.act_speed", "Slow down / speed up");
-    FSTP_LangRegisterDefault("welcome.act_normal", "Normal speed (1x)");
+    FSTP_LangRegisterDefault("welcome.act_shuttle", "Mouse shuttle — drag to scrub");
     FSTP_LangRegisterDefault("welcome.act_fullscreen", "Fullscreen");
     FSTP_LangRegisterDefault("welcome.act_subs", "Subtitles on / off");
     FSTP_LangRegisterDefault("welcome.act_quit", "Quit");
     FSTP_LangRegisterDefault("welcome.unload_note",
+        "Mouse shuttle: the click point is the centre; speed depends on drag distance, "
+        "or just hold the left button on compact devices. "
         "To unload, open another file (it replaces the current one) or close the window.");
 
     // Language packs are looked for in a lang/ folder. Prefer the explicit
@@ -325,9 +323,10 @@ void FSTPWelcome_Render(SDL_Renderer* renderer, int W, int H) {
         drawText(renderer, g_title_font, FSTP_Tr("welcome.controls_title"), white, contentX, y, 0, &tw, &th);
         y += th + 10;
 
-        // Reserve space for the (wrapped) unload note above the dots, then fit the
+        // Reserve space for the (wrapped) bottom note above the dots, then fit the
         // control rows in whatever remains — so nothing overlaps at any window size.
-        int note_reserve = 2 * line + 6;
+        // The note now carries the mouse-shuttle details, so it wraps to ~3 lines.
+        int note_reserve = 3 * line + 6;
         int note_top = dots_y - 8 - note_reserve;
         int rows_top = y;
         std::vector<CtrlRow> rows = controlRows();
@@ -335,7 +334,17 @@ void FSTPWelcome_Render(SDL_Renderer* renderer, int W, int H) {
         int row_h = (n > 0) ? (note_top - 8 - rows_top) / n : line;
         if (row_h > line + 4) row_h = line + 4;
         if (row_h < 13) row_h = 13;
-        int key_col_w = std::min(150, contentW / 2);
+        // Size the key column to the widest key label so long combos like
+        // "Shift + Left / Right" never overlap the action text. Cap it at half
+        // the content width so the action column always keeps room.
+        int key_col_w = 0;
+        for (const auto& row : rows) {
+            int kw = 0, kh = 0;
+            if (g_body_font && TTF_SizeUTF8(g_body_font, row.key.c_str(), &kw, &kh) == 0)
+                key_col_w = std::max(key_col_w, kw);
+        }
+        key_col_w += 28;                       // gap between key and action columns
+        if (key_col_w > contentW / 2) key_col_w = contentW / 2;
         int ry = rows_top;
         for (const auto& row : rows) {
             drawText(renderer, g_body_font, row.key.c_str(), accentText, contentX, ry, 0, nullptr, nullptr);

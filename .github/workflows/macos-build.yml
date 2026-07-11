@@ -109,13 +109,16 @@ jobs:
 
       - name: Zip .app
         working-directory: builds
-        run: ditto -c -k --keepParent TapeXPlayer.app TapeXPlayer-mac-universal.zip
+        # Carry the build number in the zip name, like the Windows installer / Linux .deb do.
+        run: |
+          BUILD=$(cat ../source/.build_number)
+          ditto -c -k --keepParent TapeXPlayer.app "TapeXPlayer-mac-universal-build${BUILD}.zip"
 
       - name: Upload .app artifact
         uses: actions/upload-artifact@v4
         with:
           name: TapeXPlayer-mac-universal
-          path: builds/TapeXPlayer-mac-universal.zip
+          path: builds/TapeXPlayer-mac-universal-build*.zip
           if-no-files-found: error
 
       - name: Upload universal binary artifact
