@@ -76,6 +76,13 @@ public:
     void SetEnabled(bool enabled) { m_enabled = enabled; }
     bool IsEnabled() const { return m_enabled; }
 
+    // Opt-in: show the single tracking stripe at 1× reverse (helical scan misaligned). Off by
+    // default because the flicker distracts from frame-by-frame analysis; users who want the
+    // authentic 1× reverse look enable it in Betacam settings. Gates the isReverseNormalSpeed
+    // branch of shouldShowEffect in ApplyPixelFX.
+    void SetReverseStripeEnabled(bool enabled) { m_reverse_stripe_enabled = enabled; }
+    bool IsReverseStripeEnabled() const { return m_reverse_stripe_enabled; }
+
     void UpdatePlaybackMetrics(int player_id, const PlaybackMetrics& metrics);
     void ResetPlayer(int player_id);
 
@@ -335,6 +342,7 @@ private:
     };
 
     bool m_enabled = false;
+    bool m_reverse_stripe_enabled = false;  // 1× reverse tracking stripe (opt-in; see SetReverseStripeEnabled)
     std::array<PlayerState, kMaxPlayers> m_players;
 
     static constexpr int kTransitionFrames = 6;

@@ -46,6 +46,7 @@ extern "C" void ApplyMIDISettings();
 #define IDC_FREEZE_CHECK      1016
 #define IDC_BETACAM_CHECK     1017
 #define IDC_DECODER_STATUS    1018
+#define IDC_REVERSE_STRIPE    1019
 
 // MIDI page
 #define IDC_MIDI_ENABLE       1020
@@ -400,6 +401,7 @@ struct SettingsDlgState {
     HWND hFrameOffset   = nullptr;
     HWND hFreezeCheck   = nullptr;
     HWND hBetacamCheck  = nullptr;
+    HWND hReverseStripe = nullptr;
     HWND hDecoderStatus = nullptr;
 
     // MIDI controls
@@ -659,6 +661,16 @@ static HWND BuildVideoPage(HWND parent, SettingsDlgState* s) {
     y += Dpi(22);
     y = AddHint(page, hInst, L"Adds rewind/fast-forward tape jitter. May impact performance.", x + CHECKBOX_INDENT, y, cw - CHECKBOX_INDENT);
 
+    // Sub-option of the Betacam effect: authentic tracking stripe at 1x reverse. Off by default —
+    // its flicker distracts from frame-by-frame analysis (the product's core use).
+    s->hReverseStripe = CreateWindowExW(0, L"BUTTON", L"Show tracking stripe at 1x reverse",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        x + CHECKBOX_INDENT, y, cw - CHECKBOX_INDENT, Dpi(20), page, (HMENU)IDC_REVERSE_STRIPE, hInst, nullptr);
+    if (settings && settings->betacam_reverse_stripe)
+        SendMessage(s->hReverseStripe, BM_SETCHECK, BST_CHECKED, 0);
+    y += Dpi(22);
+    y = AddHint(page, hInst, L"Authentic look; flickers, so off by default.", x + CHECKBOX_INDENT, y, cw - CHECKBOX_INDENT);
+
     // Developer / Debug
     y += Dpi(6);
     y = AddSectionHeader(page, hInst, L"Developer / Debug", x, y, cw);
@@ -889,6 +901,10 @@ static void CollectAndSave(SettingsDlgState* s) {
     if (s->hBetacamCheck) {
         settings->betacam_effect_enabled = (SendMessage(s->hBetacamCheck, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
         SetBetacamEffectEnabled(settings->betacam_effect_enabled);
+    }
+    if (s->hReverseStripe) {
+        settings->betacam_reverse_stripe = (SendMessage(s->hReverseStripe, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+        SetBetacamReverseStripe(settings->betacam_reverse_stripe);
     }
     if (s->hDecoderStatus)
         settings->show_decoder_status = (SendMessage(s->hDecoderStatus, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;

@@ -68,6 +68,13 @@ void ShutdownWindowManager();
 // Create new window
 int CreateNewWindow(const char* title, int width, int height);
 
+#ifdef _WIN32
+// Implemented in windows/FSTPWindowsWS.cpp. Installs the D3D11 live-resize crash guard (HWND
+// subclass) on a window. CreateNewWindow calls it for every window so all creation paths — menu
+// and the Cmd+N keyboard shortcut — are covered, not just the main window.
+void FSTP_InstallWindowResizeGuard(SDL_Window* win);
+#endif
+
 // Close window by ID
 void FSTPCloseWindow(int window_index);
 

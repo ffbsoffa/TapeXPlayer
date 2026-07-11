@@ -14,6 +14,7 @@ class SettingsViewModel: ObservableObject {
     @Published var frameOffset: Int = 0
     @Published var autoFreezeInactive: Bool = true
     @Published var betacamEffectEnabled: Bool = false
+    @Published var betacamReverseStripe: Bool = false
     @Published var ytDlpEnabled: Bool = false
 
     // MIDI Settings
@@ -58,6 +59,7 @@ class SettingsViewModel: ObservableObject {
             frameOffset = Int(s.pointee.frame_offset)
             autoFreezeInactive = s.pointee.auto_freeze_inactive != 0
             betacamEffectEnabled = s.pointee.betacam_effect_enabled != 0
+            betacamReverseStripe = s.pointee.betacam_reverse_stripe != 0
             ytDlpEnabled = s.pointee.yt_dlp_extension_enabled != 0
             midiEnabled = s.pointee.midi_enabled != 0
             midiInputPort = Int(s.pointee.midi_input_port)
@@ -141,6 +143,7 @@ class SettingsViewModel: ObservableObject {
         settings.pointee.frame_offset = Int32(frameOffset)
         settings.pointee.auto_freeze_inactive = autoFreezeInactive ? 1 : 0
         settings.pointee.betacam_effect_enabled = betacamEffectEnabled ? 1 : 0
+        settings.pointee.betacam_reverse_stripe = betacamReverseStripe ? 1 : 0
         settings.pointee.yt_dlp_extension_enabled = ytDlpEnabled ? 1 : 0
         settings.pointee.midi_enabled = midiEnabled ? 1 : 0
         settings.pointee.midi_input_port = Int32(midiInputPort)
@@ -160,6 +163,7 @@ class SettingsViewModel: ObservableObject {
         SetYTDLPExtensionEnabled(ytDlpEnabled ? 1 : 0)
         InitToolsMenu()
         SetBetacamEffectEnabled(betacamEffectEnabled ? 1 : 0)
+        SetBetacamReverseStripe(betacamReverseStripe ? 1 : 0)
         // If presentation is running, move/retarget it live to match the new choice.
         FSTP_ReapplyPresentationIfActive()
 
@@ -295,6 +299,14 @@ struct VideoSyncSettingsView: View {
                 Toggle("Enable Betacam tape artefact emulation", isOn: $viewModel.betacamEffectEnabled)
 
                 Text("Adds rewind/fast-forward tape jitter. May impact performance on slower GPUs.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Toggle("Show tracking stripe at 1× reverse", isOn: $viewModel.betacamReverseStripe)
+                    .disabled(!viewModel.betacamEffectEnabled)
+
+                Text("Authentic 1× reverse look. Flickers, so off by default (distracts from frame-by-frame analysis).")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

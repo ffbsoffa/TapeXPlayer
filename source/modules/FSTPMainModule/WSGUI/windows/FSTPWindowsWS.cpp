@@ -249,6 +249,17 @@ static HWND GetHWNDFromSDLWindow(SDL_Window* sdl_window) {
     return NULL;
 }
 
+// Install the D3D11 live-resize crash guard on ANY window. Called by the shared CreateNewWindow
+// (FSTPWindowManager.cpp) for EVERY window it creates — main, menu (IDM_NEW_WINDOW /
+// IDM_OPEN_NEW_INST) and the Cmd+N keyboard path all funnel through there. The render thread is
+// process-global, so a window without the subclass would still let a Present race a swapchain
+// resize and crash; installing at the single creation point covers all paths at once. (macOS gets
+// the same "all windows" coverage from one global NSNotification observer in FSTPDarwinWS.mm.)
+void FSTP_InstallWindowResizeGuard(SDL_Window* win) {
+    if (!win) return;
+    InstallResizeSubclass(GetHWNDFromSDLWindow(win));
+}
+
 // Native file dialog for Windows using IFileOpenDialog (COM)
 void ShowNativeFileDialog(int target_player_id) {
     std::cout << "ShowNativeFileDialog called with target_player_id=" << target_player_id << std::endl;
@@ -848,14 +859,12 @@ int RunMainUILoop() {
 
     std::cout << "Main window created (ID: " << main_window_index << ")" << std::endl;
 
-    // Get native HWND for Win32 dialogs
+    // Get native HWND for Win32 dialogs. The live-resize crash guard itself is already installed
+    // by CreateNewWindow (above) via FSTP_InstallWindowResizeGuard — for this main window and every
+    // other window — so it's live before StartAutonomousRendering() without an explicit call here.
     g_main_hwnd = GetHWNDFromSDLWindow(main_window->window);
     if (g_main_hwnd) {
         std::cout << "Native HWND obtained: " << g_main_hwnd << std::endl;
-        // Bracket live resize/move (and maximize/snap) so the render thread pauses presenting while
-        // SDL resizes the D3D11 swapchain — otherwise concurrent Present+ResizeBuffers crashes.
-        // Must be installed before StartAutonomousRendering() so the guard is live from frame one.
-        InstallResizeSubclass(g_main_hwnd);
     }
 
     // Initialize settings system

@@ -73,6 +73,7 @@ void ResetSettingsToDefault() {
     // Multi-instance settings
     g_settings.auto_freeze_inactive = 1;       // ENABLED BY DEFAULT (protection from forgotten players)
     g_settings.betacam_effect_enabled = 0;     // Disabled by default
+    g_settings.betacam_reverse_stripe = 0;     // Off by default (opt-in; distracts frame analysis)
     g_settings.yt_dlp_extension_enabled = 0;   // Disabled by default
 
     // MIDI settings
@@ -179,6 +180,7 @@ int SaveSettings() {
     // Video settings
     file << "[Video]\n";
     file << "betacam_effect_enabled=" << g_settings.betacam_effect_enabled << "\n";
+    file << "betacam_reverse_stripe=" << g_settings.betacam_reverse_stripe << "\n";
     file << "presentation_display=" << g_settings.presentation_display_index << "\n";
     file << "presentation_output_mode=" << g_settings.presentation_output_mode << "\n";
     file << "presentation_follow_focus=" << g_settings.presentation_follow_focus << "\n";
@@ -261,6 +263,7 @@ int LoadSettings() {
         }
         else if (current_section == "Video") {
             if (key == "betacam_effect_enabled") g_settings.betacam_effect_enabled = std::stoi(value);
+            else if (key == "betacam_reverse_stripe") g_settings.betacam_reverse_stripe = std::stoi(value);
             else if (key == "presentation_display") g_settings.presentation_display_index = std::stoi(value);
             else if (key == "presentation_output_mode") g_settings.presentation_output_mode = std::stoi(value);
             else if (key == "presentation_follow_focus") g_settings.presentation_follow_focus = std::stoi(value);
@@ -394,6 +397,13 @@ int GetBetacamEffectEnabled() {
         InitSettings();
     }
     return g_settings.betacam_effect_enabled;
+}
+
+int GetBetacamReverseStripe() {
+    if (!g_settings_initialized) {
+        InitSettings();
+    }
+    return g_settings.betacam_reverse_stripe;
 }
 
 int GetYTDLPExtensionEnabled() {

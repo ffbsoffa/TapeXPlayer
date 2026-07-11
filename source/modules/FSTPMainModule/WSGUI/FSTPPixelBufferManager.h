@@ -193,6 +193,12 @@ public:
      */
     bool IsBetacamEffectEnabled() const { return m_betacam_effect.IsEnabled(); }
 
+    /**
+     * @brief Enable/disable the opt-in 1× reverse tracking stripe (off by default).
+     */
+    void SetReverseStripeEnabled(bool enabled) { m_betacam_effect.SetReverseStripeEnabled(enabled); }
+    bool IsReverseStripeEnabled() const { return m_betacam_effect.IsReverseStripeEnabled(); }
+
     // Always-on baseline Betacam elements (analog smear + soft L/R edge fade). These are normally
     // applied inside ApplyPixelFX (via FrameContext.smear / .edge_fade); presentation output reads
     // these flags to mirror them, and uses ApplyBaselineSmearEdgeFade() when the per-speed effect

@@ -208,6 +208,7 @@ static NSStepper* g_frameOffsetStepper = nil;
 static NSTextField* g_frameOffsetTextField = nil;
 static NSButton* g_autoFreezeCheckbox = nil;
 static NSButton* g_betacamCheckbox = nil;
+static NSButton* g_reverseStripeCheckbox = nil;
 static NSButton* g_ytDlpCheckbox = nil;
 
 // UI elements for MIDI settings
@@ -234,6 +235,7 @@ static NSPopUpButton* g_midiOutputPopup = nil;
     g_frameOffsetTextField = nil;
     g_autoFreezeCheckbox = nil;
     g_betacamCheckbox = nil;
+    g_reverseStripeCheckbox = nil;
     g_ytDlpCheckbox = nil;
     g_midiEnabledCheckbox = nil;
     g_midiInputPopup = nil;
@@ -399,6 +401,15 @@ static void CreateSettingsWindow() {
 
     [videoView addSubview:CreateLabel(@"Adds rewind/fast-forward jitter. Slightly increases GPU load.",
                                       NSMakeRect(20, 90, 400, 16))];
+
+    // Sub-option of the Betacam effect: the authentic tracking stripe at 1× reverse. Off by
+    // default because its flicker distracts from frame-by-frame analysis (the product's core use).
+    g_reverseStripeCheckbox = CreateCheckbox(@"Show tracking stripe at 1× reverse", NSMakeRect(40, 62, 380, 24));
+    [g_reverseStripeCheckbox setState:(GetBetacamReverseStripe() ? NSControlStateValueOn : NSControlStateValueOff)];
+    [videoView addSubview:g_reverseStripeCheckbox];
+
+    [videoView addSubview:CreateLabel(@"Authentic look; flickers, so off by default.",
+                                      NSMakeRect(40, 44, 400, 16))];
 
     [videoTab setView:videoView];
     [g_settingsTabView addTabViewItem:videoTab];
@@ -944,6 +955,13 @@ void HandleNativeAppEvents() {
         SetBetacamEffectEnabled(betacam);
     }
 
+    if (g_reverseStripeCheckbox) {
+        int reverse_stripe = ([g_reverseStripeCheckbox state] == NSControlStateValueOn) ? 1 : 0;
+        GetSettings()->betacam_reverse_stripe = reverse_stripe;
+        NSLog(@"Betacam 1× reverse stripe set to: %d", reverse_stripe);
+        SetBetacamReverseStripe(reverse_stripe);
+    }
+
     if (g_ytDlpCheckbox) {
         int ytDlpEnabled = ([g_ytDlpCheckbox state] == NSControlStateValueOn) ? 1 : 0;
         FSTPSettings* settings = GetSettings();
@@ -1052,6 +1070,9 @@ void HandleNativeAppEvents() {
         }
         if (g_betacamCheckbox) {
             [g_betacamCheckbox setState:NSControlStateValueOff]; // Disabled by default
+        }
+        if (g_reverseStripeCheckbox) {
+            [g_reverseStripeCheckbox setState:NSControlStateValueOff]; // Off by default (opt-in)
         }
         if (g_ytDlpCheckbox) {
             [g_ytDlpCheckbox setState:NSControlStateValueOff];

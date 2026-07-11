@@ -332,6 +332,13 @@ void ShowGTKSettingsDialog() {
     pango_attr_list_unref(attrs);
     gtk_box_pack_start(GTK_BOX(betacam_box), betacam_note, FALSE, FALSE, 0);
 
+    // Sub-option of the Betacam effect: authentic tracking stripe at 1x reverse. Off by default —
+    // its flicker distracts from frame-by-frame analysis (the product's core use).
+    GtkWidget* reverse_stripe_check = gtk_check_button_new_with_label("Show tracking stripe at 1x reverse");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(reverse_stripe_check), settings->betacam_reverse_stripe);
+    gtk_widget_set_margin_start(reverse_stripe_check, 20);
+    gtk_box_pack_start(GTK_BOX(betacam_box), reverse_stripe_check, FALSE, FALSE, 0);
+
     gtk_box_pack_start(GTK_BOX(video_page), betacam_box, FALSE, FALSE, 0);
 
     // Developer/Debug settings
@@ -738,6 +745,10 @@ void ShowGTKSettingsDialog() {
         // Betacam effect
         writable_settings->betacam_effect_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(betacam_check));
         SetBetacamEffectEnabled(writable_settings->betacam_effect_enabled);
+
+        // Betacam 1x reverse tracking stripe (opt-in)
+        writable_settings->betacam_reverse_stripe = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(reverse_stripe_check));
+        SetBetacamReverseStripe(writable_settings->betacam_reverse_stripe);
 
         // Decoder status display
         writable_settings->show_decoder_status = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(decoder_status_check));

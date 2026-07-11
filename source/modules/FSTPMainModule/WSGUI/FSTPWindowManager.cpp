@@ -141,6 +141,7 @@ int InitWindowManager() {
     }
 
     SetBetacamEffectEnabled(GetBetacamEffectEnabled());
+    SetBetacamReverseStripe(GetBetacamReverseStripe());
 
     // Initialize array of windows
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -402,6 +403,13 @@ int CreateNewWindow(const char* title, int width, int height) {
 
     // Set correct window title with format "TapeXPlayer - Instance #X"
     UpdateWindowTitle(window_index, g_windows[window_index].player_instance_id, nullptr);
+
+#ifdef _WIN32
+    // Guard EVERY window against the D3D11 swapchain-resize crash — not just the main window.
+    // Windows creates windows here from the menu (IDM_NEW_WINDOW / IDM_OPEN_NEW_INST) and the
+    // Cmd+N keyboard shortcut too; installing at this single shared creation point covers them all.
+    FSTP_InstallWindowResizeGuard(g_windows[window_index].window);
+#endif
 
     return window_index;
 }
@@ -1454,6 +1462,16 @@ extern "C" void SetBetacamEffectEnabled(int enabled) {
 
     // Enable visual Betacam effect
     g_pixel_buffer_manager->SetBetacamEffectEnabled(enabled != 0);
+}
+
+// Enable/disable the opt-in 1× reverse tracking stripe. Persistence lives in FSTPSettings
+// (GetBetacamReverseStripe); this only pushes the live state into the effect — same split as
+// SetBetacamEffectEnabled above.
+extern "C" void SetBetacamReverseStripe(int enabled) {
+    if (!g_pixel_buffer_manager) {
+        return;
+    }
+    g_pixel_buffer_manager->SetReverseStripeEnabled(enabled != 0);
 }
 
 // Update window title with instance number and filename

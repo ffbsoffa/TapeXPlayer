@@ -323,7 +323,12 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     // (per-row composite memcpy + noise generation caused visible FPS drops).
     bool isSlowMotion = (rawPlaybackRate < 0.9);
     bool isFastShuttle = (rawPlaybackRate >= kEffectThreshold);
-    bool shouldShowEffect = isSlowMotion || isFastShuttle;
+    // 1× reverse shows the single tracking stripe ONLY when the user opted in (Betacam settings).
+    // Off by default: the flicker distracts from frame-by-frame analysis, the product's core use.
+    // It reuses the cheap single-stripe path (same as slow-mo), NOT the old expensive per-row
+    // tracking-artifact model, so re-enabling it here doesn't bring back those FPS drops.
+    bool shouldShowEffect = isSlowMotion || isFastShuttle ||
+                            (isReverseNormalSpeed && m_reverse_stripe_enabled);
 
     // IMPORTANT: At pause/slow motion, ALWAYS show effect regardless of hold timer
     // This ensures the pause stripe is visible even after hold_timer expires
@@ -507,7 +512,29 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     // For compositing we need Y plane and at least U plane (NV12 has UV interleaved)
     bool have_planes = dst_data[0] && dst_data[1] && (isNV12 || dst_data[2]);
 
-    if (isSlowMotion && isYUVFormat && have_planes && textureHeight > 0 && textureWidth > 0) {
+    // 1× REVERSE tracking-bar scroll. On real Betacam SP a 1× reverse pass shows a grey tracking
+    // bar scrolling smoothly DOWNWARD from the top (confirmed against hardware). Two things were
+    // wrong: (1) direction was inverted (it drifted up), (2) it was tied to the frame index, so at
+    // 1× — where frames change ~25×/s — it made a FULL sweep every frame = a 25 Hz strobe, not a
+    // scroll. Fix: drive it from the WALL CLOCK at a few Hz, increasing phase = downward (bigger
+    // phase → larger stripe_center_y → lower on screen). Computed ONCE here and shared by the
+    // compositing seam and the stripe overlay so the two stay locked together.
+    double reverse_glide_phase = 0.0;
+    if (isReverseNormalSpeed) {
+        auto now_rev = std::chrono::steady_clock::now();
+        double dt_rev = state.shuttle_comb_init
+                      ? std::chrono::duration<double>(now_rev - state.shuttle_comb_last_t).count()
+                      : 0.0;
+        state.shuttle_comb_last_t = now_rev;
+        state.shuttle_comb_init = true;
+        if (dt_rev < 0.0 || dt_rev > 0.1) dt_rev = 0.0;   // ignore stalls / first frame
+        constexpr double kReverseScrollHz = 1.5;          // downward sweeps per second — tune to taste
+        state.shuttle_comb_phase += kReverseScrollHz * dt_rev;
+        state.shuttle_comb_phase -= std::floor(state.shuttle_comb_phase);
+        reverse_glide_phase = state.shuttle_comb_phase;
+    }
+
+    if ((isSlowMotion || isReverseNormalSpeed) && isYUVFormat && have_planes && textureHeight > 0 && textureWidth > 0) {
         // OPTIMIZATION: During pure pause (speed≈0) the compositing result is identical
         // every render frame — AVFrame data persists in-place after first application.
         // Skip re-compositing when the same video frame is presented again.
@@ -530,8 +557,9 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         double scroll_phase = frame_exact - static_cast<double>(frame_ctx.frame_number);
         if (scroll_phase < 0.0) scroll_phase = 0.0;
         else if (scroll_phase > 1.0) scroll_phase = 1.0;
-        // At 1× reverse the tape moves backward → invert phase so seam scrolls downward
-        if (isReverseNormalSpeed) scroll_phase = 1.0 - scroll_phase;
+        // At 1× reverse the seam follows the slow downward wall-clock glide (see above), NOT the
+        // per-frame phase — so the composite boundary tracks the grey bar instead of strobing.
+        if (isReverseNormalSpeed) scroll_phase = reverse_glide_phase;
 
         // Calculate stripe height to match stripe rendering formula exactly
         // Scale effect geometry with the actual frame height so artefacts keep the same
@@ -766,9 +794,12 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         effectApplied = true;
     }
 
-    // Skip stripe generation ONLY if not fast AND not slow motion
-    // Slow motion (< 0.9×) also needs to show the pause stripe
-    if (!state.is_fast && !isSlowMotion) {
+    // Skip stripe generation ONLY if not fast AND not slow motion AND not 1× reverse.
+    // Slow motion (< 0.9×) shows the pause stripe; opt-in 1× reverse shows the same single
+    // tracking stripe (isReverseNormalSpeed is only ever true here when the user enabled it,
+    // since shouldShowEffect gates it — see line ~330). Without this clause the early return
+    // below skipped ALL stripe generation at 1× reverse, so the stripe never drew.
+    if (!state.is_fast && !isSlowMotion && !isReverseNormalSpeed) {
         state.last_speed = absPlaybackRate;
         state.is_fast = false;
         state.smooth_stripe_height = -1.0;
@@ -905,10 +936,9 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         if (raw_scroll_phase < 0.0) raw_scroll_phase = 0.0;
         else if (raw_scroll_phase > 1.0) raw_scroll_phase = 1.0;
     } else if (isReverseNormalSpeed) {
-        // 1× reverse: single tracking stripe tied to audio time; invert so it scrolls top→bottom.
-        raw_scroll_phase = std::fmod(frame_exact, 1.0);
-        if (raw_scroll_phase < 0) raw_scroll_phase += 1.0;
-        raw_scroll_phase = 1.0 - raw_scroll_phase;
+        // 1× reverse: slow downward wall-clock glide, shared with the compositing seam above so the
+        // grey bar and the composite boundary move together (computed once as reverse_glide_phase).
+        raw_scroll_phase = reverse_glide_phase;
     } else if (absPlaybackRate < 14.0) {
         // Smooth only within ±0.25 of 3× or 10×; masking elsewhere. Band edges are crossed only
         // while RAMPING, where a 1-frame seam is invisible.

@@ -30,6 +30,7 @@ typedef struct {
     // Multi-instance settings (protection from forgotten players)
     int auto_freeze_inactive;       // 1 = automatically freeze inactive players, 0 = disabled
     int betacam_effect_enabled;     // 1 = Betacam effect enabled, 0 = disabled
+    int betacam_reverse_stripe;     // 1 = show the tracking stripe at 1× reverse, 0 = off (default). Opt-in: it flickers, which distracts from frame-by-frame analysis, so it's off unless the user wants the authentic 1× reverse look.
     int yt_dlp_extension_enabled;   // 1 = yt-dlp extension enabled, 0 = disabled
 
     // MIDI settings
@@ -77,6 +78,8 @@ int GetAudioVolumeDuckingEnabled(); // Get volume ducking (ear protection) state
 int GetFrameOffset();          // Get frame offset
 int GetAutoFreezeInactive();   // Get auto-freeze setting
 int GetBetacamEffectEnabled(); // Get Betacam effect state
+int GetBetacamReverseStripe();          // Get 1× reverse tracking-stripe state (opt-in)
+void SetBetacamReverseStripe(int enabled); // Enable/disable the 1× reverse stripe (pushes to the effect)
 int GetYTDLPExtensionEnabled(); // Get yt-dlp extension state
 void SetYTDLPExtensionEnabled(int enabled);
 int GetMIDIEnabled();          // Get MIDI state
