@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <vector>
+#include <algorithm>
 
 #if defined(_WIN32)
 #  include <io.h>          // _isatty / _fileno
@@ -77,6 +79,42 @@ std::string OSName() {
 #endif
 }
 
+// Log file name for today: TapeXPlayer_YYYY-MM-DD.log.
+std::string DatedLogName() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "TapeXPlayer_%Y-%m-%d.log", &tm);
+    return buf;
+}
+
+// Existing daily logs, sorted oldest→newest (the date in the name sorts as plain text).
+std::vector<std::string> ListDailyLogs() {
+    std::error_code ec;
+    std::vector<std::string> logs;
+    for (auto& e : fs::directory_iterator(g_log_dir, ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("TapeXPlayer_", 0) == 0 &&
+            name.size() > 4 && name.substr(name.size() - 4) == ".log")
+            logs.push_back(e.path().string());
+    }
+    std::sort(logs.begin(), logs.end());
+    return logs;
+}
+
+// Keep the newest `keep` daily logs; delete older ones so the folder stays bounded.
+void PruneOldLogs(int keep) {
+    std::error_code ec;
+    std::vector<std::string> logs = ListDailyLogs();
+    for (size_t i = 0; i + (size_t)keep < logs.size(); ++i)
+        fs::remove(logs[i], ec);
+}
+
 } // namespace
 
 namespace FSTPLog {
@@ -88,27 +126,10 @@ void Init(bool force_file) {
     g_log_dir = ResolveLogDir();
     fs::create_directories(g_log_dir, ec);   // best-effort; ignore ec, we fall back below
 
-    g_log_path = g_log_dir + (
-#if defined(_WIN32)
-        "\\TapeXPlayer.log"
-#else
-        "/TapeXPlayer.log"
-#endif
-    );
-    const std::string prev_path = g_log_dir + (
-#if defined(_WIN32)
-        "\\TapeXPlayer.prev.log"
-#else
-        "/TapeXPlayer.prev.log"
-#endif
-    );
-
-    // Rotate: last session's log becomes .prev, this session starts fresh. Two files is
-    // plenty for a bug report and keeps disk use bounded without a size sweep.
-    if (fs::exists(g_log_path, ec)) {
-        fs::remove(prev_path, ec);
-        fs::rename(g_log_path, prev_path, ec);
-    }
+    // One log file per calendar day (TapeXPlayer_YYYY-MM-DD.log). Same-day sessions append,
+    // each with its own header banner, so "send me the log for <date>" is unambiguous.
+    g_log_path = (fs::path(g_log_dir) / DatedLogName()).string();
+    PruneOldLogs(14);   // keep the last two weeks of daily logs
 
     // Keep the console for a developer running from a terminal; redirect to the file for
     // the normal (GUI, no-TTY) launch so every real user's session is captured.
@@ -120,13 +141,13 @@ void Init(bool force_file) {
 
 #if defined(_WIN32)
     FILE* f = nullptr;
-    freopen_s(&f, g_log_path.c_str(), "w", stdout);
+    freopen_s(&f, g_log_path.c_str(), "a", stdout);
     freopen_s(&f, g_log_path.c_str(), "a", stderr);
 #else
-    if (!std::freopen(g_log_path.c_str(), "w", stdout)) {
+    if (!std::freopen(g_log_path.c_str(), "a", stdout)) {
         // Directory unwritable? fall back to a temp file so we never lose the log.
-        g_log_path = (fs::temp_directory_path(ec) / "TapeXPlayer.log").string();
-        std::freopen(g_log_path.c_str(), "w", stdout);
+        g_log_path = (fs::temp_directory_path(ec) / DatedLogName()).string();
+        std::freopen(g_log_path.c_str(), "a", stdout);
     }
     std::freopen(g_log_path.c_str(), "a", stderr);
 #endif
@@ -197,16 +218,13 @@ bool SaveDiagnosticReport(const std::string& dest_path) {
     out << "Version : " << (g_app_version.empty() ? "(unknown)" : g_app_version) << "\n";
     out << "===============================================================\n\n";
 
-    const std::string prev = g_log_dir + (
-#if defined(_WIN32)
-        "\\TapeXPlayer.prev.log"
-#else
-        "/TapeXPlayer.prev.log"
-#endif
-    );
+    // The most recent OTHER daily log (usually yesterday) — handy if the bug was earlier.
+    std::string prev;
+    for (const std::string& p : ListDailyLogs())
+        if (p != g_log_path) prev = p;   // sorted oldest→newest, so this keeps the newest other
 
     auto append_file = [&](const std::string& path, const char* label) {
-        if (!fs::exists(path, ec)) return;
+        if (path.empty() || !fs::exists(path, ec)) return;
         out << "\n########## " << label << " (" << path << ") ##########\n";
         std::ifstream in(path, std::ios::binary);
         std::fflush(stdout);   // flush live log so the current file is up to date
@@ -214,8 +232,8 @@ bool SaveDiagnosticReport(const std::string& dest_path) {
         out << "\n";
     };
 
-    append_file(prev, "PREVIOUS SESSION");
-    append_file(g_log_path, "CURRENT SESSION");
+    append_file(prev, "PREVIOUS DAY");
+    append_file(g_log_path, "CURRENT DAY");
     return out.good();
 }
 
