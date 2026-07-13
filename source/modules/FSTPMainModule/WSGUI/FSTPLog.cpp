@@ -9,6 +9,9 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
+#include <iostream>
+#include <thread>
+#include <chrono>
 
 #if defined(_WIN32)
 #  include <io.h>          // _isatty / _fileno
@@ -151,8 +154,27 @@ void Init(bool force_file) {
     }
     std::freopen(g_log_path.c_str(), "a", stderr);
 #endif
-    // Unbuffered so the log is complete even if the app is force-quit mid-run.
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // Flush every line promptly (and survive a force-quit). Two layers matter: std::cout on
+    // libc++/macOS buffers at the C++ level independent of the C stdout FILE*, so setvbuf alone
+    // left recent lines stuck — `unitbuf` makes cout/cerr flush each write; line-buffering the
+    // FILE* then turns those into one disk write per newline instead of per-operation.
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
+
+    // Safety net: setvbuf/unitbuf don't reliably keep the on-disk file current on every C++
+    // runtime (libc++/macOS block-buffers the redirected file regardless of the mode we ask
+    // for), which makes a live log look "stale" — lines only land in ~4 KB bursts. A tiny
+    // detached thread fflushes a few times a second, so the file is never more than ~250 ms
+    // behind, even without a clean exit. fflush() is thread-safe.
+    std::thread([]{
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::fflush(stdout);
+            std::fflush(stderr);
+        }
+    }).detach();
 
     WriteHeader();
 }
