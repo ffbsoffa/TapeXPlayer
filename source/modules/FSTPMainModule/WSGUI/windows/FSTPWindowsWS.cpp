@@ -25,6 +25,7 @@
 #include "../FSTPKeyboard.h"
 #include "../FSTPMemoryLocations.h"
 #include "../FSTPWelcomeScreen.h"
+#include "../FSTPLog.h"
 #include "FSTPWindowsWS.h"
 #include "FSTPSettingsDialog.h"
 #include "FSTPMemoryLocationsWindow.h"
@@ -502,6 +503,8 @@ extern "C" double GetInstanceVideoFPS(int player_id);
 #define IDM_NEW_WINDOW      40006
 #define IDM_OPEN_NEW_INST   40007
 #define IDM_CLEAR_RECENT    40008
+#define IDM_OPEN_LOG        40009
+#define IDM_SAVE_REPORT     40010
 // Recent-file entries occupy a contiguous command range: IDM_RECENT_BASE + i
 // selects the i-th recent file. Keep this above the fixed IDs and wide enough
 // for FSTP_RECENT_MAX (12) entries.
@@ -566,6 +569,9 @@ void ShowWin32ContextMenu() {
     AppendMenuW(hMenu, MF_STRING, IDM_SETTINGS,      L"Settings...\tCtrl+,");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, IDM_ABOUT,         L"About TapeXPlayer");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, IDM_OPEN_LOG,      L"Open Log Folder");
+    AppendMenuW(hMenu, MF_STRING, IDM_SAVE_REPORT,   L"Save Diagnostic Report...");
 
     // Get cursor position
     POINT pt;
@@ -642,6 +648,27 @@ void ShowWin32ContextMenu() {
         case IDM_ABOUT:
             ShowWin32AboutDialog();
             break;
+        case IDM_OPEN_LOG:
+            FSTPLog::RevealLogFolder();
+            break;
+        case IDM_SAVE_REPORT: {
+            wchar_t path[MAX_PATH] = L"TapeXPlayer-diagnostic.txt";
+            OPENFILENAMEW ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner   = g_main_hwnd;
+            ofn.lpstrFilter = L"Text files\0*.txt\0All files\0*.*\0";
+            ofn.lpstrFile   = path;
+            ofn.nMaxFile    = MAX_PATH;
+            ofn.lpstrDefExt = L"txt";
+            ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+            if (GetSaveFileNameW(&ofn)) {
+                int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr, nullptr);
+                std::string upath(len > 0 ? len - 1 : 0, '\0');
+                if (len > 0) WideCharToMultiByte(CP_UTF8, 0, path, -1, &upath[0], len, nullptr, nullptr);
+                FSTPLog::SaveDiagnosticReport(upath);
+            }
+            break;
+        }
     }
 
     std::cout << "Context menu closed" << std::endl;

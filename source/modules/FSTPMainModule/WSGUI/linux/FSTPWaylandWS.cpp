@@ -28,6 +28,7 @@
 #include "FSTPMemoryLocationsWindow.h"
 #include "FSTPAboutDialog.h"
 #include "../FSTPScreenshot.h"
+#include "../FSTPLog.h"
 #include "../FSTPZoom.h"
 
 extern "C" {
@@ -772,6 +773,42 @@ static void ShowContextMenu() {
         }
     }), window);
     gtk_box_pack_start(GTK_BOX(vbox), about_btn, FALSE, FALSE, 0);
+
+    // Separator
+    GtkWidget* sep_log = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(vbox), sep_log, FALSE, FALSE, 2);
+
+    // Open Log Folder — reveals the always-on session log in the file manager.
+    GtkWidget* open_log_btn = gtk_button_new_with_label("🗂  Open Log Folder");
+    gtk_button_set_relief(GTK_BUTTON(open_log_btn), GTK_RELIEF_NONE);
+    gtk_widget_set_size_request(open_log_btn, 280, 32);
+    g_signal_connect(open_log_btn, "clicked", G_CALLBACK(+[](GtkButton*, gpointer data) {
+        GtkWidget* win = (GtkWidget*)data;
+        gtk_widget_destroy(win);
+        FSTPLog::RevealLogFolder();
+    }), window);
+    gtk_box_pack_start(GTK_BOX(vbox), open_log_btn, FALSE, FALSE, 0);
+
+    // Save Diagnostic Report — log + system info as one file for a bug report.
+    GtkWidget* save_report_btn = gtk_button_new_with_label("💾 Save Diagnostic Report...");
+    gtk_button_set_relief(GTK_BUTTON(save_report_btn), GTK_RELIEF_NONE);
+    gtk_widget_set_size_request(save_report_btn, 280, 32);
+    g_signal_connect(save_report_btn, "clicked", G_CALLBACK(+[](GtkButton*, gpointer data) {
+        GtkWidget* menu_win = (GtkWidget*)data;
+        gtk_widget_destroy(menu_win);
+        GtkWidget* dlg = gtk_file_chooser_dialog_new(
+            "Save Diagnostic Report", nullptr, GTK_FILE_CHOOSER_ACTION_SAVE,
+            "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, nullptr);
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), "TapeXPlayer-diagnostic.txt");
+        gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
+        if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+            char* fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+            if (fn) { FSTPLog::SaveDiagnosticReport(std::string(fn)); g_free(fn); }
+        }
+        gtk_widget_destroy(dlg);
+        while (gtk_events_pending()) gtk_main_iteration();
+    }), window);
+    gtk_box_pack_start(GTK_BOX(vbox), save_report_btn, FALSE, FALSE, 0);
 
     // Close window when it loses focus
     g_signal_connect(window, "focus-out-event", G_CALLBACK(+[](GtkWidget* win, GdkEvent*, gpointer) -> gboolean {

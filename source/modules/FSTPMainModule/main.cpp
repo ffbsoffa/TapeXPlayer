@@ -14,11 +14,13 @@
     #include <mmsystem.h>   // timeBeginPeriod (process-wide 1ms timer resolution)
     #include <commdlg.h>
     #include "WSGUI/windows/FSTPWindowsWS.h"
+    #include "WSGUI/windows/BuildInfo.h"
 #elif defined(__linux__)
     #define PLATFORM_LINUX
     // GTK not needed for SDL2-based implementation
     // #include <gtk/gtk.h>
     #include <unistd.h>
+    #include "WSGUI/linux/BuildInfo.h"
 #elif defined(__APPLE__)
     #define PLATFORM_MACOS
     // #include <Cocoa/Cocoa.h>
@@ -116,6 +118,11 @@ int main(int argc, char* argv[]) {
         if (strcmp(argv[i], "--log") == 0) { force_log = true; break; }
     }
     FSTPLog::Init(force_log);
+#if defined(_WIN32) || defined(__linux__)
+    // Windows/Linux expose the build number via BuildInfo.h; macOS reads it from the
+    // .app's Info.plist (see FSTPToolsMenu). Feed it into the session log either way.
+    FSTPLog::SetAppVersion(GetTapeXPlayerVersion(), GetTapeXPlayerBuildNumber(), GetTapeXPlayerCodeName());
+#endif
 
     std::cout << "=== TapeXPlayer 2026 - Initialization ===" << std::endl;
 
