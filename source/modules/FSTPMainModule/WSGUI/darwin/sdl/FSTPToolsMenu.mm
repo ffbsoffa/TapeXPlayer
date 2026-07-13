@@ -13,6 +13,7 @@
 #include "darwin/sdl/FSTPDarwinWS.h"
 #include "../../FSTPVideoModule/FSTPVideoFrame.h"
 #include "FSTPSettings.h"
+#include "FSTPLog.h"
 #include <vector>
 #include <algorithm>
 
@@ -352,6 +353,14 @@ void InitToolsMenu() {
     // Clear existing items
     [toolsMenu removeAllItems];
 
+    // Feed the running build/version into the session log (once) so bug-report logs are
+    // self-describing. On macOS this comes from the .app's Info.plist.
+    static dispatch_once_t versionOnce;
+    dispatch_once(&versionOnce, ^{
+        NSString* ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+        if (ver) FSTPLog::SetAppVersion(std::string([ver UTF8String]), std::string(), std::string());
+    });
+
     // Add "Copy Screenshot" item
     NSMenuItem* screenshotItem = [[NSMenuItem alloc]
         initWithTitle:@"📸 Copy Screenshot"
@@ -395,6 +404,23 @@ void InitToolsMenu() {
     [showInspectorItem setKeyEquivalentModifierMask:NSEventModifierFlagCommand];
     [showInspectorItem setTarget:[NSApp delegate]];
     [toolsMenu addItem:showInspectorItem];
+
+    // Diagnostics: reveal the always-on session log, or export a report for a bug report.
+    [toolsMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem* openLogItem = [[NSMenuItem alloc]
+        initWithTitle:@"Open Log Folder"
+        action:@selector(openLogFolderAction:)
+        keyEquivalent:@""];
+    [openLogItem setTarget:[NSApp delegate]];
+    [toolsMenu addItem:openLogItem];
+
+    NSMenuItem* saveReportItem = [[NSMenuItem alloc]
+        initWithTitle:@"Save Diagnostic Report…"
+        action:@selector(saveDiagnosticReportAction:)
+        keyEquivalent:@""];
+    [saveReportItem setTarget:[NSApp delegate]];
+    [toolsMenu addItem:saveReportItem];
 
     if (GetYTDLPExtensionEnabled()) {
         [toolsMenu addItem:[NSMenuItem separatorItem]];
@@ -826,6 +852,8 @@ void ShowMemoryLocations() {
 - (void)memoryLocationDoubleClick:(id)sender;
 - (void)memoryLocationImport:(id)sender;
 - (void)memoryLocationExport:(id)sender;
+- (void)openLogFolderAction:(id)sender;
+- (void)saveDiagnosticReportAction:(id)sender;
 @end
 
 // Forward declaration
@@ -856,6 +884,26 @@ static void ShowMemoryLocationDialog(int active_player);
 
 - (void)showMemoryLocationsAction:(id)sender {
     ShowMemoryLocations();
+}
+
+- (void)openLogFolderAction:(id)sender {
+    FSTPLog::RevealLogFolder();
+}
+
+- (void)saveDiagnosticReportAction:(id)sender {
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    [panel setNameFieldStringValue:@"TapeXPlayer-diagnostic.txt"];
+    [panel setMessage:@"Save a diagnostic report (session log + system info) to attach to a bug report"];
+    if ([panel runModal] == NSModalResponseOK) {
+        NSString* path = [[panel URL] path];
+        bool ok = FSTPLog::SaveDiagnosticReport(std::string([path UTF8String]));
+        if (!ok) {
+            NSAlert* alert = [[NSAlert alloc] init];
+            [alert setMessageText:@"Could not save the diagnostic report"];
+            [alert setInformativeText:@"Please pick a different location and try again."];
+            [alert runModal];
+        }
+    }
 }
 
 - (void)memoryLocationAdd:(id)sender {
