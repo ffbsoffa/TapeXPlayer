@@ -11,7 +11,8 @@
 //   Windows : %LOCALAPPDATA%\TapeXPlayer\logs\
 //   macOS   : ~/Library/Logs/TapeXPlayer/
 //   Linux   : $XDG_STATE_HOME/TapeXPlayer/logs/  (fallback ~/.local/state/…)
-// Files: TapeXPlayer.log (this session) + TapeXPlayer.prev.log (the one before).
+// One file PER SESSION: TapeXPlayer_YYYY-MM-DD_HH-MM-SS_<pid>.log. Each launch is its own
+// self-contained file (never appended across runs); the newest 20 are kept.
 
 #include <string>
 
@@ -19,19 +20,26 @@ namespace FSTPLog {
 
 // Initialise the session log. Call ONCE, as early in main() as possible.
 //  - resolves + creates the log directory,
-//  - rotates the previous session's log aside,
-//  - redirects stdout+stderr into the log file (so std::cout / printf / ffmpeg / SDL
-//    output is all captured), UNLESS attached to an interactive terminal — a dev
-//    running from a shell keeps their console.
-// force_file: capture to the file even on a TTY (the old `--log` behaviour).
+//  - opens this session's own log file and prunes all but the newest 20,
+//  - resolves the app version (BuildInfo.h on Windows/Linux, Info.plist on macOS) and
+//    writes the header banner,
+//  - redirects stdout+stderr into the log file, so std::cout / printf / ffmpeg / SDL
+//    output is all captured.
+// A file is ALWAYS written, terminal or not — "Save Diagnostic Report" has to have
+// something to export no matter how the app was launched. When stdout is a terminal the
+// output is additionally mirrored to the console, so a dev running from a shell keeps
+// their live output as well.
+// force_file (--log): skip the console mirroring and capture straight to the file, i.e.
+// behave exactly as a GUI launch does.
 void Init(bool force_file);
 
-// Append a self-describing header (build, OS, CPU) to the current log. Called by Init;
-// call LogSystemInfo() separately once hardware/display info is available.
+// Re-write the header banner. Init already writes one; this is only for a caller that
+// wants a fresh banner mid-session. Call LogSystemInfo() separately once hardware/display
+// info is available.
 void WriteHeader();
 
-// Log the app version + code name (whoever knows it can hand it over — the header is
-// written before this is available on some platforms).
+// Override the version Init resolved on its own. Rarely needed — only for a caller that
+// knows better than BuildInfo.h / Info.plist. Logged, not silently applied.
 void SetAppVersion(const std::string& version, const std::string& build,
                    const std::string& codename);
 
@@ -46,8 +54,9 @@ std::string GetCurrentLogPath();
 // Open the log folder in the OS file manager (Explorer / Finder / xdg-open).
 void RevealLogFolder();
 
-// Copy this + the previous session log into one combined, self-describing text file
-// at dest_path (a location the user picked). Returns true on success.
+// Export THIS session's log — everything the program has written from launch up to now —
+// into one self-describing text file at dest_path (a location the user picked). Returns
+// true on success.
 bool SaveDiagnosticReport(const std::string& dest_path);
 
 } // namespace FSTPLog

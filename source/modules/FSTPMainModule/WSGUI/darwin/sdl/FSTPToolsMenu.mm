@@ -353,14 +353,6 @@ void InitToolsMenu() {
     // Clear existing items
     [toolsMenu removeAllItems];
 
-    // Feed the running build/version into the session log (once) so bug-report logs are
-    // self-describing. On macOS this comes from the .app's Info.plist.
-    static dispatch_once_t versionOnce;
-    dispatch_once(&versionOnce, ^{
-        NSString* ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        if (ver) FSTPLog::SetAppVersion(std::string([ver UTF8String]), std::string(), std::string());
-    });
-
     // Add "Copy Screenshot" item
     NSMenuItem* screenshotItem = [[NSMenuItem alloc]
         initWithTitle:@"📸 Copy Screenshot"

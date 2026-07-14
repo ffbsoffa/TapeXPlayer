@@ -14,13 +14,11 @@
     #include <mmsystem.h>   // timeBeginPeriod (process-wide 1ms timer resolution)
     #include <commdlg.h>
     #include "WSGUI/windows/FSTPWindowsWS.h"
-    #include "WSGUI/windows/BuildInfo.h"
 #elif defined(__linux__)
     #define PLATFORM_LINUX
     // GTK not needed for SDL2-based implementation
     // #include <gtk/gtk.h>
     #include <unistd.h>
-    #include "WSGUI/linux/BuildInfo.h"
 #elif defined(__APPLE__)
     #define PLATFORM_MACOS
     // #include <Cocoa/Cocoa.h>
@@ -117,12 +115,7 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--log") == 0) { force_log = true; break; }
     }
-    FSTPLog::Init(force_log);
-#if defined(_WIN32) || defined(__linux__)
-    // Windows/Linux expose the build number via BuildInfo.h; macOS reads it from the
-    // .app's Info.plist (see FSTPToolsMenu). Feed it into the session log either way.
-    FSTPLog::SetAppVersion(GetTapeXPlayerVersion(), GetTapeXPlayerBuildNumber(), GetTapeXPlayerCodeName());
-#endif
+    FSTPLog::Init(force_log);   // resolves the version itself, so the banner is complete
 
     std::cout << "=== TapeXPlayer 2026 - Initialization ===" << std::endl;
 
@@ -146,6 +139,42 @@ int main(int argc, char* argv[]) {
         g_hardware_detection->PrintDetectedHardware();
         auto best_decoder = g_hardware_detection->GetBestDecoder();
         std::cout << "Best decoder: " << FSTPHardwareDetection::AccelTypeToString(best_decoder.accel_type) << std::endl;
+
+        // Restate the machine's CPU/GPU next to the log banner. PrintDetectedHardware above
+        // is verbose and scrolls away; a bug report needs the two lines that identify the
+        // hardware to sit right at the top, next to the OS and build.
+        const FSTPCPUInfo& cpu = g_hardware_detection->GetCPUInfo();
+        const FSTPGPUInfo& gpu = g_hardware_detection->GetGPUInfo();
+
+        std::string simd;
+        if (cpu.has_avx512) simd += " AVX512";
+        else if (cpu.has_avx2) simd += " AVX2";
+        else if (cpu.has_avx) simd += " AVX";
+        else if (cpu.has_sse4_2) simd += " SSE4.2";
+        else if (cpu.has_sse2) simd += " SSE2";
+
+        std::string accel;
+        auto add = [&](bool on, const char* n) { if (on) { if (!accel.empty()) accel += ", "; accel += n; } };
+        add(gpu.videotoolbox_available, "VideoToolbox");
+        add(gpu.d3d11va_available,      "D3D11VA");
+        add(gpu.dxva2_available,        "DXVA2");
+        add(gpu.qsv_available,          "QuickSync");
+        add(gpu.nvenc_available,        "NVENC");
+        add(gpu.amf_available,          "AMF");
+        add(gpu.vaapi_available,        "VA-API");
+        add(gpu.vdpau_available,        "VDPAU");
+        if (accel.empty()) accel = "none";
+
+        std::string info =
+            "CPU     : " + cpu.model_name + " (" + cpu.architecture + ", " +
+                std::to_string(cpu.physical_cores) + "c/" + std::to_string(cpu.logical_cores) + "t," +
+                (simd.empty() ? " no SIMD" : simd) + ")\n" +
+            "GPU     : " + (gpu.model_name.empty() ? "(unknown)" : gpu.model_name) +
+                (gpu.vendor.empty() ? "" : " [" + gpu.vendor + "]") +
+                (gpu.memory_mb > 0 ? ", " + std::to_string(gpu.memory_mb) + " MB VRAM" : "") + "\n" +
+            "HW accel: " + accel + "\n" +
+            "Decoder : " + FSTPHardwareDetection::AccelTypeToString(best_decoder.accel_type);
+        FSTPLog::LogSystemInfo(info);
     }
 
     // 2. Early PortAudio initialization for smooth animation
