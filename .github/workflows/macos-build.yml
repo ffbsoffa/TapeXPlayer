@@ -9,7 +9,7 @@ name: macOS build
 
 on:
   push:
-    branches: [ stable, unstable, main, master ]
+    branches: [ stable, unstable, main, master, 'feat/**' ]
     tags: [ 'v*' ]
   pull_request:
     branches: [ stable, unstable, main, master ]
