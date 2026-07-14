@@ -120,7 +120,8 @@ ifneq (,$(findstring _NT,$(UNAME_S)))
     # prevents the exe from starting on a bare Windows 7 SP1 without the DirectX Platform Update.
     LIBS = -lmingw32 -lSDL2main -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample \
            -lssl -lcrypto -lrtmidi \
-           -lwinmm -lole32 -lgdi32 -lcomdlg32 -lcomctl32 -lshell32 -lshlwapi -luuid -luxtheme -ldwmapi
+           -lwinmm -lole32 -lgdi32 -lcomdlg32 -lcomctl32 -lshell32 -lshlwapi -luuid -luxtheme -ldwmapi \
+           -luser32 -ladvapi32
     
     # Resource compiler for manifest embedding
     WINDRES = windres

@@ -34,6 +34,7 @@
 #    include "linux/BuildInfo.h"
 #  elif defined(__APPLE__)
 #    include "darwin/sdl/FSTPBundleVersion.h"
+#    include <sys/sysctl.h>   // CPU brand string / total RAM / machine model for the banner
 #  endif
 #endif
 
@@ -132,6 +133,128 @@ std::string OSName() {
 #else
     return "Unknown OS";
 #endif
+}
+
+// Machine characteristics for the banner. A session log mailed in from another machine
+// should say what hardware it ran on without a follow-up question, so the CPU, memory and
+// graphics adapter go straight into the header. Every field is best-effort: whatever a
+// platform can't cheaply read is left out rather than guessed at.
+std::string HardwareBlock() {
+    const char* arch =
+#if defined(__aarch64__) || defined(_M_ARM64)
+        "arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+        "x86_64";
+#elif defined(__i386__) || defined(_M_IX86)
+        "x86";
+#else
+        "";
+#endif
+
+    auto trim = [](std::string s) {
+        size_t a = s.find_first_not_of(" \t");
+        size_t b = s.find_last_not_of(" \t");
+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    };
+
+    std::string cpu, cores, gpu, gpuLabel = "GPU     : ";
+    unsigned long long ram = 0;
+
+#if defined(_WIN32)
+    // CPU brand: the registry carries it verbatim and works on x86 and ARM alike, so we
+    // sidestep the MSVC-vs-MinGW cpuid-intrinsic split entirely.
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+            0, KEY_READ, &hk) == ERROR_SUCCESS) {
+        wchar_t nameW[256]; DWORD nsz = sizeof(nameW), type = 0;
+        if (RegQueryValueExW(hk, L"ProcessorNameString", nullptr, &type,
+                reinterpret_cast<LPBYTE>(nameW), &nsz) == ERROR_SUCCESS && type == REG_SZ) {
+            int wlen = (int)(nsz / sizeof(wchar_t));
+            while (wlen > 0 && nameW[wlen - 1] == L'\0') --wlen;   // drop trailing NULs
+            if (wlen > 0) {
+                int len = WideCharToMultiByte(CP_UTF8, 0, nameW, wlen, nullptr, 0, nullptr, nullptr);
+                cpu.resize(len);
+                WideCharToMultiByte(CP_UTF8, 0, nameW, wlen, &cpu[0], len, nullptr, nullptr);
+            }
+        }
+        RegCloseKey(hk);
+    }
+    SYSTEM_INFO si{}; GetNativeSystemInfo(&si);
+    cores = std::to_string(si.dwNumberOfProcessors);
+    MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) ram = ms.ullTotalPhys;
+    // Graphics adapter: the one driving the primary display (fall back to the first).
+    DISPLAY_DEVICEW dd{}; dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i, dd.cb = sizeof(dd)) {
+        bool primary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+        if (primary || gpu.empty()) {
+            int len = WideCharToMultiByte(CP_UTF8, 0, dd.DeviceString, -1, nullptr, 0, nullptr, nullptr);
+            if (len > 0) { gpu.resize(len - 1); WideCharToMultiByte(CP_UTF8, 0, dd.DeviceString, -1, &gpu[0], len, nullptr, nullptr); }
+        }
+        if (primary) break;
+    }
+#elif defined(__APPLE__)
+    auto sctlStr = [](const char* n) -> std::string {
+        size_t len = 0;
+        if (sysctlbyname(n, nullptr, &len, nullptr, 0) != 0 || len == 0) return "";
+        std::string s(len, '\0');
+        if (sysctlbyname(n, &s[0], &len, nullptr, 0) != 0) return "";
+        if (!s.empty() && s.back() == '\0') s.pop_back();
+        return s;
+    };
+    auto sctlU64 = [](const char* n) -> unsigned long long {
+        unsigned long long v = 0; size_t len = sizeof(v);
+        return sysctlbyname(n, &v, &len, nullptr, 0) == 0 ? v : 0ULL;
+    };
+    cpu = sctlStr("machdep.cpu.brand_string");
+    if (unsigned long long c = sctlU64("hw.logicalcpu")) cores = std::to_string(c);
+    ram = sctlU64("hw.memsize");
+    // Apple GPUs don't enumerate through a portable API here, but the machine model
+    // ("Mac14,10", "MacBookPro18,3") pins the exact GPU down — so report that instead.
+    gpuLabel = "Model   : ";
+    gpu = sctlStr("hw.model");
+#elif defined(__linux__)
+    {
+        std::ifstream f("/proc/cpuinfo"); std::string l;
+        while (std::getline(f, l)) {
+            if (l.rfind("model name", 0) == 0) {
+                size_t p = l.find(':');
+                if (p != std::string::npos) cpu = trim(l.substr(p + 1));
+                break;
+            }
+        }
+    }
+    if (unsigned hc = std::thread::hardware_concurrency()) cores = std::to_string(hc);
+    {
+        std::ifstream f("/proc/meminfo"); std::string l;
+        while (std::getline(f, l)) {
+            if (l.rfind("MemTotal:", 0) == 0) {
+                unsigned long long kb = 0;
+                if (std::sscanf(l.c_str(), "MemTotal: %llu kB", &kb) == 1) ram = kb * 1024ULL;
+                break;
+            }
+        }
+    }
+    // A GPU model has no dependency-free source on Linux; left out rather than guessed.
+#endif
+
+    cpu = trim(cpu);
+    std::string paren;
+    if (!cores.empty()) paren = cores + " cores";
+    if (arch[0])        paren += (paren.empty() ? "" : ", ") + std::string(arch);
+    std::string cpuLine = cpu;
+    if (!paren.empty()) cpuLine += (cpuLine.empty() ? "" : " ") + std::string("(") + paren + ")";
+
+    std::string out;
+    if (!cpuLine.empty()) out += "CPU     : " + cpuLine + "\n";
+    if (ram) {
+        char b[32]; std::snprintf(b, sizeof(b), "%.1f GB", ram / 1073741824.0);
+        out += "Memory  : " + std::string(b) + "\n";
+    }
+    gpu = trim(gpu);
+    if (!gpu.empty()) out += gpuLabel + gpu + "\n";
+    return out;
 }
 
 // Per-session log name: TapeXPlayer_YYYY-MM-DD_HH-MM-SS_<pid>.log. Each launch gets its
@@ -396,16 +519,19 @@ void Init(bool force_file) {
 
 // Write the banner. Caller must hold g_mutex.
 void WriteHeaderLocked() {
+    std::string hw = HardwareBlock();   // zero or more "Label   : value\n" lines
     std::fprintf(stdout,
         "================ TapeXPlayer session log ================\n"
         "Started : %s\n"
         "OS      : %s\n"
         "Version : %s\n"
+        "%s"
         "Log     : %s\n"
         "=========================================================\n",
         NowStamp().c_str(),
         OSName().c_str(),
         g_app_version.empty() ? "(unknown)" : g_app_version.c_str(),
+        hw.c_str(),
         g_to_console ? "(console)" : g_log_path.c_str());
     std::fflush(stdout);
 }
