@@ -59,4 +59,9 @@ void RevealLogFolder();
 // true on success.
 bool SaveDiagnosticReport(const std::string& dest_path);
 
+// Default file name to offer in the save dialog, stamped with the current date and time:
+// "TapeXPlayer-diagnostic_2026-07-14_18-30-05.txt". Reports pile up in one folder and get
+// mailed around, so the name has to say when it was taken without opening it.
+std::string SuggestedReportName();
+
 } // namespace FSTPLog

@@ -652,7 +652,11 @@ void ShowWin32ContextMenu() {
             FSTPLog::RevealLogFolder();
             break;
         case IDM_SAVE_REPORT: {
-            wchar_t path[MAX_PATH] = L"TapeXPlayer-diagnostic.txt";
+            // Offer a date/time-stamped name so saved reports are self-identifying.
+            const std::string suggested = FSTPLog::SuggestedReportName();
+            wchar_t path[MAX_PATH] = L"";
+            MultiByteToWideChar(CP_UTF8, 0, suggested.c_str(), -1, path, MAX_PATH);
+
             OPENFILENAMEW ofn = {};
             ofn.lStructSize = sizeof(ofn);
             ofn.hwndOwner   = g_main_hwnd;
@@ -665,7 +669,14 @@ void ShowWin32ContextMenu() {
                 int len = WideCharToMultiByte(CP_UTF8, 0, path, -1, nullptr, 0, nullptr, nullptr);
                 std::string upath(len > 0 ? len - 1 : 0, '\0');
                 if (len > 0) WideCharToMultiByte(CP_UTF8, 0, path, -1, &upath[0], len, nullptr, nullptr);
-                FSTPLog::SaveDiagnosticReport(upath);
+                if (!FSTPLog::SaveDiagnosticReport(upath)) {
+                    // Silence here is what made the empty-report bug so confusing: the file
+                    // appeared, so the save looked like it had worked.
+                    MessageBoxW(g_main_hwnd,
+                                L"Could not write the diagnostic report.\n"
+                                L"Please pick a different location and try again.",
+                                L"TapeXPlayer", MB_OK | MB_ICONWARNING);
+                }
             }
             break;
         }

@@ -799,11 +799,25 @@ static void ShowContextMenu() {
         GtkWidget* dlg = gtk_file_chooser_dialog_new(
             "Save Diagnostic Report", nullptr, GTK_FILE_CHOOSER_ACTION_SAVE,
             "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, nullptr);
-        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), "TapeXPlayer-diagnostic.txt");
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg),
+                                          FSTPLog::SuggestedReportName().c_str());
         gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
         if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
             char* fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
-            if (fn) { FSTPLog::SaveDiagnosticReport(std::string(fn)); g_free(fn); }
+            if (fn) {
+                bool ok = FSTPLog::SaveDiagnosticReport(std::string(fn));
+                g_free(fn);
+                if (!ok) {
+                    // Say so — a report that silently isn't written looks identical to one
+                    // that was, right up until someone opens it.
+                    GtkWidget* err = gtk_message_dialog_new(
+                        nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING, GTK_BUTTONS_OK,
+                        "Could not write the diagnostic report.\n"
+                        "Please pick a different location and try again.");
+                    gtk_dialog_run(GTK_DIALOG(err));
+                    gtk_widget_destroy(err);
+                }
+            }
         }
         gtk_widget_destroy(dlg);
         while (gtk_events_pending()) gtk_main_iteration();

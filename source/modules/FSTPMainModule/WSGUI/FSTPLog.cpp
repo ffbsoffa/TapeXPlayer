@@ -216,6 +216,41 @@ bool MirrorToConsole(const std::string& path) {
 #endif
 }
 
+// Copy the live log file into `out`, returning false if it couldn't be read.
+//
+// The catch is Windows: the log is still open for writing via freopen, and the CRT opens it
+// with no sharing, so a plain ifstream is DENIED and reads nothing — which is exactly how
+// "Save Diagnostic Report" ended up producing an empty file there while the log itself was
+// fine. CreateFileW with FILE_SHARE_READ|WRITE|DELETE asks for the sharing the CRT didn't,
+// so the read succeeds while our own writer keeps the handle. POSIX has no such rule and an
+// ifstream is fine.
+bool CopyLiveLog(std::ofstream& out, const std::string& path) {
+#if defined(_WIN32)
+    // Widen the UTF-8 path — the log dir sits under %LOCALAPPDATA%, which may be non-ASCII.
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return false;
+    std::wstring wpath(wlen - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], wlen);
+
+    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    char buf[64 * 1024];
+    DWORD got = 0;
+    while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0)
+        out.write(buf, (std::streamsize)got);
+    CloseHandle(h);
+    return true;
+#else
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    out << in.rdbuf();
+    return true;
+#endif
+}
+
 // Point stdout AND stderr at `path`, returning false if it can't be opened.
 //
 // stderr is aliased onto stdout's file descriptor rather than opened separately: two
@@ -418,6 +453,10 @@ void RevealLogFolder() {
 #endif
 }
 
+std::string SuggestedReportName() {
+    return FormatNow("TapeXPlayer-diagnostic_%Y-%m-%d_%H-%M-%S") + ".txt";
+}
+
 bool SaveDiagnosticReport(const std::string& dest_path) {
     std::lock_guard<std::mutex> lk(g_mutex);
     std::error_code ec;
@@ -444,8 +483,12 @@ bool SaveDiagnosticReport(const std::string& dest_path) {
     // banner carrying the build, OS and its own path, so repeating any of that here would
     // only make the reader wonder which of the two headers to believe.
     out << "TapeXPlayer diagnostic report — saved " << NowStamp() << "\n\n";
-    std::ifstream in(g_log_path, std::ios::binary);
-    if (in) out << in.rdbuf();
+    if (!CopyLiveLog(out, g_log_path)) {
+        // Report the failure instead of shipping a file with a header and no log — the
+        // report looking "empty but successful" is worse than an explicit error.
+        out << "(could not read the session log at " << g_log_path << ")\n";
+        return false;
+    }
     return out.good();
 }
 

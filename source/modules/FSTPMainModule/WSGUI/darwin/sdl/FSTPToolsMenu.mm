@@ -884,7 +884,8 @@ static void ShowMemoryLocationDialog(int active_player);
 
 - (void)saveDiagnosticReportAction:(id)sender {
     NSSavePanel* panel = [NSSavePanel savePanel];
-    [panel setNameFieldStringValue:@"TapeXPlayer-diagnostic.txt"];
+    [panel setNameFieldStringValue:
+        [NSString stringWithUTF8String:FSTPLog::SuggestedReportName().c_str()]];
     [panel setMessage:@"Save a diagnostic report (session log + system info) to attach to a bug report"];
     if ([panel runModal] == NSModalResponseOK) {
         NSString* path = [[panel URL] path];
