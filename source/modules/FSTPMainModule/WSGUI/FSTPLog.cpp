@@ -341,12 +341,14 @@ bool MirrorToConsole(const std::string& path) {
 
 // Copy the live log file into `out`, returning false if it couldn't be read.
 //
-// The catch is Windows: the log is still open for writing via freopen, and the CRT opens it
-// with no sharing, so a plain ifstream is DENIED and reads nothing — which is exactly how
-// "Save Diagnostic Report" ended up producing an empty file there while the log itself was
-// fine. CreateFileW with FILE_SHARE_READ|WRITE|DELETE asks for the sharing the CRT didn't,
-// so the read succeeds while our own writer keeps the handle. POSIX has no such rule and an
-// ifstream is fine.
+// Windows decides a share conflict from BOTH handles: an open succeeds only if the existing
+// handle's share mode permits the new access, AND the new share mode permits the existing
+// handle's access. The FILE_SHARE_* flags below are only the second half — they declare what
+// we tolerate from others, and cannot win us access past a writer that denies it. So this
+// read is possible only because OpenLogStream keeps the log on plain freopen (_SH_DENYNO);
+// no reader-side flag could rescue it from the exclusive freopen_s that used to be there.
+// We still go through CreateFileW rather than an ifstream to be explicit that we tolerate
+// our own writer, and a pending delete, for the whole copy. POSIX has no such rule.
 bool CopyLiveLog(std::ofstream& out, const std::string& path) {
 #if defined(_WIN32)
     // Widen the UTF-8 path — the log dir sits under %LOCALAPPDATA%, which may be non-ASCII.
@@ -383,15 +385,19 @@ bool CopyLiveLog(std::ofstream& out, const std::string& path) {
 // the two log lines it actually occurred between, which is the whole point of a bug-report
 // log. freopen is still what redirects stdout, so C-runtime/SDL/ffmpeg output is captured
 // too, not just std::cout.
+//
+// Plain freopen deliberately, on every platform — NOT the "secure" freopen_s on Windows.
+// fopen_s/freopen_s open the file with exclusive access (documented, and unlike fopen), which
+// locks the log so hard that not even this process can read it back: that is what made "Save
+// Diagnostic Report" fail on Windows with a sharing violation while the log itself was
+// perfectly fine. Plain freopen opens with _SH_DENYNO, so the report can copy the log out
+// from under our own writer. Measured on Win11 with the shipped MinGW runtime:
+//   freopen_s(stdout, "a") -> a later CreateFileW(GENERIC_READ, FILE_SHARE_*) fails, err 32
+//   freopen  (stdout, "a") -> the same read succeeds
+// Both variants report failure the same way (NULL return), so nothing is lost by not using _s.
 bool OpenLogStream(const std::string& path) {
-#if defined(_WIN32)
-    FILE* f = nullptr;
-    if (freopen_s(&f, path.c_str(), "a", stdout) != 0 || !f)
-        return false;   // Windows used to ignore this and silently discard every log line
-#else
     if (!std::freopen(path.c_str(), "a", stdout))
-        return false;
-#endif
+        return false;   // Windows used to ignore this and silently discard every log line
     if (FSTP_DUP2(FSTP_FILENO(stdout), FSTP_FILENO(stderr)) == -1) {
         // dup2 failed (vanishingly rare). Fall back to a second handle in APPEND mode:
         // O_APPEND makes each write atomically seek to EOF, so the streams can't clobber
