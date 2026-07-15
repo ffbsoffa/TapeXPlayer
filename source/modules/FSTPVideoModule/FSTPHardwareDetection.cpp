@@ -53,31 +53,6 @@ extern "C" {
 // Global variable
 FSTPHardwareDetection* g_hardware_detection = nullptr;
 
-// ============================================================
-// Helper: extract the Intel CPU generation from the brand string.
-// "Intel Core i5-6267U CPU @ 2.90GHz" → 6  (Skylake, 2015–2016)
-// "Intel Core i7-8750H CPU @ 2.20GHz" → 8  (Coffee Lake, 2018)
-// "Intel Core i9-10900K"               → 10 (Comet Lake, 2020)
-// Returns 0 if the brand is not a Core iX or the generation is undetermined.
-// ============================================================
-static int ExtractIntelGeneration(const std::string& brand) {
-    size_t pos = brand.find("Core i");
-    if (pos == std::string::npos) return 0;
-    pos += 6;  // skip "Core i"
-    // find the dash after the digit (3/5/7/9)
-    while (pos < brand.size() && brand[pos] != '-') ++pos;
-    if (pos >= brand.size()) return 0;
-    ++pos;  // skip '-'
-    if (pos >= brand.size() || !std::isdigit(brand[pos])) return 0;
-    // read the model number digits
-    std::string digits;
-    while (pos < brand.size() && std::isdigit(brand[pos])) digits += brand[pos++];
-    // 4 digits: first = generation (6xxx → 6, 8xxx → 8)
-    // 5 digits: first two = generation (10xxx → 10, 11xxx → 11)
-    if (digits.size() == 4) return digits[0] - '0';
-    if (digits.size() == 5) return std::stoi(digits.substr(0, 2));
-    return 0;
-}
 
 // ============================================================
 // Correctly parse the Mac release year from the model identifier.
@@ -163,124 +138,43 @@ static int GetMacYearFromModelString(const std::string& mac_model) {
 //   MINIMUM        → Intel Celeron Gold 7505 (Tiger Lake 2-core, 15 W)
 // ============================================================
 FSTPDecoderProfile FSTPHardwareDetection::DetermineDecoderProfile(const FSTPCPUInfo& cpu) const {
-
-    // ── Profile 1: Apple Silicon (M1/M2/M3/M4) ──────────────────────────────
-    // Measurement: sysctl hw.optional.arm64 != 0
-    if (cpu.is_apple_silicon) {
-        std::cout << "  🎯 Decoder Profile: FULL_HARDWARE (Apple Silicon M1+)" << std::endl;
-        return FSTPDecoderProfile::FULL_HARDWARE;
-    }
-
-    // ── Profile 3: MINIMUM-class CPU ─────────────────────────────────────────
-    // Primary: brand "Celeron" / "Pentium" / "Atom"
-    //   Directly matches the reference: Celeron Gold 7505
-    //   Extrapolation: all Celeron/Pentium/Atom variants share this profile
-    // Secondary: ≤2 physical x86 cores
-    //   Rationale: Celeron 7505 (2-core, 15 W) ≈ decode throughput of two-core
-    //   Core i3/i5 of previous generations (i3-6006U 2016, i5-5300U 2015, etc.)
-    if (cpu.IsMinimumClass()) {
-        std::cout << "  🎯 Decoder Profile: MINIMUM" << std::endl;
-        if (cpu.model_name.find("Celeron") != std::string::npos ||
-            cpu.model_name.find("Pentium") != std::string::npos ||
-            cpu.model_name.find("Atom")    != std::string::npos) {
-            std::cout << "     Reason: Celeron/Pentium/Atom-class CPU — '"
-                      << cpu.model_name << "'" << std::endl;
-        } else {
-            std::cout << "     Reason: ≤2 physical x86 cores → throughput"
-                      << " similar to Celeron Gold 7505" << std::endl;
-        }
-        return FSTPDecoderProfile::MINIMUM;
-    }
-
-#ifdef PLATFORM_MACOS
-    // ── macOS Intel Mac ───────────────────────────────────────────────────────
-    // All Intel Macs from 2012+ = HYBRID_VT_CPU
-    // Confirmed by test: MacBook Pro 2016 (Skylake) works best in the combined
-    // mode — VideoToolbox for full-res, CPU for proxy ≤640p.
-    // Extrapolated back: 2012 (Ivy Bridge, gen 3) — minimum for HYBRID.
-    // Lower support bound: 2011 MacBook Pro (Sandy Bridge).
-    if (cpu.IsIntelMac()) {
-        if (cpu.mac_year > 0 && cpu.mac_year < 2012) {
-            // Sandy Bridge (2011) and older: VideoToolbox too limited
-            std::cout << "  🎯 Decoder Profile: SOFTWARE_ONLY"
-                      << " (Intel Mac " << cpu.mac_year << ", Sandy Bridge or older)" << std::endl;
-            return FSTPDecoderProfile::SOFTWARE_ONLY;
-        }
-        std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
-                  << " (Intel Mac";
-        if (cpu.mac_year > 0) std::cout << " " << cpu.mac_year;
-        std::cout << ")" << std::endl;
-        return FSTPDecoderProfile::HYBRID_VT_CPU;
-    }
-    // Intel Mac, year undetermined → use CPU generation as fallback
-    if (cpu.intel_generation >= 3) {
-        std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
-                  << " (Intel Mac gen " << cpu.intel_generation << ", year undetermined)" << std::endl;
-        return FSTPDecoderProfile::HYBRID_VT_CPU;
-    }
-#endif
-
-#if defined(PLATFORM_LINUX) || defined(PLATFORM_WINDOWS)
-    // ── AMD Ryzen / Athlon ────────────────────────────────────────────────────
-    // Note: Athlon Silver/Gold are already filtered out by IsMinimumClass() above.
-    // Only more capable AMD processors reach here.
+    // With the division of labour settled — the GPU decodes the original, the CPU serves the proxy
+    // — exactly one question is left worth asking here: is there a hardware decoder to put the
+    // original on? Everything this function used to weigh has been removed, because none of it
+    // survived contact with the evidence:
     //
-    // AMD hierarchy (analogous to Intel):
-    //   Athlon Silver/Gold  ≈ Celeron/Pentium   → MINIMUM (caught above)
-    //   Ryzen 3             ≈ Core i3            → HYBRID_VT_CPU
-    //   Ryzen 5/7/9         ≈ Core i5/i7/i9      → HYBRID_VT_CPU
+    //   * The Intel-generation ladder never ran. ExtractIntelGeneration looked for the literal
+    //     "Core i", and no real brand string contains it — CPUID reports "Intel(R) Core(TM) i9-…".
+    //     Every Intel machine scored 0 and fell straight through, so those branches were dead from
+    //     the day they were written.
+    //   * The Celeron/Atom and core-count rules sorted CPUs into profiles that nothing consumed.
+    //   * FULL_HARDWARE ("VideoToolbox for everything") is not true even on Apple Silicon: the
+    //     proxy decodes on the CPU there too, and has for a long time.
     //
-    // HW decode on AMD:
-    //   Linux:   VA-API via Mesa AMDGPU (all Zen-based, 2017+)
-    //   Windows: D3D11VA + AMF (Advanced Media Framework)
-    bool is_amd = (cpu.vendor == "AuthenticAMD" ||
-                   cpu.model_name.find("AMD ") != std::string::npos ||
-                   cpu.model_name.find("Ryzen") != std::string::npos);
-    if (is_amd) {
-        if (cpu.model_name.find("Ryzen") != std::string::npos) {
-            // Ryzen 3/5/7/9: VA-API (Linux) / D3D11VA + AMF (Windows)
-            std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
-                      << " (AMD Ryzen, VA-API/D3D11VA/AMF capable)" << std::endl;
-            return FSTPDecoderProfile::HYBRID_VT_CPU;
-        }
-        // Other AMD with AVX2 (Zen without "Ryzen" in the brand)
-        if (cpu.has_avx2 || cpu.physical_cores >= 4) {
-            std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
-                      << " (AMD, AVX2/4+ cores)" << std::endl;
-            return FSTPDecoderProfile::HYBRID_VT_CPU;
-        }
-        // Weak AMD without Ryzen, without AVX2, few cores → MINIMUM
-        std::cout << "  🎯 Decoder Profile: MINIMUM (AMD low-power, no AVX2)" << std::endl;
-        return FSTPDecoderProfile::MINIMUM;
+    // Worse, the ladder printed its verdict into every session log, where it reads as a decision.
+    // It never was one — nothing in the tree consumes this value; the real choices are made at the
+    // decode sites. A machine with a D3D11VA-capable RTX 4080 was being told, in its own log, that
+    // it had "no suitable HW acceleration", and that line cost real time during the #10 hunt.
+    //
+    // This is the interim, honest version: one question, answered from what was actually detected.
+    // The proper rework — decide by measuring both paths rather than by recognising hardware — is
+    // issue #12.
+    (void)cpu;
+
+    if (gpu_info_.HasAnyHWAccel() && gpu_info_.hw_decode_score >= 50.0) {
+        std::cout << "  🎯 Decode plan: GPU for the original, CPU for the proxy"
+                  << "  [" << (gpu_info_.model_name.empty() ? std::string("unnamed GPU")
+                                                            : gpu_info_.model_name)
+                  << ", hw_decode_score " << gpu_info_.hw_decode_score << "]" << std::endl;
+        return FSTPDecoderProfile::HYBRID_VT_CPU;
     }
 
-    // ── Linux / Windows: Intel by generation ─────────────────────────────────
-    // gen 5+ (Broadwell, 2015) = minimum for reliable H.264 QSV/VAAPI
-    // gen 3-4 (Ivy Bridge/Haswell, 2012-2014) = limited but acceptable HYBRID
-    if (cpu.intel_generation >= 5) {
-        std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
-                  << " (Intel gen " << cpu.intel_generation << ", QSV/VAAPI capable)" << std::endl;
-        return FSTPDecoderProfile::HYBRID_VT_CPU;
+    std::cout << "  🎯 Decode plan: CPU for both — no usable hardware decoder";
+    if (gpu_info_.HasAnyHWAccel()) {
+        std::cout << " (one was detected but scored only " << gpu_info_.hw_decode_score
+                  << ", below the 50 needed)";
     }
-    if (cpu.intel_generation >= 3 && (cpu.has_avx || cpu.has_avx2)) {
-        std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU"
-                  << " (Intel gen " << cpu.intel_generation << " + AVX, conservative)" << std::endl;
-        return FSTPDecoderProfile::HYBRID_VT_CPU;
-    }
-    if (cpu.intel_generation > 0) {
-        std::cout << "  🎯 Decoder Profile: SOFTWARE_ONLY"
-                  << " (Intel gen " << cpu.intel_generation << ", too old for HW decode)" << std::endl;
-        return FSTPDecoderProfile::SOFTWARE_ONLY;
-    }
-#endif
-
-    // ── Fallback for unknown hardware ────────────────────────────────────────
-    if (cpu.has_avx2) {
-        // AVX2 = Haswell (gen 4) or newer → most likely HW decode capable
-        std::cout << "  🎯 Decoder Profile: HYBRID_VT_CPU (AVX2 detected, gen 4+)" << std::endl;
-        return FSTPDecoderProfile::HYBRID_VT_CPU;
-    }
-    std::cout << "  🎯 Decoder Profile: SOFTWARE_ONLY (no suitable HW acceleration)" << std::endl;
+    std::cout << std::endl;
     return FSTPDecoderProfile::SOFTWARE_ONLY;
 }
 
@@ -670,7 +564,6 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
     info.is_pentium_gold_7505 = false;
     info.is_compact_device = false;
     info.device_model = "";
-    info.intel_generation = 0;
     info.decoder_profile = FSTPDecoderProfile::UNKNOWN;
 
     // macOS-specific fields
@@ -739,7 +632,6 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
     DetectCPUPowerMode(info);
 
     // Determine the Intel generation from the brand string
-    info.intel_generation = ExtractIntelGeneration(info.model_name);
 
     // Apply CPU-specific optimizations
     ApplyCPUSpecificOptimizations(info);
@@ -773,7 +665,6 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
     // Determine the Intel generation from the brand string (cross-platform method)
     // "Core i7-6920HQ" → gen 6 (Skylake), "Core i5-8259U" → gen 8 (Coffee Lake)
     if (!info.is_apple_silicon) {
-        info.intel_generation = ExtractIntelGeneration(info.model_name);
     }
 
     // Get CPU vendor

@@ -377,7 +377,18 @@ int CreateNewWindow(const char* title, int width, int height) {
         }
     }
     
-    std::cout << "🎬 [FINAL SETUP] Window " << window_index << " ready: YUV textures + Double buffering + Software timing (no VSync)" << std::endl;
+    // Report what the renderer actually does, rather than what it once did. Every path above asks
+    // for SDL_RENDERER_PRESENTVSYNC and then calls SDL_RenderSetVSync(1) on top, so the old fixed
+    // "Software timing (no VSync)" was simply false — and the Windows render thread contradicted it
+    // one line later by announcing itself as VSync-paced. A banner that states the opposite of the
+    // truth is worse than no banner: it sent this exact investigation the wrong way. Ask SDL.
+    SDL_RendererInfo rinfo{};
+    const bool vsync_on = (SDL_GetRendererInfo(renderer, &rinfo) == 0) &&
+                          (rinfo.flags & SDL_RENDERER_PRESENTVSYNC) != 0;
+    std::cout << "🎬 [FINAL SETUP] Window " << window_index
+              << " ready: YUV textures + Double buffering + "
+              << (vsync_on ? "VSync (loop paces on present)" : "NO VSync (loop free-runs)")
+              << std::endl;
 
     // Fill window structure
     g_windows[window_index].window = window;
