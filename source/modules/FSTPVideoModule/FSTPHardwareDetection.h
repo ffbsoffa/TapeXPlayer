@@ -116,7 +116,6 @@ struct FSTPCPUInfo {
     //   gen 5+ (Broadwell, 2015) = minimum for reliable VideoToolbox/QSV on H.264
     //   gen 3-4 (Ivy Bridge/Haswell, 2012-2014) = limited HW decode
     //   gen 1-2 (Sandy Bridge, 2011) = very limited, support edge
-    int intel_generation;
 
     // === Decoder Profile (determined after full hardware detection) ===
     FSTPDecoderProfile decoder_profile;
