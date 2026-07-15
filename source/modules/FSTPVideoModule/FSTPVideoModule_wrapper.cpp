@@ -65,7 +65,7 @@ void NotifyVideoFrameUpdate(int instance_id) {
 namespace fs = std::filesystem;
 
 // Debug control: set to true to enable verbose logging
-static constexpr bool ENABLE_VIDEO_DEBUG = false;
+static constexpr bool ENABLE_VIDEO_DEBUG = true;   // DIAG BUILD ONLY (feat/shuttle-diag) — render/UpdateVideoFrame rate + breakdown
 
 // Export from WindowManager for updating color metadata renderer
 extern "C" void FSTP_UpdatePlayerColorMetadata(int player_id, int colorspace, int color_range, int color_primaries, int color_trc);

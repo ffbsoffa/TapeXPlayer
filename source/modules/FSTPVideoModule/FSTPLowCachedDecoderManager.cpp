@@ -14,7 +14,7 @@ extern "C" void RequestForceRender();
 extern void NotifyVideoFrameUpdate(int instance_id);
 
 // Debug control: set to true to enable verbose logging
-static constexpr bool ENABLE_LOWCACHED_DEBUG = false;
+static constexpr bool ENABLE_LOWCACHED_DEBUG = true;   // DIAG BUILD ONLY (feat/shuttle-diag) — on-demand decode wakeups
 
 namespace FSTP {
 

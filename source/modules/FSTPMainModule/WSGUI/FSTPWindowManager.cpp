@@ -35,7 +35,7 @@ extern "C" {
 std::atomic<int> g_texture_skip_counter{0};
 
 // Debug control: set to true to enable verbose logging
-static constexpr bool ENABLE_WINDOW_MANAGER_DEBUG = false;
+static constexpr bool ENABLE_WINDOW_MANAGER_DEBUG = true;   // DIAG BUILD ONLY (feat/shuttle-diag) — Texture/OSD/Present timing
 
 // Counting rectangle with preserving aspect ratio (letterbox/pillarbox)
 static SDL_Rect ComputeAspectFitRect(int texture_width, int texture_height, int target_width, int target_height) {
@@ -699,32 +699,36 @@ void RenderAllWindows() {
 
     auto t_after_video = std::chrono::high_resolution_clock::now();
 
-    // Diagnostics: how many windows are active and profiling
+    // Diagnostics: how many windows are active and profiling.
+    //
+    // The four counters below are accumulated on every render regardless; only the report was
+    // ever switched off, so reviving it costs nothing but the printing itself.
     static int window_count_report = 0;
     if (++window_count_report >= 60) {
-        // Render timing statistics (disabled in production)
-        // int active_window_count = 0;
-        // for (int i = 0; i < MAX_WINDOWS; i++) {
-        //     if (g_windows[i].is_active && !g_windows[i].is_minimized && g_windows[i].renderer) {
-        //         active_window_count++;
-        //     }
-        // }
+        if (ENABLE_WINDOW_MANAGER_DEBUG) {
+            int active_window_count = 0;
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                if (g_windows[i].is_active && !g_windows[i].is_minimized && g_windows[i].renderer) {
+                    active_window_count++;
+                }
+            }
 
-        // int samples = perf_sample_count.load();
-        // if (samples > 0) {
-        //     uint64_t avg_video = total_update_video_us.load() / samples;
-        //     uint64_t avg_texture = total_texture_update_us.load() / samples;
-        //     uint64_t avg_osd = total_osd_render_us.load() / samples;
-        //     uint64_t avg_present = total_render_present_us.load() / samples;
-        //     uint64_t total_avg = avg_video + avg_texture + avg_osd + avg_present;
-        //
-        //     std::cout << "⏱️  [RENDER] UpdateVideo: " << avg_video << "μs"
-        //               << ", Texture: " << avg_texture << "μs"
-        //               << ", OSD: " << avg_osd << "μs"
-        //               << ", Present: " << avg_present << "μs"
-        //               << " | TOTAL: " << total_avg << "μs"
-        //               << " (" << active_window_count << " win)" << std::endl;
-        // }
+            int samples = perf_sample_count.load();
+            if (samples > 0) {
+                uint64_t avg_video = total_update_video_us.load() / samples;
+                uint64_t avg_texture = total_texture_update_us.load() / samples;
+                uint64_t avg_osd = total_osd_render_us.load() / samples;
+                uint64_t avg_present = total_render_present_us.load() / samples;
+                uint64_t total_avg = avg_video + avg_texture + avg_osd + avg_present;
+
+                std::cout << "⏱️  [RENDER] UpdateVideo: " << avg_video << "μs"
+                          << ", Texture: " << avg_texture << "μs"
+                          << ", OSD: " << avg_osd << "μs"
+                          << ", Present: " << avg_present << "μs"
+                          << " | TOTAL: " << total_avg << "μs"
+                          << " (" << active_window_count << " win)" << std::endl;
+            }
+        }
 
         window_count_report = 0;
         total_update_video_us.store(0);

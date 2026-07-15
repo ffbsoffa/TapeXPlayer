@@ -35,7 +35,7 @@ extern FSTPHardwareDetection* g_hardware_detection;
 namespace FSTP {
 
 // Debug control: set to true to enable verbose logging
-static constexpr bool ENABLE_LOWRES_DECODER_DEBUG = false;
+static constexpr bool ENABLE_LOWRES_DECODER_DEBUG = true;   // DIAG BUILD ONLY (feat/shuttle-diag) — GPU→CPU copy timing
 
 // ---------------------------------------------------------------------------
 // Proxy cache manifest — a tiny sidecar "<proxy>.meta" that pins each cached
