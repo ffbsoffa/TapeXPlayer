@@ -684,6 +684,13 @@ void RenderAllWindows() {
     static std::atomic<uint64_t> total_texture_update_us{0};
     static std::atomic<uint64_t> total_osd_render_us{0};
     static std::atomic<uint64_t> total_render_present_us{0};
+    // Sub-timers inside the "texture" span, which is really the whole compositing path, so a
+    // big number can be attributed instead of guessed at. MakeTexture (CreateOrUpdateTexture)
+    // is the one that does the pixel work, re-runs the effect and uploads; Hsync is the
+    // separate overlay pass; Copy is the blit. Whatever is left over is frame prep.
+    static std::atomic<uint64_t> total_maketex_us{0};
+    static std::atomic<uint64_t> total_effect_us{0};
+    static std::atomic<uint64_t> total_copy_us{0};
     static std::atomic<int> perf_sample_count{0};
 
     // Hold the render lock for the whole pass so a concurrent CreateNewWindow / FSTPCloseWindow /
@@ -719,14 +726,39 @@ void RenderAllWindows() {
                 uint64_t avg_texture = total_texture_update_us.load() / samples;
                 uint64_t avg_osd = total_osd_render_us.load() / samples;
                 uint64_t avg_present = total_render_present_us.load() / samples;
+                uint64_t avg_maketex = total_maketex_us.load() / samples;
+                uint64_t avg_effect = total_effect_us.load() / samples;
+                uint64_t avg_copy = total_copy_us.load() / samples;
+                // Composite = the old "Texture" number. Prep is what is left once the named
+                // parts are taken out, so the four always add back up to it.
+                uint64_t named = avg_maketex + avg_effect + avg_copy;
+                uint64_t avg_prep = (avg_texture > named) ? (avg_texture - named) : 0;
                 uint64_t total_avg = avg_video + avg_texture + avg_osd + avg_present;
 
                 std::cout << "⏱️  [RENDER] UpdateVideo: " << avg_video << "μs"
-                          << ", Texture: " << avg_texture << "μs"
+                          << ", Composite: " << avg_texture << "μs"
+                          << " (MakeTexture: " << avg_maketex << "μs"
+                          << ", Hsync: " << avg_effect << "μs"
+                          << ", Copy: " << avg_copy << "μs"
+                          << ", Prep: " << avg_prep << "μs)"
                           << ", OSD: " << avg_osd << "μs"
                           << ", Present: " << avg_present << "μs"
                           << " | TOTAL: " << total_avg << "μs"
                           << " (" << active_window_count << " win)" << std::endl;
+
+                // Which effects were actually on while those numbers were measured. Without
+                // this the timings are unreadable: "the effect was off" is the first thing
+                // anyone says about a slow composite, and smear/edgefade/grain default to on
+                // INDEPENDENTLY of the Betacam toggle — they keep the scratch path alive on
+                // their own (see want_scratch in FSTPPixelBufferManager::CreateOrUpdateTexture).
+                if (g_pixel_buffer_manager) {
+                    std::cout << "    🎛️  [FX] betacam=" << (g_pixel_buffer_manager->IsBetacamEffectEnabled() ? "on" : "off")
+                              << ", smear=" << (g_pixel_buffer_manager->IsSmearEnabled() ? "on" : "off")
+                              << ", edgefade=" << (g_pixel_buffer_manager->IsEdgeFadeEnabled() ? "on" : "off")
+                              << ", grain(active)=" << (g_pixel_buffer_manager->IsFilmGrainActive() ? "on" : "off")
+                              << ", reverse_stripe=" << (g_pixel_buffer_manager->IsReverseStripeEnabled() ? "on" : "off")
+                              << std::endl;
+                }
             }
         }
 
@@ -735,6 +767,9 @@ void RenderAllWindows() {
         total_texture_update_us.store(0);
         total_osd_render_us.store(0);
         total_render_present_us.store(0);
+        total_maketex_us.store(0);
+        total_effect_us.store(0);
+        total_copy_us.store(0);
         perf_sample_count.store(0);
     }
 
@@ -887,8 +922,15 @@ void RenderAllWindows() {
 
                     SDL_Texture* new_texture = nullptr;
                     if (need_update) {
+                        // This is the expensive one: CreateOrUpdateTexture does the pixel work,
+                        // re-runs the effect (see the note above) and uploads the texture, so it
+                        // carries nearly the whole composite cost. Timed separately because that
+                        // cost is otherwise indistinguishable from frame prep.
+                        auto t_before_maketex = std::chrono::high_resolution_clock::now();
                         new_texture = g_pixel_buffer_manager->CreateOrUpdateTexture(
                             player_id, renderer, pixel_buffer, g_windows[i].texture_buffer[current_buf]);
+                        auto t_after_maketex = std::chrono::high_resolution_clock::now();
+                        total_maketex_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_maketex - t_before_maketex).count());
                     } else {
                         // Use existing texture
                         new_texture = g_windows[i].texture_buffer[current_buf];
@@ -973,15 +1015,21 @@ void RenderAllWindows() {
                         bool hsync_rendered = false;
                         if (g_pixel_buffer_manager && !src_rect_ptr) {
                             // HSync effect only works with full frame (no zoom)
+                            auto t_before_effect = std::chrono::high_resolution_clock::now();
                             hsync_rendered = g_pixel_buffer_manager->RenderWithHsync(
                                 player_id, renderer, new_texture,
                                 pixel_buffer->width, pixel_buffer->height, dst_rect
                             );
+                            auto t_after_effect = std::chrono::high_resolution_clock::now();
+                            total_effect_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_effect - t_before_effect).count());
                         }
 
                         // Fallback to normal rendering if hsync was not applied
                         if (!hsync_rendered) {
+                            auto t_before_copy = std::chrono::high_resolution_clock::now();
                             SDL_RenderCopy(renderer, new_texture, src_rect_ptr, &dst_rect);
+                            auto t_after_copy = std::chrono::high_resolution_clock::now();
+                            total_copy_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_copy - t_before_copy).count());
                         }
 
                         if (is_new_frame) {

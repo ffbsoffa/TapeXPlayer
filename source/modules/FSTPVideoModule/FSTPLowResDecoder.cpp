@@ -1460,8 +1460,13 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
 
                                         std::cout << "⏱️  [LowResDecoder PERF] Thread " << std::this_thread::get_id() << std::endl;
                                         std::cout << "    📊 Breakdown per frame (avg over " << samples << " frames):" << std::endl;
-                                        std::cout << "       • Read packet:     " << avg_read << "μs" << std::endl;
-                                        std::cout << "       • Send (decode):   " << avg_send << "μs ⬅️ BOTTLENECK" << std::endl;
+                                        // Read/Send accumulate per PACKET but are divided by the FRAME count, so on a
+                                        // GOP-seeking path (shuttle) they read high and can even exceed TOTAL. They are
+                                        // not per-frame costs — don't rank them against the rest. The label that used to
+                                        // hang off Send said "BOTTLENECK" unconditionally, which is how a hardcoded string
+                                        // ends up looking like a measurement.
+                                        std::cout << "       • Read packet:     " << avg_read << "μs (per packet, not per frame)" << std::endl;
+                                        std::cout << "       • Send (decode):   " << avg_send << "μs (per packet, not per frame)" << std::endl;
                                         std::cout << "       • Receive:         " << avg_receive << "μs" << std::endl;
                                         if (avg_hw_transfer > 0) {
                                             std::cout << "       • GPU→CPU copy:    " << avg_hw_transfer << "μs" << std::endl;

@@ -2259,12 +2259,13 @@ void FSTPVideoModuleWrapper::UpdateVideoFrame() {
 
     // auto t_start = std::chrono::high_resolution_clock::now();  // Unused - performance timing disabled
 
-    // Every 100 calls report hot spots
+    // Every 100 calls report the UpdateVideoFrame breakdown.
+    //
+    // The call-counter hot-spots table used to print here too: 26 lines of box-drawing per
+    // report, which buries the timings that actually answer the shuttle question.
     if (ENABLE_VIDEO_DEBUG) {
         static int report_counter = 0;
         if (++report_counter >= 100) {
-            FSTP_REPORT_HOTSPOTS();
-
             // Report UpdateVideoFrame profiling
             if (perf_samples > 0) {
                 std::cout << "⏱️  [UpdateVideoFrame PERF] GetAudioFrame: " << (total_get_audio_frame_us / perf_samples)
