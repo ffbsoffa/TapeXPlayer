@@ -44,11 +44,59 @@
 #include <cstdio>    // freopen / freopen_s / setvbuf (for --log)
 #include <cstdlib>   // getenv (for --log)
 #include <cstring>   // strcmp
+#include <clocale>   // setlocale — force UTF-8 on Windows (Cyrillic user paths)
+#include <locale>    // std::locale::global
+#include <codecvt>   // std::codecvt_utf8 — UTF-8 facet for std::filesystem on Windows
 #include "main.h"
 #include "../FSTPPlayerModule/FSTPPlayerManager.h"
 #include "../FSTPVideoModule/FSTPHardwareDetection.h"
 
 int main(int argc, char* argv[]) {
+    #ifdef _WIN32
+    // Make the whole process handle non-ASCII paths BEFORE anything touches the filesystem.
+    //
+    // A colleague's real 2016 MacBook Pro (Bootcamp Windows, Cyrillic username "Максим") crashed the
+    // instant a file was loaded: libstdc++ threw an uncaught std::filesystem_error ("Cannot convert
+    // character sequence: Illegal byte sequence") on a background thread and std::terminate aborted
+    // the process. Two independent things caused it, both handled here:
+    //
+    //   1. Wrong bytes IN. Narrow std::getenv returns %LOCALAPPDATA% / %APPDATA% / %USERPROFILE% in
+    //      the legacy ANSI code page (CP1251 on a Russian Windows), not UTF-8. The dozens of
+    //      getenv-based path builds across the app then feed those bytes into std::filesystem. We
+    //      re-publish each path var as UTF-8 — read it WIDE (_wgetenv, always correct), write it
+    //      back with _putenv_s — so every later getenv is UTF-8. One central fix, not 37 call sites.
+    //
+    //   2. Wrong conversion. std::filesystem converts a path between narrow (char) and native wide
+    //      using the codecvt<wchar_t,char> facet of the GLOBAL C++ locale; the default "C" locale's
+    //      codecvt rejects every byte >= 0x80. We install a std::codecvt_utf8<wchar_t>, so the UTF-8
+    //      bytes from (1) decode correctly. This does not depend on a locale NAME being known
+    //      (std::locale(".UTF-8") throws on MinGW), so it is reliable.
+    //
+    // setlocale(".UTF-8") aligns the CRT too, and the manifest's activeCodePage=UTF-8 keeps the
+    // narrow WinAPI consistent (ignored on Win7/8, so nothing breaks there).
+    {
+        auto w2u8 = [](const wchar_t* w) -> std::string {
+            if (!w) return {};
+            int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+            std::string s(n > 0 ? n - 1 : 0, '\0');
+            if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+            return s;
+        };
+        const wchar_t* vars[] = { L"LOCALAPPDATA", L"APPDATA", L"USERPROFILE", L"TEMP", L"TMP", L"HOMEPATH", L"HOME" };
+        for (const wchar_t* name : vars) {
+            if (const wchar_t* wv = _wgetenv(name)) {
+                char nameA[64];
+                WideCharToMultiByte(CP_UTF8, 0, name, -1, nameA, sizeof(nameA), nullptr, nullptr);
+                _putenv_s(nameA, w2u8(wv).c_str());
+            }
+        }
+    }
+    std::setlocale(LC_ALL, ".UTF-8");
+    try {
+        std::locale::global(std::locale(std::locale::classic(), new std::codecvt_utf8<wchar_t>));
+    } catch (...) {}
+    #endif
+
     #ifndef _WIN32
     // CRITICAL: Set malloc arena limit BEFORE any allocations
     // Fixes glibc malloc arena corruption in PipeWire/PortAudio cleanup
