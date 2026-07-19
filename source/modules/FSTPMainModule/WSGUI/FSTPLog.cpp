@@ -396,20 +396,30 @@ bool CopyLiveLog(std::ofstream& out, const std::string& path) {
 //   freopen  (stdout, "a") -> the same read succeeds
 // Both variants report failure the same way (NULL return), so nothing is lost by not using _s.
 bool OpenLogStream(const std::string& path) {
+#if defined(_WIN32)
+    // Widen the UTF-8 path first — a Cyrillic %LOCALAPPDATA% (C:\Users\Максим\...) can't be opened
+    // through the narrow CRT, which reads the bytes as CP1251 and silently discards every log line.
+    std::wstring wpath;
+    int wn = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wn > 0) { wpath.resize(wn - 1); MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], wn); }
+    if (!_wfreopen(wpath.c_str(), L"a", stdout))
+        return false;
+    if (FSTP_DUP2(FSTP_FILENO(stdout), FSTP_FILENO(stderr)) == -1) {
+        // dup2 failed (vanishingly rare). Fall back to a second APPEND handle.
+        _wfreopen(wpath.c_str(), L"a", stderr);
+    }
+    return true;
+#else
     if (!std::freopen(path.c_str(), "a", stdout))
-        return false;   // Windows used to ignore this and silently discard every log line
+        return false;
     if (FSTP_DUP2(FSTP_FILENO(stdout), FSTP_FILENO(stderr)) == -1) {
         // dup2 failed (vanishingly rare). Fall back to a second handle in APPEND mode:
         // O_APPEND makes each write atomically seek to EOF, so the streams can't clobber
         // one another even with separate offsets.
-#if defined(_WIN32)
-        FILE* e = nullptr;
-        freopen_s(&e, path.c_str(), "a", stderr);
-#else
         std::freopen(path.c_str(), "a", stderr);
-#endif
     }
     return true;
+#endif
 }
 
 // Keep the newest `keep` session logs; delete older ones so the folder stays bounded.
