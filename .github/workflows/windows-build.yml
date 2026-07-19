@@ -6,7 +6,9 @@ name: Windows x64 build
 
 on:
   push:
-    branches: [ stable, unstable, main, master ]
+    # feat/** builds too: a feature branch is exactly where a Windows-only regression
+    # needs catching, and Windows can't be tested locally from a macOS dev machine.
+    branches: [ stable, unstable, main, master, 'feat/**' ]
     tags: [ 'v*' ]
   pull_request:
     branches: [ stable, unstable, main, master ]

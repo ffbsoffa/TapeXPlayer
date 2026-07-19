@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cstdio>    // freopen / freopen_s / setvbuf (for --log)
 #include <cstdlib>   // getenv (for --log)
+#include "WSGUI/FSTPLog.h"   // always-on session logging
 #include <cstring>   // strcmp
 #include <clocale>   // setlocale — force UTF-8 on Windows (Cyrillic user paths)
 #include <locale>    // std::locale::global
@@ -178,42 +179,14 @@ int main(int argc, char* argv[]) {
     }
     #endif
 
-    // --log : mirror all stdout/stderr to TapeXPlayer_log.txt on the Desktop, so a
-    // bug report is one flag away with no manual copy/paste from the console. Uses
-    // freopen so it also captures C-runtime / ffmpeg / SDL output, not just std::cout.
+    // Session logging: always write a rolling log to a reliable per-user folder (see
+    // FSTPLog) so a bug report already has a log — no flag, and no OneDrive-Desktop
+    // hunt. `--log` only forces file capture even when attached to a terminal (dev use).
+    bool force_log = false;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--log") == 0) {
-            std::string desktop;   // UTF-8 form, only for the "[LOG] Writing…" message below
-            #ifdef _WIN32
-                // Read USERPROFILE WIDE (we no longer re-publish it as UTF-8 — see the var list
-                // above), build the path in wide and open it with _wfreopen so a Cyrillic Desktop
-                // (C:\Users\Максим\Desktop) works.
-                std::wstring wdesktop;
-                if (const wchar_t* up = _wgetenv(L"USERPROFILE"))
-                    wdesktop = std::wstring(up) + L"\\Desktop\\TapeXPlayer_log.txt";
-                else
-                    wdesktop = L"TapeXPlayer_log.txt";
-                int dn = WideCharToMultiByte(CP_UTF8, 0, wdesktop.c_str(), -1, nullptr, 0, nullptr, nullptr);
-                if (dn > 0) { desktop.resize(dn - 1); WideCharToMultiByte(CP_UTF8, 0, wdesktop.c_str(), -1, &desktop[0], dn, nullptr, nullptr); }
-                _wfreopen(wdesktop.c_str(), L"w", stdout);
-                _wfreopen(wdesktop.c_str(), L"a", stderr);
-            #else
-                // ~/Desktop on macOS and Linux
-                if (const char* home = std::getenv("HOME"))
-                    desktop = std::string(home) + "/Desktop/TapeXPlayer_log.txt";
-                else
-                    desktop = "TapeXPlayer_log.txt";
-                freopen(desktop.c_str(), "w", stdout);
-                freopen(desktop.c_str(), "a", stderr);
-            #endif
-            std::cout.clear();
-            std::cerr.clear();
-            // Unbuffered so the log is complete even if the app is force-quit mid-run.
-            std::setvbuf(stdout, nullptr, _IONBF, 0);
-            std::cout << "[LOG] Writing session log to: " << desktop << std::endl;
-            break;
-        }
+        if (strcmp(argv[i], "--log") == 0) { force_log = true; break; }
     }
+    FSTPLog::Init(force_log);   // resolves the version itself, so the banner is complete
 
     std::cout << "=== TapeXPlayer 2026 - Initialization ===" << std::endl;
 
@@ -237,6 +210,42 @@ int main(int argc, char* argv[]) {
         g_hardware_detection->PrintDetectedHardware();
         auto best_decoder = g_hardware_detection->GetBestDecoder();
         std::cout << "Best decoder: " << FSTPHardwareDetection::AccelTypeToString(best_decoder.accel_type) << std::endl;
+
+        // Restate the machine's CPU/GPU next to the log banner. PrintDetectedHardware above
+        // is verbose and scrolls away; a bug report needs the two lines that identify the
+        // hardware to sit right at the top, next to the OS and build.
+        const FSTPCPUInfo& cpu = g_hardware_detection->GetCPUInfo();
+        const FSTPGPUInfo& gpu = g_hardware_detection->GetGPUInfo();
+
+        std::string simd;
+        if (cpu.has_avx512) simd += " AVX512";
+        else if (cpu.has_avx2) simd += " AVX2";
+        else if (cpu.has_avx) simd += " AVX";
+        else if (cpu.has_sse4_2) simd += " SSE4.2";
+        else if (cpu.has_sse2) simd += " SSE2";
+
+        std::string accel;
+        auto add = [&](bool on, const char* n) { if (on) { if (!accel.empty()) accel += ", "; accel += n; } };
+        add(gpu.videotoolbox_available, "VideoToolbox");
+        add(gpu.d3d11va_available,      "D3D11VA");
+        add(gpu.dxva2_available,        "DXVA2");
+        add(gpu.qsv_available,          "QuickSync");
+        add(gpu.nvenc_available,        "NVENC");
+        add(gpu.amf_available,          "AMF");
+        add(gpu.vaapi_available,        "VA-API");
+        add(gpu.vdpau_available,        "VDPAU");
+        if (accel.empty()) accel = "none";
+
+        std::string info =
+            "CPU     : " + cpu.model_name + " (" + cpu.architecture + ", " +
+                std::to_string(cpu.physical_cores) + "c/" + std::to_string(cpu.logical_cores) + "t," +
+                (simd.empty() ? " no SIMD" : simd) + ")\n" +
+            "GPU     : " + (gpu.model_name.empty() ? "(unknown)" : gpu.model_name) +
+                (gpu.vendor.empty() ? "" : " [" + gpu.vendor + "]") +
+                (gpu.memory_mb > 0 ? ", " + std::to_string(gpu.memory_mb) + " MB VRAM" : "") + "\n" +
+            "HW accel: " + accel + "\n" +
+            "Decoder : " + FSTPHardwareDetection::AccelTypeToString(best_decoder.accel_type);
+        FSTPLog::LogSystemInfo(info);
     }
 
     // 2. Early PortAudio initialization for smooth animation
