@@ -743,8 +743,14 @@ static bool LocateYTDLPBinary(std::string& binary_path) {
     if (path_env) {
         std::string path_str(path_env);
         size_t start = 0;
+        // PATH separator: ';' on Windows (':' collides with drive letters like C:\), ':' elsewhere.
+#ifdef _WIN32
+        const char sep = ';';
+#else
+        const char sep = ':';
+#endif
         while (start <= path_str.size()) {
-            size_t end = path_str.find(':', start);
+            size_t end = path_str.find(sep, start);
             std::string part = path_str.substr(start, end == std::string::npos ? std::string::npos : end - start);
             if (!part.empty()) {
                 search_dirs.insert(part);
@@ -759,8 +765,16 @@ static bool LocateYTDLPBinary(std::string& binary_path) {
 #endif
 
     for (const auto& dir : search_dirs) {
-        fs::path candidate = fs::path(dir) / "yt-dlp";
+        // PATH is the one env var we don't re-publish as UTF-8, so a Cyrillic directory in it stays
+        // CP1251. Building that into an fs::path throws "illegal byte sequence" — and this runs on
+        // the settings-open thread, so uncaught it std::terminate'd the app. Skip such entries.
         std::error_code ec;
+        fs::path candidate;
+        try {
+            candidate = fs::path(dir) / "yt-dlp";
+        } catch (const std::exception&) {
+            continue;
+        }
         if (fs::exists(candidate, ec) && fs::is_regular_file(candidate, ec)) {
 #ifdef _WIN32
             cached_path = candidate.string();
