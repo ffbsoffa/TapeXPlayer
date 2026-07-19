@@ -1125,9 +1125,12 @@ public:
             // --- No Change Needed ---
             // else { /* current == target and not jogging/resuming */ }
 
-            // === FRAME ALIGNMENT ON PROLONGED PAUSE ===
-            // After 10 seconds of pause, gradually align audio time to nearest frame boundary
-            // This removes the visible "stripe" artifact from Betacam effect
+            // === FRAME ALIGNMENT ON PAUSE ===
+            // Shortly after pausing, gradually align audio time to the nearest frame boundary.
+            // This resolves the visible Betacam "stripe" to a clean still. It ALSO gates the video
+            // module's pure-pause re-render (IsFrameAligned() stays false until this fires, and the
+            // video module force-re-renders every vblank until it's true) — so a long delay here
+            // pinned a paused player near 17% CPU on a high-refresh panel. Keep it short.
             {
                 bool is_paused = (current == 0.0 && target == 0.0 && !is_jogging);
 
@@ -1142,10 +1145,13 @@ public:
                     // Check if 10 seconds have passed and alignment not done yet
                     if (pause_time_tracking.load() && !frame_alignment_done.load()) {
                         auto now = std::chrono::steady_clock::now();
-                        auto pause_duration = std::chrono::duration_cast<std::chrono::seconds>(
+                        auto pause_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             now - pause_start_time).count();
 
-                        if (pause_duration >= 10) {
+                        // 800 ms: long enough to show the head-switch stripe on entering pause,
+                        // short enough that the frame settles to a clean still and the render
+                        // thread can freeze instead of re-rendering for 10 s. Tunable.
+                        if (pause_duration_ms >= 800) {
                             // Calculate current time in seconds
                             double current_pos_samples = playback_position.load();
                             double current_time_sec = current_pos_samples / (sample_rate * channels);

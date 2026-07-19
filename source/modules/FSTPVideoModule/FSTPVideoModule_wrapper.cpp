@@ -2310,47 +2310,57 @@ void FSTPVideoModuleWrapper::UpdateVideoFrame() {
     bool betacam_speed_range = (abs_speed < 0.9 || abs_speed > 1.1);
     if (betacam_speed_range) {
         bool is_pure_pause = (abs_speed < 0.05);
-        if (!is_pure_pause) {
-            // Slow motion or shuttle: re-render continuously so the Betacam stripe animates and the
-            // proxy steps, even when the audio frame index hasn't advanced. This forced re-render
-            // runs once per PRESENT, so it scales with display refresh — on a 165 Hz panel it fired
-            // 2.75× as often as on 60 Hz, and each present also pays the megacommit's on-demand
-            // proxy decode (decodeFrameNow + per-slot lock) → visible drops on high-refresh screens
-            // (reported by a 165 Hz user, effect on OR off). Cap it to 60 fps by wall clock: ~60
-            // proxy frames/sec during a scrub is visually identical and the stripe animates just as
-            // smoothly, at a fraction of the cost.
-            //
-            // Render is vblank-locked, so on a panel whose refresh isn't a multiple of 60 (165 Hz)
-            // we can only skip WHOLE presents. Advancing the deadline by one 60 Hz period (instead
-            // of resetting it to "now") makes the long-run count land on exactly 60 renders/sec:
-            // the skips alternate 2/3 vblanks (≈82/≈55 fps instantaneous) and average to 60. Panels
-            // at 60/120/144 Hz render on every Nth present cleanly; a small tolerance keeps 60 Hz
-            // itself rendering every present despite present-time jitter. An explicit force
-            // (segment-decode ready, already in `force_update`) is never throttled away.
-            constexpr double kTargetFrameMs   = 1000.0 / 60.0;  // 16.667 ms → 60 fps
-            constexpr double kJitterToleranceMs = 2.0;          // don't let jitter halve a 60 Hz panel
+
+        // Cap forced re-renders to 60 fps by wall clock — shared by the slow-motion/shuttle path
+        // and the pure-pause path below. Render is vblank-locked, so on a panel whose refresh isn't
+        // a multiple of 60 (165 Hz) we can only skip WHOLE presents; advancing the deadline by one
+        // 60 Hz period (not resetting it to "now") makes the long-run count land on exactly 60/sec —
+        // the skips alternate 2/3 vblanks (≈82/≈55 fps instantaneous) and average to 60. Panels at
+        // 60/120/144 Hz render on every Nth present cleanly; a small tolerance keeps 60 Hz itself
+        // rendering every present despite present-time jitter. Returns true if this present is
+        // within budget (render it), false if it should be skipped this vblank.
+        constexpr double kTargetFrameMs   = 1000.0 / 60.0;  // 16.667 ms → 60 fps
+        constexpr double kJitterToleranceMs = 2.0;          // don't let jitter halve a 60 Hz panel
+        auto within_60fps_budget = [&]() -> bool {
             auto now = std::chrono::steady_clock::now();
             double since_ms =
                 std::chrono::duration<double, std::milli>(now - m_last_shuttle_render).count();
             if (!force_update && since_ms + kJitterToleranceMs < kTargetFrameMs) {
-                return;  // too soon since the last shuttle render — skip this present entirely
+                return false;  // too soon since the last render — skip this present
             }
             if (since_ms > kTargetFrameMs * 4.0) {
-                // Big gap (just entered shuttle, or was idle): resync to avoid a catch-up burst.
-                m_last_shuttle_render = now;
+                m_last_shuttle_render = now;  // big gap (just entered / was idle): resync
             } else {
-                // Advance by a whole 60 Hz period so the average stays exactly 60 fps.
-                m_last_shuttle_render += std::chrono::microseconds(16667);
+                m_last_shuttle_render += std::chrono::microseconds(16667);  // exact 60 fps average
+            }
+            return true;
+        };
+
+        if (!is_pure_pause) {
+            // Slow motion or shuttle: re-render continuously so the Betacam stripe animates and the
+            // proxy steps, even when the audio frame index hasn't advanced — but capped to 60 fps
+            // (a 165 Hz panel otherwise fired 2.75× as often, each present paying real decode work;
+            // reported by a 165 Hz user, effect on OR off). An explicit force (segment-decode ready,
+            // already in `force_update`) is never throttled away.
+            if (!within_60fps_budget()) {
+                return;  // too soon since the last shuttle render — skip this present entirely
             }
             force_update = true;
         } else {
-            // Pure pause: force until audio aligns to frame boundary (stripe disappears).
-            // On the transition frame (false→true): force ONE more DisplayFrame so the
-            // betacam effect renders a clean frame (no prev/next compositing).
+            // Pure pause: re-render only until the audio time aligns to a frame boundary and the
+            // Betacam stripe resolves to a clean still — THEN stop, leaving the frame frozen. The
+            // old code forced a re-render on EVERY vblank until IsFrameAligned(), which only fired
+            // after a prolonged-pause timer → on a 165 Hz panel a paused player sat near 17% CPU
+            // (DisplayFrame every vblank) while the picture never changed. Now the pre-settle
+            // re-render is 60 fps-capped, and once aligned this stops forcing → the frame freezes.
+            // The settle transition (false→true) forces ONE clean-frame render (no prev/next
+            // compositing).
             bool stripe_settled = m_audio_module && m_audio_module->IsFrameAligned();
             bool just_aligned = stripe_settled && !m_last_frame_aligned;
             m_last_frame_aligned = stripe_settled;
-            if (!stripe_settled || just_aligned) {
+            if (just_aligned) {
+                force_update = true;
+            } else if (!stripe_settled && within_60fps_budget()) {
                 force_update = true;
             }
         }
