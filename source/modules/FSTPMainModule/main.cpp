@@ -73,8 +73,10 @@ int main(int argc, char* argv[]) {
     //      bytes from (1) decode correctly. This does not depend on a locale NAME being known
     //      (std::locale(".UTF-8") throws on MinGW), so it is reliable.
     //
-    // setlocale(".UTF-8") aligns the CRT too, and the manifest's activeCodePage=UTF-8 keeps the
-    // narrow WinAPI consistent (ignored on Win7/8, so nothing breaks there).
+    // setlocale(".UTF-8") aligns the CRT too. We deliberately do NOT set the manifest's
+    // activeCodePage=UTF-8: on MinGW/msvcrt it doesn't reach the CRT anyway, and it made the
+    // shell file dialog render the Cyrillic Desktop as mojibake. The env re-publish + codecvt
+    // carry the fix on their own; every file open goes through fs::path (wide), not narrow fopen.
     {
         auto w2u8 = [](const wchar_t* w) -> std::string {
             if (!w) return {};
