@@ -138,8 +138,24 @@ copy_dll "zlib*.dll"         "no"
 copy_dll "libzstd*.dll"      "no"
 echo ""
 
+# ── FFmpeg CLI binaries ───────────────────────────────────────────────────────
+# The proxy converter shells out to ffmpeg/ffprobe (FSTPProxyConverter.cpp runs them
+# by bare name). Without these in the bundle a fresh machine with no ffmpeg on PATH
+# just stalls the proxy at 0%. They link the same libav* DLLs already bundled above.
+echo "8️⃣   FFmpeg CLI tools (proxy converter runs ffmpeg/ffprobe)..."
+for _tool in ffmpeg ffprobe; do
+    if [ -f "$MINGW_BIN/$_tool.exe" ]; then
+        cp "$MINGW_BIN/$_tool.exe" "$OUT_DIR/$_tool.exe"
+        echo "   🔧 $_tool.exe"
+    else
+        echo "❌  $_tool.exe not found in $MINGW_BIN — proxy conversion can't run on a bare machine"
+        MISSING_REQUIRED=1
+    fi
+done
+echo ""
+
 # ── Also copy the exe itself into the bundle dir ──────────────────────────────
-echo "8️⃣   Copying TapeXPlayer.exe..."
+echo "9️⃣   Copying TapeXPlayer.exe..."
 cp "$EXE_PATH" "$OUT_DIR/TapeXPlayer.exe"
 echo "   📄 TapeXPlayer.exe"
 echo ""
@@ -176,26 +192,29 @@ _is_system_dll() {
     return 1
 }
 
-echo "9️⃣   Resolving transitive DLL dependencies..."
+echo "🔟   Resolving transitive DLL dependencies..."
 if command -v ldd &>/dev/null; then
     # ldd uses the Windows loader — resolves ALL transitive deps in one shot,
     # much faster than walking objdump output recursively on MSYS2.
+    # Walk the app AND the ffmpeg/ffprobe binaries so their extra codec/filter
+    # DLLs get pulled in too (most overlap with the app's libav* deps already).
     LDD_ADDED=0
-    while IFS= read -r dll_path; do
-        [ -z "$dll_path" ] || [ ! -f "$dll_path" ] && continue
-        dll_name=$(basename "$dll_path")
-        _is_system_dll "$dll_name" && continue
-        if [ ! -f "$OUT_DIR/$dll_name" ]; then
-            cp "$dll_path" "$OUT_DIR/$dll_name"
-            echo "   + transitive: $dll_name"
-            LDD_ADDED=$((LDD_ADDED + 1))
-        fi
-    # Use the original exe (not the copy in OUT_DIR) so ldd searches
-    # MINGW_BIN via PATH rather than the already-populated bundle dir.
-    done < <(ldd "$EXE_PATH" 2>/dev/null \
-             | awk '$3 ~ /\// {print $3}' \
-             | grep -i "mingw" \
-             | sort -u)
+    for _bin in "$EXE_PATH" "$OUT_DIR/ffmpeg.exe" "$OUT_DIR/ffprobe.exe"; do
+        [ -f "$_bin" ] || continue
+        while IFS= read -r dll_path; do
+            [ -z "$dll_path" ] || [ ! -f "$dll_path" ] && continue
+            dll_name=$(basename "$dll_path")
+            _is_system_dll "$dll_name" && continue
+            if [ ! -f "$OUT_DIR/$dll_name" ]; then
+                cp "$dll_path" "$OUT_DIR/$dll_name"
+                echo "   + transitive: $dll_name"
+                LDD_ADDED=$((LDD_ADDED + 1))
+            fi
+        done < <(ldd "$_bin" 2>/dev/null \
+                 | awk '$3 ~ /\// {print $3}' \
+                 | grep -i "mingw" \
+                 | sort -u)
+    done
     echo "   Added $LDD_ADDED additional DLLs via ldd"
 elif command -v objdump &>/dev/null; then
     # Fallback: single objdump pass (no recursion, no find-per-dep)
