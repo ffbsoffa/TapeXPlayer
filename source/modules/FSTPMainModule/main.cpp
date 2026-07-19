@@ -85,7 +85,13 @@ int main(int argc, char* argv[]) {
             if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
             return s;
         };
-        const wchar_t* vars[] = { L"LOCALAPPDATA", L"APPDATA", L"USERPROFILE", L"TEMP", L"TMP", L"HOMEPATH", L"HOME" };
+        // Only the vars OUR code reads for paths: getCachePath uses %LOCALAPPDATA%/%TEMP%;
+        // settings / recent / resume / memory-locations use %APPDATA%. Deliberately NOT
+        // %USERPROFILE% / %HOMEPATH% / %HOME% — the Windows shell file dialog reads %USERPROFILE%
+        // for its default location, and re-publishing it as UTF-8 made the dialog render the
+        // Cyrillic profile as mojibake ("C:\Users\РњР°РєСЃРёРј\Desktop"). --log reads USERPROFILE
+        // wide instead (below), so nothing of ours depends on it being re-published.
+        const wchar_t* vars[] = { L"LOCALAPPDATA", L"APPDATA", L"TEMP", L"TMP" };
         for (const wchar_t* name : vars) {
             if (const wchar_t* wv = _wgetenv(name)) {
                 char nameA[64];
@@ -177,30 +183,26 @@ int main(int argc, char* argv[]) {
     // freopen so it also captures C-runtime / ffmpeg / SDL output, not just std::cout.
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--log") == 0) {
-            std::string desktop;
+            std::string desktop;   // UTF-8 form, only for the "[LOG] Writing…" message below
             #ifdef _WIN32
-                // %USERPROFILE%\Desktop
-                if (const char* up = std::getenv("USERPROFILE"))
-                    desktop = std::string(up) + "\\Desktop\\TapeXPlayer_log.txt";
+                // Read USERPROFILE WIDE (we no longer re-publish it as UTF-8 — see the var list
+                // above), build the path in wide and open it with _wfreopen so a Cyrillic Desktop
+                // (C:\Users\Максим\Desktop) works.
+                std::wstring wdesktop;
+                if (const wchar_t* up = _wgetenv(L"USERPROFILE"))
+                    wdesktop = std::wstring(up) + L"\\Desktop\\TapeXPlayer_log.txt";
                 else
-                    desktop = "TapeXPlayer_log.txt";
+                    wdesktop = L"TapeXPlayer_log.txt";
+                int dn = WideCharToMultiByte(CP_UTF8, 0, wdesktop.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                if (dn > 0) { desktop.resize(dn - 1); WideCharToMultiByte(CP_UTF8, 0, wdesktop.c_str(), -1, &desktop[0], dn, nullptr, nullptr); }
+                _wfreopen(wdesktop.c_str(), L"w", stdout);
+                _wfreopen(wdesktop.c_str(), L"a", stderr);
             #else
                 // ~/Desktop on macOS and Linux
                 if (const char* home = std::getenv("HOME"))
                     desktop = std::string(home) + "/Desktop/TapeXPlayer_log.txt";
                 else
                     desktop = "TapeXPlayer_log.txt";
-            #endif
-
-            #ifdef _WIN32
-                // Widen the UTF-8 path first — a Cyrillic Desktop (C:\Users\Максим\Desktop)
-                // won't open through the narrow CRT, which reads the bytes as CP1251.
-                int wn = MultiByteToWideChar(CP_UTF8, 0, desktop.c_str(), -1, nullptr, 0);
-                std::wstring wdesktop(wn > 0 ? wn - 1 : 0, L'\0');
-                if (wn > 0) MultiByteToWideChar(CP_UTF8, 0, desktop.c_str(), -1, &wdesktop[0], wn);
-                _wfreopen(wdesktop.c_str(), L"w", stdout);
-                _wfreopen(wdesktop.c_str(), L"a", stderr);
-            #else
                 freopen(desktop.c_str(), "w", stdout);
                 freopen(desktop.c_str(), "a", stderr);
             #endif
