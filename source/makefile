@@ -436,7 +436,11 @@ update-buildinfo-windows:
 # raced object compilation and the link failed on the missing .o.)
 $(OBJDIR)/modules/FSTPMainModule/WSGUI/windows/FSTPAboutDialog.o: modules/FSTPMainModule/WSGUI/windows/BuildInfo.h
 
-$(RC_OBJECT): $(RC_SOURCE)
+# windres resolves the paths inside resources.rc ("../resources/TapeXPlayer.manifest", ".ico")
+# relative to the make CWD (source/), i.e. the REPO-ROOT resources/ dir — not the stale copy under
+# modules/.../WSGUI/resources/. List the manifest so editing it actually re-runs windres; the .rc
+# itself almost never changes, so without this a manifest edit silently keeps the old embedded one.
+$(RC_OBJECT): $(RC_SOURCE) ../resources/TapeXPlayer.manifest
 	@echo "[RC] $(notdir $(RC_SOURCE))"
 	@mkdir -p $(dir $(RC_OBJECT))
 	@$(WINDRES) -i $(RC_SOURCE) -o $(RC_OBJECT) --include-dir=$(dir $(RC_SOURCE))

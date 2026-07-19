@@ -27,7 +27,13 @@
   </trustInfo>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+      <!-- DPI-UNAWARE on purpose. The app doesn't scale its SDL window/content to the monitor DPI,
+           so PerMonitor/System awareness made the video window come up half-size on a >100%-scaled
+           display. Unaware lets Windows bitmap-scale the window to the correct physical size.
+           NOTE: this is the manifest that actually ships — windres resolves the resources.rc path
+           "../resources/TapeXPlayer.manifest" from the makefile's CWD (source/), i.e. THIS repo-root
+           file, not the stale copy under modules/.../WSGUI/resources/. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">false</dpiAware>
     </windowsSettings>
   </application>
 </assembly>
