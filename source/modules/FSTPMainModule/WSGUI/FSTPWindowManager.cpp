@@ -171,6 +171,7 @@ int InitWindowManager() {
         g_windows[i].last_rendered_frame = -1;
         g_windows[i].betacam_hold_frames = 0;
         g_windows[i].last_effect_speed = 0.0;
+        g_windows[i].was_pure_pause = false;
 
         // Deprecated fields for compatibility
         g_windows[i].video_texture = nullptr;
@@ -849,6 +850,18 @@ void RenderAllWindows() {
                 }
                 g_windows[i].last_frame_aligned = frame_aligned;
 
+                // Seed a short composite window when pure pause BEGINS. On Windows
+                // GetInstanceFrameAligned() often never latches, so the alignment-driven hold
+                // above never fires — the pause effect then re-composited every vblank and pinned
+                // a paused player near 16% CPU (and the recompute occasionally overran the vblank,
+                // the "slight hang" absent on Metal). These few frames let the tracking stripe lay
+                // down, after which pause_settled freezes the still.
+                if (is_pure_pause && !g_windows[i].was_pure_pause) {
+                    g_windows[i].betacam_hold_frames =
+                        std::max(g_windows[i].betacam_hold_frames, 8);
+                }
+                g_windows[i].was_pure_pause = is_pure_pause;
+
                 // Pass frame_aligned to betacam effect so it can render clean frame
                 playback_metrics.frame_aligned = frame_aligned;
                 g_pixel_buffer_manager->UpdatePlaybackMetrics(player_id, playback_metrics);
@@ -875,7 +888,18 @@ void RenderAllWindows() {
                     // During pure pause: force until IsFrameAligned fires, then hold 30 frames.
                     // Once frame_aligned and hold_frames == 0 — stripe gone, allow frame skip.
                     bool betacam_speed = (absPlaybackRate < 0.9 || absPlaybackRate > 1.1);
-                    bool pause_settled = is_pure_pause && frame_aligned && g_windows[i].betacam_hold_frames == 0;
+                    // Freeze a still pause: once pure pause has begun, its warm-up hold has
+                    // elapsed, and the source frame is unchanged, stop re-running the Betacam
+                    // effect every vblank. The stripe + grey-zone offset are generated once on
+                    // entering pause and don't animate, and the user wants a frozen field (no grain
+                    // shimmer on a still), so the cached composite is pixel-identical. Unlike the
+                    // old gate this does NOT need frame_aligned, which on Windows never latched —
+                    // that was why a paused player sat at ~16% CPU with a hitchy present. A frame
+                    // step delivers a new frame_number, so this drops false and re-composites at once.
+                    bool pause_settled = is_pure_pause &&
+                                         g_windows[i].betacam_hold_frames == 0 &&
+                                         g_windows[i].texture_buffer_valid[current_buf] &&
+                                         (pixel_buffer->frame_number == g_windows[i].last_rendered_frame);
                     if (betacam_speed && !pause_settled) {
                         need_update = true;
                     }
@@ -885,8 +909,9 @@ void RenderAllWindows() {
                         need_update = true;
                     }
                     // Film grain: re-apply every render frame so it shimmers at ~60fps (the
-                    // grain pass re-rolls each call). Settled-still pause already skipped above.
-                    if (grain_active) {
+                    // grain pass re-rolls each call). But a frozen pause is a still field — don't
+                    // let the grain re-roll keep the effect re-compositing (and thaw the freeze).
+                    if (grain_active && !pause_settled) {
                         need_update = true;
                     }
 

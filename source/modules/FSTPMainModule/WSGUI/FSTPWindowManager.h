@@ -43,6 +43,7 @@ typedef struct {
     double last_effect_speed;
     bool last_frame_aligned;         // Previous IsFrameAligned() state (for transition detection)
     uint64_t last_settled_render_ms; // Timestamp of last render in settled pause (for throttling)
+    bool was_pure_pause;             // Previous is_pure_pause state — seeds the pause-freeze warm-up
     
     // DEPRECATED fields - kept for compatibility but use new buffers
     SDL_Texture* video_texture;            // -> texture_buffer[current_buffer_index]
