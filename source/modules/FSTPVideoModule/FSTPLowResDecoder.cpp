@@ -758,20 +758,13 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
     std::atomic<bool> success{true};
 
     auto decodeSegment = [&](int threadId, int threadStartFrame, int threadEndFrame) {
-#if defined(__APPLE__) || defined(_WIN32)
-        // macOS + Windows: SOFTWARE-decode the small proxy. HW decode (VideoToolbox / D3D11VA) of a
-        // 720×540/540p frame is dominated by the HW→system-memory readback (av_hwframe_transfer_data,
-        // ~20–40ms/frame) plus, on macOS, the shared VT queue contending with the full-res 1080p V2
-        // decoder — versus ~4ms for a libavcodec software decode that lands straight in system memory.
-        // The on-demand shuttle model pays this cost on (nearly) every shown frame, so on a high-refresh
-        // panel the readback starves the decode and the picture stutters (Windows 165 Hz report). The
-        // proxy↔full-res handoff already recreates the texture, so the NV12→yuv420p change costs nothing.
+        // GPU for the original, CPU for the proxy — on ALL platforms (macOS / Windows / Linux).
+        // The proxy is small (540p); HW-decoding it (VideoToolbox / D3D11VA / VA-API) is dominated by
+        // the HW→system-memory readback (av_hwframe_transfer_data, ~20–40ms/frame) and contends with
+        // the full-res 1080p decoder on the same GPU, versus ~4ms for a libavcodec software decode that
+        // lands straight in system memory. So the original owns the GPU and the proxy stays on the CPU;
+        // this is what keeps the segment prefetch fast enough to feed the display without it decoding.
         bool useHardwareAccel = false;
-#else
-        // Linux / VA-API: keep HW for now (weak Intel Celeron / VA-API targets; readback issue unverified there).
-        bool useHardwareAccel = true;
-        if (isReverse) useHardwareAccel = true;
-#endif
         ThreadDecoderContext* ctx = getOrCreateThreadContext(threadId, useHardwareAccel);
 
         if (!ctx || !ctx->initialized) {
