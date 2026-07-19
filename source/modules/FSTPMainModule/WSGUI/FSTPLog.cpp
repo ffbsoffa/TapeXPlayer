@@ -603,7 +603,10 @@ bool SaveDiagnosticReport(const std::string& dest_path) {
     std::lock_guard<std::mutex> lk(g_mutex);
     std::error_code ec;
 
-    std::ofstream out(dest_path, std::ios::binary | std::ios::trunc);
+    // Route the chosen destination through fs::path (wide on Windows) — a Cyrillic save location
+    // (C:\Users\Максим\Desktop\...) can't be opened by the narrow ofstream, which reads the bytes
+    // as CP1251, so the export failed with a modal on non-ASCII profiles.
+    std::ofstream out(fs::path(dest_path), std::ios::binary | std::ios::trunc);
     if (!out) return false;
 
     // Export ONLY this session's log — everything the program has written from launch up to
