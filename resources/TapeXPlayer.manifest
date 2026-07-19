@@ -27,13 +27,16 @@
   </trustInfo>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <!-- DPI-UNAWARE on purpose. The app doesn't scale its SDL window/content to the monitor DPI,
-           so PerMonitor/System awareness made the video window come up half-size on a >100%-scaled
-           display. Unaware lets Windows bitmap-scale the window to the correct physical size.
-           NOTE: this is the manifest that actually ships — windres resolves the resources.rc path
-           "../resources/TapeXPlayer.manifest" from the makefile's CWD (source/), i.e. THIS repo-root
-           file, not the stale copy under modules/.../WSGUI/resources/. -->
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">false</dpiAware>
+      <!-- Process stays DPI-AWARE so the Win32 settings dialogs (which scale their own fonts/geometry
+           by the monitor DPI) render CRISP. The one thing that shouldn't be DPI-aware is the SDL
+           VIDEO window — it doesn't scale its content, so under awareness it came up half-size on a
+           scaled display. That single window is created in a DPI-UNAWARE thread context instead
+           (FSTP_PushWindowDpiUnaware in windows/FSTPWindowsWS.cpp), so Windows bitmap-scales JUST it
+           to the right physical size while everything else stays sharp (mixed-mode DPI).
+           NOTE: this is the manifest that actually ships — windres resolves resources.rc's
+           "../resources/TapeXPlayer.manifest" from the makefile CWD (source/) = THIS repo-root file,
+           not the stale copy under modules/.../WSGUI/resources/. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
     </windowsSettings>
   </application>
 </assembly>

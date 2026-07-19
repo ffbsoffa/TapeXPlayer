@@ -144,6 +144,34 @@ void AutoRenderFrame() {
     }
 }
 
+// --- Per-window DPI awareness (mixed-mode) ---
+// The process is DPI-aware (manifest) so the Win32 settings dialogs, which scale their own fonts and
+// geometry by the monitor DPI, stay CRISP. But the SDL VIDEO window doesn't scale its content, so on
+// a >100%-scaled display it came up half-size. Creating JUST that window in a DPI-UNAWARE thread
+// context makes Windows bitmap-scale it to the right physical size, leaving everything else sharp.
+// SetThreadDpiAwarenessContext is Win10 1803+; loaded dynamically so older Windows simply no-ops
+// (the window stays aware = small, same as before — a safe fallback, never a crash).
+// Called around SDL_CreateWindow from FSTPWindowManager.cpp (C++ linkage — matches its extern decl).
+static void* g_pfnSetThreadDpiAwarenessContext_probed() {
+    typedef HANDLE (WINAPI *PFN)(HANDLE);
+    static PFN pSet = reinterpret_cast<PFN>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext"));
+    return reinterpret_cast<void*>(pSet);
+}
+void* FSTP_PushWindowDpiUnaware() {
+    typedef HANDLE (WINAPI *PFN)(HANDLE);
+    PFN pSet = reinterpret_cast<PFN>(g_pfnSetThreadDpiAwarenessContext_probed());
+    if (!pSet) return nullptr;
+    // DPI_AWARENESS_CONTEXT_UNAWARE == (HANDLE)-1. Returns the previous context to restore.
+    return reinterpret_cast<void*>(pSet(reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-1))));
+}
+void FSTP_PopWindowDpiAware(void* prev) {
+    if (!prev) return;
+    typedef HANDLE (WINAPI *PFN)(HANDLE);
+    PFN pSet = reinterpret_cast<PFN>(g_pfnSetThreadDpiAwarenessContext_probed());
+    if (pSet) pSet(static_cast<HANDLE>(prev));
+}
+
 // Walk SDL's D3D11 renderer to the primary output's IDXGIOutput, for WaitForVBlank. Returns nullptr
 // if the renderer isn't D3D11 (SDL picked D3D9/OpenGL) or the chain can't be walked — the vblank
 // thread then falls back to a refresh-rate timer. All calls here are COM vtable calls / QueryInterface

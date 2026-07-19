@@ -231,6 +231,14 @@ void ShutdownWindowManager() {
     std::cout << "Window manager shutdown complete" << std::endl;
 }
 
+#ifdef _WIN32
+// Implemented in windows/FSTPWindowsWS.cpp. Switch the calling thread to a DPI-UNAWARE context for
+// the duration of the SDL video-window creation (so Windows scales that one window to the right
+// physical size while the process stays DPI-aware for crisp dialogs), then restore.
+extern void* FSTP_PushWindowDpiUnaware();
+extern void  FSTP_PopWindowDpiAware(void* prev);
+#endif
+
 int CreateNewWindow(const char* title, int width, int height) {
     if (!g_window_manager_initialized) {
         std::cerr << "Window manager not initialized" << std::endl;
@@ -265,7 +273,14 @@ int CreateNewWindow(const char* title, int width, int height) {
     // Prefer software rendering (hints already set globally)
     std::cout << "🖼️ [WINDOW MANAGER] Attempting to create software renderer..." << std::endl;
     
-    // Create SDL window without hardware acceleration
+    // Create SDL window without hardware acceleration.
+    // On Windows: create it in a DPI-UNAWARE thread context so Windows bitmap-scales JUST this video
+    // window to the right physical size on a scaled display, while the process stays DPI-aware for the
+    // crisp Win32 settings dialogs. FSTP_PushWindowDpiUnaware/Pop are implemented in FSTPWindowsWS.cpp
+    // and restore the previous context immediately after creation (pre-1803 Windows → no-op).
+#ifdef _WIN32
+    void* _dpi_prev_ctx = FSTP_PushWindowDpiUnaware();
+#endif
     SDL_Window* window = SDL_CreateWindow(
         title,
         SDL_WINDOWPOS_UNDEFINED,
@@ -273,6 +288,9 @@ int CreateNewWindow(const char* title, int width, int height) {
         width, height,
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
     );
+#ifdef _WIN32
+    FSTP_PopWindowDpiAware(_dpi_prev_ctx);
+#endif
 
     if (window == nullptr) {
         std::cerr << "Failed to create window: " << SDL_GetError() << std::endl;
