@@ -27,12 +27,9 @@
   </trustInfo>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <!-- Process stays DPI-AWARE so the Win32 settings dialogs (which scale their own fonts/geometry
-           by the monitor DPI) render CRISP. The one thing that shouldn't be DPI-aware is the SDL
-           VIDEO window — it doesn't scale its content, so under awareness it came up half-size on a
-           scaled display. That single window is created in a DPI-UNAWARE thread context instead
-           (FSTP_PushWindowDpiUnaware in windows/FSTPWindowsWS.cpp), so Windows bitmap-scales JUST it
-           to the right physical size while everything else stays sharp (mixed-mode DPI).
+      <!-- DPI-aware (system). Keeps the Win32 settings dialogs crisp; the video window renders at
+           real pixels (so it comes up small on a >100%-scaled display — a known trade-off, see the
+           HiDPI note; a proper fix would scale the SDL window size by the monitor DPI).
            NOTE: this is the manifest that actually ships — windres resolves resources.rc's
            "../resources/TapeXPlayer.manifest" from the makefile CWD (source/) = THIS repo-root file,
            not the stale copy under modules/.../WSGUI/resources/. -->
