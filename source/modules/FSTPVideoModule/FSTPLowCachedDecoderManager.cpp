@@ -294,6 +294,19 @@ void LowCachedDecoderManager::decodingLoop() {
         bool justLeftShuttle = (previousPlaybackRate_ >= 2.0 && currentRate < 2.0);
 
         if (segmentChanged || directionChanged) {
+            // GUARANTEE THE CURRENT FRAME FIRST. The 300-frame segment fill below takes time, and the
+            // segment-decoder restore REMOVED the display-side decodeFrameNow that used to supply the
+            // exact displayed frame — so on a seek/direction-reversal nothing put the current frame in
+            // the buffer until the segment decode reached it. Meanwhile the display held its last
+            // full-res frame (anti-flicker hold, FSTPVideoModule_wrapper.cpp) → a frozen field / frozen
+            // Betacam "snow" = the visible stutter at pause→play-after-seek and shuttle direction
+            // changes (owner-reported; confirmed by diag: full-res buffer emptied every jump, proxy
+            // segment not yet at the new position). Decode JUST the current frame now — GOP-aware,
+            // GOP=2 so ~1-2 frames, and decodeFrameNow no-ops if it's already present — on THIS manager
+            // thread (decode contexts 2/3, never the display thread, so it can't stall present). This
+            // restores the guarantee without the old display-thread block.
+            decodeFrameNow(currentFrame_.load());
+
             // SIMPLE SLIDING WINDOW APPROACH
             // Decode segments around current position regardless of direction
             // Window size: ±1 segment (total 3 segments: before, current, after) — but only the
