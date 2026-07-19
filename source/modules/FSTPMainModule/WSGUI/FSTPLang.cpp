@@ -4,6 +4,7 @@
 #include <string>
 #include <mutex>
 #include <fstream>
+#include <filesystem>
 #include <cstdlib>
 #include <cctype>
 
@@ -120,7 +121,7 @@ void FSTP_LangRegisterDefault(const char* key, const char* english) {
 
 bool FSTP_LangLoadPack(const char* path) {
     if (!path) return false;
-    std::ifstream f(path);
+    std::ifstream f{std::filesystem::path(path)};
     if (!f.is_open()) return false;
 
     std::lock_guard<std::mutex> lock(mutex());

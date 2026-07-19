@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <fstream>
+#include <filesystem>
 #include <cstring>
 #include <cstdlib>
 
@@ -45,7 +46,7 @@ void copyField(char* dst, size_t cap, const std::string& src) {
 
 // Parse a manifest.txt (key=value) into an Ext. Returns false if it lacks an id.
 bool parseManifest(const std::string& path, Ext& out) {
-    std::ifstream f(path);
+    std::ifstream f{std::filesystem::path(path)};
     if (!f.is_open()) return false;
     out = Ext{};
     out.enabled = true;

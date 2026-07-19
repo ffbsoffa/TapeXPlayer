@@ -89,7 +89,7 @@ void EnsureDefaults() {
 
 void LoadLocked() {
     EnsureDefaults();
-    std::ifstream f(ConfigPath());
+    std::ifstream f{std::filesystem::path(ConfigPath())};
     if (f.is_open()) {
         std::string line;
         while (std::getline(f, line)) {
@@ -245,7 +245,7 @@ int FSTP_KB_MacKeyToSDL(int mac, int uni) {
 void FSTP_KB_Save(void) {
     std::lock_guard<std::mutex> lk(g_mutex);
     EnsureLoaded();
-    std::ofstream f(ConfigPath(), std::ios::trunc);
+    std::ofstream f{std::filesystem::path(ConfigPath()), std::ios::trunc};
     if (!f.is_open()) return;
     f << "# TapeXPlayer key bindings (action_id keycode mods)\n";
     for (int i = 0; i < kActionCount; ++i) {

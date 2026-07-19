@@ -10,6 +10,7 @@
 #include <vector>
 #include <algorithm>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <cstdio>
 
@@ -72,7 +73,7 @@ std::string stripTags(const std::string& in) {
 
 std::vector<Cue> parseSRT(const std::string& path) {
     std::vector<Cue> cues;
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f{std::filesystem::path(path), std::ios::binary};
     if (!f.is_open()) return cues;
 
     std::string line;
@@ -156,7 +157,7 @@ std::string sidecarPath(const std::string& video) {
 }
 
 bool fileExists(const std::string& p) {
-    std::ifstream f(p);
+    std::ifstream f{std::filesystem::path(p)};
     return f.good();
 }
 

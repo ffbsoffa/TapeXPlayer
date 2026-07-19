@@ -65,7 +65,7 @@ void WriteProxyManifest(const fs::path& proxyPath, const std::string& source,
     long long mt = SourceMTimeSeconds(source, ec);
     if (ec) return;
 
-    std::ofstream f(ProxyManifestPath(proxyPath));
+    std::ofstream f{std::filesystem::path(ProxyManifestPath(proxyPath))};
     if (!f) return;
     // Bump this whenever the manifest format OR the proxy encoding profile changes, so every
     // cached proxy from an older profile is rebuilt:
@@ -86,7 +86,7 @@ void WriteProxyManifest(const fs::path& proxyPath, const std::string& source,
 // True only if the manifest exists, is current-schema, and matches the source's
 // current size + mtime. Any mismatch / missing file → false → regenerate.
 bool ValidateProxyManifest(const fs::path& proxyPath, const std::string& source) {
-    std::ifstream f(ProxyManifestPath(proxyPath));
+    std::ifstream f{std::filesystem::path(ProxyManifestPath(proxyPath))};
     if (!f) return false;
 
     std::map<std::string, std::string> kv;

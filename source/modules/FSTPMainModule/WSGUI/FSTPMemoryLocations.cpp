@@ -203,7 +203,7 @@ MemoryLocation* MemoryLocationsManager::GetPreviousLocation(double current_time)
 
 // Save to file
 bool MemoryLocationsManager::SaveToFile(const std::string& filepath) {
-    std::ofstream file(filepath);
+    std::ofstream file{fs::path(filepath)};
     if (!file.is_open()) {
         std::cerr << "Failed to save Memory Locations to " << filepath << std::endl;
         return false;
@@ -229,7 +229,7 @@ bool MemoryLocationsManager::SaveToFile(const std::string& filepath) {
 
 // Load from file
 bool MemoryLocationsManager::LoadFromFile(const std::string& filepath) {
-    std::ifstream file(filepath);
+    std::ifstream file{fs::path(filepath)};
     if (!file.is_open()) {
         std::cerr << "Failed to load Memory Locations from " << filepath << std::endl;
         return false;
@@ -270,7 +270,7 @@ bool MemoryLocationsManager::LoadFromFile(const std::string& filepath) {
 
 // Export to CSV for scientific analysis
 bool MemoryLocationsManager::ExportToCSV(const std::string& filepath) {
-    std::ofstream file(filepath);
+    std::ofstream file{fs::path(filepath)};
     if (!file.is_open()) {
         std::cerr << "Failed to export Memory Locations to CSV: " << filepath << std::endl;
         return false;

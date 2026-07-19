@@ -176,9 +176,13 @@ int main(int argc, char* argv[]) {
             #endif
 
             #ifdef _WIN32
-                FILE* lf = nullptr;
-                freopen_s(&lf, desktop.c_str(), "w", stdout);
-                freopen_s(&lf, desktop.c_str(), "a", stderr);
+                // Widen the UTF-8 path first — a Cyrillic Desktop (C:\Users\Максим\Desktop)
+                // won't open through the narrow CRT, which reads the bytes as CP1251.
+                int wn = MultiByteToWideChar(CP_UTF8, 0, desktop.c_str(), -1, nullptr, 0);
+                std::wstring wdesktop(wn > 0 ? wn - 1 : 0, L'\0');
+                if (wn > 0) MultiByteToWideChar(CP_UTF8, 0, desktop.c_str(), -1, &wdesktop[0], wn);
+                _wfreopen(wdesktop.c_str(), L"w", stdout);
+                _wfreopen(wdesktop.c_str(), L"a", stderr);
             #else
                 freopen(desktop.c_str(), "w", stdout);
                 freopen(desktop.c_str(), "a", stderr);

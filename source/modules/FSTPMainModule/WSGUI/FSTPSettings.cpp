@@ -149,7 +149,7 @@ int SaveSettings() {
         std::filesystem::create_directories(settings_dir, ec);
     }
 
-    std::ofstream file(g_settings_path);
+    std::ofstream file{std::filesystem::path(g_settings_path)};
     if (!file.is_open()) {
         std::cerr << "Failed to open settings file for writing: " << g_settings_path << std::endl;
         return -1;
@@ -214,7 +214,7 @@ int SaveSettings() {
 
 // Simple settings load (primitive parser)
 int LoadSettings() {
-    std::ifstream file(g_settings_path);
+    std::ifstream file{std::filesystem::path(g_settings_path)};
     if (!file.is_open()) {
         return -1; // File not found
     }
@@ -539,7 +539,7 @@ static std::unordered_map<std::string, double>& GetResumeCache() {
     static bool loaded = false;
     if (!loaded) {
         loaded = true;
-        std::ifstream f(GetResumeFilePath());
+        std::ifstream f{std::filesystem::path(GetResumeFilePath())};
         std::string line;
         while (std::getline(f, line)) {
             if (line.empty() || line[0] == '#') continue;
@@ -560,7 +560,7 @@ static void FlushResumeCache() {
         auto dir = std::filesystem::path(path).parent_path();
         if (!dir.empty()) std::filesystem::create_directories(dir, ec);
     }
-    std::ofstream f(path);
+    std::ofstream f{std::filesystem::path(path)};
     if (!f.is_open()) return;
     f << "# TapeXPlayer Resume Positions\n";
     constexpr size_t MAX_ENTRIES = 200;
@@ -620,7 +620,7 @@ static std::vector<std::string>& GetRecentList() {
     static bool loaded = false;
     if (!loaded) {
         loaded = true;
-        std::ifstream f(GetRecentFilePath());
+        std::ifstream f{std::filesystem::path(GetRecentFilePath())};
         std::string line;
         while (std::getline(f, line)) {
             if (line.empty() || line[0] == '#') continue;
@@ -640,7 +640,7 @@ static void FlushRecentList() {
         auto dir = std::filesystem::path(path).parent_path();
         if (!dir.empty()) std::filesystem::create_directories(dir, ec);
     }
-    std::ofstream f(path);
+    std::ofstream f{std::filesystem::path(path)};
     if (!f.is_open()) return;
     f << "# TapeXPlayer Recent Files (most recent first)\n";
     auto& list = GetRecentList();

@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <sstream>
 #include <fstream>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -291,7 +292,7 @@ static std::string BuildCommand(const ProxyConverter::Params& p,
 static bool WriteConcatList(const fs::path& listPath,
                             const std::vector<fs::path>& segments)
 {
-    std::ofstream f(listPath);
+    std::ofstream f{std::filesystem::path(listPath)};
     if (!f) return false;
     for (const auto& seg : segments) {
         f << "file '" << seg.string() << "'\n";
