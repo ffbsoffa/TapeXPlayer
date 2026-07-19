@@ -34,13 +34,6 @@ extern "C" {
 // Global counter of skipped texture updates (for adaptive FPS)
 std::atomic<int> g_texture_skip_counter{0};
 
-// Bumped on every SDL_RenderPresent inside RenderAllWindows. The Windows render thread watches it:
-// a pass that presents NOTHING (a settled pause skips Present) never blocks on VSync, so without
-// this the thread would spin the render loop at ~400k iterations/sec — measured ~17% CPU / fans on
-// a paused player. Non-static so windows/FSTPWindowsWS.cpp can extern it. Harmless on mac/Linux
-// (their render threads pace differently and never read it).
-std::atomic<uint64_t> g_render_present_count{0};
-
 // Debug control: set to true to enable verbose logging
 static constexpr bool ENABLE_WINDOW_MANAGER_DEBUG = false;
 
@@ -75,6 +68,23 @@ static SDL_Rect ComputeAspectFitRect(int texture_width, int texture_height, int 
 }
 
 static SDL_Renderer* CreateRendererWithVSync(SDL_Window* window, int index, Uint32 flags) {
+#ifdef _WIN32
+    // On Windows the render thread is paced by a dedicated DXGI vblank thread (FSTPWindowsWS.cpp),
+    // which wakes it once per vertical retrace — the macOS CVDisplayLink model. The present must
+    // therefore be IMMEDIATE: a blocking VSync present would double-pace (vblank CV + present block)
+    // and, worse, block the render thread inside present instead of letting it sleep on the CV,
+    // re-introducing the exact stall/starvation the vblank model removes. So drop PRESENTVSYNC.
+    flags &= ~SDL_RENDERER_PRESENTVSYNC;
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, index, flags);
+#if SDL_VERSION_ATLEAST(2,0,18)
+    if (renderer) {
+        SDL_RenderSetVSync(renderer, 0);
+    }
+#endif
+    return renderer;
+#else
+    // macOS/Linux keep VSync on the present (mac additionally paces via CVDisplayLink; Metal's
+    // present doesn't hard-block the CPU the way D3D11's does, so there's no double-pace stall).
 #if !SDL_VERSION_ATLEAST(2,0,18)
     SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");
 #endif
@@ -85,6 +95,7 @@ static SDL_Renderer* CreateRendererWithVSync(SDL_Window* window, int index, Uint
     }
 #endif
     return renderer;
+#endif
 }
 
 // Global array of windows
@@ -1102,7 +1113,6 @@ void RenderAllWindows() {
             // Race condition: window might start closing between loop check and here
             if (!g_windows[i].is_closing && g_windows[i].is_active) {
                 SDL_RenderPresent(renderer);
-                g_render_present_count.fetch_add(1, std::memory_order_relaxed);
             }
 
             auto t_after_present = std::chrono::high_resolution_clock::now();
@@ -1141,7 +1151,6 @@ void RenderAllWindows() {
                 SDL_SetRenderDrawColor(g_presentation.renderer, 0, 0, 0, 255);
                 SDL_RenderClear(g_presentation.renderer);
                 SDL_RenderPresent(g_presentation.renderer);
-                g_render_present_count.fetch_add(1, std::memory_order_relaxed);
             }
             g_presentation.active           = false;
             g_presentation.linked_player_id = -1;
@@ -1154,7 +1163,6 @@ void RenderAllWindows() {
                 SDL_SetRenderDrawColor(g_presentation.renderer, 0, 0, 0, 255);
                 SDL_RenderClear(g_presentation.renderer);
                 SDL_RenderPresent(g_presentation.renderer);
-                g_render_present_count.fetch_add(1, std::memory_order_relaxed);
             } else {
                 SDL_Renderer* renderer = g_presentation.renderer;
                 AVFrame* f = pb->av_frame.get();
@@ -1299,7 +1307,6 @@ void RenderAllWindows() {
                         SDL_RenderCopy(renderer, tex, nullptr, &dst);
 
                     SDL_RenderPresent(renderer);
-                    g_render_present_count.fetch_add(1, std::memory_order_relaxed);
                     g_presentation.last_timestamp = pb->timestamp;
                 }
             }

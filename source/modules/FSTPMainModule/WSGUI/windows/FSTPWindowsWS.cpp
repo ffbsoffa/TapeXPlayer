@@ -2,7 +2,10 @@
 
 #include <SDL.h>
 #include <SDL_syswm.h>
+#include <SDL_system.h>       // SDL_RenderGetD3D11Device — for the DXGI vblank source
 #include <windows.h>
+#include <d3d11.h>            // ID3D11Device (returned by SDL_RenderGetD3D11Device)
+#include <dxgi.h>             // IDXGIDevice/Adapter/Output — WaitForVBlank (COM vtable, no extra link)
 #include <mmsystem.h>
 #include <commdlg.h>
 #include <shlobj.h>
@@ -12,6 +15,8 @@
 #include <cmath>
 #include <atomic>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <iostream>
 #include <vector>
@@ -52,10 +57,20 @@ static std::atomic<bool> g_renderingActive{false};
 // access is serialised against window create/close by g_render_mutex inside FSTPWindowManager.
 static std::thread g_renderThread;
 static std::atomic<bool> g_renderThreadRunning{false};
-// Defined in FSTPWindowManager.cpp — bumped on each SDL_RenderPresent inside RenderAllWindows. The
-// render loop below watches it to tell a real (VSync-blocking) present from a pass that presented
-// nothing (a settled pause), so it can sleep instead of spinning.
-extern std::atomic<uint64_t> g_render_present_count;
+
+// --- VSync source, mirroring macOS's CVDisplayLink (FSTPDarwinWS.mm) ---
+// A dedicated thread blocks on the primary output's vertical retrace (DXGI WaitForVBlank) and
+// signals g_vsyncCV once per vblank; the render thread SLEEPS on that CV and renders exactly ONE
+// frame per signal. This replaces the old "spin the loop, let SDL_RenderPresent's VSync block pace
+// it" design. Consequences: the render thread is idle between vblanks (like macOS), so it no longer
+// needs THREAD_PRIORITY_TIME_CRITICAL — which on Windows is near-realtime and starved the
+// event/input thread during shuttle ("иногда управление не реагирует") — and it can't spin on a
+// settled pause (which is why the old design pinned ~17% CPU there and needed a sleep band-aid).
+static std::mutex g_vsyncMutex;
+static std::condition_variable g_vsyncCV;
+static std::atomic<bool> g_vsyncSignal{false};
+static std::thread g_vblankThread;
+static std::atomic<bool> g_vblankThreadRunning{false};
 // Set while the window is in a live move/resize loop (WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE). D3D11 is
 // far less forgiving than Metal about presenting during a swapchain resize, so the render thread
 // pauses while this is true.
@@ -129,58 +144,120 @@ void AutoRenderFrame() {
     }
 }
 
-// Start the dedicated render thread. VSync is enabled, so SDL_RenderPresent inside AutoRenderFrame
-// blocks on this thread until the next vblank — pacing us to the display refresh WITHOUT stalling
-// the event loop. Renderer/window lifetime is serialised via g_render_mutex in the window manager,
-// so create/close on the event thread cannot race this thread's rendering.
+// Walk SDL's D3D11 renderer to the primary output's IDXGIOutput, for WaitForVBlank. Returns nullptr
+// if the renderer isn't D3D11 (SDL picked D3D9/OpenGL) or the chain can't be walked — the vblank
+// thread then falls back to a refresh-rate timer. All calls here are COM vtable calls / QueryInterface
+// (no dxgi/d3d11 import library needed; only the headers).
+static IDXGIOutput* AcquirePrimaryDXGIOutput() {
+    SDL_Renderer* r = GetWindowRenderer(0);
+    if (!r) return nullptr;
+    ID3D11Device* dev = SDL_RenderGetD3D11Device(r);  // AddRef'd, or null if the renderer isn't D3D11
+    if (!dev) return nullptr;
+
+    // Define the IID locally, exactly like FSTPHardwareDetection.cpp does — this MinGW toolchain's
+    // __uuidof is unreliable and named IID_* GUIDs would drag in a -ldxguid link dependency.
+    // IDXGIDevice = {54ec77fa-1377-44e6-8c32-88fd5f44c84c}
+    static const GUID kIID_IDXGIDevice =
+        { 0x54ec77fa, 0x1377, 0x44e6, { 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c } };
+
+    IDXGIOutput* output = nullptr;
+    IDXGIDevice* dxgiDev = nullptr;
+    if (SUCCEEDED(dev->QueryInterface(kIID_IDXGIDevice, reinterpret_cast<void**>(&dxgiDev))) && dxgiDev) {
+        IDXGIAdapter* adapter = nullptr;
+        if (SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter) {
+            adapter->EnumOutputs(0, &output);  // output 0 = primary (matches macOS's CGMainDisplayID)
+            adapter->Release();
+        }
+        dxgiDev->Release();
+    }
+    dev->Release();  // SDL_RenderGetD3D11Device AddRef'd it for us
+    return output;
+}
+
+// Start the vblank source + the dedicated render thread. The render thread now SLEEPS on g_vsyncCV
+// and renders one frame per vblank signal (mirrors macOS's CVDisplayLink model) — VSync pacing is
+// the vblank thread's job, NOT a blocking SDL_RenderPresent, so the renderer is created WITHOUT
+// PRESENTVSYNC (see FSTPWindowManager.cpp). Renderer/window lifetime is serialised via g_render_mutex
+// in the window manager, so create/close on the event thread cannot race this thread's rendering.
 void StartAutonomousRendering() {
     if (g_renderThreadRunning.load()) return;
     g_renderingActive = true;
     g_renderThreadRunning = true;
+    g_vblankThreadRunning = true;
+
+    // VSync source: block on the primary output's vertical retrace and pulse the CV once per vblank.
+    g_vblankThread = std::thread([]() {
+        IDXGIOutput* output = AcquirePrimaryDXGIOutput();
+        // Fallback period if WaitForVBlank isn't available (non-D3D11 renderer, or the output is lost
+        // on a mode change) — the current display refresh, so we still pace near vblank and never spin.
+        DEVMODE dm{}; dm.dmSize = sizeof(dm);
+        int hz = (EnumDisplaySettings(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+                 ? static_cast<int>(dm.dmDisplayFrequency) : 60;
+        auto fallback_period = std::chrono::microseconds(1000000 / hz);
+        std::cout << "[VBLANK] source=" << (output ? "DXGI WaitForVBlank" : "timer")
+                  << ", fallback " << hz << " Hz" << std::endl;
+
+        while (g_vblankThreadRunning.load()) {
+            if (output) {
+                if (FAILED(output->WaitForVBlank())) {
+                    std::this_thread::sleep_for(fallback_period);  // output lost — pace, don't spin
+                }
+            } else {
+                std::this_thread::sleep_for(fallback_period);
+            }
+            g_vsyncSignal.store(true);
+            g_vsyncCV.notify_one();
+        }
+        if (output) output->Release();
+        std::cout << "[VBLANK] vblank thread stopped" << std::endl;
+    });
 
     g_renderThread = std::thread([]() {
-        // Raise the render thread's priority so the OS scheduler doesn't let other
-        // threads preempt it between vblanks. macOS runs this thread at
-        // QOS_CLASS_USER_INTERACTIVE (FSTPDarwinWS.mm) for <0.5ms jitter; on Windows
-        // the plain std::thread ran at NORMAL priority, so during mouse-shuttle the
-        // frame that reflects the new scrub position could be delayed behind other
-        // work — the UI lagged the cursor. TIME_CRITICAL matches macOS's intent
-        // (kernel32 only, no extra link deps like avrt/MMCSS).
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        // macOS runs this at QOS_CLASS_USER_INTERACTIVE (a hint the scheduler may still park). HIGHEST
+        // is the closest Windows analog that still lets the NORMAL-priority event/input thread run.
+        // TIME_CRITICAL (the old value) is near-realtime and starved input during shuttle; it's also
+        // no longer needed now the thread sleeps on the CV between vblanks instead of spinning.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
-        std::cout << "[RENDER THREAD] Windows render thread started (VSync-paced, TIME_CRITICAL)" << std::endl;
+        std::cout << "[RENDER THREAD] Windows render thread started (vblank-driven, HIGHEST)" << std::endl;
         while (g_renderThreadRunning.load()) {
+            // Sleep until the vblank thread signals the next vertical retrace — mirrors macOS's
+            // g_vsyncCV.wait on the CVDisplayLink callback. Idle (no CPU) between vblanks.
+            {
+                std::unique_lock<std::mutex> lock(g_vsyncMutex);
+                g_vsyncCV.wait(lock, []{ return g_vsyncSignal.load() || !g_renderThreadRunning.load(); });
+                if (!g_renderThreadRunning.load()) break;
+                g_vsyncSignal.store(false);
+            }
+
             // Pause presenting during a live window move/resize — D3D11 swapchain resize and a
-            // concurrent Present don't mix. The event thread drives the resize; we idle briefly.
-            // Publish g_renderPausedAck so the resize-enter handler knows we're parked OUTSIDE
-            // SDL_RenderPresent before it lets the swapchain resize begin.
+            // concurrent Present don't mix. The event thread drives the resize; we park (re-checking
+            // each vblank) and publish g_renderPausedAck so the resize-enter handler knows we're
+            // OUTSIDE SDL_RenderPresent before it lets the swapchain resize begin.
             if (g_isLiveResizing.load()) {
                 g_renderPausedAck.store(true);
-                std::this_thread::sleep_for(std::chrono::milliseconds(4));
                 continue;
             }
             g_renderPausedAck.store(false);
-            // AutoRenderFrame → RenderAllWindows takes g_render_mutex and (with VSync on) blocks in
-            // SDL_RenderPresent until vblank, so this loop self-paces to the refresh rate — BUT only
-            // when it actually presents. On a settled pause every window is throttle-skipped, no
-            // Present runs, nothing blocks on VSync, and this loop would spin at ~400k iterations/sec
-            // (measured ~17% CPU on a paused player, fans on). Detect a pass that presented nothing
-            // via the present counter and sleep instead. A real frame change presents next pass and
-            // cancels the sleep; 5 ms ≈ 200 Hz worst case, far above any pause-time redraw need.
-            uint64_t presents_before = g_render_present_count.load(std::memory_order_relaxed);
+
+            // Present is immediate now (no PRESENTVSYNC), so this returns promptly and the thread goes
+            // straight back to sleeping on the CV — no spin, even on a settled pause (which just skips
+            // the present internally).
             AutoRenderFrame();
-            if (g_render_present_count.load(std::memory_order_relaxed) == presents_before) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            }
         }
         std::cout << "[RENDER THREAD] Windows render thread stopped" << std::endl;
     });
 }
 
-// Stop the render thread and join it. MUST be called before tearing down windows / SDL so the
-// render thread is guaranteed not to touch the renderer during shutdown.
+// Stop the render + vblank threads and join them. MUST be called before tearing down windows / SDL
+// so neither thread touches the renderer during shutdown.
 void StopAutonomousRendering() {
     g_renderThreadRunning = false;
+    g_vblankThreadRunning = false;
+    g_vsyncCV.notify_all();  // wake the render thread so it sees the flag and exits
+    if (g_vblankThread.joinable()) {
+        g_vblankThread.join();  // WaitForVBlank returns within ~1 frame, then the loop checks the flag
+    }
     if (g_renderThread.joinable()) {
         g_renderThread.join();
         std::cout << "[RENDER THREAD] Windows render thread joined" << std::endl;
