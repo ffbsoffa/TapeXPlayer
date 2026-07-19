@@ -47,6 +47,7 @@
 #include <clocale>   // setlocale — force UTF-8 on Windows (Cyrillic user paths)
 #include <locale>    // std::locale::global
 #include <codecvt>   // std::codecvt_utf8 — UTF-8 facet for std::filesystem on Windows
+#include <exception> // std::set_terminate — log an uncaught throw instead of dying silently
 #include "main.h"
 #include "../FSTPPlayerModule/FSTPPlayerManager.h"
 #include "../FSTPVideoModule/FSTPHardwareDetection.h"
@@ -95,6 +96,20 @@ int main(int argc, char* argv[]) {
     try {
         std::locale::global(std::locale(std::locale::classic(), new std::codecvt_utf8<wchar_t>));
     } catch (...) {}
+
+    // Last-resort net: if any path that isn't valid UTF-8 still reaches std::filesystem on a
+    // thread that doesn't catch it, libstdc++ throws and std::terminate kills us with no clue.
+    // Log the exception's message first (captured by --log) so the site is at least identifiable.
+    std::set_terminate([] {
+        std::cerr << "[FATAL] std::terminate";
+        if (std::exception_ptr e = std::current_exception()) {
+            try { std::rethrow_exception(e); }
+            catch (const std::exception& ex) { std::cerr << " — uncaught: " << ex.what(); }
+            catch (...)                       { std::cerr << " — uncaught non-std exception"; }
+        }
+        std::cerr << std::endl;
+        std::abort();
+    });
     #endif
 
     #ifndef _WIN32

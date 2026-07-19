@@ -115,8 +115,19 @@ void FSTPVideoModuleWrapper::Shutdown() {
 }
 
 FSTPVideoModuleWrapper::ProxyState FSTPVideoModuleWrapper::ProbeProxy(const std::string& filepath) {
-    fs::path sourcePath(filepath);
-    if (!fs::exists(sourcePath)) {
+    // A path an older build left in the legacy code page (a stale Cyrillic recent.ini entry,
+    // say) is not valid UTF-8. Building an fs::path from it throws "illegal byte sequence" —
+    // and this runs on a detached proxy thread, so the throw would std::terminate the app.
+    // Fail the load instead.
+    fs::path sourcePath;
+    try {
+        sourcePath = fs::path(filepath);
+    } catch (const std::exception&) {
+        std::cerr << "[VIDEO] Source path is not valid UTF-8, cannot load: " << filepath << std::endl;
+        return ProxyState::Error;
+    }
+    std::error_code ec;
+    if (!fs::exists(sourcePath, ec) || ec) {
         std::cerr << "[VIDEO] Source file does not exist: " << filepath << std::endl;
         return ProxyState::Error;
     }
