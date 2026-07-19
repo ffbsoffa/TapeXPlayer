@@ -274,17 +274,11 @@ void LowCachedDecoderManager::decodingLoop() {
             continue;
         }
 
-        // STAGE 2: across the WHOLE shuttle range (≥2× — same point where full-res hands off to
-        // the proxy) the display decodes exactly the shown frame on demand (decodeFrameNow), so
-        // skip segment PREFETCH here. Threshold matches the on-demand gate in DisplayFrame so there
-        // is only ONE seam, and it coincides with the existing full-res↔proxy handoff at 2× — no
-        // separate mid-shuttle (was 12×) seam that froze on deceleration. We don't unload here;
-        // the manager resumes full prefetch + cleanup once speed drops below 2×.
-        if (currentRate >= 2.0) {
-            previousPlaybackRate_ = currentRate;
-            previousIsReverse_ = isReverse_.load();
-            continue;
-        }
+        // Restore the segment decoder: the ≥2× skip that idled the manager during shuttle and
+        // pushed synchronous decodeFrameNow onto the display thread is REMOVED. The manager now
+        // segment-prefetches at ALL speeds (as it did pre-"mega commit"/build1563). With the light
+        // CPU proxy (540p) it keeps up, so the display no longer decodes — it only reads. Improves
+        // shuttle dynamics + input responsiveness on slower HW (verified better on macOS).
 
         int currentSegment = current / segmentSize_;
         int numSegmentsTotal = (frameIndex_.size() + segmentSize_ - 1) / segmentSize_;

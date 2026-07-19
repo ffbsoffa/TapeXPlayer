@@ -1447,21 +1447,10 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     // "one frame, then a closer one". The "already decoded" peek makes steady-state nearly free
     // (the manager's prefetch usually already filled the slot below 2×); on-demand only fills the
     // gaps after a seek. Decode contexts 2/3 keep it off the manager's 0/1 and full-res's own.
-    if (proxy_mgr && m_decoders_active.load()) {
-        proxy_mgr->decodeFrameNow(clamped);
-
-        // Betacam SLOW-MO compositing reads the N-1 and N+1 NEIGHBOURS, so when the proxy is the
-        // base right after a shuttle seek those neighbour slots must be present too (otherwise the
-        // adjacent read picks up a stale slot → N+1 spike). But this only matters in SLOW MOTION
-        // (<0.9×) — at 1× there is no compositing, so the triplet there was pure wasted work that
-        // tripled the on-demand decode and stalled the display thread (~50ms blocks at 1×). Gate it
-        // to slow-mo only.
-        double sp_now = m_audio_module ? std::abs(m_audio_module->GetActualSpeed()) : 0.0;
-        if (sp_now < 0.9) {
-            proxy_mgr->decodeFrameNow(clamped - 1);  // bounds-checked + no-op if decoded
-            proxy_mgr->decodeFrameNow(clamped + 1);
-        }
-    }
+    // Restore the segment decoder: the on-demand decodeFrameNow that ran ON THE DISPLAY THREAD is
+    // REMOVED. The manager now segment-prefetches at all speeds (skip removed), so the present just
+    // READS whatever the manager decoded — the display no longer decodes at all.
+    (void)proxy_mgr;
 
     FSTP::FrameInfo& info = (*frame_vector)[actual_index];
     std::shared_ptr<AVFrame> frame;
