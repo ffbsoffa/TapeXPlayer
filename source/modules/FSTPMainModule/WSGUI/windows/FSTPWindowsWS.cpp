@@ -52,6 +52,10 @@ static std::atomic<bool> g_renderingActive{false};
 // access is serialised against window create/close by g_render_mutex inside FSTPWindowManager.
 static std::thread g_renderThread;
 static std::atomic<bool> g_renderThreadRunning{false};
+// Defined in FSTPWindowManager.cpp — bumped on each SDL_RenderPresent inside RenderAllWindows. The
+// render loop below watches it to tell a real (VSync-blocking) present from a pass that presented
+// nothing (a settled pause), so it can sleep instead of spinning.
+extern std::atomic<uint64_t> g_render_present_count;
 // Set while the window is in a live move/resize loop (WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE). D3D11 is
 // far less forgiving than Metal about presenting during a swapchain resize, so the render thread
 // pauses while this is true.
@@ -157,8 +161,17 @@ void StartAutonomousRendering() {
             }
             g_renderPausedAck.store(false);
             // AutoRenderFrame → RenderAllWindows takes g_render_mutex and (with VSync on) blocks in
-            // SDL_RenderPresent until vblank, so this loop self-paces to the refresh rate.
+            // SDL_RenderPresent until vblank, so this loop self-paces to the refresh rate — BUT only
+            // when it actually presents. On a settled pause every window is throttle-skipped, no
+            // Present runs, nothing blocks on VSync, and this loop would spin at ~400k iterations/sec
+            // (measured ~17% CPU on a paused player, fans on). Detect a pass that presented nothing
+            // via the present counter and sleep instead. A real frame change presents next pass and
+            // cancels the sleep; 5 ms ≈ 200 Hz worst case, far above any pause-time redraw need.
+            uint64_t presents_before = g_render_present_count.load(std::memory_order_relaxed);
             AutoRenderFrame();
+            if (g_render_present_count.load(std::memory_order_relaxed) == presents_before) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
         }
         std::cout << "[RENDER THREAD] Windows render thread stopped" << std::endl;
     });
