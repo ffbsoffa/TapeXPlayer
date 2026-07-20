@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <memory>
+#include <thread>   // std::thread::hardware_concurrency — cross-platform core count
 
 // Platform detection
 #ifdef _WIN32
@@ -571,6 +572,18 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
     info.mac_model = "";
     info.mac_year = 0;
 
+    // Real core count for EVERY platform, set BEFORE the capability classification runs. Windows and
+    // Linux never populated it, so cpu_info_ kept a hardcoded default of 2 — which mislabelled every
+    // machine as a weak 2-core CPU (the MINIMUM screen) and starved the decode thread-count sizing, on
+    // ANY processor including recent high-core parts. hardware_concurrency() is logical cores:
+    // brand-free, correct for any part present or future (no lookup table to go stale), and enough for
+    // the coarse tiers. macOS refines it via sysctl below. (The HW-vs-software decode CHOICE is made
+    // from the GPU in DetermineDecoderProfile — this feeds honest reporting, thread sizing and tiers.)
+    if (unsigned hc = std::thread::hardware_concurrency()) {
+        info.logical_cores  = static_cast<int>(hc);
+        info.physical_cores = static_cast<int>(hc);
+    }
+
 #ifdef PLATFORM_LINUX
     // Detect architecture
     struct utsname uts;
@@ -631,9 +644,9 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
     // Detect power mode
     DetectCPUPowerMode(info);
 
-    // Determine the Intel generation from the brand string
-
-    // Apply CPU-specific optimizations
+    // Classify the CPU by capability (core count) — the brand-string generation parser that used to
+    // sit here was dead (it matched the literal "Core i", never present in a real CPUID string) and
+    // is gone; the decode plan no longer depends on it (see DetermineDecoderProfile).
     ApplyCPUSpecificOptimizations(info);
 #endif
 
@@ -661,11 +674,6 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
     size_t cpu_brand_size = sizeof(cpu_brand);
     sysctlbyname("machdep.cpu.brand_string", cpu_brand, &cpu_brand_size, nullptr, 0);
     info.model_name = std::string(cpu_brand);
-
-    // Determine the Intel generation from the brand string (cross-platform method)
-    // "Core i7-6920HQ" → gen 6 (Skylake), "Core i5-8259U" → gen 8 (Coffee Lake)
-    if (!info.is_apple_silicon) {
-    }
 
     // Get CPU vendor
     char cpu_vendor[256];
@@ -747,6 +755,19 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
                   << " AVX=" << (info.has_avx ? "✅" : "❌")
                   << " AVX2=" << (info.has_avx2 ? "✅" : "❌")
                   << " AVX512=" << (info.has_avx512 ? "✅" : "❌") << std::endl;
+    }
+#endif
+
+#ifdef PLATFORM_WINDOWS
+    // This module has no Windows CPU brand/feature probe (only the GPU side is implemented here; the
+    // CPU name is printed in the session-log hardware header). Report at least the capability tier
+    // from the now-real core count, so the CPU side of the plan is honest about new processors.
+    {
+        int c = info.physical_cores;
+        std::cout << "🖥️  [CPU] " << c << " logical cores — "
+                  << (c >= 6 ? "high-performance" : c <= 2 ? "minimum-class" : "standard")
+                  << " (decode plan is GPU-driven; the CPU serves the light proxy). Name in log header."
+                  << std::endl;
     }
 #endif
 
@@ -864,11 +885,24 @@ void FSTPHardwareDetection::ApplyCPUSpecificOptimizations(FSTPCPUInfo& info) {
         return;
     }
 
-    // ── High-performance CPUs (AVX-512) ──────────────────────────────────────
-    if (info.has_avx512) {
-        std::cout << "  ⚡ AVX-512 CPU detected: " << info.model_name << std::endl;
-        std::cout << "     Max speed: 32× (high-performance CPU)" << std::endl;
+    // ── High-performance CPUs — recognised by CORE COUNT, nothing else ───────────
+    // Deliberately NOT AVX-512: (a) the old gate was AVX-512-only, and modern Intel from Alder Lake
+    // on (Arrow Lake / Core Ultra and later) DROPPED it, so no recent high-end Intel was ever
+    // recognised; (b) AVX-512 on Intel is a crash minefield — fused off on Pentium/Celeron Tiger Lake
+    // (the 7505 MINIMUM device, where it crashed the app) and unsafe under P/E-core migration — which
+    // is exactly why has_avx512 and the AVX-512 SIMD paths are FORCE-DISABLED across this codebase
+    // (heap-corruption risk). Physical core count is a robust, brand-free capability signal that
+    // covers future parts without a lookup table. Anything reaching here already cleared the MINIMUM
+    // screens above, so a healthy multi-core part is a capable software-proxy decoder — full 32×.
+    if (info.physical_cores >= 6) {
+        std::cout << "  ⚡ High-performance CPU: " << info.model_name
+                  << " (" << info.physical_cores << " cores) → full 32× shuttle" << std::endl;
         info.recommended_max_speed = 32;
+    } else {
+        // Mid-range (e.g. a 4-core i5/i7): keep whatever the default/MINIMUM screens left. No brand
+        // guessing — the GPU decodes the original and the CPU only serves the light 540p proxy.
+        std::cout << "  ℹ️  CPU: " << info.model_name << " (" << info.physical_cores
+                  << " cores) — default decode plan, GPU handles the original" << std::endl;
     }
 }
 
