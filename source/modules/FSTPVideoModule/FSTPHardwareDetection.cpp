@@ -759,15 +759,58 @@ FSTPCPUInfo FSTPHardwareDetection::DetectCPU() {
 #endif
 
 #ifdef PLATFORM_WINDOWS
-    // This module has no Windows CPU brand/feature probe (only the GPU side is implemented here; the
-    // CPU name is printed in the session-log hardware header). Report at least the capability tier
-    // from the now-real core count, so the CPU side of the plan is honest about new processors.
+    // Windows CPU probe. The GPU side is detected above; fill the CPU side too so cpu_info_ carries
+    // the real processor instead of the "Unknown CPU" default — the honest report and the
+    // "---- system info ----" line then name it correctly. Same registry source as the session-log
+    // header: it carries the brand string verbatim on x86 and ARM, sidestepping the MSVC-vs-MinGW
+    // cpuid-name split.
     {
+        HKEY hk;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                0, KEY_READ, &hk) == ERROR_SUCCESS) {
+            wchar_t nameW[256]; DWORD nsz = sizeof(nameW), type = 0;
+            if (RegQueryValueExW(hk, L"ProcessorNameString", nullptr, &type,
+                    reinterpret_cast<LPBYTE>(nameW), &nsz) == ERROR_SUCCESS && type == REG_SZ) {
+                int wlen = (int)(nsz / sizeof(wchar_t));
+                while (wlen > 0 && nameW[wlen - 1] == L'\0') --wlen;   // drop trailing NULs
+                if (wlen > 0) {
+                    int len = WideCharToMultiByte(CP_UTF8, 0, nameW, wlen, nullptr, 0, nullptr, nullptr);
+                    std::string name(len, '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, nameW, wlen, &name[0], len, nullptr, nullptr);
+                    while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+                    if (!name.empty()) info.model_name = name;
+                }
+            }
+            RegCloseKey(hk);
+        }
+
+        // Vendor from the brand string (the registry name always leads with the maker).
+        if (info.model_name.find("Intel") != std::string::npos)      info.vendor = "Intel";
+        else if (info.model_name.find("AMD") != std::string::npos)   info.vendor = "AMD";
+
+        // Architecture of the running machine.
+        SYSTEM_INFO si{}; GetNativeSystemInfo(&si);
+        info.architecture = (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64) ? "arm64"
+                          : (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL) ? "x86"
+                          : "x86_64";
+
+        // SIMD is REPORTED ONLY (it never gates the decode plan — that reads the GPU). The GCC/MinGW
+        // builtins read CPUID without executing any wide instruction, so probing can't fault; this is
+        // just honest reporting, not the AVX-512 tier test that was deliberately removed.
+#if defined(__i386__) || defined(__x86_64__)
+        __builtin_cpu_init();
+        info.has_sse2   = __builtin_cpu_supports("sse2");
+        info.has_sse4_2 = __builtin_cpu_supports("sse4.2");
+        info.has_avx    = __builtin_cpu_supports("avx");
+        info.has_avx2   = __builtin_cpu_supports("avx2");
+        info.has_avx512 = __builtin_cpu_supports("avx512f");
+#endif
+
         int c = info.physical_cores;
-        std::cout << "🖥️  [CPU] " << c << " logical cores — "
+        std::cout << "🖥️  [CPU] " << info.model_name << " — " << c << " logical cores, "
                   << (c >= 6 ? "high-performance" : c <= 2 ? "minimum-class" : "standard")
-                  << " (decode plan is GPU-driven; the CPU serves the light proxy). Name in log header."
-                  << std::endl;
+                  << " (decode plan is GPU-driven; the CPU serves the light proxy)." << std::endl;
     }
 #endif
 
