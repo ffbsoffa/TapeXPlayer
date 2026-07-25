@@ -34,62 +34,78 @@ jobs:
       - name: Install Rosetta (needed to run the x86_64 Homebrew)
         run: sudo softwareupdate --install-rosetta --agree-to-license
 
+      # NOTE: sdl2 / sdl2_ttf are deliberately NOT installed from Homebrew — its `sdl2`
+      # is now an alias of `sdl2-compat` (an SDL3 shim); we build real SDL2 from source
+      # in the next step. freetype is here for the from-source SDL2_ttf. ffmpeg still
+      # pulls sdl2-compat as its own dep, but we overwrite libSDL2 with the real one and
+      # ffmpeg's libav* don't link SDL, so that is harmless.
       - name: Install arm64 dependencies (/opt/homebrew)
-        run: brew install sdl2 sdl2_ttf portaudio ffmpeg openssl@3 rtmidi
+        run: brew install portaudio ffmpeg openssl@3 rtmidi freetype
 
       - name: Install x86_64 Homebrew + dependencies (/usr/local)
         run: |
           arch -x86_64 /bin/bash -c \
             'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-          arch -x86_64 /usr/local/bin/brew install sdl2 sdl2_ttf portaudio ffmpeg openssl@3 rtmidi
+          arch -x86_64 /usr/local/bin/brew install portaudio ffmpeg openssl@3 rtmidi freetype
 
-      # Guard: the code is pure SDL2. Homebrew has been migrating sdl2_ttf/ffmpeg
-      # to link against SDL3, which then leaks into the bundle via bundle_libs.sh
-      # and makes the shipped .app crash at launch ("SDL3 not found"). Fail fast
-      # HERE — at install time — if any dylib that will be bundled references
-      # libSDL3, instead of letting a broken universal binary reach users.
-      - name: Guard against SDL3 contamination (both arches)
+      # Homebrew renamed `sdl2` to an alias of `sdl2-compat` — an SDL2-ABI shim that
+      # dlopen()s SDL3 at RUNTIME. It carries NO load-time libSDL3 reference, so the old
+      # otool guard passed while the shipped .app crashed on any Mac without SDL3 present.
+      # Real SDL2 is gone from Homebrew core, so build it (and SDL2_ttf) from the libsdl-org
+      # SDL2 maintenance branch and install into BOTH Homebrew prefixes, OVERWRITING the
+      # compat libs. The makefile finds SDL via -I$PREFIX/include / -L$PREFIX/lib -lSDL2
+      # -lSDL2_ttf (SDL_PATH = HOMEBREW_PATH), so no makefile change is needed. This runs
+      # AFTER the brew installs so our real SDL2 wins over ffmpeg's sdl2-compat dep.
+      - name: Build real SDL2 + SDL2_ttf from source (both arches)
         run: |
           set -euo pipefail
-          fail=0
-          check() {           # $1 = human label, $2 = glob of dylibs to inspect
-            local label="$1"; shift
-            for f in "$@"; do
-              [ -f "$f" ] || continue
-              if otool -L "$f" 2>/dev/null | grep -qi 'libSDL3'; then
-                echo "❌  $label: $f links libSDL3 — Homebrew pulled SDL3 in."
-                otool -L "$f" | grep -i sdl || true
-                fail=1
-              fi
-            done
+          WORK="$(mktemp -d)"
+          git clone --depth 1 --branch SDL2 https://github.com/libsdl-org/SDL     "$WORK/SDL"
+          git clone --depth 1 --branch SDL2 https://github.com/libsdl-org/SDL_ttf "$WORK/SDL_ttf"
+          JOBS="$(sysctl -n hw.ncpu)"
+
+          build_sdl() {   # $1=arch  $2=prefix
+            cmake -S "$WORK/SDL" -B "$WORK/b-sdl-$1" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="$1" \
+              -DCMAKE_INSTALL_PREFIX="$2" \
+              -DCMAKE_INSTALL_NAME_DIR="$2/lib" \
+              -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST=OFF
+            cmake --build "$WORK/b-sdl-$1" -j"$JOBS"
+            cmake --install "$WORK/b-sdl-$1"
           }
-          # arm64 (/opt/homebrew) and x86_64 (/usr/local): sdl2_ttf is the prime
-          # suspect, ffmpeg av* libs are secondary.
-          check "arm64 sdl2_ttf"  /opt/homebrew/opt/sdl2_ttf/lib/libSDL2_ttf*.dylib
-          check "x86_64 sdl2_ttf" /usr/local/opt/sdl2_ttf/lib/libSDL2_ttf*.dylib
-          check "arm64 ffmpeg"    /opt/homebrew/opt/ffmpeg/lib/libav*.dylib /opt/homebrew/opt/ffmpeg/lib/libsw*.dylib
-          check "x86_64 ffmpeg"   /usr/local/opt/ffmpeg/lib/libav*.dylib   /usr/local/opt/ffmpeg/lib/libsw*.dylib
-          if [ "$fail" -ne 0 ]; then
-            echo ""
-            echo "⚠️  SDL3 leaked in. Rebuilding sdl2_ttf from source against SDL2…"
-            # Rebuilding from source forces sdl2_ttf to link the SDL2 already
-            # installed above, instead of using a bottle pre-linked to SDL3.
-            brew reinstall --build-from-source sdl2_ttf || true
-            arch -x86_64 /usr/local/bin/brew reinstall --build-from-source sdl2_ttf || true
-            # Re-verify; if it STILL links SDL3, fail hard (don't ship a crasher).
-            fail=0
-            check "arm64 sdl2_ttf (post-rebuild)"  /opt/homebrew/opt/sdl2_ttf/lib/libSDL2_ttf*.dylib
-            check "x86_64 sdl2_ttf (post-rebuild)" /usr/local/opt/sdl2_ttf/lib/libSDL2_ttf*.dylib
-            check "arm64 ffmpeg"    /opt/homebrew/opt/ffmpeg/lib/libav*.dylib
-            check "x86_64 ffmpeg"   /usr/local/opt/ffmpeg/lib/libav*.dylib
-            if [ "$fail" -ne 0 ]; then
-              echo "❌  SDL3 still present after rebuild. The app is SDL2-only; aborting."
-              exit 1
-            fi
-            echo "✅  Rebuild fixed it — no SDL3 linkage remains."
-          else
-            echo "✅  No SDL3 linkage in sdl2_ttf / ffmpeg on either arch."
-          fi
+          build_ttf() {   # $1=arch  $2=prefix — needs the real SDL2 above + brew freetype
+            cmake -S "$WORK/SDL_ttf" -B "$WORK/b-ttf-$1" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="$1" \
+              -DCMAKE_INSTALL_PREFIX="$2" \
+              -DCMAKE_INSTALL_NAME_DIR="$2/lib" \
+              -DCMAKE_PREFIX_PATH="$2" \
+              -DBUILD_SHARED_LIBS=ON \
+              -DSDL2TTF_SAMPLES=OFF -DSDL2TTF_VENDORED=OFF -DSDL2TTF_HARFBUZZ=OFF
+            cmake --build "$WORK/b-ttf-$1" -j"$JOBS"
+            cmake --install "$WORK/b-ttf-$1"
+          }
+          build_sdl arm64  /opt/homebrew
+          build_sdl x86_64 /usr/local
+          build_ttf arm64  /opt/homebrew
+          build_ttf x86_64 /usr/local
+
+      # Fail loudly BEFORE building the app if any prefix still carries the compat shim.
+      - name: Verify installed SDL2 is REAL (not sdl2-compat / SDL3)
+        run: |
+          set -euo pipefail
+          bad=0
+          for p in /opt/homebrew /usr/local; do
+            for lib in "$p/lib/libSDL2-2.0.0.dylib" "$p/lib/libSDL2_ttf-2.0.0.dylib"; do
+              if [ ! -f "$lib" ]; then echo "❌ missing $lib"; bad=1; continue; fi
+              if otool -L "$lib" | grep -qi 'libSDL3'; then echo "❌ $lib load-time-links libSDL3"; bad=1; fi
+              if strings -a "$lib" | grep -qiE 'sdl2-compat|Failed loading SDL3 library'; then
+                echo "❌ $lib is the sdl2-compat SDL3 shim"; bad=1; fi
+            done
+            echo "   $p libSDL2 id → $(otool -D "$p/lib/libSDL2-2.0.0.dylib" | tail -1)"
+          done
+          if [ "$bad" -eq 0 ]; then echo "✅ Both prefixes carry REAL SDL2 + SDL2_ttf."; else exit 1; fi
 
       - name: Show toolchain
         run: |

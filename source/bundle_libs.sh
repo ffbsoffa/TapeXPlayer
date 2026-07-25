@@ -177,6 +177,16 @@ if ls "$FRAMEWORKS_DIR"/libSDL3* >/dev/null 2>&1; then
     echo "   ❌ libSDL3 dylib present in Frameworks: $(ls "$FRAMEWORKS_DIR"/libSDL3*)"
     SDL3_HITS=$((SDL3_HITS + 1))
 fi
+# sdl2-compat evades the otool checks above: it is an SDL2-ABI shim that dlopen()s SDL3
+# at RUNTIME, so it carries NO load-time libSDL3 reference — yet the app still needs SDL3
+# present at launch, which we don't ship → crash on a clean Mac. Detect it by its strings.
+for dylib in "$EXECUTABLE" "$FRAMEWORKS_DIR"/libSDL2-*.dylib; do
+    [ -f "$dylib" ] || continue
+    if strings -a "$dylib" 2>/dev/null | grep -qiE 'sdl2-compat|Failed loading SDL3 library'; then
+        echo "   ❌ $(basename "$dylib") is sdl2-compat (an SDL3 shim), not real SDL2"
+        SDL3_HITS=$((SDL3_HITS + 1))
+    fi
+done
 if [ "$SDL3_HITS" -ne 0 ]; then
     echo ""
     echo "❌  SDL3 contamination detected ($SDL3_HITS). This app is SDL2-only."
