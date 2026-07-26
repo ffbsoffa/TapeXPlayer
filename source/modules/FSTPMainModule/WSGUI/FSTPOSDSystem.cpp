@@ -522,7 +522,20 @@ static CachedText* GetCachedText(SDL_Renderer* renderer, const std::string& text
     // Get cache for specific renderer
     auto& renderer_cache = (*cache)[renderer];
 
-    auto it = renderer_cache.find(text);
+    // Key by text AND colour. The caches above only split white/yellow/gray, so any OTHER
+    // colour (e.g. the {150,150,150} threading-grey speed on the normal font) fell into the
+    // "white" map under the bare text key and poisoned it: the glyph was baked grey, so when
+    // the same text later rendered white it got the stale grey texture back — the "speed stays
+    // grey / stuck after threading" bug. Folding the colour into the key keeps each
+    // (text,colour) a distinct entry.
+    std::string key = text;
+    key.push_back('\x1f');
+    key.push_back(static_cast<char>(color.r));
+    key.push_back(static_cast<char>(color.g));
+    key.push_back(static_cast<char>(color.b));
+    key.push_back(static_cast<char>(color.a));
+
+    auto it = renderer_cache.find(key);
     if (it != renderer_cache.end()) {
         return &it->second; // Already in cache
     }
@@ -546,8 +559,8 @@ static CachedText* GetCachedText(SDL_Renderer* renderer, const std::string& text
         SDL_FreeSurface(surface);
     }
 
-    renderer_cache[text] = cached;
-    return &renderer_cache[text];
+    renderer_cache[key] = cached;
+    return &renderer_cache[key];
 }
 
 // Render cached text
@@ -1170,6 +1183,33 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
         SDL_Rect bgRect = {indicatorX, indicatorY, INDICATOR_WIDTH, INDICATOR_HEIGHT};
         SDL_SetRenderDrawColor(renderer, whiteColor.r, whiteColor.g, whiteColor.b, whiteColor.a);
         SDL_RenderDrawRect(renderer, &bgRect);
+
+        // PROXY THREADING PROGRESS: this box maps to the WHOLE clip (position 0..1), so
+        // proxy conversion (now a background job after load) reads naturally as the box
+        // filling left→right — it literally shows how much of the clip has been proxied.
+        // Drawn UNDER the playhead bar below so the head stays visible on top.
+        if (data.proxy_threading_progress >= 0) {
+            int pct = std::max(0, std::min(100, data.proxy_threading_progress));
+            int innerW = INDICATOR_WIDTH - 4;              // inside the 2px frame padding
+            int fillW = (innerW * pct) / 100;
+            if (fillW > 0) {
+                SDL_BlendMode prevBlend;
+                SDL_GetRenderDrawBlendMode(renderer, &prevBlend);
+                SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+                // Translucent green wash = "building proxy".
+                SDL_SetRenderDrawColor(renderer, greenColor.r, greenColor.g, greenColor.b, 90);
+                SDL_Rect fillRect = {indicatorX + 2, indicatorY + 2, fillW, INDICATOR_HEIGHT - 4};
+                SDL_RenderFillRect(renderer, &fillRect);
+
+                // Brighter leading edge so the growth stays legible frame-to-frame.
+                SDL_SetRenderDrawColor(renderer, greenColor.r, greenColor.g, greenColor.b, 220);
+                SDL_Rect edgeRect = {indicatorX + 2 + fillW - 1, indicatorY + 2, 1, INDICATOR_HEIGHT - 4};
+                SDL_RenderFillRect(renderer, &edgeRect);
+
+                SDL_SetRenderDrawBlendMode(renderer, prevBlend);
+            }
+        }
 
         double position = 0.0;
         if (data.total_duration > 0.0) {
