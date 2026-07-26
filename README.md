@@ -30,9 +30,9 @@ TapeXPlayer is built with **C**,**C++**, **Objective-C**, **Swift** using indust
 
 | Platform | Status | Architecture | Build |
 |----------|--------|--------------|-------|
-| **macOS** | ✅ Available | Universal Binary (Intel + Apple Silicon) | Build 1841 |
-| **Linux** | ✅ Available (DEB) | x86_64, ARM64 | Build 1843 |
-| **Windows** | ✅ Available | x86_64, ARM64 | Builds 1841, 1842 |
+| **macOS** | ✅ Available | Universal Binary (Intel + Apple Silicon) | Build 1866 |
+| **Linux** | ✅ Available (DEB) | x86_64 | Build 1866 |
+| **Windows** | ✅ Available | x86_64 | Builds 1866 |
 
 ---
 
