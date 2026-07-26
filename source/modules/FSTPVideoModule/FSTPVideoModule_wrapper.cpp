@@ -563,8 +563,16 @@ void FSTPVideoModuleWrapper::UnloadFile() {
         std::cout << "[VIDEO] Starting careful gradual frame cleanup ("
                   << frame_count << " frames in batches of 100)" << std::endl;
 
-        const size_t BATCH_SIZE = 100;  // Clean 100 frames at a time
-        const int PAUSE_MS = 2;         // 2ms pause between batches
+        // Teardown used to scale with clip DURATION, not with the memory actually held:
+        // m_frames has one slot per frame in the WHOLE video (resize(GetTotalFrames())),
+        // but only a small cache window is ever decoded, so almost every slot holds a
+        // null shared_ptr. The old 2ms sleep after every 100-slot batch therefore cost
+        // (totalFrames/100)*2ms of pure waiting — ~1.8s for an hour @25fps on macOS, and
+        // MUCH worse on Windows where sleep_for(2ms) rounds up to the ~15ms system timer
+        // tick (~13s/hour). The real work (av_frame_free) is bounded by the cache size and
+        // takes a few ms. Drop the sleep and walk in big batches; thread-safety is already
+        // handled by STEP 0 (decoder threads joined) + the per-slot mutex (vs render thread).
+        const size_t BATCH_SIZE = 4096;
 
         size_t cleaned = 0;
         auto cleanup_start = std::chrono::steady_clock::now();
@@ -605,10 +613,8 @@ void FSTPVideoModuleWrapper::UnloadFile() {
                           << elapsed_ms << "ms elapsed)" << std::endl;
             }
 
-            // Pause between batches to let heap allocator breathe
-            if (batch_end < frame_count) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(PAUSE_MS));
-            }
+            // No artificial pause here — see the note above the batch constants.
+            // The render thread stays responsive via try_lock on each slot's mutex.
         }
 
         // Finally clear the vector itself
