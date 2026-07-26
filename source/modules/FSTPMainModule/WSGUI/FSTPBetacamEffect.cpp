@@ -853,9 +853,15 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         // "unnaturally thin" and gave the emulation away. Keep the grey band fuller:
         // gentle LINEAR taper toward a thicker mid-shuttle target (not the very thin
         // currentMinStripeHeight). Continuous with the ≥14× plateau (24·scale) below.
+        // Thin through 6–10× so the picture stays readable (many bands there → lots of coverage). A
+        // straight linear ramp from the full 3.7× height can't reach ~half by 10× without a jump at
+        // 3.7×, so use a POWER curve: 3.7× stays full (continuous with the 2–3.7× branch) but the band
+        // thins fast — ≈16px at 10× (half of the old ~32px) — then settles to ~10px by 14×.
         double t = (absPlaybackRate - 3.7) / 10.3;
-        const int midShuttleHeight = static_cast<int>(24 * resolutionScale);
-        stripeHeight = static_cast<int>(baseStripeHeight * 0.75 * (1.0 - t) + midShuttleHeight * t);
+        double f = std::pow(t, 0.35);                        // fast early thinning (tunable exponent)
+        const double startPx = 0.75 * baseStripeHeight;      // ~64px at 3.7× (continuous)
+        const double thinPx  = 12.5 * resolutionScale;       // 14× end, joins the ≥14× branch (10× ≈ 20px)
+        stripeHeight = static_cast<int>(startPx * (1.0 - f) + thinPx * f);
         stripeSpacing = static_cast<int>(baseStripeSpacing * 0.8 * (1.0 - t) + minStripeSpacing * t);
     } else { // ≥ 14.0x
         stripeSpacing = minStripeSpacing;
@@ -864,7 +870,7 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         // to be), continuing to a very thin band at extreme speeds. fullMid matches the
         // 3.7–14× branch at 14× for a seamless join; the sqrt curve makes the band thin
         // quickly right after 14× so 15–18× already reads as thin.
-        const double fullMidPixels = 24.0; // join with 3.7–14× branch at 14×
+        const double fullMidPixels = 12.5; // join with 3.7–14× branch at 14× (kept continuous with the thinner mid-shuttle above)
         const double thinPixels    = 10.0; // 15–18× thin band (as it used to be)
         const double minPixels     = 6.0;  // extreme speeds (24×+)
 
@@ -939,52 +945,35 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         // 1× reverse: slow downward wall-clock glide, shared with the compositing seam above so the
         // grey bar and the composite boundary move together (computed once as reverse_glide_phase).
         raw_scroll_phase = reverse_glide_phase;
-    } else if (absPlaybackRate < 14.0) {
-        // Smooth only within ±0.25 of 3× or 10×; masking elsewhere. Band edges are crossed only
-        // while RAMPING, where a 1-frame seam is invisible.
-        bool smoothBand = (std::abs(absPlaybackRate - 3.0) < 0.25) ||
-                          (std::abs(absPlaybackRate - 10.0) < 0.25);
-        if (smoothBand) {
-            // Constant VISIBLE comb drift = kGlideHz periods/sec (÷ stripe count). 540p-tuned, but
-            // phase-based → identical at any resolution.
-            constexpr double kGlideHz = 1.4;
-            double N = std::max(1.0, std::round(absPlaybackRate - 1.0));   // visible stripe count in-band
-            auto now = std::chrono::steady_clock::now();
-            double dt = state.shuttle_comb_init
-                      ? std::chrono::duration<double>(now - state.shuttle_comb_last_t).count()
-                      : 0.0;
-            state.shuttle_comb_last_t = now;
-            state.shuttle_comb_init = true;
-            if (dt < 0.0 || dt > 0.1) dt = 0.0;
-            double dir = metrics.is_reverse ? -1.0 : 1.0;
-            state.shuttle_comb_phase += dir * kGlideHz * dt / N;
-            state.shuttle_comb_phase -= std::floor(state.shuttle_comb_phase);
-            raw_scroll_phase = state.shuttle_comb_phase;
-        } else {
-            // Masking multiplier-detune: tiny per-frame beat hides new-stripe formation on ramps.
-            constexpr double kRefreshHz     = 60.0;
-            constexpr double kGlidePerFrame = 0.06;
-            double advancePerFrame = absPlaybackRate * fps_for_calc / kRefreshHz;
-            double mult = 1.0;
-            if (advancePerFrame > kGlidePerFrame) {
-                double base    = std::round(advancePerFrame - kGlidePerFrame);
-                double desired = base + kGlidePerFrame;
-                if (desired > 0.05) mult = desired / advancePerFrame;
-            }
-            raw_scroll_phase = std::fmod(currentTime * fps_for_calc * mult, 1.0);
-            if (raw_scroll_phase < 0) raw_scroll_phase += 1.0;
-            // Seed the accumulator so ENTERING a smooth band continues seamlessly from here.
-            state.shuttle_comb_phase   = raw_scroll_phase;
-            state.shuttle_comb_last_t  = std::chrono::steady_clock::now();
-            state.shuttle_comb_init    = true;
-        }
     } else {
-        // ≥14×: race straight off audio time.
-        raw_scroll_phase = std::fmod(frame_exact, 1.0);
-        if (raw_scroll_phase < 0) raw_scroll_phase += 1.0;
-        state.shuttle_comb_phase   = raw_scroll_phase;
-        state.shuttle_comb_last_t  = std::chrono::steady_clock::now();
-        state.shuttle_comb_init    = true;
+        // FRAME-ANCHORED COMB — ALL shuttle speeds. shuttle_comb_phase is the drift W in FRAME units
+        // (1 unit = one frame-seam = one band spacing). The band loop places a seam at each integer
+        // frame inside the window [W, W+S], so a new band slides IN AT THE TOP EDGE and one leaves at
+        // the bottom — never born mid-screen. Advance W from wall-clock dt (smooth, jitter-proof) at a
+        // ANTI-STROBE: the band VISUAL speed V (screens/sec) is a FAST strobe baseline everywhere,
+        // dipping to a CALM pace only in the narrow "analysis" zones the owner parks on — 3× (≈2.9–3.1)
+        // and 10× — so those read steady while everything between them strobes (real-Betacam behaviour).
+        // Smooth Gaussian dips → no regime toggle; W accumulates so position stays continuous. dW/dt =
+        // V·S. Tunable: kVfast = overall strobe pace; kVcalm3/10 = how calm the two parked zones are.
+        constexpr double kVfast   = 4.0;    // strobe baseline (screens/sec) — fast enough to MASK the stepwise band-count change
+        constexpr double kVcalm3  = 0.7;    // calm at 3× (the pace the owner called perfect)
+        constexpr double kVcalm10 = 0.9;    // slightly dimmed at 10×
+        double d3  = absPlaybackRate - 3.0;
+        double d10 = absPlaybackRate - 10.0;
+        double w3  = std::exp(-(d3  * d3)  / (2.0 * 0.20 * 0.20));   // calm within ≈±0.2 of 3×
+        double w10 = std::exp(-(d10 * d10) / (2.0 * 0.50 * 0.50));   // calm within ≈±0.5 of 10×
+        double V = kVfast + (kVcalm3 - kVfast) * w3 + (kVcalm10 - kVfast) * w10;
+        double S = std::max(1.0, absPlaybackRate - 1.0);
+        auto now = std::chrono::steady_clock::now();
+        double dt = state.shuttle_comb_init
+                  ? std::chrono::duration<double>(now - state.shuttle_comb_last_t).count()
+                  : 0.0;
+        state.shuttle_comb_last_t = now;
+        state.shuttle_comb_init = true;
+        if (dt < 0.0 || dt > 0.1) dt = 0.0;
+        double dir = metrics.is_reverse ? -1.0 : 1.0;
+        state.shuttle_comb_phase += dir * V * S * dt;   // W in frames (unbounded; double is fine)
+        raw_scroll_phase = state.shuttle_comb_phase - std::floor(state.shuttle_comb_phase);  // nominal [0,1)
     }
 
     double scroll_phase = raw_scroll_phase;
@@ -1002,9 +991,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     // Use fractional stripe count to allow smooth transitions at integer boundaries
     // e.g., at 2.8x → 1.8 stripes (1 full + 0.8 partial)
     //       at 3.2x → 2.2 stripes (2 full + 0.2 partial)
-    double fractional_stripes = 0.0;
-    int num_stripes = 0;
-    double partial_stripe_opacity = 0.0;  // Opacity of the "newest" stripe (0.0-1.0)
+    double fractional_stripes = 0.0;   // = S, the window span in frame-seams (= band count) for shuttle
+    int num_stripes = 0;               // only meaningful for the slow-mo / 1× single tracking bar now
 
     if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
         // Slow motion or 1× reverse: single stripe (head switching noise bar).
@@ -1016,47 +1004,32 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         num_stripes = aligned_pause ? 0 : 1;
         fractional_stripes = static_cast<double>(num_stripes);
     } else if (absPlaybackRate > 1.1) {
-        // Fast motion: stripes = track boundaries crossed = speed - 1
+        // Fast motion: stripes = track boundaries the head crosses per sweep = speed - 1.
+        // Kept FRACTIONAL and driven continuously so the comb never snaps: the existing bands
+        // glide to their new spacing (offset = i / fractional_stripes below) and a fresh band is
+        // BORN AS A SLIVER and grows to full height across the integer step (emergeFrac), instead
+        // of a whole band toggling on at full size the instant an integer count incremented.
         int targetSpacing = static_cast<int>(18.0 * resolutionScale);
         int estimatedStripeHeight = std::max(2, static_cast<int>(stripeHeight * 0.8));
         int stripeUnit = estimatedStripeHeight + targetSpacing;
         int minStripesForSpacing = std::max(1, textureHeight / stripeUnit);
 
-        // Helical scan physics: fractional stripes = speed - 1
-        // This allows smooth transitions at integer boundaries
         fractional_stripes = absPlaybackRate - 1.0;
         if (fractional_stripes < 1.0) fractional_stripes = 1.0;
 
-        // Base integer stripes (floor of fractional)
-        int baseStripes = static_cast<int>(std::floor(fractional_stripes));
-
-        // Partial stripe opacity = fractional part
-        // e.g., 2.3 stripes → 2 full + 0.3 opacity partial
-        partial_stripe_opacity = fractional_stripes - baseStripes;
-
-        // Gradual transition from 14x to 24x for dense stripe mode
-        if (absPlaybackRate < 14.0) {
-            num_stripes = baseStripes;
-            // Add partial stripe if opacity > threshold (gradual appearance)
-            if (partial_stripe_opacity > 0.3) {
-                num_stripes = baseStripes + 1;
-                // Remap opacity: 0.3-1.0 → 0.0-1.0
-                partial_stripe_opacity = (partial_stripe_opacity - 0.3) / 0.7;
-            } else {
-                partial_stripe_opacity = 0.0;  // No partial stripe yet
-            }
-        } else if (absPlaybackRate >= 24.0) {
-            num_stripes = std::max(baseStripes, minStripesForSpacing);
-            partial_stripe_opacity = 0.0;  // All stripes full at high speeds
-        } else {
-            // Smooth interpolation from 14x to 24x
+        // Above 14× the comb saturates toward a dense minimum count; ramp the FRACTIONAL count up
+        // to it (still continuous) instead of switching modes, so there is still no snap.
+        if (absPlaybackRate >= 24.0) {
+            fractional_stripes = std::max(fractional_stripes, static_cast<double>(minStripesForSpacing));
+        } else if (absPlaybackRate >= 14.0) {
             double t = (absPlaybackRate - 14.0) / (24.0 - 14.0);
             t = t * t * (3.0 - 2.0 * t);
-            int targetStripes = std::max(baseStripes, minStripesForSpacing);
-            num_stripes = static_cast<int>(baseStripes + (targetStripes - baseStripes) * t);
-            num_stripes = std::max(baseStripes, num_stripes);
-            partial_stripe_opacity = 0.0;
+            double dense = std::max(fractional_stripes, static_cast<double>(minStripesForSpacing));
+            fractional_stripes = fractional_stripes + (dense - fractional_stripes) * t;
         }
+
+        // fractional_stripes = S is the window span in frames; the band loop below enumerates the
+        // frame-seams inside [W, W+S] directly, so no integer stripe count / offset is needed here.
     }
     // else: 0.9-1.1× = normal playback, no stripes
 
@@ -1082,14 +1055,38 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     }
     int finalStripeHeight = std::max(1, static_cast<int>(std::round(state.smooth_stripe_height)));
 
-    // Generate stripe positions - distributed across frame with individual variation
-    // Spacing = frame_height / num_stripes (e.g., at 10×: spacing = 10% of height)
-    // Each stripe has individual random offset for uneven, authentic look
-    for (int i = 0; i < num_stripes; i++) {
-        // Each stripe offset by (i / num_stripes) of the frame
-        // All stripes scroll together with scroll_phase
-        double stripe_offset = static_cast<double>(i) / static_cast<double>(num_stripes);
-        double stripe_phase = std::fmod(scroll_phase + stripe_offset, 1.0);
+    // FRAME-ANCHORED COMB: one band at each integer frame-seam j inside the sliding window [W, W+S]
+    // (W = drift in frames, S = span = speed-1). phase = (W+S-j)/S maps the window to 0=top..1=bottom;
+    // as W drifts the seams move down and a new band slides IN AT THE TOP edge (one leaves at the
+    // bottom) — never born mid-screen. Each seam keeps a stable identity j (jitter salt) so the comb
+    // glides instead of reshuffling. Seams just past the edges are included so they enter/exit via the
+    // existing NO-WRAP edge clipping below.
+    std::vector<std::pair<double,int>> bandPhases;   // (phase, seam id)
+    if (absPlaybackRate < 0.9 || isReverseNormalSpeed) {
+        if (num_stripes > 0) bandPhases.emplace_back(scroll_phase, 0);   // single tracking bar
+    } else if (absPlaybackRate >= 18.0) {
+        // ORIGINAL prerelease high-speed comb (18–32×, well-tuned — owner asked to keep it): dense,
+        // even i/N spacing, scroll RACED off frame time (fmod frame_exact). At these speeds frame_exact
+        // aliases far past 60 Hz, so the pattern reads as STABLE and only jitters frame-to-frame — no
+        // smooth global drift (that upward crawl the owner flagged on the 24× screenshot).
+        int nS = std::max(1, static_cast<int>(std::lround(fractional_stripes)));
+        double sp = std::fmod(frame_exact, 1.0); if (sp < 0.0) sp += 1.0;
+        for (int i = 0; i < nS; ++i) {
+            bandPhases.emplace_back(std::fmod(sp + static_cast<double>(i) / nS, 1.0), i);
+        }
+    } else if (absPlaybackRate > 1.1) {
+        // NEW frame-anchored window (2–18×): seams slide in from the top edge; drift W (∝ speed) above.
+        double S = std::max(1.0, fractional_stripes);
+        double W = state.shuttle_comb_phase;                             // drift, in frame units
+        int jEnd = static_cast<int>(std::ceil(W + S));
+        for (int j = static_cast<int>(std::floor(W)); j <= jEnd; ++j) {
+            bandPhases.emplace_back((W + S - static_cast<double>(j)) / S, j);
+        }
+    }
+
+    for (size_t k = 0; k < bandPhases.size(); ++k) {
+        double stripe_phase = bandPhases[k].first;
+        int saltId = bandPhases[k].second;
 
         // Convert phase to Y position with extended travel
         // Extended travel ensures stripe smoothly enters/exits visible area
@@ -1114,7 +1111,7 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
         // uneven offset/height while the whole comb glides. Slow-mo/pause still uses
         // per-frame randomness (tape instability on a held, non-scrolling frame).
         auto slotRand = [&](int salt) -> uint32_t {
-            uint32_t h = (static_cast<uint32_t>(i) * 2654435761u)
+            uint32_t h = (static_cast<uint32_t>(saltId) * 2654435761u)
                        ^ (static_cast<uint32_t>(salt) * 40503u);
             h ^= h >> 13; h *= 2246822519u; h ^= h >> 16; return h;
         };
@@ -1124,6 +1121,11 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
             int maxJitter = std::max(1, static_cast<int>(2.5 * (effectiveHeight / 480.0)));
             int slotOffset = static_cast<int>(slotRand(1) % static_cast<uint32_t>(2 * maxJitter + 1)) - maxJitter;
             stripe_y += slotOffset;
+            // Small PER-FRAME Y wobble (analog head-tracking instability): a few px that re-rolls each
+            // frame on top of the smooth glide, so no band ever looks frozen — even when the comb is
+            // dense at high shuttle speeds.
+            int microJ = std::max(1, static_cast<int>(std::lround(1.5 * resolutionScale)));
+            stripe_y += randomInt(-microJ, microJ);
         }
 
         // Stripe height variation.
