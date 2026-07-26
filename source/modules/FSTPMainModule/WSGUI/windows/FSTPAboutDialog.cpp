@@ -208,7 +208,7 @@ void ShowWin32AboutDialog() {
 
     // Copyright (bottom area of left panel)
     h = CreateWindowExW(0, L"STATIC",
-        L"\xa9 2025 Maksim Maloletkin (FFB_soffa).\r\nLicensed under GPL.",
+        L"\xa9 2026 Maksim Maloletkin (FFB_soffa).\r\nLicensed under GPL.",
         WS_CHILD | WS_VISIBLE | SS_CENTER,
         lx, 330, 240, 32, g_about_hwnd, NULL, NULL, NULL);
     SendMessage(h, WM_SETFONT, (WPARAM)hFontSmall, TRUE);

@@ -145,7 +145,7 @@ void ShowGTKAboutDialog() {
 
     // Copyright text
     GtkWidget* copyright_label = gtk_label_new(
-        "© 2025 Maksim Maloletkin (FFB_soffa).\n"
+        "© 2026 Maksim Maloletkin (FFB_soffa).\n"
         "Licensed under GPL."
     );
     gtk_label_set_justify(GTK_LABEL(copyright_label), GTK_JUSTIFY_CENTER);

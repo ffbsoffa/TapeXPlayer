@@ -779,7 +779,7 @@ void HandleNativeAppEvents() {
         // Fallback for older macOS versions - show simple window
         NSAlert* alert = [[NSAlert alloc] init];
         [alert setMessageText:@"TapeXPlayer 2026"];
-        [alert setInformativeText:@"Professional Video Playback System\n\nDeveloped by Maksim Maloletkin (FFB_soffa)\nhttps://apps.ffbsoffa.org/tapexplayer\n\nLicensed under GPL (GNU General Public License)\nCopyright © 2025 Maksim Maloletkin\n\nThis software uses FFmpeg, SDL2, PortAudio, RtMidi, OpenSSL and Apple frameworks."];
+        [alert setInformativeText:@"Professional Video Playback System\n\nDeveloped by Maksim Maloletkin (FFB_soffa)\nhttps://apps.ffbsoffa.org/tapexplayer\n\nLicensed under GPL (GNU General Public License)\nCopyright © 2026 Maksim Maloletkin\n\nThis software uses FFmpeg, SDL2, PortAudio, RtMidi, OpenSSL and Apple frameworks."];
         [alert addButtonWithTitle:@"OK"];
         [alert runModal];
     }

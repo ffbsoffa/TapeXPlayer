@@ -54,7 +54,7 @@ struct FSTPAboutView: View {
 
                 // Copyright and license
                 VStack(spacing: 6) {
-                    Text("© 2025 Maksim Maloletkin (FFB_soffa). Licensed under GPL.")
+                    Text("© 2026 Maksim Maloletkin (FFB_soffa). Licensed under GPL.")
                         .font(.system(size: 9))
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
