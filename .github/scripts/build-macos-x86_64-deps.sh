@@ -47,6 +47,8 @@ CMAKE_X86=(
     -DCMAKE_INSTALL_NAME_DIR="$PREFIX/lib"
     -DCMAKE_PREFIX_PATH="$PREFIX"
     -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew
+    # CMake 4 refuses projects declaring cmake_minimum_required < 3.5 (PortAudio 19.7 does)
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 )
 
 cmake_build() {   # $1=src dir, rest = extra cmake args
