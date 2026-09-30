@@ -7,6 +7,7 @@
 #   make rebuild  - Rebuild everything from scratch
 #   make run      - Build and run
 #   make help     - List the targets for the current platform
+#   make check    - Check compiler + libraries (also runs before every build)
 #
 # macOS:
 #   make bundle   - Create .app bundle with libraries (current architecture)
@@ -24,6 +25,7 @@
 #   X86_64_PREFIX=<dir> - Where the x86_64 libraries live for bundle-universal (default /usr/local).
 #     Build them with ../.github/scripts/build-macos-x86_64-deps.sh <dir>
 #   FREEZE_BUILD_NUMBER=1 - Don't increment .build_number (CI uses this)
+#   SKIP_CHECK=1 - Don't run the dependency check before compiling
 #
 
 # === BUILD VERSION CONFIGURATION ===
@@ -216,6 +218,10 @@ ifeq ($(UNAME_S),Linux)
 else
     # macOS configuration
     USE_SWIFT = yes
+    # Same floor as SWIFT_TARGET: without it clang targets the host SDK (e.g. 15.0) and ld
+    # warns on every object that it is "built for newer macOS than being linked (13.0)".
+    CXXFLAGS_BASE += -mmacosx-version-min=13.0
+    OBJCFLAGS += -mmacosx-version-min=13.0
     # Swift target determined by architecture (requires macOS 13.0 for modern SwiftUI APIs)
     ifeq ($(UNAME_M),arm64)
         SWIFT_TARGET = arm64-apple-macosx13.0
@@ -309,40 +315,54 @@ else
     OBJECTS = $(CPP_OBJECTS) $(MM_OBJECTS)
 endif
 
+# Labels for the header and the end-of-build summary
+ifeq ($(PLATFORM),windows)
+    PLATFORM_LABEL = Windows ($(or $(MSYSTEM),MinGW))
+    UI_LABEL = Win32 + SDL2
+    CHECK_PLATFORM = windows
+    DEPS_PREFIX = $(MINGW_PATH)
+else ifeq ($(UNAME_S),Linux)
+    PLATFORM_LABEL = Linux ($(UNAME_M))
+    UI_LABEL = GTK 3 + SDL2
+    CHECK_PLATFORM = linux
+else
+    PLATFORM_LABEL = macOS ($(or $(filter arm64 x86_64,$(ARCH_FLAGS)),$(UNAME_M)))
+    UI_LABEL = Cocoa + SwiftUI + SDL2
+    CHECK_PLATFORM = macos
+    DEPS_PREFIX = $(HOMEBREW_PATH)
+endif
+
+# "Next:" hints only after a plain `make`, not inside bundle/deb/run
+SHOW_NEXT := $(if $(filter-out all rebuild,$(MAKECMDGOALS)),,yes)
+
 # Main target
 all: platform-info $(TARGET)
 
 # Platform information
 .PHONY: platform-info
 platform-info:
-	@echo "================================================"
-	@echo "TapeXPlayer 2026 - Universal Build System"
-	@echo "================================================"
-ifeq ($(PLATFORM),windows)
-	@echo "Platform:        Windows (MinGW)"
-	@echo "Build Type:      Win32/SDL2"
-	@echo "Compiler:        $(CXX)"
-	@echo "Target:          $(notdir $(TARGET))"
-	@echo "Build Number:    $(BUILD_NUMBER)"
-	@echo "Version:         $(VERSION) \"$(CODE_NAME)\""
-	@echo "------------------------------------------------"
-else ifeq ($(UNAME_S),Linux)
-	@echo "Platform:        Linux ($(UNAME_M))"
-	@echo "Build Type:      GTK+/SDL2"
-	@echo "Compiler:        $(CXX)"
-	@echo "Target:          $(notdir $(TARGET))"
-	@echo "Build Number:    $(BUILD_NUMBER)"
-	@echo "Version:         $(VERSION) \"$(CODE_NAME)\""
-	@echo "------------------------------------------------"
-else
-	@echo "Platform:        macOS ($(UNAME_M))"
-	@echo "Build Type:      Cocoa/SDL2/Swift"
-	@echo "Target:          $(notdir $(TARGET))"
-	@echo "Build Number:    $(BUILD_NUMBER)"
-	@echo "Version:         $(VERSION) \"$(CODE_NAME)\""
-	@echo "------------------------------------------------"
-endif
 	@echo ""
+	@echo "TapeXPlayer $(VERSION) \"$(CODE_NAME)\" · build $(BUILD_NUMBER)"
+	@echo "  Platform   $(PLATFORM_LABEL) · $(UI_LABEL)"
+	@echo "  Compiler   $(shell $(CXX) --version 2>/dev/null | head -1)"
+	@echo "  Output     $(TARGET)"
+	@echo ""
+
+# Dependency check: runs before the first object is compiled, prints the exact install
+# command for whatever is missing. `make check` runs it alone; SKIP_CHECK=1 skips it.
+.PHONY: check
+check: platform-info
+ifndef SKIP_CHECK
+	@CHECK_PLATFORM=$(CHECK_PLATFORM) DEPS_PREFIX="$(DEPS_PREFIX)" CXX="$(CXX)" bash check_deps.sh
+endif
+
+$(OBJECTS) $(RC_OBJECT): | check
+
+define BUILD_SUMMARY
+@echo ""
+@echo "✅ Build complete: $(TARGET)"
+@echo "   $(PLATFORM_LABEL) · build $(BUILD_NUMBER) · $(words $(CPP_SOURCES) $(MM_SOURCES) $(SWIFT_SOURCES)) source files"
+endef
 
 # Generate BuildInfo.swift before build (always regenerated) - only on macOS
 ifeq ($(USE_SWIFT),yes)
@@ -403,16 +423,14 @@ $(TARGET): $(BUILD_INFO_SWIFT) $(OBJECTS)
 	@echo "[Link] $(notdir $(TARGET))"
 	@mkdir -p $(dir $(TARGET))
 	@$(LINKER) $(LINKER_FLAGS) $(OBJECTS) $(LIBS) -o $(TARGET)
+	$(BUILD_SUMMARY)
+ifeq ($(SHOW_NEXT),yes)
 	@echo ""
-	@echo "================================================"
-	@echo "✅ Build complete!"
-	@echo "================================================"
-	@echo "Target:     $(TARGET)"
-	@echo "Platform:   macOS ($(UNAME_M))"
-	@echo "Build:      $(BUILD_NUMBER)"
+	@echo "Next:"
+	@echo "  make run       start it"
+	@echo "  make bundle    self-contained app → $(APP_BUNDLE)"
 	@echo ""
-	@echo "To run: $(TARGET)"
-	@echo "================================================"
+endif
 else ifeq ($(PLATFORM),windows)
 # Windows build - update BuildInfo.h before building
 WINDOWS_BUILDINFO_H = modules/FSTPMainModule/WSGUI/windows/BuildInfo.h
@@ -465,17 +483,15 @@ $(TARGET): update-buildinfo-windows $(OBJECTS) $(RC_OBJECT)
 	@echo "[Link] $(notdir $(TARGET))"
 	@mkdir -p $(dir $(TARGET))
 	@$(LINKER) $(LDFLAGS) $(OBJECTS) $(RC_OBJECT) $(LIBS) -o $(TARGET)
+	$(BUILD_SUMMARY)
+ifeq ($(SHOW_NEXT),yes)
 	@echo ""
-	@echo "================================================"
-	@echo "✅ Build complete!"
-	@echo "================================================"
-	@echo "Target:     $(TARGET)"
-	@echo "Platform:   Windows (MinGW)"
-	@echo "Files:      $(words $(CPP_SOURCES)) C++ sources"
-	@echo "Build:      $(BUILD_NUMBER)"
+	@echo "Next:"
+	@echo "  make run                        start it (from this MSYS2 shell)"
+	@echo "  ./bundle_dlls.sh                exe + all DLLs → ../builds/win-bundle/ (runs anywhere)"
+	@echo "  ./create_win_installer.sh x64   installer → ../builds/TapeXPlayer-Setup-x64-build$(BUILD_NUMBER).exe"
 	@echo ""
-	@echo "To run: $(TARGET)"
-	@echo "================================================"
+endif
 
 else
 # Linux build - update BuildInfo.h before building
@@ -493,17 +509,14 @@ $(TARGET): update-buildinfo $(OBJECTS)
 	@echo "[Link] $(notdir $(TARGET))"
 	@mkdir -p $(dir $(TARGET))
 	@$(LINKER) $(OBJECTS) $(LIBS) -o $(TARGET)
+	$(BUILD_SUMMARY)
+ifeq ($(SHOW_NEXT),yes)
 	@echo ""
-	@echo "================================================"
-	@echo "✅ Build complete!"
-	@echo "================================================"
-	@echo "Target:     $(TARGET)"
-	@echo "Platform:   Linux ($(UNAME_M))"
-	@echo "Files:      $(words $(CPP_SOURCES)) C++ sources"
-	@echo "Version:     Build $(shell grep 'TAPEXPLAYER_BUILD_NUMBER' modules/FSTPMainModule/WSGUI/linux/BuildInfo.h 2>/dev/null | grep -o '[0-9]*' || echo 'N/A')"
+	@echo "Next:"
+	@echo "  make run       start it"
+	@echo "  make deb       .deb package → ../builds/binaries/deb/"
 	@echo ""
-	@echo "To run: $(TARGET)"
-	@echo "================================================"
+endif
 endif
 
 # Compile C++ files
@@ -745,6 +758,7 @@ help:
 ifeq ($(UNAME_S),Linux)
 	@echo "Linux targets:"
 	@echo "  make              - Build executable"
+	@echo "  make check        - Check compiler + libraries, print install command"
 	@echo "  make clean        - Clean build artifacts"
 	@echo "  make rebuild      - Rebuild from scratch"
 	@echo "  make run          - Build and run"
@@ -759,6 +773,7 @@ ifeq ($(UNAME_S),Linux)
 else ifeq ($(PLATFORM),windows)
 	@echo "Windows targets (MSYS2 MINGW64 shell):"
 	@echo "  make              - Build executable"
+	@echo "  make check        - Check compiler + libraries, print install command"
 	@echo "  make clean        - Clean build artifacts"
 	@echo "  make rebuild      - Rebuild from scratch"
 	@echo "  make run          - Build and run"
@@ -775,6 +790,7 @@ else ifeq ($(PLATFORM),windows)
 else
 	@echo "macOS targets:"
 	@echo "  make                    - Build executable"
+	@echo "  make check              - Check compiler + libraries, print install command"
 	@echo "  make app                - Create .app bundle"
 	@echo "  make bundle             - Create self-contained .app with libraries"
 	@echo "  make bundle-universal   - Create Universal Binary (x86_64 + arm64)"
@@ -821,4 +837,4 @@ uninstall:
 	@echo "✅ TapeXPlayer uninstalled"
 endif
 
-.PHONY: all clean rebuild run app bundle bundle-universal release release-help win-release platform-info show-sources help deb install-deb uninstall
+.PHONY: all clean rebuild run app bundle bundle-universal release release-help win-release platform-info check show-sources help deb install-deb uninstall
