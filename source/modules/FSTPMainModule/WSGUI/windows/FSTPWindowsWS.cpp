@@ -64,7 +64,7 @@ static std::atomic<bool> g_renderThreadRunning{false};
 // frame per signal. This replaces the old "spin the loop, let SDL_RenderPresent's VSync block pace
 // it" design. Consequences: the render thread is idle between vblanks (like macOS), so it no longer
 // needs THREAD_PRIORITY_TIME_CRITICAL — which on Windows is near-realtime and starved the
-// event/input thread during shuttle ("иногда управление не реагирует") — and it can't spin on a
+// event/input thread during shuttle ("controls sometimes stop responding") — and it can't spin on a
 // settled pause (which is why the old design pinned ~17% CPU there and needed a sleep band-aid).
 static std::mutex g_vsyncMutex;
 static std::condition_variable g_vsyncCV;

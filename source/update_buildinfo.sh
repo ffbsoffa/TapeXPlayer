@@ -25,7 +25,7 @@ cat > "$OUTPUT_FILE" << EOF
 #pragma once
 
 // Auto-generated build information for Linux
-// Generated on: $(date)
+// Generated on: $(LC_ALL=C date)
 // This file is synchronized with ../VERSION and .build_number
 
 #define TAPEXPLAYER_VERSION "${VERSION}"
