@@ -93,7 +93,7 @@ make -j$(sysctl -n hw.ncpu)     # -> builds/binaries/TapeXPlayer
 make bundle                     # -> builds/TapeXPlayer.app (libraries copied in, ad-hoc signed)
 ```
 
-`make bundle-universal` builds an arm64 + x86_64 app. It needs a second, x86_64 Homebrew in `/usr/local` and copies the result to `/Applications` unless you pass `SKIP_INSTALL=1`.
+`make bundle-universal` builds an arm64 + x86_64 app and copies it to `/Applications` unless you pass `SKIP_INSTALL=1`. Homebrew no longer supports Intel, so the x86_64 libraries are built from source first: `../.github/scripts/build-macos-x86_64-deps.sh <dir>`, then `make bundle-universal X86_64_PREFIX=<dir>` (default `/usr/local`).
 
 Homebrew's `sdl2` is now `sdl2-compat` (SDL2 API on top of SDL3). It is fine for local builds; release builds use real SDL2 built from source, see [`macos-build.yml`](.github/workflows/macos-build.yml).
 

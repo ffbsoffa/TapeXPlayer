@@ -1,9 +1,9 @@
 name: macOS build
 
 # Build a UNIVERSAL TapeXPlayer.app (arm64 + x86_64) on a macos-15 runner.
-# The runner is Apple Silicon (arm64 deps in /opt/homebrew); we add an x86_64
-# Homebrew in /usr/local via Rosetta so `make bundle-universal` can build both
-# slices and lipo them together — exactly the makefile's own universal flow.
+# The runner is Apple Silicon (arm64 deps in /opt/homebrew); the x86_64 deps are
+# cross-built from source into X86_64_PREFIX (cached) so `make bundle-universal` can
+# build both slices and lipo them together — exactly the makefile's own universal flow.
 # NOTE: macOS runner minutes bill ~10x and this does two full builds. Trim the
 # trigger to workflow_dispatch only if it's too costly.
 
@@ -19,10 +19,10 @@ jobs:
   build:
     runs-on: macos-15        # Apple Silicon; Xcode 16+ so Apple clang accepts -std=c++23
     env:
-      # openssl@3 is keg-only; cover BOTH arch prefixes so each sub-build finds
-      # -lssl/-lcrypto (arm64 from /opt/homebrew, x86_64 from /usr/local).
-      LIBRARY_PATH: /opt/homebrew/opt/openssl@3/lib:/usr/local/opt/openssl@3/lib
-      CPATH: /opt/homebrew/opt/openssl@3/include:/usr/local/opt/openssl@3/include
+      # x86_64 libraries for the Intel slice. Homebrew no longer installs on Intel
+      # ("only supported on Apple Silicon"), so they are cross-built from source by
+      # .github/scripts/build-macos-x86_64-deps.sh and cached between runs.
+      X86_64_PREFIX: ${{ github.workspace }}/../x86_64-deps
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,72 +31,58 @@ jobs:
         # The makefile hardcodes -std=c++23; older Apple clang only knows c++2b.
         run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
 
-      - name: Install Rosetta (needed to run the x86_64 Homebrew)
-        run: sudo softwareupdate --install-rosetta --agree-to-license
-
       # NOTE: sdl2 / sdl2_ttf are deliberately NOT installed from Homebrew — its `sdl2`
-      # is now an alias of `sdl2-compat` (an SDL3 shim); we build real SDL2 from source
-      # in the next step. freetype is here for the from-source SDL2_ttf. ffmpeg still
-      # pulls sdl2-compat as its own dep, but we overwrite libSDL2 with the real one and
-      # ffmpeg's libav* don't link SDL, so that is harmless.
+      # is an alias of `sdl2-compat` (an SDL3 shim); real SDL2 is built from source
+      # below. freetype is for the from-source SDL2_ttf. nasm/meson/ninja are for the
+      # x86_64 cross-build (FFmpeg asm, dav1d).
       - name: Install arm64 dependencies (/opt/homebrew)
-        run: brew install portaudio ffmpeg openssl@3 rtmidi freetype
+        run: brew install portaudio ffmpeg openssl@3 rtmidi freetype nasm meson ninja
 
-      - name: Install x86_64 Homebrew + dependencies (/usr/local)
-        run: |
-          arch -x86_64 /bin/bash -c \
-            'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-          arch -x86_64 /usr/local/bin/brew install portaudio ffmpeg openssl@3 rtmidi freetype
+      - name: Restore x86_64 dependencies cache
+        id: x86deps
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.X86_64_PREFIX }}
+          key: x86_64-deps-${{ hashFiles('.github/scripts/build-macos-x86_64-deps.sh') }}
 
-      # Homebrew renamed `sdl2` to an alias of `sdl2-compat` — an SDL2-ABI shim that
-      # dlopen()s SDL3 at RUNTIME. It carries NO load-time libSDL3 reference, so the old
-      # otool guard passed while the shipped .app crashed on any Mac without SDL3 present.
-      # Real SDL2 is gone from Homebrew core, so build it (and SDL2_ttf) from the libsdl-org
-      # SDL2 maintenance branch and install into BOTH Homebrew prefixes, OVERWRITING the
-      # compat libs. The makefile finds SDL via -I$PREFIX/include / -L$PREFIX/lib -lSDL2
-      # -lSDL2_ttf (SDL_PATH = HOMEBREW_PATH), so no makefile change is needed. This runs
-      # AFTER the brew installs so our real SDL2 wins over ffmpeg's sdl2-compat dep.
-      - name: Build real SDL2 + SDL2_ttf from source (both arches)
+      - name: Build x86_64 dependencies from source
+        # Skips everything already present, so a cache hit makes this a no-op.
+        run: .github/scripts/build-macos-x86_64-deps.sh "$X86_64_PREFIX"
+
+      # Homebrew's `sdl2` is `sdl2-compat` — an SDL2-ABI shim that dlopen()s SDL3 at
+      # RUNTIME. It carries NO load-time libSDL3 reference, so an otool guard passes while
+      # the shipped .app crashes on any Mac without SDL3. Build real SDL2 (and SDL2_ttf)
+      # from the libsdl-org SDL2 branch into /opt/homebrew, OVERWRITING the compat libs.
+      # (The x86_64 SDL2 comes from the deps script above.) This runs AFTER the brew
+      # installs so our real SDL2 wins over ffmpeg's sdl2-compat dep.
+      - name: Build real SDL2 + SDL2_ttf from source (arm64)
         run: |
           set -euo pipefail
           WORK="$(mktemp -d)"
           git clone --depth 1 --branch SDL2 https://github.com/libsdl-org/SDL     "$WORK/SDL"
           git clone --depth 1 --branch SDL2 https://github.com/libsdl-org/SDL_ttf "$WORK/SDL_ttf"
           JOBS="$(sysctl -n hw.ncpu)"
-
-          build_sdl() {   # $1=arch  $2=prefix
-            cmake -S "$WORK/SDL" -B "$WORK/b-sdl-$1" \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_OSX_ARCHITECTURES="$1" \
-              -DCMAKE_INSTALL_PREFIX="$2" \
-              -DCMAKE_INSTALL_NAME_DIR="$2/lib" \
-              -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST=OFF
-            cmake --build "$WORK/b-sdl-$1" -j"$JOBS"
-            cmake --install "$WORK/b-sdl-$1"
-          }
-          build_ttf() {   # $1=arch  $2=prefix — needs the real SDL2 above + brew freetype
-            cmake -S "$WORK/SDL_ttf" -B "$WORK/b-ttf-$1" \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_OSX_ARCHITECTURES="$1" \
-              -DCMAKE_INSTALL_PREFIX="$2" \
-              -DCMAKE_INSTALL_NAME_DIR="$2/lib" \
-              -DCMAKE_PREFIX_PATH="$2" \
-              -DBUILD_SHARED_LIBS=ON \
-              -DSDL2TTF_SAMPLES=OFF -DSDL2TTF_VENDORED=OFF -DSDL2TTF_HARFBUZZ=OFF
-            cmake --build "$WORK/b-ttf-$1" -j"$JOBS"
-            cmake --install "$WORK/b-ttf-$1"
-          }
-          build_sdl arm64  /opt/homebrew
-          build_sdl x86_64 /usr/local
-          build_ttf arm64  /opt/homebrew
-          build_ttf x86_64 /usr/local
+          P=/opt/homebrew
+          cmake -S "$WORK/SDL" -B "$WORK/b-sdl" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_INSTALL_PREFIX="$P" -DCMAKE_INSTALL_NAME_DIR="$P/lib" \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST=OFF
+          cmake --build "$WORK/b-sdl" -j"$JOBS"
+          cmake --install "$WORK/b-sdl"
+          cmake -S "$WORK/SDL_ttf" -B "$WORK/b-ttf" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_INSTALL_PREFIX="$P" -DCMAKE_INSTALL_NAME_DIR="$P/lib" \
+            -DCMAKE_PREFIX_PATH="$P" -DBUILD_SHARED_LIBS=ON \
+            -DSDL2TTF_SAMPLES=OFF -DSDL2TTF_VENDORED=OFF -DSDL2TTF_HARFBUZZ=OFF
+          cmake --build "$WORK/b-ttf" -j"$JOBS"
+          cmake --install "$WORK/b-ttf"
 
       # Fail loudly BEFORE building the app if any prefix still carries the compat shim.
       - name: Verify installed SDL2 is REAL (not sdl2-compat / SDL3)
         run: |
           set -euo pipefail
           bad=0
-          for p in /opt/homebrew /usr/local; do
+          for p in /opt/homebrew "$X86_64_PREFIX"; do
             for lib in "$p/lib/libSDL2-2.0.0.dylib" "$p/lib/libSDL2_ttf-2.0.0.dylib"; do
               if [ ! -f "$lib" ]; then echo "❌ missing $lib"; bad=1; continue; fi
               if otool -L "$lib" | grep -qi 'libSDL3'; then echo "❌ $lib load-time-links libSDL3"; bad=1; fi
@@ -114,7 +100,7 @@ jobs:
 
       - name: Build universal .app (arm64 + x86_64)
         working-directory: source
-        run: make -j"$(sysctl -n hw.ncpu)" bundle-universal SKIP_INSTALL=1 FREEZE_BUILD_NUMBER=1   # pin to committed .build_number
+        run: make -j"$(sysctl -n hw.ncpu)" bundle-universal SKIP_INSTALL=1 FREEZE_BUILD_NUMBER=1 X86_64_PREFIX="$X86_64_PREFIX"   # pin to committed .build_number
 
       - name: Verify universal binary
         run: |
