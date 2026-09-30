@@ -37,77 +37,115 @@ TapeXPlayer is built with **C**,**C++**, **Objective-C**, **Swift** using indust
 ---
 
 ## Installation
-### Method 1: Automatic Installation (Recommended)
+
+Prebuilt packages are on the [releases page](https://github.com/ffbsoffa/TapeXPlayer/releases).
 
 #### macOS
 
-The application has technical preview status and has not undergone Apple notarization yet.
-
-On first launch, macOS Gatekeeper blocks the unsigned application. To install and bypass this restriction, use the following script:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/refs/heads/stable/install.sh | bash
-```
-
-The script performs the following actions:
-1. Downloads the latest version of TapeXPlayer from the GitHub repository
-2. Extracts the archive to the `/Applications` directory
-3. Removes the quarantine attribute using `xattr -d com.apple.quarantine`
-
-After running the script, the application is ready to use.
-
-### Windows
-For automatic installation on Windows, open PowerShell and run:
-
-```powershell
-iwr -useb https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/refs/heads/stable/install.ps1 | iex
-```
-
-The script performs the following actions:
-1. Downloads the latest version of TapeXPlayer from the GitHub repository
-2. Extracts the archive to the `C:\Program Files\TapeXPlayer` directory
-3. Creates a desktop shortcut
-
-**Note:** On first launch, Windows Defender SmartScreen may display a warning — select "More info" followed by "Run anyway".
-
-### Method 2: Manual Installation via Terminal
-
-#### macOS
-
-1. Go to the [GitHub releases page](https://github.com/ffbsoffa/TapeXPlayer/releases)
-2. Download the ZIP archive with the latest release for macOS
-3. Extract the archive and drag `TapeXPlayer.app` to the `/Applications` folder
-4. **Important:** Remove the quarantine attribute manually via Terminal:
+1. Download `TapeXPlayer-mac-universal-build….zip` and unpack it
+2. Drag `TapeXPlayer.app` to `/Applications`
+3. The app is not notarized yet, so remove the quarantine flag once:
    ```bash
    xattr -d com.apple.quarantine /Applications/TapeXPlayer.app
    ```
-5. Launch the application from the `Applications` folder
-
-On first launch, the system may request permission. Confirm in "Security & Privacy" settings.
+4. Launch it from `Applications`. If macOS still asks, confirm in System Settings → Privacy & Security → Open Anyway
 
 #### Windows
 
-1. Download the ZIP archive from the [releases page](https://github.com/ffbsoffa/TapeXPlayer/releases)
-2. Extract the archive to a convenient directory (for example, `C:\Program Files\TapeXPlayer`)
-3. Run `TapeXPlayer.exe`
+1. Download `TapeXPlayer-Setup-x64-build….exe` and run it
+2. The installer adds Start Menu and desktop shortcuts and an entry in "Add or Remove Programs"
 
-On first launch, Windows Defender SmartScreen may display a warning. Select "More info" followed by "Run anyway".
+The build is not code-signed yet — if SmartScreen warns, choose "More info" → "Run anyway".
 
 #### Linux
 
-1. Download the DEB package from the [releases page](https://github.com/ffbsoffa/TapeXPlayer/releases)
-2. Install the package:
-   ```bash
-   sudo dpkg -i tapexplayer_*.deb
-   sudo apt-get install -f
-   ```
+Download `tapexplayer_…_amd64.deb` and install it:
+```bash
+sudo apt install ./tapexplayer_*_amd64.deb
+```
+The package is built on Ubuntu 24.04. On older releases or other distributions, build from source (below).
+
+---
+
+## Building from source
+
+TapeXPlayer builds with a plain `makefile` (no CMake) from the `source/` directory. The same makefile detects the platform. The CI workflows in [`.github/workflows/`](.github/workflows) build every platform on each push and are the reference if something here drifts.
+
+```bash
+git clone https://github.com/ffbsoffa/TapeXPlayer.git
+cd TapeXPlayer/source
+```
+
+Every local `make` bumps `source/.build_number`. Add `FREEZE_BUILD_NUMBER=1` to keep it unchanged. `make help` lists the targets for your platform.
+
+### macOS
+
+Requirements: Xcode 16+ (Apple clang with `-std=c++23`; Xcode 16 itself needs macOS 14.5+) and [Homebrew](https://brew.sh). The resulting app runs on macOS 13+.
+
+```bash
+xcode-select --install          # if the command line tools are missing
+brew install ffmpeg sdl2 sdl2_ttf portaudio openssl@3 rtmidi
+brew install lua                # optional: enables Lua extensions
+```
+
+```bash
+make -j$(sysctl -n hw.ncpu)     # -> builds/binaries/TapeXPlayer
+make bundle                     # -> builds/TapeXPlayer.app (libraries copied in, ad-hoc signed)
+```
+
+`make bundle-universal` builds an arm64 + x86_64 app. It needs a second, x86_64 Homebrew in `/usr/local` and copies the result to `/Applications` unless you pass `SKIP_INSTALL=1`.
+
+Homebrew's `sdl2` is now `sdl2-compat` (SDL2 API on top of SDL3). It is fine for local builds; release builds use real SDL2 built from source, see [`macos-build.yml`](.github/workflows/macos-build.yml).
+
+### Linux (Debian / Ubuntu)
+
+Requirements: Ubuntu 22.04+ or Debian 12+, GCC 11+. CI builds on Ubuntu 24.04.
+
+```bash
+sudo apt update
+sudo apt install build-essential pkg-config \
+    libavformat-dev libavcodec-dev libavfilter-dev libavutil-dev libswscale-dev libswresample-dev \
+    libsdl2-dev libsdl2-ttf-dev portaudio19-dev libssl-dev librtmidi-dev \
+    libgtk-3-dev libva-dev
+```
+
+```bash
+make -j$(nproc)                 # -> builds/binaries/TapeXPlayer_linux
+make deb                        # -> builds/binaries/deb/tapexplayer_<version>.<build>_<arch>.deb
+```
+
+On other distributions install the development packages of the same libraries (FFmpeg, SDL2, SDL2_ttf, PortAudio, OpenSSL, RtMidi, GTK 3) and `pkg-config`; the makefile finds GTK through `pkg-config`, everything else through the standard include/lib paths. x86_64 and arm64 are supported.
+
+### Windows
+
+Windows builds use [MSYS2](https://www.msys2.org) with the MinGW-w64 toolchain. Use the **MSYS2 MINGW64** shell, not MSYS or UCRT64: the makefile links against `/mingw64`.
+
+The quickest way is the bootstrap script. It installs the toolchain and dependencies, clones the repo, builds and bundles the DLLs:
+```bash
+curl -fsSL https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/stable/source/bootstrap_win.sh -o bootstrap_win.sh
+bash bootstrap_win.sh
+```
+
+Or by hand:
+```bash
+pacman -S --needed make git zip \
+    mingw-w64-x86_64-toolchain mingw-w64-x86_64-SDL2 mingw-w64-x86_64-SDL2_ttf \
+    mingw-w64-x86_64-portaudio mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-openssl \
+    mingw-w64-x86_64-rtmidi mingw-w64-x86_64-nsis
+```
+
+```bash
+make -j$(nproc)                 # -> builds/binaries/TapeXPlayer.exe
+./bundle_dlls.sh                # -> builds/win-bundle/ (exe + all DLLs, runs without MSYS2)
+./create_win_installer.sh x64   # -> builds/TapeXPlayer-Setup-x64-build<N>.exe (NSIS)
+```
 
 ---
 
 ## System Requirements
 
 **Minimum requirements:**
-- Operating system: Windows 10/11, macOS 10.14+, Linux (Ubuntu 20.04+ or Debian - at now)
+- Operating system: Windows 10 (1903+) / 11 x64, macOS 13 Ventura+, Linux x86_64 (Ubuntu 22.04+ / Debian 12+)
 - Processor: Intel Pentium Gold 7505 or equivalent with hardware decoding support (Intel QSV, AMD VCE)
 - Memory: 8 GB RAM
 - Video card with built-in hardware video decoder
