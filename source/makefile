@@ -1,25 +1,34 @@
 # TapeXPlayer 2026 Makefile
 # Automated build using wildcard
 #
-# MAIN TARGETS:
+# MAIN TARGETS (all platforms):
 #   make          - Build executable
-#   make bundle   - Create .app bundle with libraries (current architecture)
-#   make bundle-universal - Create Universal Binary + auto-install to /Applications (x86_64 + arm64)
-#   make notarize - Notarize application for public distribution (requires Developer ID)
-#   make app      - Create basic .app bundle (requires installed Homebrew dependencies)
 #   make clean    - Clean object files
 #   make rebuild  - Rebuild everything from scratch
+#   make run      - Build and run
+#   make help     - List the targets for the current platform
+#
+# macOS:
+#   make bundle   - Create .app bundle with libraries (current architecture)
+#   make bundle-universal - Create Universal Binary + auto-install to /Applications (x86_64 + arm64)
+#   make app      - Create basic .app bundle (requires installed Homebrew dependencies)
+#   make release  - Zip an existing bundle for GitHub Releases
+# Linux:
+#   make deb      - Create .deb package
+# Windows (MSYS2 MINGW64):
+#   make win-release - Zip an existing win-bundle (run ./bundle_dlls.sh first)
 #
 # OPTIONS:
 #   SKIP_INSTALL=1 - Skip automatic installation to /Applications (for bundle-universal only)
 #     Example: make bundle-universal SKIP_INSTALL=1
+#   FREEZE_BUILD_NUMBER=1 - Don't increment .build_number (CI uses this)
 #
 
 # === BUILD VERSION CONFIGURATION ===
-# Application version (can override: make VERSION=2026.02)
+# Version and code name live in ../VERSION (also read by update_buildinfo.sh and
+# create_deb.sh). Command line still wins: make VERSION=2026.02 CODE_NAME=Apollo
+-include ../VERSION
 VERSION ?= 2026.01
-
-# Build code name (can override: make CODE_NAME=Apollo)
 CODE_NAME ?= Albatross
 
 # File for storing build number
@@ -169,7 +178,10 @@ ifeq ($(UNAME_S),Linux)
     # REMOVED AVX512 due to heap corruption issues on Intel CPUs
     # AVX512 requires 64-byte alignment which causes problems with AVFrame allocation
     ifeq ($(UNAME_M),x86_64)
-        CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -march=x86-64-v3 -msse2 -msse4.1 -mavx -mavx2 -Wno-unused-parameter
+        # Same SSE4.1 baseline as Windows: -march=x86-64-v3 / -mavx2 made the .deb die with
+        # SIGILL on CPUs without AVX2 (Pentium/Celeron, pre-2013). AVX2 paths in
+        # FSTPSIMDOptimizations are target("avx2") + HasAVX2() runtime-dispatched anyway.
+        CXXFLAGS = -std=c++23 -Wall -Wextra -O2 -g -msse2 -msse4.1 -Wno-unused-parameter
     else
         # arm64 Linux (VM on Apple Silicon, Raspberry Pi 5, etc.): NEON in AArch64
         # is always on, x86 flags (-march/-msse/-mavx) break the build here.
@@ -219,7 +231,13 @@ else
     SWIFTFLAGS = -target $(SWIFT_TARGET) -import-objc-header modules/FSTPMainModule/WSGUI/darwin/sdl/TapeXPlayer-Bridging-Header.h -parse-as-library
     SDL_PATH = $(HOMEBREW_PATH)
     INCLUDES = -I$(SDL_PATH)/include -Imodules/FSTPMainModule -Imodules/FSTPMainModule/WSGUI -Imodules/FSTPPlayerModule -Imodules/FSTPVideoModule -Imodules/FSTPAudioModule
-    LIBS = -L$(SDL_PATH)/lib -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample -lssl -lcrypto -lrtmidi -framework Cocoa -framework CoreFoundation -framework CoreVideo -framework UniformTypeIdentifiers -framework VideoToolbox -framework IOKit -framework QuartzCore -framework CoreMIDI -framework AVFoundation -framework CoreMedia
+    # openssl@3 is keg-only in Homebrew: it is not always linked into $(SDL_PATH)/include|lib
+    OPENSSL_PATH = $(wildcard $(HOMEBREW_PATH)/opt/openssl@3)
+    ifneq ($(OPENSSL_PATH),)
+        INCLUDES += -I$(OPENSSL_PATH)/include
+        OPENSSL_LDFLAGS = -L$(OPENSSL_PATH)/lib
+    endif
+    LIBS = -L$(SDL_PATH)/lib $(OPENSSL_LDFLAGS) -lSDL2 -lSDL2_ttf -lportaudio -lavformat -lavcodec -lavfilter -lavutil -lswscale -lswresample -lssl -lcrypto -lrtmidi -framework Cocoa -framework CoreFoundation -framework CoreVideo -framework UniformTypeIdentifiers -framework VideoToolbox -framework IOKit -framework QuartzCore -framework CoreMIDI -framework AVFoundation -framework CoreMedia
     # Optional Lua for the extension executor. Linked only when pkg-config finds a
     # 'lua' package (e.g. `brew install lua`); otherwise the build proceeds with the
     # executor stubbed out (FSTP_HAVE_LUA undefined), so it never breaks a build.
@@ -242,12 +260,6 @@ LIBS_WITH_ARCH = $(LIBS) $(ARCH_FLAGS)
 # OBJDIR and TARGET are already set in platform-specific sections
 APP_BUNDLE ?= ../builds/TapeXPlayer.app
 ICON_SOURCE = ../resources/TapeXPlayer.icns
-
-# Integrated test
-TEST_TARGET = ../builds/binaries/test_integrated_system
-
-# Render test
-RENDER_TEST_TARGET = ../builds/binaries/test_render_backends
 
 # Find source files with wildcard (exclude example and _old files)
 CPP_SOURCES_RAW = $(filter-out modules/FSTPPlayerModule/example_usage.cpp, \
@@ -317,6 +329,8 @@ else ifeq ($(UNAME_S),Linux)
 	@echo "Build Type:      GTK+/SDL2"
 	@echo "Compiler:        $(CXX)"
 	@echo "Target:          $(notdir $(TARGET))"
+	@echo "Build Number:    $(BUILD_NUMBER)"
+	@echo "Version:         $(VERSION) \"$(CODE_NAME)\""
 	@echo "------------------------------------------------"
 else
 	@echo "Platform:        macOS ($(UNAME_M))"
@@ -677,7 +691,7 @@ release-help:
 	@echo ""
 	@echo "Usage:"
 	@echo "  make bundle        # First build the bundle"
-	@echo "  make release       # Creates ZIP with README and install script"
+	@echo "  make release       # Creates ZIP with README and uninstall script"
 	@echo ""
 	@echo "Or with custom code name:"
 	@echo "  make release CODE_NAME=Albatross"
@@ -685,7 +699,6 @@ release-help:
 	@echo "Creates ZIP archive containing:"
 	@echo "  • TapeXPlayer.app (Universal Binary)"
 	@echo "  • README.txt (detailed instructions)"
-	@echo "  • install.command (automatic installation)"
 	@echo "  • uninstall.command (removal)"
 	@echo ""
 	@echo "Result: ../builds/TapeXPlayer-CODENAME-buildXXX.zip"
@@ -717,7 +730,7 @@ endif
 	@echo ""
 	@echo "Total files: $(words $(CPP_SOURCES) $(MM_SOURCES) $(SWIFT_SOURCES))"
 
-# Help target for Linux users
+# Help
 .PHONY: help
 help:
 	@echo "TapeXPlayer 2026 - Universal Build System"
@@ -737,7 +750,23 @@ ifeq ($(UNAME_S),Linux)
 	@echo "Build output:"
 	@echo "  Executable: $(TARGET)"
 	@echo "  Objects:    $(OBJDIR)"
-	@echo "  DEB:        ../binaries/deb/*.deb"
+	@echo "  DEB:        ../builds/binaries/deb/*.deb"
+else ifeq ($(PLATFORM),windows)
+	@echo "Windows targets (MSYS2 MINGW64 shell):"
+	@echo "  make              - Build executable"
+	@echo "  make clean        - Clean build artifacts"
+	@echo "  make rebuild      - Rebuild from scratch"
+	@echo "  make run          - Build and run"
+	@echo "  make win-release  - Zip the bundle (after ./bundle_dlls.sh)"
+	@echo "  make show-sources - Show all source files"
+	@echo ""
+	@echo "After make:"
+	@echo "  ./bundle_dlls.sh          - Copy DLLs next to the exe (../builds/win-bundle/)"
+	@echo "  ./create_win_installer.sh - Build the NSIS installer"
+	@echo ""
+	@echo "Build output:"
+	@echo "  Executable: $(TARGET)"
+	@echo "  Objects:    $(OBJDIR)"
 else
 	@echo "macOS targets:"
 	@echo "  make                    - Build executable"
@@ -767,7 +796,7 @@ deb: $(TARGET)
 # Install DEB package
 install-deb: deb
 	@echo "Installing DEB package..."
-	@DEB_FILE=$$(ls ../binaries/deb/*.deb 2>/dev/null | head -1); \
+	@DEB_FILE=$$(ls ../builds/binaries/deb/*.deb 2>/dev/null | head -1); \
 	if [ -n "$$DEB_FILE" ]; then \
 		echo "Installing $$DEB_FILE..."; \
 		sudo dpkg -i "$$DEB_FILE"; \
@@ -787,4 +816,4 @@ uninstall:
 	@echo "✅ TapeXPlayer uninstalled"
 endif
 
-.PHONY: all clean rebuild run test test-run debug config test-render test-render-run app bundle bundle-universal notarize notarize-help release release-help win-release platform-info show-sources help deb install-deb uninstall
+.PHONY: all clean rebuild run app bundle bundle-universal release release-help win-release platform-info show-sources help deb install-deb uninstall

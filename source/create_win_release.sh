@@ -68,14 +68,8 @@ find "$BUNDLE_DIR" -maxdepth 1 -name "*.dll" -exec cp {} "$RELEASE_CONTENT/" \;
 DLL_COUNT=$(find "$RELEASE_CONTENT" -maxdepth 1 -name "*.dll" | wc -l | tr -d ' ')
 echo "   Copied $DLL_COUNT DLLs"
 
-# ── Copy installer scripts ────────────────────────────────────────────────────
-echo "3️⃣   Copying installer scripts..."
-if [ -f "install.ps1" ]; then
-    cp "install.ps1" "$RELEASE_CONTENT/"
-    echo "   ✓ install.ps1"
-fi
-
 # ── Create uninstall.ps1 ──────────────────────────────────────────────────────
+echo "3️⃣   Creating uninstall.ps1..."
 cat > "$RELEASE_CONTENT/uninstall.ps1" << 'PSEOF'
 # TapeXPlayer Uninstaller for Windows
 # Run with: powershell -ExecutionPolicy Bypass -File uninstall.ps1
@@ -177,17 +171,13 @@ Windows 10 or later required (x86_64)
 QUICK INSTALL
 ================================================================================
 
-Option 1 — PowerShell installer (recommended):
-  Right-click install.ps1 → "Run with PowerShell"
-  Or in PowerShell:
-    powershell -ExecutionPolicy Bypass -File install.ps1
+Option 1 — Installer (recommended):
+  Download TapeXPlayer-Setup-x64-build${BUILD}.exe from
+  https://github.com/ffbsoffa/TapeXPlayer/releases and run it.
 
 Option 2 — Portable (no installation):
   Run TapeXPlayer.exe directly from this folder.
   All required DLLs are included — no additional software needed.
-
-Option 3 — One-line install from web (PowerShell):
-  iwr -useb https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/main/source/install.ps1 | iex
 
 ================================================================================
 SYSTEM REQUIREMENTS
@@ -336,7 +326,6 @@ echo ""
 echo "  Contents:"
 echo "    • TapeXPlayer.exe"
 echo "    • $DLL_COUNT runtime DLLs (fully self-contained)"
-echo "    • install.ps1"
 echo "    • uninstall.ps1"
 echo "    • README.txt (EN/RU)"
 echo "    • LICENSES_THIRD_PARTY.txt"

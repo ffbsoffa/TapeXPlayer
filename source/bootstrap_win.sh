@@ -6,7 +6,7 @@
 # TapeXPlayer.exe and bundles its DLLs.
 #
 #   Usage (from anywhere inside MSYS2 MINGW64):
-#     curl -fsSL https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/main/source/bootstrap_win.sh -o bootstrap_win.sh
+#     curl -fsSL https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/stable/source/bootstrap_win.sh -o bootstrap_win.sh
 #     bash bootstrap_win.sh
 #
 #   Or, if you already cloned the repo, just run it from source/:
