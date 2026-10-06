@@ -19,6 +19,7 @@
 #include <cmath>
 #include <limits>
 #include <iomanip>
+#include <cstring>
 #include <fstream>
 #ifdef _WIN32
 #include <windows.h>
@@ -26,6 +27,7 @@
 
 extern "C" {
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 }
 
 namespace fs = std::filesystem;
@@ -153,7 +155,86 @@ static enum AVPixelFormat SelectHWFormat(AVCodecContext* ctx, const AVPixelForma
         if (*p == g_win_hw_pix_fmt)         return *p;
 #endif
     }
+    // No hardware format on offer (a profile the hwaccel can't take): decode in software instead
+    // of failing the stream — returning NONE left the context producing nothing at all (the same
+    // fix as FSTPFullResDecoderV2::GetHWFormat).
+    for (p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(*p);
+        if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) return *p;
+    }
     return AV_PIX_FMT_NONE;
+}
+
+// Which proxy decode contexts run on the GPU. Contexts 0/1 decode segments during playback, next
+// to the original on the GPU: those stay on the CPU (see decodeLowResRange). Contexts 2/3 are the
+// shuttle's on-demand "tape head" — a GOP-aware seek and 1-4 frames for every picture shown,
+// while the original's decoder is parked — and on Linux/VA-API they go to the GPU: measured on a
+// Pentium Gold 7505 in power-saver, 720x540 GOP-4 proxy, 2.5 ms of CPU per frame in software
+// against 0.35 ms on the GPU plus ~1 ms to bring the one shown frame back. H.264 decoding is
+// bit-exact, so the picture is the same. FSTP_PROXY_HEAD_SW=1 keeps them on the CPU (A/B).
+static bool ProxyContextUsesGpu(int threadId) {
+#if defined(__linux__)
+    static const bool head_on_cpu = std::getenv("FSTP_PROXY_HEAD_SW") != nullptr;
+    return threadId >= 2 && !head_on_cpu;
+#else
+    (void)threadId;
+    return false;   // macOS / Windows: not measured yet
+#endif
+}
+
+// True if an H.264 access unit carries an IDR slice (nal_unit_type 5): decoding can start there
+// with nothing from earlier pictures, so the decoder needs no flush before it. avcC (MP4,
+// length-prefixed NAL units) or Annex B (start codes).
+static bool H264PacketHasIdr(const AVPacket* pkt, const AVCodecParameters* par) {
+    if (!pkt || !pkt->data || pkt->size <= 0 || !par || par->codec_id != AV_CODEC_ID_H264) return false;
+    const uint8_t* p = pkt->data;
+    const uint8_t* end = p + pkt->size;
+    if (par->extradata && par->extradata_size >= 7 && par->extradata[0] == 1) {
+        const int len_size = (par->extradata[4] & 3) + 1;
+        while (end - p > len_size) {
+            uint32_t len = 0;
+            for (int i = 0; i < len_size; ++i) len = (len << 8) | p[i];
+            p += len_size;
+            if (len == 0 || len > static_cast<uint32_t>(end - p)) return false;
+            if ((p[0] & 0x1f) == 5) return true;
+            p += len;
+        }
+        return false;
+    }
+    for (; end - p > 3; ++p) {
+        if (p[0] == 0 && p[1] == 0 && p[2] == 1) {
+            if ((p[3] & 0x1f) == 5) return true;
+            p += 2;
+        }
+    }
+    return false;
+}
+
+// NV12 (Y + interleaved UV) -> planar YUV 4:2:0 into dst, already allocated at src's size.
+// A GPU-decoded proxy frame comes back as NV12; it is stored in the proxy's own planar format so
+// every frame in the index looks alike — the Betacam compositor pairs a frame with its neighbours
+// N-1/N+1 without checking their formats, and those may come from the software segment decode.
+static bool NV12ToYUV420P(const AVFrame* src, AVFrame* dst) {
+    const bool planar420 = (dst && (dst->format == AV_PIX_FMT_YUV420P || dst->format == AV_PIX_FMT_YUVJ420P));
+    if (!src || !planar420 || src->format != AV_PIX_FMT_NV12 ||
+        src->width != dst->width || src->height != dst->height || !dst->data[2]) {
+        return false;
+    }
+    const int w = src->width, h = src->height;
+    for (int y = 0; y < h; ++y) {
+        std::memcpy(dst->data[0] + y * dst->linesize[0], src->data[0] + y * src->linesize[0], w);
+    }
+    const int cw = (w + 1) / 2, ch = (h + 1) / 2;
+    for (int y = 0; y < ch; ++y) {
+        const uint8_t* uv = src->data[1] + y * src->linesize[1];
+        uint8_t* u = dst->data[1] + y * dst->linesize[1];
+        uint8_t* v = dst->data[2] + y * dst->linesize[2];
+        for (int x = 0; x < cw; ++x) {
+            u[x] = uv[2 * x];
+            v[x] = uv[2 * x + 1];
+        }
+    }
+    return true;
 }
 
 // OPTIMIZATION: Binary search for B-frame time matching
@@ -375,13 +456,10 @@ bool LowResDecoder::initialize() {
     // cheap reuse path. Must match the accel used by decodeLowResRange (the cached context keeps
     // whatever the FIRST call created): SOFTWARE on macOS and Windows (small-proxy HW decode is
     // readback-bound — see decodeLowResRange), HW only on Linux/VA-API for now.
-#if defined(__APPLE__) || defined(_WIN32)
-    constexpr bool kProxyHwAccel = false;
-#else
-    constexpr bool kProxyHwAccel = true;
-#endif
+    // (Not reached today: the constructor already sets initialized_, so contexts are created
+    // lazily by their first decodeLowResRange call. Kept consistent with it all the same.)
     for (int tid : {0, 1, 2, 3}) {
-        getOrCreateThreadContext(tid, kProxyHwAccel);
+        getOrCreateThreadContext(tid, ProxyContextUsesGpu(tid));
     }
 
     return true;
@@ -681,6 +759,15 @@ LowResDecoder::ThreadDecoderContext* LowResDecoder::getOrCreateThreadContext(int
             ctx.codecCtx->flags |= strategy.codec_flags;
             ctx.codecCtx->flags2 |= strategy.codec_flags2;
 
+            if (ctx.hw_accel_enabled) {
+                // One frame at a time on the GPU: frame threads would only hold output back (a
+                // single-frame decode would have to feed packets past its target to get it), and
+                // FAST's non-compliant shortcuts must not apply if the stream falls back to
+                // software in SelectHWFormat — the picture has to match the CPU decode.
+                ctx.codecCtx->thread_count = 1;
+                ctx.codecCtx->flags2 &= ~AV_CODEC_FLAG2_FAST;
+            }
+
             // Apply performance tuning
             ctx.codecCtx->skip_frame = static_cast<AVDiscard>(strategy.skip_frame);
             ctx.codecCtx->skip_idct = static_cast<AVDiscard>(strategy.skip_idct);
@@ -688,7 +775,7 @@ LowResDecoder::ThreadDecoderContext* LowResDecoder::getOrCreateThreadContext(int
 
             std::cout << "✅ [Thread " << threadId << "] Decoder configured: "
                       << (strategy.use_hw_accel ? "HW" : "CPU") << " decode, "
-                      << strategy.thread_count << " threads, SIMD level " << strategy.simd_level << std::endl;
+                      << ctx.codecCtx->thread_count << " threads, SIMD level " << strategy.simd_level << std::endl;
         } else {
             std::cerr << "⚠️  [Thread " << threadId << "] g_hardware_detection not initialized, using defaults" << std::endl;
         }
@@ -765,7 +852,8 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
         // the full-res 1080p decoder on the same GPU, versus ~4ms for a libavcodec software decode that
         // lands straight in system memory. So the original owns the GPU and the proxy stays on the CPU;
         // this is what keeps the segment prefetch fast enough to feed the display without it decoding.
-        bool useHardwareAccel = false;
+        // Except the shuttle's on-demand contexts on Linux (ProxyContextUsesGpu).
+        bool useHardwareAccel = ProxyContextUsesGpu(threadId);
         ThreadDecoderContext* ctx = getOrCreateThreadContext(threadId, useHardwareAccel);
 
         if (!ctx || !ctx->initialized) {
@@ -802,6 +890,7 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
         // SOLUTION: Find keyframe BEFORE threadStartFrame for correct decoding
         int64_t seekTargetTimeMs = -1;
         int seekFrame = threadStartFrame;
+        bool flushUnlessIdr = false;   // GPU contexts: flush at the first packet unless it's an IDR
 
         // Find nearest keyframe backwards (up to 400 frames - covers GOP=300 with margin)
         int searchLimit = std::max(0, threadStartFrame - 400);
@@ -839,6 +928,11 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
                  std::cerr << "[Thread " << threadId << "] Warning: Seek to ts " << seek_target_ts
                            << " (ms " << seekTargetTimeMs << ") failed: " << av_errbuf_seek << std::endl;
                  avcodec_flush_buffers(codecContext);
+            } else if (ctx->hw_accel_enabled) {
+                // GPU context: a flush makes FFmpeg re-create the hwaccel for the next picture
+                // (~1.6 ms of CPU each on a Pentium Gold 7505 — as much as the decode and the
+                // transfer together). Decide at the first packet: an IDR needs none.
+                flushUnlessIdr = true;
             } else {
                  avcodec_flush_buffers(codecContext); // Flush after successful seek too
                 if (ENABLE_LOWRES_DECODER_DEBUG) {
@@ -874,6 +968,12 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
         while (!stop_requested_.load()) {
             auto t_before_read = std::chrono::high_resolution_clock::now();
             int read_result = av_read_frame(formatContext, packet);
+            if (read_result >= 0 && flushUnlessIdr && packet->stream_index == videoStream) {
+                flushUnlessIdr = false;
+                if (!H264PacketHasIdr(packet, formatContext->streams[videoStream]->codecpar)) {
+                    avcodec_flush_buffers(codecContext);
+                }
+            }
             auto t_after_read = std::chrono::high_resolution_clock::now();
             total_read_frame_us += std::chrono::duration_cast<std::chrono::microseconds>(t_after_read - t_before_read).count();
 
@@ -1119,7 +1219,26 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
                             selected_pool = nullptr;
                         }
 
-                        if (selected_pool) {
+                        // GPU-decoded (NV12 after the transfer): store it in the proxy's planar
+                        // format, in a pool frame, with the decoder's colour metadata (the transfer
+                        // carries none) — indistinguishable from a software-decoded frame.
+                        if (temp_hw_frame && source_frame == temp_hw_frame && source_format == AV_PIX_FMT_NV12 &&
+                            (pixFmt_ == AV_PIX_FMT_YUV420P || pixFmt_ == AV_PIX_FMT_YUVJ420P) && frame_pool_) {
+                            ref_frame = frame_pool_->Acquire();
+                            if (ref_frame && NV12ToYUV420P(source_frame, ref_frame)) {
+                                av_frame_copy_props(ref_frame, frame);
+                                ref_frame->pts = framePts;
+                                ref_frame->best_effort_timestamp = framePts;
+                                ref_frame->pkt_dts = frame->pkt_dts;
+                                ref_frame->sample_aspect_ratio = ctx->sar;
+                                from_pool = true;
+                            } else if (ref_frame) {
+                                frame_pool_->Release(ref_frame);
+                                ref_frame = nullptr;
+                            }
+                        }
+
+                        if (selected_pool && !ref_frame) {
                             // FAST PATH: Use frame pool (CPU or HW)
                             ref_frame = selected_pool->Acquire();
                             if (ref_frame) {
@@ -1530,8 +1649,12 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
         av_frame_free(&frame);
         av_packet_free(&packet);
 
-        // Flush decoder buffers for next segment (cleanup state)
-        avcodec_flush_buffers(codecContext);
+        // Flush decoder buffers for next segment (cleanup state). Not on a GPU context: the next
+        // call decides at its first packet (flushUnlessIdr) — low-delay baseline leaves nothing
+        // pending in the decoder, and an IDR starts clean by definition.
+        if (!ctx->hw_accel_enabled) {
+            avcodec_flush_buffers(codecContext);
+        }
 
         static int thread_done_count = 0;
         if (++thread_done_count % 10 == 0) {
