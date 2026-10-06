@@ -48,6 +48,10 @@ bool FSTPSubtitles_HasTrack(int player_id);
 void FSTPSubtitles_Render(SDL_Renderer* renderer, int player_id,
                           double time_seconds, int win_w, int win_h);
 
+// The cue's rendered lines are kept per (renderer, player) until the cue changes. Call before
+// SDL_DestroyRenderer, like ClearOSDCacheForRenderer, so they're freed with their renderer.
+void FSTPSubtitles_ForgetRenderer(SDL_Renderer* renderer);
+
 #ifdef __cplusplus
 }
 #endif

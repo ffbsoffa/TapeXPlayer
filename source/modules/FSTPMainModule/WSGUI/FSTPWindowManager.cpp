@@ -497,6 +497,7 @@ void FSTPCloseWindow(int window_index) {
         // CRITICAL: Clear OSD cache BEFORE destroying renderer
         // Otherwise ShutdownOSDSystem will try to delete textures of already destroyed renderer → CRASH
         ClearOSDCacheForRenderer(g_windows[window_index].renderer);
+        FSTPSubtitles_ForgetRenderer(g_windows[window_index].renderer);
 
         SDL_DestroyRenderer(g_windows[window_index].renderer);
         g_windows[window_index].renderer = nullptr;
