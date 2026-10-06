@@ -188,15 +188,29 @@ FSTPVideoModuleWrapper::ProxyState FSTPVideoModuleWrapper::ProbeProxy(const std:
 
     // If using original - create symlink or copy
     if (use_original_as_proxy) {
-        if (!fs::exists(m_proxy_path)) {
-            try {
-                // Create symlink instead of copying to save space
-                fs::create_symlink(sourcePath, m_proxy_path);
+        // The link lives in the cache dir, so a relative path from the command line
+        // ("../clip.mp4") would dangle. Older builds left such dangling links: drop them.
+        fs::path target = fs::absolute(sourcePath, ec);
+        if (ec) target = sourcePath;
+        if (fs::is_symlink(fs::symlink_status(m_proxy_path, ec)) && !fs::exists(m_proxy_path, ec)) {
+            fs::remove(m_proxy_path, ec);
+        }
+        if (!fs::exists(m_proxy_path, ec)) {
+            // Create symlink instead of copying to save space
+            fs::create_symlink(target, m_proxy_path, ec);
+            if (!ec) {
                 std::cout << "[VIDEO] Created symlink to original: " << m_proxy_path << std::endl;
-            } catch (...) {
-                // If symlink failed, copy file
-                fs::copy_file(sourcePath, m_proxy_path, fs::copy_options::overwrite_existing);
-                std::cout << "[VIDEO] Copied original as proxy: " << m_proxy_path << std::endl;
+            } else {
+                // If symlink failed, copy file; if that fails too, read the original directly.
+                // This runs on a detached proxy thread — a throw here would std::terminate the app.
+                fs::copy_file(target, m_proxy_path, fs::copy_options::overwrite_existing, ec);
+                if (!ec) {
+                    std::cout << "[VIDEO] Copied original as proxy: " << m_proxy_path << std::endl;
+                } else {
+                    std::cerr << "[VIDEO] Could not link or copy the original into the cache ("
+                              << ec.message() << "), using it in place" << std::endl;
+                    m_proxy_path = target.string();
+                }
             }
         } else {
             std::cout << "[VIDEO] Found existing proxy (original): " << m_proxy_path << std::endl;
