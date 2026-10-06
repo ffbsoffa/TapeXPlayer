@@ -942,8 +942,15 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
                 currentX += charWidth;
             }
         } else {
-            // Normal mode - render the whole string
-            RenderCachedText(renderer, timecode, timecodeX, timecodeY, textColor, shadowColor, g_large_font);
+            // Normal mode: glyph by glyph from the glyph cache, like seek mode. The running
+            // timecode is a new string every frame, so drawing it whole meant two TTF renders and
+            // two new textures per frame. The OSD font is fixed-width (Iosevka Fixed): the glyph-
+            // by-glyph picture is pixel-identical to the whole string (checked with SDL_ttf 2.24
+            // on macOS and Ubuntu's on Linux, sizes 32 and 16, text and outline colours).
+            int currentX = timecodeX;
+            for (char c : timecode) {
+                currentX += RenderCachedGlyph(renderer, c, currentX, timecodeY, textColor, shadowColor, g_large_font);
+            }
         }
 
         // auto timecode_end = std::chrono::high_resolution_clock::now();
