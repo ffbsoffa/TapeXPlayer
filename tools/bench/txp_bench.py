@@ -326,6 +326,8 @@ def main():
     try:
         {"phases": phases, "reverse": reverse, "play-after-shuttle": play_after_shuttle,
          "play": play}[args.scenario](player, args)
+        if player.proc.poll() is not None:
+            print(f"PLAYER DIED during the run (code {player.proc.returncode})", flush=True)
     finally:
         player.stop()
 
