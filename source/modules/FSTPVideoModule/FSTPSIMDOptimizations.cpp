@@ -723,6 +723,7 @@ void SIMDOptimizations::AudioFloatPlanarToS16(const float* const* planes, int ch
         return;
     }
     size_t i = 0;
+#if defined(FSTP_KERNEL_SSE2) || defined(FSTP_KERNEL_NEON)
     if (channels == 2) {   // stereo: convert both planes 8 frames at a time and interleave
         const float* left = planes[0];
         const float* right = planes[1];
@@ -732,7 +733,7 @@ void SIMDOptimizations::AudioFloatPlanarToS16(const float* const* planes, int ch
             _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * i), _mm_unpacklo_epi16(l, r));
             _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * i + 8), _mm_unpackhi_epi16(l, r));
         }
-#elif defined(FSTP_KERNEL_NEON)
+#else
         for (; i + 8 <= frames; i += 8) {
             int16x8x2_t lr;
             lr.val[0] = FloatToS16x8(left + i);
@@ -741,6 +742,7 @@ void SIMDOptimizations::AudioFloatPlanarToS16(const float* const* planes, int ch
         }
 #endif
     }
+#endif
     for (; i < frames; ++i) {
         for (int ch = 0; ch < channels; ++ch) {
             dst[i * channels + ch] = FloatSampleToS16(planes[ch][i]);
