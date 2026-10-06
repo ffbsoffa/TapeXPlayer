@@ -28,6 +28,12 @@ namespace FSTP {
 
 class LowResDecoder {
 public:
+    // Keyframe interval of every proxy (FSTPProxyConverter encodes with -g 4). The tape-head
+    // shuttle decodes only the frame on screen, i.e. from the previous keyframe: an original is
+    // used as its own proxy only when its GOP is no longer than this.
+    static constexpr int kProxyGop = 4;
+
+public:
     explicit LowResDecoder(const std::string& lowResFilename);
     ~LowResDecoder();
 

@@ -1738,12 +1738,12 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
     }
 
     // CRITICAL: Check GOP BEFORE checking resolution/codec
-    if (max_gop_size > 50) {
-        std::cout << "⚠️  [LowResDecoder] Large GOP detected (" << max_gop_size
-                  << " frames) - creating short-GOP (GOP=4) proxy for responsive scrubbing" << std::endl;
+    if (max_gop_size > kProxyGop) {
+        std::cout << "⚠️  [LowResDecoder] GOP " << max_gop_size << " is longer than a proxy's ("
+                  << kProxyGop << ") - creating short-GOP proxy for responsive scrubbing" << std::endl;
         // Continue creating proxy below
     } else {
-        // GOP is adequate (≤50) - check if we can use original
+        // GOP is as short as a proxy's - check if we can use original
         bool is_low_res = (width * height) <= (720 * 480);
 
         // macOS OPTIMIZATION: Use low-bitrate Full HD videos directly (surveillance cameras)
@@ -1817,7 +1817,9 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
     // STANDARD MODE: 540p with square pixels. 540p is the sweet spot for resolution; blockiness is
     // killed by a HIGHER bitrate (below), not more pixels. Resolution is decoupled from shuttle speed
     // anyway — Stage 2 (seek-per-frame on demand) decodes only the ~60 shown frames/s at shuttle.
-    int proxy_height = 540;
+    // Never above the source: a 360p original would otherwise be blown up to 720x540 —
+    // 2.25x the pixels to encode now and to decode on every shuttle picture later.
+    int proxy_height = (orig_height >= 2) ? std::min(540, orig_height & ~1) : 540;
     int proxy_width;
 
     // Calculate display aspect ratio (DAR) from original dimensions and SAR

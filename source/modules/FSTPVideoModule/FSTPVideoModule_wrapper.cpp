@@ -169,13 +169,16 @@ FSTPVideoModuleWrapper::ProxyState FSTPVideoModuleWrapper::ProbeProxy(const std:
             }
             av_packet_free(&packet);
 
-            // NEW STRATEGY: ≤480p AND h264 → ALWAYS use original (any GOP!)
-            // Adaptive segment sizing handles any GOP structure (25, 100, 300, etc.)
-            if (source_height <= 480 && is_h264 && max_gop_size > 0) {
+            // ≤480p H.264 is its own proxy only when its GOP is already as short as a proxy's.
+            // A long-GOP original (a 360p web clip, GOP 125-175) made the tape-head shuttle decode
+            // from a keyframe up to 175 frames back for every picture: 3-5 pictures/s at 24x on a
+            // Pentium Gold 7505 instead of ~43. It gets a short-GOP proxy like any other file.
+            if (source_height <= 480 && is_h264 && max_gop_size > 0 &&
+                max_gop_size <= FSTP::LowResDecoder::kProxyGop) {
                 use_original_as_proxy = true;
                 m_use_original_as_proxy = true;  // Flag to disable Full_Res
                 std::cout << "[VIDEO] ✅ Video is " << source_height << "p H.264 with GOP=" << max_gop_size
-                          << " - using original as proxy (adaptive segments will handle any GOP)" << std::endl;
+                          << " - using original as proxy" << std::endl;
             }
         }
         avformat_close_input(&fmt);
