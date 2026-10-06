@@ -26,7 +26,10 @@ extern "C" {
 namespace FSTP {
 
 // SIMD Optimization utilities for Intel Celeron + PowerSaver
-// Provides efficient vectorized operations for video frame processing
+// The one place for CPU-specific (SSE/AVX/NEON) code in the app — video, effect and audio
+// kernels alike — so every platform path sits side by side. Sections, in order:
+//   CPU feature detection · memory operations · frame processing · YUV processing ·
+//   color space conversions · frame validation · Betacam effect kernels · audio conversion.
 
 class SIMDOptimizations {
 public:
@@ -70,7 +73,28 @@ public:
     // Frame validation and safety checks
     static bool ValidateFrameData(const AVFrame* frame);
     static void SanitizeFrameData(AVFrame* frame);
-    
+
+    // Betacam effect kernels — the same result on every CPU: SSE2 on any x86-64 (Intel and
+    // AMD alike; part of the x86-64 baseline, so no runtime check), NEON on any arm64 (Apple
+    // M-series, Windows on Snapdragon, Raspberry Pi), scalar elsewhere. Bit-identical paths.
+    //
+    // Horizontal analog smear: one-pole IIR trailing left→right along each of `rows` rows of
+    // `samples` samples, out[x] = (in[x]·(256−k) + out[x−1]·k) >> 8. interleaved: two channels
+    // in alternate bytes (NV12 UV), each smeared on its own.
+    static void AnalogSmear(uint8_t* plane, int pitch, int rows, int samples, bool interleaved, int k);
+    // One row of the soft-edge blur: dst = cur + ((((above + 2·cur + below) >> 2) − cur)·mix >> 8).
+    static void SoftEdgeRow(uint8_t* dst, const uint8_t* above, const uint8_t* cur,
+                            const uint8_t* below, int width, int mix);
+
+    // Audio sample conversion into the int16 playback buffer — same result on every CPU
+    // (SSE2 / NEON / scalar, bit-identical). Float samples: clamp to [−1, 1] (NaN → 1), ×32767,
+    // truncate toward zero.
+    static void AudioS32ToS16(const int32_t* src, int16_t* dst, size_t count);     // keeps src >> 16
+    static void AudioFloatToS16(const float* src, int16_t* dst, size_t count);     // interleaved float
+    // Planar float (AAC, Opus…) → interleaved int16: `frames` frames of `channels` planes.
+    static void AudioFloatPlanarToS16(const float* const* planes, int channels, size_t frames,
+                                      int16_t* dst);
+
 private:
     // Internal helper functions
     static void AlignMemory_SSE2(void* ptr, size_t size, int alignment);

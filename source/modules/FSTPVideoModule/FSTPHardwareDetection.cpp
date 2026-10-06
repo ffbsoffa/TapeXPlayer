@@ -863,6 +863,11 @@ void FSTPHardwareDetection::DetectCPUPowerMode(FSTPCPUInfo& info) {
 }
 
 void FSTPHardwareDetection::ApplyCPUSpecificOptimizations(FSTPCPUInfo& info) {
+    // Shuttle speed is NOT capped by CPU class any more (it was 24× here, 16× on Atom): the proxy
+    // manager's tape-head mode decodes only what the display shows (~60 pictures/s), so 32× costs
+    // the same as 8×. Measured on the Pentium Gold 7505 in power-saver mode: 24× went from ~2 cores
+    // for ~5 new pictures/s to ~0.6 core for ~47. recommended_max_speed stays at its 32× default.
+
     // ── MINIMUM class: Celeron / Pentium / Atom ───────────────────────────────
     // Reference: Intel Celeron Gold 7505 (Tiger Lake, 2-core, 15 W, user tested)
     // Extrapolation: all Celeron, Pentium, Atom share similar limitations
@@ -877,19 +882,15 @@ void FSTPHardwareDetection::ApplyCPUSpecificOptimizations(FSTPCPUInfo& info) {
 
         if (is_7505) {
             std::cout << "  🎯 Intel Celeron/Pentium Gold 7505 (MINIMUM reference device)" << std::endl;
-            std::cout << "     User test: 24× max, 360p proxy, QSV" << std::endl;
+            std::cout << "     Reference low-end device: GPU decodes the original, tape-head shuttle" << std::endl;
             info.decode_throughput_fps = 1450.0;  // QSV: 1400-1500 fps
         } else if (is_atom) {
             std::cout << "  🔧 Intel Atom detected: " << info.model_name << std::endl;
-            std::cout << "     Max speed: 16× (very low-power CPU)" << std::endl;
-            info.recommended_max_speed = 16;  // Atom slower than Celeron
         } else {
             std::cout << "  🔧 Intel Celeron/Pentium detected: " << info.model_name << std::endl;
-            std::cout << "     Extrapolated from Celeron 7505: 24× max, 360p proxy" << std::endl;
         }
 
         info.requires_performance_mode = true;
-        if (info.recommended_max_speed == 32) info.recommended_max_speed = 24;  // limit
         info.is_pentium_gold_7505 = true;  // flag for MINIMUM-profile optimizations
         return;
     }
@@ -900,9 +901,7 @@ void FSTPHardwareDetection::ApplyCPUSpecificOptimizations(FSTPCPUInfo& info) {
     if (!info.is_apple_silicon && info.physical_cores <= 2 &&
         (info.architecture == "x86_64" || info.architecture.find("i686") != std::string::npos)) {
         std::cout << "  🔧 2-core x86 CPU: " << info.model_name << std::endl;
-        std::cout << "     Throughput similar to Celeron 7505 → 24× limit" << std::endl;
         info.requires_performance_mode = true;
-        if (info.recommended_max_speed == 32) info.recommended_max_speed = 24;
         info.is_pentium_gold_7505 = true;
         return;
     }
@@ -912,9 +911,7 @@ void FSTPHardwareDetection::ApplyCPUSpecificOptimizations(FSTPCPUInfo& info) {
                           info.model_name.find("Athlon Gold")   != std::string::npos);
     if (is_athlon_low) {
         std::cout << "  🔧 AMD Athlon Silver/Gold detected: " << info.model_name << std::endl;
-        std::cout << "     AMD equivalent of Celeron/Pentium → 24× limit, 360p proxy" << std::endl;
         info.requires_performance_mode = true;
-        if (info.recommended_max_speed == 32) info.recommended_max_speed = 24;
         info.is_pentium_gold_7505 = true;  // use the same MINIMUM profile
         return;
     }
@@ -961,8 +958,9 @@ bool FSTPHardwareDetection::SetPerformanceMode() {
     std::cout << "  ⚡ Switching CPU to performance mode..." << std::endl;
     std::cout << "     Original mode: " << original_governor_ << std::endl;
 
-    // Try to set performance mode for all CPUs
-    int result = system("for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance | sudo tee $cpu > /dev/null 2>&1; done");
+    // Try to set performance mode for all CPUs. sudo -n: never prompt — launched from a terminal,
+    // a plain sudo stopped the app's startup on an (invisible) password prompt.
+    int result = system("for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance | sudo -n tee $cpu > /dev/null 2>&1; done");
 
     if (result == 0) {
         std::cout << "  ✅ CPU switched to performance mode" << std::endl;
@@ -987,7 +985,7 @@ bool FSTPHardwareDetection::RestorePowerMode() {
     std::cout << "  🔄 Restoring CPU power mode to: " << original_governor_ << std::endl;
 
     std::string cmd = "for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo " +
-                      original_governor_ + " | sudo tee $cpu > /dev/null 2>&1; done";
+                      original_governor_ + " | sudo -n tee $cpu > /dev/null 2>&1; done";
     int result = system(cmd.c_str());
 
     if (result == 0) {

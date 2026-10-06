@@ -1,6 +1,7 @@
 #ifdef __linux__
 
 #include <SDL2/SDL.h>
+#include "../FSTPThreadName.h"
 #include <SDL2/SDL_syswm.h>
 #include <gtk/gtk.h>
 #include <portaudio.h>
@@ -8,6 +9,10 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
+#include "../FSTPYUVRenderer.h"
 #include <iostream>
 #include <condition_variable>
 #include <mutex>
@@ -103,6 +108,7 @@ void StartAutonomousRendering(SDL_Renderer* renderer) {
     g_renderThreadRunning = true;
 
     g_renderThread = std::thread([]() {
+        FSTPSetThreadName("fstp-render");
         std::cout << "🎬 [RENDER THREAD] Linux render thread started (60 FPS)" << std::endl;
 
         const int TARGET_FPS = 60;
@@ -956,9 +962,43 @@ int RunMainUILoop() {
     SDL_Event event;
     std::thread cleanup_thread;
 
+    // FSTP_RENDER_STATS=1: once a second, how the UI loop actually performs — iterations,
+    // render cost, the slowest iteration, and how many video frames reached a texture.
+    const bool render_stats = std::getenv("FSTP_RENDER_STATS") != nullptr;
+    auto stats_start = std::chrono::steady_clock::now();
+    auto loop_start = stats_start;
+    int stats_loops = 0;
+    double stats_render_ms = 0.0, stats_max_loop_ms = 0.0;
+
     while (running) {
+        if (render_stats) {
+            auto now = std::chrono::steady_clock::now();
+            if (stats_loops > 0) {
+                stats_max_loop_ms = std::max(stats_max_loop_ms,
+                    std::chrono::duration<double, std::milli>(now - loop_start).count());
+            }
+            loop_start = now;
+            double window_s = std::chrono::duration<double>(now - stats_start).count();
+            if (window_s >= 1.0) {
+                int uploads = g_fstp_texture_uploads.exchange(0, std::memory_order_relaxed);
+                int distinct = g_fstp_distinct_frames.exchange(0, std::memory_order_relaxed);
+                int max_gap = g_fstp_max_picture_gap_ms.exchange(0, std::memory_order_relaxed);
+                std::printf("📈 [RENDER STATS] loops/s=%.1f render_avg=%.2fms loop_max=%.1fms video_uploads/s=%.1f new_frames/s=%.1f max_picture_gap=%dms\n",
+                            stats_loops / window_s, stats_loops ? stats_render_ms / stats_loops : 0.0,
+                            stats_max_loop_ms, uploads / window_s, distinct / window_s, max_gap);
+                std::fflush(stdout);
+                stats_start = now; stats_loops = 0; stats_render_ms = 0.0; stats_max_loop_ms = 0.0;
+            }
+        }
+
         // Render frame from main thread (SDL context requirement)
+        auto render_start = std::chrono::steady_clock::now();
         AutoRenderFrame();
+        if (render_stats) {
+            stats_render_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - render_start).count();
+            ++stats_loops;
+        }
 
         // CRITICAL: Asynchronous shutdown - destroy player instances in SEPARATE THREAD
         // This allows main thread to continue rendering "unthreading" OSD
@@ -1063,8 +1103,18 @@ int RunMainUILoop() {
             }
         }
 
-        // Small delay to limit FPS
-        SDL_Delay(16); // ~60 FPS
+        // Pace the loop to ~60 Hz by DEADLINE. SDL_Delay(16) after the frame's work made the
+        // period 16 ms + render time: with the Betacam effect on (~5 ms a frame on a Pentium Gold
+        // 7505 in power-saver mode) that was ~47 Hz, below a 50 fps clip, so 1× dropped frames.
+        // A present that already waited for vsync just leaves nothing to sleep here.
+        {
+            static auto next_tick = std::chrono::steady_clock::now();
+            constexpr auto kTick = std::chrono::microseconds(16667);
+            next_tick += kTick;
+            const auto now_tick = std::chrono::steady_clock::now();
+            if (next_tick < now_tick) next_tick = now_tick;   // fell behind: don't burst to catch up
+            std::this_thread::sleep_until(next_tick);
+        }
     }
 
     std::cout << "🛑 Shutting down gracefully..." << std::endl;

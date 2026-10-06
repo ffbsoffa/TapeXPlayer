@@ -1,4 +1,5 @@
 #include "FSTPVideoModule_wrapper.h"
+#include "FSTPThreadName.h"
 
 #include "../FSTPMainModule/WSGUI/FSTPOSDSystem.h"
 #include "../FSTPMainModule/WSGUI/FSTPWindowManager.h"
@@ -258,6 +259,7 @@ bool FSTPVideoModuleWrapper::EnsureProxy(const std::string& filepath, const std:
 // stays in the cache and the next open of this file picks it up instantly.
 void FSTPVideoModuleWrapper::BackgroundProxyConversion(int instance_id, uint32_t generation,
                                                        std::string filepath) {
+    FSTPSetThreadName("fstp-proxyconv");
     std::cout << "[VIDEO] 🧵 Background proxy conversion started (instance " << instance_id
               << "): " << filepath << std::endl;
 
@@ -334,6 +336,7 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath, double initia
     }
 
     m_current_file = filepath;
+    m_full_res_probed = false;
     // Fresh load: no proxy decoder published yet (UnloadFile also clears this; the first
     // load and failed-load retries land here without an unload).
     m_proxy_ready.store(false, std::memory_order_release);
@@ -395,7 +398,12 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath, double initia
         }
     }
 
-    m_current_index.store(0);
+    // Start at the frame we will actually show (resume position), so the proxy manager's first
+    // background fill lands there instead of around frame 0.
+    m_current_index.store((initial_time > 0.0 && m_frame_index && m_frame_index->GetTotalFrames() > 0)
+        ? std::max(0, std::min(m_frame_index->FindFrameByTime(initial_time),
+                               static_cast<int>(m_frame_index->GetTotalFrames()) - 1))
+        : 0);
 
     m_duration.store(m_frame_index->GetDuration());
     m_frame_rate = m_frame_index->GetFrameRate();
@@ -404,9 +412,10 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath, double initia
     m_video_height = m_frame_index->GetHeight();
 
     // Phase 2: Proxy probe (cheap — GOP scan / cache check, never a transcode).
-    // TAPE THREADING: when a full conversion is needed and the full-res V2 decoder is
-    // available, don't block on it — playback starts from the ORIGINAL right away and
-    // BackgroundProxyConversion publishes the proxy decoder when the tape is "threaded".
+    // TAPE THREADING: when a full conversion is needed and the ORIGINAL plays on this machine
+    // (measured — StartFullResDecoder), don't block on it — playback starts from the original
+    // right away and BackgroundProxyConversion publishes the proxy decoder when the tape is
+    // "threaded".
     SetPlayerLoadingStatus(osdPlayerId, "proxy");
     ProxyState proxy_state = ProbeProxy(filepath);
     if (proxy_state == ProxyState::Error) {
@@ -418,10 +427,10 @@ bool FSTPVideoModuleWrapper::LoadFile(const std::string& filepath, double initia
 
     bool defer_proxy = false;
     if (proxy_state == ProxyState::NeedsConversion) {
-        // On this CPU profile the V2 decoder is skipped entirely — without a proxy there
-        // would be no picture at all, so keep the old blocking conversion (25-60%).
-        bool v2_unavailable = (g_hardware_detection &&
-                               g_hardware_detection->GetCPUInfo().is_pentium_gold_7505);
+        // Try the original first. If this machine can't keep up with it (no GPU path for this
+        // stream and not enough CPU), there would be no picture at all without a proxy — only
+        // then fall back to the blocking conversion (25-60%).
+        bool v2_unavailable = !StartFullResDecoder(initial_time);
         if (v2_unavailable) {
             auto proxyProgress = [playerId = osdPlayerId](int percent) {
                 int scaled = 25 + percent * 35 / 100;
@@ -787,14 +796,81 @@ bool FSTPVideoModuleWrapper::SetupProxyDecoder() {
     return true;
 }
 
+// The original plays only if its decoder sustains this multiple of realtime HERE — measured on
+// the actual file, GPU or CPU alike, on every platform. 2× keeps it at no more than half of what
+// the machine can decode, leaving the rest to the proxy decoder and the UI. For scale: on the
+// low-end reference (Pentium Gold 7505, VA-API) 1080p H.264 measures ~10×, HEVC 2160p25 ~3×,
+// while 1080p H.264 in software on its two cores manages ~3× at the cost of all four threads.
+static constexpr double kFullResRealtimeMargin = 2.0;
+
+bool FSTPVideoModuleWrapper::StartFullResDecoder(double initial_time) {
+    m_full_res_probed = true;
+    std::cout << "[VIDEO] Creating FSTPFullResDecoderV2 (streaming mode)" << std::endl;
+    try {
+        m_full_res_decoder = std::make_unique<FSTPFullResDecoderV2>(m_current_file, initial_time);
+    } catch (const std::exception& ex) {
+        std::cerr << "❌ [VIDEO] Failed to create full-res decoder: " << ex.what() << std::endl;
+        m_full_res_decoder.reset();
+        return false;
+    }
+    if (!m_full_res_decoder || !m_full_res_decoder->IsInitialized()) {
+        std::cerr << "⚠️  [VIDEO] FSTPFullResDecoderV2 initialization failed" << std::endl;
+        m_full_res_decoder.reset();
+        return false;
+    }
+
+    // The constructor already waited (≤800 ms) for its startup buffer. Give a slow start a little
+    // more time to produce enough frames for a meaningful number; a decoder that can't deliver
+    // even that is far below realtime anyway.
+    const int kWantSamples = 8;   // steady-state frames, after the decoder's start-up frames
+    const int kMinSamples  = 3;   // near EOF there may be no more frames than this to measure
+    for (int i = 0; i < 60 && m_full_res_decoder->SteadyFrames() < kWantSamples; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    const double clip_fps = (m_full_res_decoder->GetFrameRate() > 0.0) ? m_full_res_decoder->GetFrameRate()
+                          : (m_frame_rate > 0.0 ? m_frame_rate : 25.0);
+    const int    samples  = m_full_res_decoder->MeasuredFrames();
+    const double measured = m_full_res_decoder->MeasuredDecodeFps();
+    const double ratio    = measured / clip_fps;
+    const bool   keep     = samples >= kMinSamples && ratio >= kFullResRealtimeMargin;
+
+    std::cout << "[VIDEO] 📏 Original " << m_full_res_decoder->GetNativeWidth() << "x"
+              << m_full_res_decoder->GetNativeHeight() << " decodes on "
+              << (m_full_res_decoder->DecodesOnGPU() ? "the GPU" : "the CPU") << ": "
+              << std::fixed << std::setprecision(0) << measured << " fps measured over " << samples
+              << " frames = " << std::setprecision(1) << ratio << "× realtime (need "
+              << kFullResRealtimeMargin << "×) → full-res " << (keep ? "ON" : "OFF, proxy only")
+              << std::defaultfloat << std::endl;
+
+    if (!keep) {
+        m_full_res_decoder->RequestStop();
+        m_full_res_decoder.reset();
+    }
+    return keep;
+}
+
 bool FSTPVideoModuleWrapper::InitializeDecoders(double initial_time, bool with_proxy) {
     std::cout << "[VIDEO] InitializeDecoders: Using LowCachedDecoderManager (the proven solution)" << std::endl;
 
     const int osdPlayerId = (m_instance_id >= 0 ? m_instance_id : 0);
 
-    // Progress: 60% → 85% (Low-res decoder setup)
+    // V2 first: its throughput probe (StartFullResDecoder) must run before the proxy manager's
+    // background segment fill starts — on two cores that fill competed with the probe and pushed
+    // a 2.7× GPU decode under the 2× gate on a Pentium Gold 7505 (full-res wrongly OFF). Not
+    // needed when the original itself is the proxy (≤480p H.264); with tape threading LoadFile
+    // has already started (and measured) it.
     SetPlayerLoadingProgress(osdPlayerId, 78);
     UpdateOSDLoadingProgress(osdPlayerId, 78);
+    if (m_use_original_as_proxy) {
+        std::cout << "[VIDEO] ⚡ Skipping Full-Res decoder (the original is the proxy)" << std::endl;
+    } else if (!m_full_res_probed) {
+        StartFullResDecoder(initial_time);
+    }
+
+    // Progress: → 88% (Low-res decoder setup)
+    SetPlayerLoadingProgress(osdPlayerId, 85);
+    UpdateOSDLoadingProgress(osdPlayerId, 85);
 
     if (with_proxy) {
         if (!SetupProxyDecoder()) {
@@ -807,47 +883,8 @@ bool FSTPVideoModuleWrapper::InitializeDecoders(double initial_time, bool with_p
                      "until the background conversion completes" << std::endl;
     }
 
-    SetPlayerLoadingProgress(osdPlayerId, 88);
-    UpdateOSDLoadingProgress(osdPlayerId, 88);
-
-    // V2: Streaming full-res decoder (only if video > 480p or not h264)
-    // For ≤480p h264 video we use only proxy - save resources!
-    // PENTIUM GOLD 7505 OPTIMIZATION: Always disable Full-Res decoder on this CPU
-    bool skip_fullres = m_use_original_as_proxy;
-    if (g_hardware_detection && g_hardware_detection->GetCPUInfo().is_pentium_gold_7505) {
-        skip_fullres = true;
-        std::cout << "[VIDEO] 🎯 Pentium Gold 7505: Full-Res decoder DISABLED (always use optimized proxy)" << std::endl;
-    }
-
-    if (!skip_fullres) {
-        std::cout << "[VIDEO] InitializeDecoders: Creating FSTPFullResDecoderV2 (streaming mode)" << std::endl;
-
-        SetPlayerLoadingProgress(osdPlayerId, 92);
-        UpdateOSDLoadingProgress(osdPlayerId, 92);
-
-        try {
-            m_full_res_decoder = std::make_unique<FSTPFullResDecoderV2>(m_current_file, initial_time);
-
-            if (m_full_res_decoder && m_full_res_decoder->IsInitialized()) {
-                 std::cout << "✅ [VIDEO] FSTPFullResDecoderV2 initialized successfully" << std::endl;
-                 std::cout << "   Display: " << m_full_res_decoder->GetWidth() << "x"
-                          << m_full_res_decoder->GetHeight() << " (downscaled from "
-                          << m_full_res_decoder->GetNativeWidth() << "x"
-                          << m_full_res_decoder->GetNativeHeight() << ")" << std::endl;
-            } else {
-                std::cerr << "⚠️  [VIDEO] FSTPFullResDecoderV2 initialization failed" << std::endl;
-                m_full_res_decoder.reset();
-            }
-        } catch (const std::exception& ex) {
-            std::cerr << "❌ [VIDEO] Failed to create full-res decoder: " << ex.what() << std::endl;
-            m_full_res_decoder.reset();
-        }
-    } else {
-        std::cout << "[VIDEO] ⚡ Skipping Full-Res decoder (resource optimization)" << std::endl;
-        // Still update progress for consistency
-        SetPlayerLoadingProgress(osdPlayerId, 92);
-        UpdateOSDLoadingProgress(osdPlayerId, 92);
-    }
+    SetPlayerLoadingProgress(osdPlayerId, 92);
+    UpdateOSDLoadingProgress(osdPlayerId, 92);
 
     // Progressive scan functionality removed
 
@@ -927,10 +964,18 @@ void FSTPVideoModuleWrapper::SetSpeed(double speed) {
             m_full_res_decoder->RequestStop();
             m_full_res_stopped = true;
         } else if (m_full_res_stopped && abs_speed <= RESUME_THRESHOLD) {
-            std::cout << "✅ [SPEED OPT] Speed <= 1.5x (" << abs_speed << "x), resuming Full-Res decoder" << std::endl;
-            m_full_res_decoder->ClearStopRequest();
+            // Re-armed only: DisplayFrame resumes the decoder (ClearStopRequest + the current
+            // position) once the tape has stayed slow — resuming here on every pass through 0×
+            // during a jog reversal started a GOP catch-up that was thrown away a moment later.
+            std::cout << "✅ [SPEED OPT] Speed <= 1.5x (" << abs_speed << "x), Full-Res decoder re-armed" << std::endl;
             m_full_res_stopped = false;
         }
+    }
+
+    // Entering shuttle: abort a proxy segment prefetch in flight, so the tape-head mode can start
+    // now instead of after up to ~1 s of segment decode (the freeze at the start of a shuttle).
+    if (std::abs(speed) >= 2.0) {
+        if (auto* proxy_mgr = ProxyManager()) proxy_mgr->interruptPrefetchForShuttle();
     }
 
     NotifyDecodersOfFrameChange(m_current_index.load());
@@ -1197,6 +1242,23 @@ bool FSTPVideoModuleWrapper::SubmitFrameToTexture(const std::shared_ptr<AVFrame>
 
     if (!frame) {
         return false;
+    }
+    {
+        // Count distinct PICTURES (by buffer), not frame numbers: in shuttle the same decoded
+        // frame can stand in for several playhead positions.
+        static std::atomic<const uint8_t*> last_picture{nullptr};
+        if (last_picture.exchange(frame->data[0], std::memory_order_relaxed) != frame->data[0]) {
+            g_fstp_distinct_frames.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<int64_t> last_picture_ms{0};
+            const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const int64_t prev_ms = last_picture_ms.exchange(now_ms, std::memory_order_relaxed);
+            if (prev_ms > 0) {
+                int gap = static_cast<int>(now_ms - prev_ms);
+                int seen = g_fstp_max_picture_gap_ms.load(std::memory_order_relaxed);
+                while (gap > seen && !g_fstp_max_picture_gap_ms.compare_exchange_weak(seen, gap)) {}
+            }
+        }
     }
 
     // ZERO-COPY ARCHITECTURE: pass AVFrame directly without copying!
@@ -1480,8 +1542,18 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         actual_speed = m_audio_module->GetActualSpeed();
     }
 
-    // Use V2 at speeds ≤ 1x: pause (0x), slow motion (0.5x), normal (1x)
-    bool slow_or_normal_speed = (actual_speed <= 1.0);
+    // Use V2 at speeds ≤ 1x: pause (0x), slow motion (0.5x), normal (1x) — but only once the tape
+    // has been slow for kFullResSettleMs after running fast. A jog reversal or a stop passes
+    // through ≤1× for a moment; engaging V2 there made it jump to the new position and start a
+    // long-GOP catch-up (up to 255 frames + its buffer) that competed with the shuttle decode for
+    // the two cores and was thrown away when the tape sped up again — the freeze on reversals.
+    // Meanwhile the proxy (tape-head frame) carries the picture.
+    constexpr int64_t kFullResSettleMs = 350;
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (std::abs(actual_speed) > 1.4) m_last_fast_ms.store(now_ms, std::memory_order_relaxed);
+    bool slow_or_normal_speed = (actual_speed <= 1.0) &&
+        (now_ms - m_last_fast_ms.load(std::memory_order_relaxed) >= kFullResSettleMs);
 
     // DEBUG: Log V2 decoder state per player
     if (ENABLE_VIDEO_DEBUG) {
@@ -1676,6 +1748,26 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                 std::unique_lock<std::mutex> off_lock((*frame_vector)[pidx].mutex, std::try_to_lock);
                 if (off_lock.owns_lock()) proxyFrame = (*frame_vector)[pidx].low_res_frame;
             }
+            // SHUTTLE: the exact frame under the playhead is rarely decoded in time (at 24× the head
+            // moves ~12 frames during one ~10 ms decode), so waiting for an exact match left ~4–11
+            // new pictures/s on screen. Show the frame the manager read last instead, as long as it
+            // is within ~50 ms of tape motion of the playhead — the picture follows the head. Also
+            // right after a shuttle stops: the head frame bridges the gap until the exact proxy
+            // frame or the full-res one is ready (otherwise the picture froze until then).
+            bool shuttle_substitute = false;
+            if ((!proxyFrame || !proxyFrame->data[0]) && proxy_mgr && proxy_mgr->shuttleSlot() >= 0) {
+                const int head_slot = proxy_mgr->shuttleSlot();
+                const double fps = (m_frame_rate > 0.0) ? m_frame_rate : 25.0;
+                const int window = std::max(8, static_cast<int>(std::ceil(std::abs(actual_speed) * fps * 0.05)));
+                if (head_slot >= 0 && head_slot < static_cast<int>(frame_vector->size()) &&
+                    std::abs(head_slot - actual_index) <= window) {
+                    std::unique_lock<std::mutex> head_lock((*frame_vector)[head_slot].mutex, std::try_to_lock);
+                    if (head_lock.owns_lock()) {
+                        proxyFrame = (*frame_vector)[head_slot].low_res_frame;
+                        shuttle_substitute = static_cast<bool>(proxyFrame);
+                    }
+                }
+            }
 
             if (proxyFrame && proxyFrame->data[0]) {
                 // CRITICAL: ALWAYS check PTS before using the proxy frame (prevents jitter on
@@ -1694,7 +1786,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                     frame_time = proxyFrame->pts * av_q2d(info.time_base);
                 }
 
-                if (frame_time >= 0.0) {
+                if (frame_time >= 0.0 && !shuttle_substitute) {
                     // The offset shifts the proxy frame's own PTS by |offset| frames vs the
                     // requested time, so widen the tolerance by that much (otherwise the
                     // correct shifted frame would be wrongly rejected).

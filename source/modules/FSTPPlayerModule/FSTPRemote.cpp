@@ -1,5 +1,7 @@
 #include "FSTPRemote.h"
+#include "FSTPThreadName.h"
 #include "FSTPPlayerManager.h"
+#include "FSTPHardwareDetection.h"
 #include <iostream>
 #if !defined(_WIN32) || defined(__MINGW32__)
 // POSIX thread-priority branch (see StartProcessingThread): on gcc/MinGW
@@ -18,7 +20,11 @@ extern "C" int GetActivePlayerID();
 
 // Speed control constants
 const double MIN_SPEED = 0.01;   // Minimum speed (1%)
-const double MAX_SPEED = 24.0;   // Maximum speed (2400%)
+// Maximum shuttle speed: the same limit the keyboard and mouse use (32× unless detection lowers it).
+static double MaxShuttleSpeed() {
+    return (g_hardware_detection && g_hardware_detection->GetMaxRecommendedSpeed() > 0.0)
+        ? g_hardware_detection->GetMaxRecommendedSpeed() : 32.0;
+}
 const double SPEED_EPSILON = 0.0001; // Epsilon for speed comparison
 const double DEFAULT_SPEED = 4.0;   // 400% default speed
 const double SPEED_STEP = 0.75;   // 75% speed change per step
@@ -277,6 +283,7 @@ void FSTPRemote::StopProcessingThread() {
 }
 
 void FSTPRemote::CommandProcessingThread() {
+    FSTPSetThreadName("fstp-remote");
     while (m_thread_running) {
         ProcessCommands();
         UpdateTimecode();
@@ -347,6 +354,19 @@ void FSTPRemote::ProcessCommands() {
                     HandleSeek(target_time);
                 }
                 break;
+            case RemoteCommand::Type::MOUSE_SHUTTLE:
+                {
+                    // Same calls as the mouse shuttle (FSTPKeyboard UpdateMouseShuttle): instant
+                    // direction + speed, no ramps — lets a script reproduce jog/shuttle reversals.
+                    int active_player = GetActivePlayerID();
+                    if (active_player >= 0) {
+                        if (!IsInstancePlaying(active_player)) PlayInstance(active_player);
+                        SetInstanceReverseInstant(active_player, cmd.speed_value < 0.0);
+                        SetInstanceSpeedInstant(active_player,
+                            std::clamp(std::abs(cmd.speed_value), MIN_SPEED, MaxShuttleSpeed()));
+                    }
+                }
+                break;
             case RemoteCommand::Type::NONE:
                 break;
         }
@@ -412,7 +432,7 @@ void FSTPRemote::HandleStop() {
 }
 
 void FSTPRemote::HandleSetSpeed(double speed) {
-    speed = std::clamp(speed, MIN_SPEED, MAX_SPEED);
+    speed = std::clamp(speed, MIN_SPEED, MaxShuttleSpeed());
     int active_player = GetActivePlayerID();
     if (active_player >= 0) {
         SetInstanceSpeed(active_player, speed);
@@ -434,7 +454,7 @@ void FSTPRemote::HandleAdjustSpeed(double delta) {
         new_speed = std::abs(new_speed);
     }
 
-    new_speed = std::clamp(new_speed, MIN_SPEED, MAX_SPEED);
+    new_speed = std::clamp(new_speed, MIN_SPEED, MaxShuttleSpeed());
 
     if (std::abs(new_speed - current_speed) > SPEED_EPSILON) {
         SetInstanceSpeed(active_player, new_speed);

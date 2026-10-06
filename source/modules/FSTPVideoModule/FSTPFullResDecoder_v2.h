@@ -82,6 +82,18 @@ public:
     int GetNativeWidth() const { return native_width_; }
     int GetNativeHeight() const { return native_height_; }
     double GetDuration() const { return duration_; }
+    double GetFrameRate() const { return frame_rate_; }
+
+    // MEASURED, not guessed: frames this decoder actually produces per second of its own busy
+    // time on this file and this machine (decode + GPU→RAM copy included). The wrapper keeps the
+    // full-res decoder only if this clears realtime with margin — one rule on every platform,
+    // instead of recognising the CPU by name.
+    double MeasuredDecodeFps() const;
+    int MeasuredFrames() const { return all_frames_.load(std::memory_order_relaxed); }
+    // Frames measured after the start-up frames (see kWarmupFrames in the .cpp).
+    int SteadyFrames() const { return steady_frames_.load(std::memory_order_relaxed); }
+    // Whether the frames come off a hardware decoder (VideoToolbox / D3D11VA / VA-API surface).
+    bool DecodesOnGPU() const { return gpu_frames_.load(std::memory_order_relaxed) > 0; }
 
 private:
     // Initialization
@@ -91,6 +103,7 @@ private:
     // Hardware acceleration
     bool InitializeHardwareAcceleration(const AVCodec* codec);
     static AVPixelFormat GetHWFormat(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts);
+    bool HardwareTakesThisStream();
 
     // Decoding frame with downscaling
     std::shared_ptr<AVFrame> DecodeAndProcessFrame(double targetTime);
@@ -133,6 +146,18 @@ private:
 
     // Downscaling context (cached)
     SwsContext* downscale_ctx_;
+
+    // Output format FFmpeg settled on through GetHWFormat (-2 = not asked yet)
+    std::atomic<int> chosen_pix_fmt_{-2};
+
+    // Throughput measurement (see MeasuredDecodeFps): everything, and the steady part after the
+    // start-up frames — those carry decoder init and, with frame threading, the pipeline fill,
+    // and made a 3×-realtime 4K HEVC decode measure 2.0× on the Pentium Gold 7505.
+    std::atomic<int> all_frames_{0};
+    std::atomic<int64_t> all_busy_us_{0};
+    std::atomic<int> steady_frames_{0};
+    std::atomic<int64_t> steady_busy_us_{0};
+    std::atomic<int> gpu_frames_{0};
 
     // STREAMING BUFFER (independent of frameIndex!)
     std::deque<StreamFrame> stream_buffer_;

@@ -1,4 +1,5 @@
 #include "FSTPPlayerManager.h"
+#include "FSTPThreadName.h"
 #include "FSTPPlayerInstance.h"
 #include "FSTPRemote.h"
 #include "../FSTPMainModule/WSGUI/FSTPOSDSystem.h"
@@ -41,6 +42,7 @@ static struct {
 
 // Autonomous video update function (ADAPTIVE FPS - synchronized with video file)
 static void VideoUpdateLoop() {
+    FSTPSetThreadName("fstp-vupdate");
     std::cout << "🎥 [VIDEO THREAD] Autonomous video update thread started (ADAPTIVE FPS)" << std::endl;
 
     // FIXED: Use 50 FPS for better synchronization with 25 FPS PAL video

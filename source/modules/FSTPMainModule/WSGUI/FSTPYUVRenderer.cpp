@@ -4,6 +4,10 @@
 #include <iostream>
 #include <cstring>
 
+std::atomic<int> g_fstp_texture_uploads{0};
+std::atomic<int> g_fstp_distinct_frames{0};
+std::atomic<int> g_fstp_max_picture_gap_ms{0};
+
 extern "C" {
 #include <libswscale/swscale.h>
 #include <libavutil/pixfmt.h>
@@ -183,6 +187,18 @@ bool FSTPYUVRenderer::UpdateYUVNative(const YUVPlanes& planes) {
         SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT709);
     }
 
+    // Partial update: only the rows that changed (see YUVPlanes::update_y/update_h).
+    SDL_Rect rows{0, 0, planes.width, planes.height};
+    const SDL_Rect* rect = nullptr;   // nullptr = full texture
+    if (planes.update_h > 0 && planes.update_h < planes.height) {
+        rows.y = planes.update_y;
+        rows.h = planes.update_h;
+        rect = &rows;
+    }
+    const int cy = rows.y / 2;        // chroma row (4:2:0, update_y is even)
+    const uint8_t* y_src = planes.y_plane + static_cast<size_t>(rows.y) * planes.y_pitch;
+    const uint8_t* u_src = planes.u_plane + static_cast<size_t>(cy) * planes.u_pitch;
+
     int result;
     // Use texture format to decide which SDL function to call
     // The texture format must match the data format, or texture will be recreated
@@ -191,18 +207,19 @@ bool FSTPYUVRenderer::UpdateYUVNative(const YUVPlanes& planes) {
         // NV12 format: Y plane + interleaved UV plane
         result = SDL_UpdateNVTexture(
             texture_,
-            nullptr,  // Update full texture
-            planes.y_plane, planes.y_pitch,
-            planes.u_plane, planes.u_pitch  // UV interleaved plane
+            rect,
+            y_src, planes.y_pitch,
+            u_src, planes.u_pitch  // UV interleaved plane
         );
     } else {
         // IYUV/YV12 format: Y + U + V separate planes
+        const uint8_t* v_src = planes.v_plane + static_cast<size_t>(cy) * planes.v_pitch;
         result = SDL_UpdateYUVTexture(
             texture_,
-            nullptr,  // Update full texture
-            planes.y_plane, planes.y_pitch,
-            planes.u_plane, planes.u_pitch,
-            planes.v_plane, planes.v_pitch
+            rect,
+            y_src, planes.y_pitch,
+            u_src, planes.u_pitch,
+            v_src, planes.v_pitch
         );
     }
 
@@ -214,6 +231,7 @@ bool FSTPYUVRenderer::UpdateYUVNative(const YUVPlanes& planes) {
         return false;
     }
 
+    g_fstp_texture_uploads.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 

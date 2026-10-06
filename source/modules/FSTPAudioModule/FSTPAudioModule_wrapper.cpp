@@ -1,4 +1,6 @@
 #include "FSTPAudioModule_wrapper.h"
+#include "FSTPThreadName.h"
+#include "FSTPSIMDOptimizations.h"   // sample conversion kernels (SSE2 / NEON / scalar)
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -32,7 +34,15 @@ namespace {
 // duration lands on target regardless of the OS tick granularity. Because each
 // step targets start + n·step (not "previous wake + step"), jitter cannot
 // accumulate — the animation always finishes on time.
+//
+// The spin is Windows-only. Linux and macOS sleep to within ~0.1ms of the deadline,
+// and there the 2ms tail cost a core for nothing: the speed loop ticks every 2–8ms,
+// so it spun 25–100% of the time, ~0.25 core even when paused (measured on the
+// Pentium Gold 7505 in power-saver mode).
 inline void precise_sleep_until(std::chrono::steady_clock::time_point deadline) {
+#ifndef _WIN32
+    std::this_thread::sleep_until(deadline);
+#else
     for (;;) {
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) return;
@@ -46,124 +56,9 @@ inline void precise_sleep_until(std::chrono::steady_clock::time_point deadline) 
             std::this_thread::yield();  // release the core but keep re-checking
         }
     }
+#endif
 }
 } // namespace
-
-// NEON SIMD for Apple Silicon optimization
-#if defined(__aarch64__) || defined(__ARM_NEON)
-#include <arm_neon.h>
-#define USE_NEON_SIMD 1
-
-// NEON-optimized float to int16 conversion (8 samples at once)
-inline void neon_float_to_int16(const float* src, int16_t* dst, size_t count) {
-    size_t simd_count = count & ~7; // Process 8 samples at a time
-
-    const float32x4_t scale = vdupq_n_f32(32767.0f);
-    const float32x4_t min_val = vdupq_n_f32(-1.0f);
-    const float32x4_t max_val = vdupq_n_f32(1.0f);
-
-    for (size_t i = 0; i < simd_count; i += 8) {
-        // Load 8 floats (2 vectors of 4)
-        float32x4_t f0 = vld1q_f32(src + i);
-        float32x4_t f1 = vld1q_f32(src + i + 4);
-
-        // Clamp to [-1.0, 1.0]
-        f0 = vmaxq_f32(min_val, vminq_f32(max_val, f0));
-        f1 = vmaxq_f32(min_val, vminq_f32(max_val, f1));
-
-        // Scale to int16 range
-        f0 = vmulq_f32(f0, scale);
-        f1 = vmulq_f32(f1, scale);
-
-        // Convert to int32, then to int16
-        int32x4_t i0 = vcvtq_s32_f32(f0);
-        int32x4_t i1 = vcvtq_s32_f32(f1);
-
-        // Narrow to int16 and store
-        int16x4_t s0 = vmovn_s32(i0);
-        int16x4_t s1 = vmovn_s32(i1);
-        int16x8_t result = vcombine_s16(s0, s1);
-
-        vst1q_s16(dst + i, result);
-    }
-
-    // Handle remaining samples (scalar fallback)
-    for (size_t i = simd_count; i < count; i++) {
-        float sample = std::max(-1.0f, std::min(1.0f, src[i]));
-        dst[i] = static_cast<int16_t>(sample * 32767.0f);
-    }
-}
-
-// NEON-optimized memcpy for audio samples (64-byte aligned transfers)
-inline void neon_copy_samples(int16_t* dst, const int16_t* src, size_t count) {
-    size_t simd_count = count & ~15; // Process 16 samples (32 bytes) at a time
-
-    for (size_t i = 0; i < simd_count; i += 16) {
-        int16x8_t v0 = vld1q_s16(src + i);
-        int16x8_t v1 = vld1q_s16(src + i + 8);
-        vst1q_s16(dst + i, v0);
-        vst1q_s16(dst + i + 8, v1);
-    }
-
-    // Handle remaining samples
-    for (size_t i = simd_count; i < count; i++) {
-        dst[i] = src[i];
-    }
-}
-
-// NEON-optimized int32 to int16 conversion (4 samples at once)
-inline void neon_int32_to_int16(const int32_t* src, int16_t* dst, size_t count) {
-    size_t simd_count = count & ~3; // Process 4 samples at a time
-
-    for (size_t i = 0; i < simd_count; i += 4) {
-        int32x4_t i32 = vld1q_s32(src + i);
-        // Shift right by 16 bits to convert 32-bit to 16-bit range
-        int32x4_t shifted = vshrq_n_s32(i32, 16);
-        int16x4_t i16 = vmovn_s32(shifted);
-        vst1_s16(dst + i, i16);
-    }
-
-    // Handle remaining samples
-    for (size_t i = simd_count; i < count; i++) {
-        dst[i] = static_cast<int16_t>(src[i] >> 16);
-    }
-}
-
-// NEON-optimized float interleaved to int16 conversion
-inline void neon_float_interleaved_to_int16(const float* src, int16_t* dst, size_t count) {
-    size_t simd_count = count & ~7; // Process 8 samples at a time
-
-    const float32x4_t scale = vdupq_n_f32(32767.0f);
-    const float32x4_t min_val = vdupq_n_f32(-1.0f);
-    const float32x4_t max_val = vdupq_n_f32(1.0f);
-
-    for (size_t i = 0; i < simd_count; i += 8) {
-        float32x4_t f0 = vld1q_f32(src + i);
-        float32x4_t f1 = vld1q_f32(src + i + 4);
-
-        f0 = vmaxq_f32(min_val, vminq_f32(max_val, f0));
-        f1 = vmaxq_f32(min_val, vminq_f32(max_val, f1));
-
-        f0 = vmulq_f32(f0, scale);
-        f1 = vmulq_f32(f1, scale);
-
-        int32x4_t i0 = vcvtq_s32_f32(f0);
-        int32x4_t i1 = vcvtq_s32_f32(f1);
-
-        int16x4_t s0 = vmovn_s32(i0);
-        int16x4_t s1 = vmovn_s32(i1);
-        int16x8_t result = vcombine_s16(s0, s1);
-
-        vst1q_s16(dst + i, result);
-    }
-
-    // Handle remaining samples
-    for (size_t i = simd_count; i < count; i++) {
-        float sample = std::max(-1.0f, std::min(1.0f, src[i]));
-        dst[i] = static_cast<int16_t>(sample * 32767.0f);
-    }
-}
-#endif
 
 // Headers for memory mapping
 #ifdef _WIN32
@@ -790,6 +685,7 @@ public:
         smooth_speed_running.store(true);
 
         smooth_speed_thread = std::thread([this]() {
+            FSTPSetThreadName("fstp-aspeed");
             smooth_speed_change();
         });
     }
@@ -1274,6 +1170,23 @@ public:
             resume_position = clamped;
         }
 
+        // Compressed audio (AAC, Opus, MP3...): decode only a short zone at the start position up
+        // front and let DecodePriorityZone's background thread fill the rest (forward to the end,
+        // then back to 0) — playback and seeks are already bounded to the decoded range while it
+        // grows. Decoding the whole file first (≤12 min) held the picture back: 2.2 s for a 5-min
+        // Opus track on a Pentium Gold 7505 in power-saver mode, a fraction of that on fast
+        // machines. The background pass decodes ~145× realtime there, so even a 24× shuttle right
+        // after opening stays inside the decoded range. PCM keeps its memcpy-speed full read below.
+        constexpr double STARTUP_ZONE_DURATION = 30.0;
+        if (!reduce_fast_buffer_for_pcm && duration > STARTUP_ZONE_DURATION) {
+            std::cout << "Decoding a " << STARTUP_ZONE_DURATION << "s startup zone at " << resume_position
+                      << "s, rest in background (duration " << duration << "s)" << std::endl;
+            if (DecodePriorityZone(filepath, resume_position, STARTUP_ZONE_DURATION)) {
+                return true;
+            }
+            std::cerr << "Startup-zone decode failed — falling back to the full decode" << std::endl;
+        }
+
         // If resume position is beyond the fast buffer, use priority-zone decode.
         // Exception: PCM files decode at memcpy speed — decode the full file immediately
         // and then just set the playback head, no need for a zone + 2-phase background.
@@ -1351,6 +1264,12 @@ public:
 
         size_t resume_sample = static_cast<size_t>(resume_pos * sample_rate * channels);
         size_t zone_samples  = static_cast<size_t>(zone_duration * sample_rate * channels);
+        // Whole interleaved frames only: an odd sample offset on a stereo file would write the
+        // zone shifted by one sample — left and right swapped from the resume point on.
+        if (channels > 1) {
+            resume_sample -= resume_sample % channels;
+            zone_samples  -= zone_samples % channels;
+        }
 
         std::cout << "[RESUME] Decoding priority zone: " << resume_pos << "s – "
                   << zone_end << "s (" << zone_samples << " samples)" << std::endl;
@@ -1392,6 +1311,7 @@ public:
         background_decode_running.store(true);
 
         background_decode_thread = std::thread([this, filepath, resume_sample, decoded_zone]() {
+            FSTPSetThreadName("fstp-adecode");
             std::cout << "[RESUME BG] Phase 1: forward from " << (resume_sample + decoded_zone)
                       << " to end (" << total_samples << ")" << std::endl;
 
@@ -2193,12 +2113,7 @@ private:
                             mmap_buffer[write_offset + i] = static_cast<int16_t>((val >> 8) | (val << 8));
                         }
                     } else {
-                        // OPTIMIZATION: Always use NEON on Apple Silicon for maximum speed
-#ifdef USE_NEON_SIMD
-                        neon_copy_samples(&mmap_buffer[write_offset], src, samples_to_copy);
-#else
                         std::memcpy(&mmap_buffer[write_offset], src, samples_to_copy * sizeof(int16_t));
-#endif
                     }
 
                     write_offset += samples_to_copy;
@@ -2281,6 +2196,7 @@ private:
 
             // OPTIMIZATION: Use PCM fast path for background decode too
             background_decode_thread = std::thread([this, filepath, decoded_fast]() {
+                FSTPSetThreadName("fstp-adecode");
                 std::cout << "🧵 [BACKGROUND THREAD] Thread started, beginning decode..." << std::endl;
                 size_t remaining = 0;
                 if (reduce_fast_buffer_for_pcm) {
@@ -2499,16 +2415,7 @@ private:
                         size_t samples_to_copy = std::min<size_t>(total_frame_samples, remaining);
                         const int16_t* src = reinterpret_cast<int16_t*>(frame->data[0]);
 
-#ifdef USE_NEON_SIMD
-                        // NEON-optimized copy for large blocks
-                        if (samples_to_copy >= 16) {
-                            neon_copy_samples(&mmap_buffer[write_offset], src, samples_to_copy);
-                        } else {
-                            std::memcpy(&mmap_buffer[write_offset], src, samples_to_copy * sizeof(int16_t));
-                        }
-#else
                         std::memcpy(&mmap_buffer[write_offset], src, samples_to_copy * sizeof(int16_t));
-#endif
                         write_offset += samples_to_copy;
                         current_sample += samples_to_copy;
 
@@ -2519,19 +2426,13 @@ private:
                         continue; // Skip to next frame
                     }
 
-                    // OPTIMIZATION 2: S32 (32-bit PCM) to S16 conversion with NEON
+                    // OPTIMIZATION 2: S32 (32-bit PCM) to S16 conversion (SIMD kernel)
                     if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_S32) {
                         size_t remaining = max_samples - current_sample;
                         size_t samples_to_copy = std::min<size_t>(total_frame_samples, remaining);
                         const int32_t* src = reinterpret_cast<int32_t*>(frame->data[0]);
 
-#ifdef USE_NEON_SIMD
-                        neon_int32_to_int16(src, &mmap_buffer[write_offset], samples_to_copy);
-#else
-                        for (size_t i = 0; i < samples_to_copy; i++) {
-                            mmap_buffer[write_offset + i] = static_cast<int16_t>(src[i] >> 16);
-                        }
-#endif
+                        FSTP::SIMDOptimizations::AudioS32ToS16(src, &mmap_buffer[write_offset], samples_to_copy);
                         write_offset += samples_to_copy;
                         current_sample += samples_to_copy;
 
@@ -2542,20 +2443,13 @@ private:
                         continue;
                     }
 
-                    // OPTIMIZATION 3: FLT (float interleaved) to S16 conversion with NEON
+                    // OPTIMIZATION 3: FLT (float interleaved) to S16 conversion (SIMD kernel)
                     if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLT) {
                         size_t remaining = max_samples - current_sample;
                         size_t samples_to_copy = std::min<size_t>(total_frame_samples, remaining);
                         const float* src = reinterpret_cast<float*>(frame->data[0]);
 
-#ifdef USE_NEON_SIMD
-                        neon_float_interleaved_to_int16(src, &mmap_buffer[write_offset], samples_to_copy);
-#else
-                        for (size_t i = 0; i < samples_to_copy; i++) {
-                            float sample = std::max(-1.0f, std::min(1.0f, src[i]));
-                            mmap_buffer[write_offset + i] = static_cast<int16_t>(sample * 32767.0f);
-                        }
-#endif
+                        FSTP::SIMDOptimizations::AudioFloatToS16(src, &mmap_buffer[write_offset], samples_to_copy);
                         write_offset += samples_to_copy;
                         current_sample += samples_to_copy;
 
@@ -2587,31 +2481,24 @@ private:
                         continue;
                     }
 
-                    // OPTIMIZATION: NEON-accelerated float planar to int16 conversion
-                    if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLTP) {
-#ifdef USE_NEON_SIMD
-                        // Process all channels with NEON
-                        for (int ch = 0; ch < frame_channels && current_sample < max_samples; ch++) {
-                            size_t remaining = max_samples - current_sample;
-                            size_t samples_to_process = std::min<size_t>(samples_per_channel, remaining / frame_channels);
-
-                            if (samples_to_process > 0) {
-                                float* channel_data = reinterpret_cast<float*>(frame->data[ch]);
-
-                                // Use NEON for batches, interleave into output
-                                for (size_t i = 0; i < samples_to_process; i++) {
-                                    if (write_offset + ch < total_samples) {
-                                        float sample = std::max(-1.0f, std::min(1.0f, channel_data[i]));
-                                        mmap_buffer[write_offset + i * frame_channels + ch] = static_cast<int16_t>(sample * 32767.0f);
-                                    }
-                                }
-                            }
+                    // OPTIMIZATION 5: FLTP (float planar: AAC, Opus…) to interleaved S16 (SIMD
+                    // kernel). Same output and limits as the generic loop below — stops at
+                    // max_samples or the buffer end, a cut frame keeps its leading channels —
+                    // on every platform (Apple Silicon used to take a separate path here).
+                    if (codec_ctx->sample_fmt == AV_SAMPLE_FMT_FLTP && frame_channels > 0) {
+                        size_t limit = std::min<size_t>(total_frame_samples, max_samples - current_sample);
+                        limit = std::min<size_t>(limit, write_offset < total_samples ? total_samples - write_offset : 0);
+                        const size_t frames = limit / frame_channels;
+                        const float* const* planes = reinterpret_cast<const float* const*>(frame->extended_data);
+                        FSTP::SIMDOptimizations::AudioFloatPlanarToS16(planes, frame_channels, frames,
+                                                                       &mmap_buffer[write_offset]);
+                        for (size_t ch = 0; ch < limit - frames * frame_channels; ++ch) {
+                            float sample = std::max(-1.0f, std::min(1.0f, planes[ch][frames]));
+                            mmap_buffer[write_offset + frames * frame_channels + ch] = static_cast<int16_t>(sample * 32767.0f);
                         }
-                        size_t processed = std::min<size_t>(samples_per_channel * frame_channels, max_samples - current_sample);
-                        write_offset += processed;
-                        current_sample += processed;
+                        write_offset += limit;
+                        current_sample += limit;
                         continue;
-#endif
                     }
 
                     // Fallback: Generic sample-by-sample conversion

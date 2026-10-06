@@ -63,6 +63,7 @@ public:
     AVPixelFormat getPixelFormat() const;
 
     void requestStop();
+    bool isStopRequested() const { return stop_requested_.load(); }
 
 private:
     bool initialize();

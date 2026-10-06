@@ -1,4 +1,6 @@
 #include "FSTPBetacamEffect.h"
+#include "FSTPPassStats.h"
+#include "FSTPSIMDOptimizations.h"   // per-CPU kernels: smear, soft-edge row
 
 #include <algorithm>
 #include <chrono>
@@ -23,6 +25,31 @@ constexpr double kTwoPi = 6.28318530717958647692;
 template<typename T>
 T clamp_val(T value, T min_val, T max_val) {
     return std::max(min_val, std::min(value, max_val));
+}
+
+// Noise for the stripes' noise edges: per pixel a luma offset (-4..4) and the share of the
+// original kept (50..65 %), the same distributions as rolling two randoms per pixel. Rolled
+// once; each row reads it from a random offset. Per-pixel rolls were a serial xorshift chain,
+// ~1 ms per update at 24× on a Pentium Gold 7505. Doubled so a row up to kEdgeNoiseLen pixels
+// wide (8K) reads contiguously.
+struct EdgeNoise {
+    int8_t noise;
+    uint8_t keep;
+};
+constexpr int kEdgeNoiseLen = 8192;
+const EdgeNoise* EdgeNoiseRow(uint32_t random) {
+    static const std::vector<EdgeNoise> table = [] {
+        std::vector<EdgeNoise> t(2 * kEdgeNoiseLen);
+        uint32_t x = 0x9E3779B9u;
+        auto next = [&x] { x ^= x << 13; x ^= x >> 17; x ^= x << 5; return x; };
+        for (int i = 0; i < kEdgeNoiseLen; ++i) {
+            t[i].noise = static_cast<int8_t>(-4 + static_cast<int>(next() % 9));
+            t[i].keep = static_cast<uint8_t>(50 + next() % 16);
+            t[i + kEdgeNoiseLen] = t[i];
+        }
+        return t;
+    }();
+    return table.data() + (random & (kEdgeNoiseLen - 1));
 }
 
 // Apply track mask to frame based on visible regions from drum physics
@@ -150,6 +177,8 @@ bool FSTPBetacamEffect::HasPendingDropout(int player_id) const {
 }
 
 void FSTPBetacamEffect::ApplyEdgeFade(uint8_t* y_plane, int pitch, int width, int height, uint32_t format) {
+    struct PassTimer { std::chrono::steady_clock::time_point t = FSTPPassStats::Start(); FSTPPassStats::Pass p;
+                       ~PassTimer() { FSTPPassStats::Add(p, t); } } pass_timer{FSTPPassStats::Start(), FSTPPassStats::EdgeFade};
     if (!m_enabled || !y_plane || pitch <= 0 || width <= 0 || height <= 0) {
         return;
     }
@@ -198,6 +227,8 @@ void FSTPBetacamEffect::ApplyEdgeFade(uint8_t* y_plane, int pitch, int width, in
 void FSTPBetacamEffect::ApplyAnalogSmear(uint8_t* y_plane, int y_pitch,
         uint8_t* u_plane, uint8_t* v_plane, int u_pitch, int v_pitch,
         int width, int height, uint32_t format) {
+    struct PassTimer { std::chrono::steady_clock::time_point t = FSTPPassStats::Start(); FSTPPassStats::Pass p;
+                       ~PassTimer() { FSTPPassStats::Add(p, t); } } pass_timer{FSTPPassStats::Start(), FSTPPassStats::Smear};
     if (!m_enabled || !y_plane || width < 2 || height < 1) return;
     // One-pole IIR (out = in*(256-k)/256 + prev*k/256), trailing left→right. Chroma smears
     // more than luma. Strength scales with resolution so the trail is a consistent fraction of
@@ -208,39 +239,17 @@ void FSTPBetacamEffect::ApplyAnalogSmear(uint8_t* y_plane, int y_pitch,
     const int khLuma   = static_cast<int>(std::lround(256.0 * rL / (1.0 + rL)));
     const int khChroma = static_cast<int>(std::lround(256.0 * rC / (1.0 + rC)));
 
-    for (int yy = 0; yy < height; ++yy) {
-        uint8_t* row = y_plane + static_cast<size_t>(yy) * y_pitch;
-        int prev = row[0];
-        for (int xx = 1; xx < width; ++xx) {
-            int cur = (row[xx] * (256 - khLuma) + prev * khLuma) >> 8;
-            row[xx] = static_cast<uint8_t>(cur);
-            prev = cur;
-        }
-    }
+    // Kernel (SSE2 / NEON / scalar, bit-identical): FSTP::SIMDOptimizations::AnalogSmear.
+    FSTP::SIMDOptimizations::AnalogSmear(y_plane, y_pitch, height, width, /*interleaved=*/false, khLuma);
 
     int cw = width / 2, ch = height / 2;
     if (cw < 2 || ch < 1) return;
     if (format == SDL_PIXELFORMAT_NV12 && u_plane) {
-        for (int yy = 0; yy < ch; ++yy) {
-            uint8_t* row = u_plane + static_cast<size_t>(yy) * u_pitch;  // interleaved UV
-            int pu = row[0], pv = row[1];
-            for (int xx = 1; xx < cw; ++xx) {
-                int cu = (row[xx * 2]     * (256 - khChroma) + pu * khChroma) >> 8;
-                int cv = (row[xx * 2 + 1] * (256 - khChroma) + pv * khChroma) >> 8;
-                row[xx * 2]     = static_cast<uint8_t>(cu); pu = cu;
-                row[xx * 2 + 1] = static_cast<uint8_t>(cv); pv = cv;
-            }
-        }
+        // Interleaved UV: U at even bytes, V at odd — two independent chains per row.
+        FSTP::SIMDOptimizations::AnalogSmear(u_plane, u_pitch, ch, cw, /*interleaved=*/true, khChroma);
     } else if ((format == SDL_PIXELFORMAT_IYUV || format == SDL_PIXELFORMAT_YV12) && u_plane && v_plane) {
-        for (int yy = 0; yy < ch; ++yy) {
-            uint8_t* urow = u_plane + static_cast<size_t>(yy) * u_pitch;
-            uint8_t* vrow = v_plane + static_cast<size_t>(yy) * v_pitch;
-            int pu = urow[0], pv = vrow[0];
-            for (int xx = 1; xx < cw; ++xx) {
-                int cu = (urow[xx] * (256 - khChroma) + pu * khChroma) >> 8; urow[xx] = static_cast<uint8_t>(cu); pu = cu;
-                int cv = (vrow[xx] * (256 - khChroma) + pv * khChroma) >> 8; vrow[xx] = static_cast<uint8_t>(cv); pv = cv;
-            }
-        }
+        FSTP::SIMDOptimizations::AnalogSmear(u_plane, u_pitch, ch, cw, /*interleaved=*/false, khChroma);
+        FSTP::SIMDOptimizations::AnalogSmear(v_plane, v_pitch, ch, cw, /*interleaved=*/false, khChroma);
     }
 }
 
@@ -253,17 +262,17 @@ void FSTPBetacamEffect::ApplySoftEdges(uint8_t* y_plane, int y_pitch,
     // only (chroma is already subsampled). Uses the ORIGINAL neighbour rows (a one
     // row backup) so the blur is symmetric and frame-rate stable.
     const int mix = 96; // 0..256, ~37% toward blurred — subtle, tunable
-    std::vector<uint8_t> above(width), curOrig(width);
-    std::memcpy(above.data(), y_plane, width);            // row 0 (top edge clamp)
+    static thread_local std::vector<uint8_t> rows;
+    rows.resize(2 * static_cast<size_t>(width));
+    uint8_t* above = rows.data();
+    uint8_t* curOrig = above + width;
+    std::memcpy(above, y_plane, width);                   // row 0 (top edge clamp)
     for (int yy = 1; yy < height - 1; ++yy) {
         uint8_t* cur = y_plane + static_cast<size_t>(yy) * y_pitch;
         const uint8_t* below = y_plane + static_cast<size_t>(yy + 1) * y_pitch; // original
-        std::memcpy(curOrig.data(), cur, width);
-        for (int xx = 0; xx < width; ++xx) {
-            int blurred = (above[xx] + 2 * curOrig[xx] + below[xx]) >> 2;
-            cur[xx] = static_cast<uint8_t>(curOrig[xx] + (((blurred - curOrig[xx]) * mix) >> 8));
-        }
-        std::memcpy(above.data(), curOrig.data(), width); // next row's "above" = this row's original
+        std::memcpy(curOrig, cur, width);
+        FSTP::SIMDOptimizations::SoftEdgeRow(cur, above, curOrig, below, width, mix);
+        std::swap(above, curOrig);                        // next row's "above" = this row's original
     }
 }
 
@@ -1398,12 +1407,14 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
                             static_cast<int>(edgeY(group[3]) * keepOriginal + edgePed * (1.0f - keepOriginal)), 16, 235));
                     }
                 } else {
-                    // IYUV/NV12: Strong desaturation, subtle noise to Y plane
-                    for (int x = 0; x < textureWidth; ++x) {
-                        int noise = randomInt(-4, 4);  // Very subtle
-                        float keepOriginal = 0.50f + (randomInt(0, 15) / 100.0f);  // 50-65% original
-                        int origVal = edgeY(rowStart[x]);
-                        int newVal = static_cast<int>(origVal * keepOriginal + (edgePed + noise) * (1.0f - keepOriginal));
+                    // IYUV/NV12: Strong desaturation, subtle noise (±4) to Y plane, 50-65% of
+                    // the original kept. Integer form of the float blend; edgeY's ×1.12 is ×112/100.
+                    const EdgeNoise* en = EdgeNoiseRow(xrand());
+                    const int width = std::min(textureWidth, kEdgeNoiseLen);
+                    for (int x = 0; x < width; ++x) {
+                        const int keep = en[x].keep;
+                        const int origVal = slowEdges ? (rowStart[x] - 32) * 112 / 100 : rowStart[x];
+                        const int newVal = (origVal * keep + (edgePed + en[x].noise) * (100 - keep)) / 100;
                         rowStart[x] = static_cast<uint8_t>(clamp_val(newVal, 16, 235));
                     }
                     // UV planes: 80% desaturation in edge zones (very strong)
@@ -1578,6 +1589,22 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
             const int snowThickness = std::max(1, static_cast<int>(std::lround(effectScale)));
             tailLength = std::max(1, static_cast<int>(tailLength * effectScale));
 
+            // Tail brightness depends only on k and the resolution scale: kept in a table
+            // instead of an exp() per tail pixel, particle and stripe (~10k per update at 24×).
+            // Head (k==0) bright 235; the tail fades over the SCALED length so its shape
+            // matches 480p.
+            static thread_local std::vector<uint8_t> tailFade;
+            static thread_local double tailFadeScale = -1.0;
+            if (tailFadeScale != effectScale) {
+                tailFade.clear();
+                tailFadeScale = effectScale;
+            }
+            while (static_cast<int>(tailFade.size()) < tailLength) {
+                const int k = static_cast<int>(tailFade.size());
+                tailFade.push_back(static_cast<uint8_t>(
+                    k == 0 ? 235 : 128 + static_cast<int>(107 * std::exp(-0.15 * k / effectScale))));
+            }
+
             // Pick Y position for snow
             int snowY = startY;
             for (int j = 0; j < snowCount; ++j) {
@@ -1603,14 +1630,7 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
                     if (xPos >= textureWidth) {
                         break;
                     }
-                    int brightness;
-                    if (k == 0) {
-                        brightness = 235;
-                    } else {
-                        // Fade over the SCALED length so the tail shape matches 480p.
-                        double fadeFactor = std::exp(-0.15 * k / effectScale);
-                        brightness = 128 + static_cast<int>(107 * fadeFactor);
-                    }
+                    const int brightness = tailFade[k];
                     for (int dy = 0; dy < snowThickness; ++dy) {
                         int yRow = snowY + dy;
                         if (yRow < 0 || yRow >= textureHeight) {

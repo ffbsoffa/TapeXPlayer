@@ -1540,7 +1540,11 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
 
     int totalFramesInRange = endFrame - startFrame + 1;
 
-        if (isReverse) {
+        if (totalFramesInRange <= 4) {
+            // A frame or a handful (the shuttle's on-demand decode): run on the caller's thread.
+            // Spawning a worker per call and joining it at once only added a thread per frame.
+            decodeSegment(threadIdBase, startFrame, endFrame);
+        } else if (isReverse) {
             // ============================================================
             // REVERSE: 3-PART PRIORITY DECODING FOR 32X OPTIMIZATION
             // ============================================================
@@ -1734,16 +1738,7 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
     }
 
     // CRITICAL: Check GOP BEFORE checking resolution/codec
-    // PENTIUM GOLD 7505 OPTIMIZATION: ALWAYS create proxy (never use original)
-    bool is_pentium_7505 = false;
-    if (g_hardware_detection != nullptr) {
-        is_pentium_7505 = g_hardware_detection->GetCPUInfo().is_pentium_gold_7505;
-    }
-
-    if (is_pentium_7505) {
-        std::cout << "🎯 [Pentium 7505] ALWAYS creating 360p GOP=25 proxy (original disabled)" << std::endl;
-        // Continue creating proxy below
-    } else if (max_gop_size > 50) {
+    if (max_gop_size > 50) {
         std::cout << "⚠️  [LowResDecoder] Large GOP detected (" << max_gop_size
                   << " frames) - creating short-GOP (GOP=4) proxy for responsive scrubbing" << std::endl;
         // Continue creating proxy below

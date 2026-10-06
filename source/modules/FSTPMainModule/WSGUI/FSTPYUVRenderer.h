@@ -1,6 +1,7 @@
 #ifndef FSTP_YUV_RENDERER_H
 #define FSTP_YUV_RENDERER_H
 
+#include <atomic>
 #include <SDL2/SDL.h>
 #include <cstdint>
 
@@ -28,7 +29,19 @@ struct YUVPlanes {
     int height;
     bool is_full_range;  // true = 0-255 (JPEG/proxy), false = 16-235 (TV/BT.709)
     int format;  // AVPixelFormat (AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV12, etc.)
+    // Rows to upload, [update_y, update_y + update_h): even-aligned; update_h == 0 = whole
+    // picture. Plane pointers stay at row 0. Honoured in NATIVE_YUV mode (the RGB fallback
+    // converts the whole picture anyway).
+    int update_y = 0;
+    int update_h = 0;
 };
+
+// Video frames actually uploaded to a texture (all windows) — read by the render-stats line.
+extern std::atomic<int> g_fstp_texture_uploads;
+// Distinct video frames submitted for display (a new frame number) — read by the render-stats line.
+extern std::atomic<int> g_fstp_distinct_frames;
+// Longest wait between two distinct pictures (ms) since the last render-stats line.
+extern std::atomic<int> g_fstp_max_picture_gap_ms;
 
 class FSTPYUVRenderer {
 public:

@@ -91,7 +91,11 @@ private:
 
     std::unique_ptr<FSTP::LowCachedDecoderManager> m_low_cached_manager;
     std::unique_ptr<FSTPFullResDecoderV2> m_full_res_decoder;  // V2: Streaming decoder
+    bool m_full_res_probed = false;  // StartFullResDecoder already ran for this load (kept or rejected)
     bool m_full_res_stopped = false;  // SPEED OPT state (per-instance; hysteresis in SetSpeed)
+    // Last time the tape ran fast (>1.4×), steady-clock ms. The full-res decoder re-engages only
+    // once the tape has been slow for a while (see DisplayFrame) — not on every pass through 0×.
+    std::atomic<int64_t> m_last_fast_ms{0};
 
     // Pause-frame cache: avoid re-querying decoder when position hasn't changed
     std::shared_ptr<AVFrame> m_v2_cached_frame;
@@ -152,6 +156,10 @@ private:
     // with_proxy=false → V2-only start (tape threading); proxy decoder arrives later
     // via BackgroundProxyConversion → SetupProxyDecoder → m_proxy_ready publication.
     bool InitializeDecoders(double initial_time = 0.0, bool with_proxy = true);
+    // Starts the full-res decoder on the original and keeps it only if it MEASURES at least
+    // kFullResRealtimeMargin × the clip's frame rate here (GPU or CPU alike). Same rule on every
+    // platform — no CPU-name checks. Returns whether m_full_res_decoder is live afterwards.
+    bool StartFullResDecoder(double initial_time);
     void ShutdownDecoders();
     void NotifyDecodersOfFrameChange(int frame_number);
     bool SubmitFrameToTexture(const std::shared_ptr<AVFrame>& frame,
