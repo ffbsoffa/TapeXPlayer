@@ -897,7 +897,10 @@ void RenderAllWindows() {
                     // BETACAM EFFECT: Always update at slow motion or shuttle speeds.
                     // During pure pause: force until IsFrameAligned fires, then hold 30 frames.
                     // Once frame_aligned and hold_frames == 0 — stripe gone, allow frame skip.
-                    bool betacam_speed = (absPlaybackRate < 0.9 || absPlaybackRate > 1.1);
+                    // Only while the effect is on: with it off, re-applying meant re-uploading the
+                    // same picture every render (a full-frame texture upload 60×/s in pause).
+                    bool betacam_speed = g_pixel_buffer_manager->IsBetacamEffectEnabled() &&
+                                         (absPlaybackRate < 0.9 || absPlaybackRate > 1.1);
                     bool pause_settled = is_pure_pause && frame_aligned && g_windows[i].betacam_hold_frames == 0;
                     if (betacam_speed && !pause_settled) {
                         need_update = true;
