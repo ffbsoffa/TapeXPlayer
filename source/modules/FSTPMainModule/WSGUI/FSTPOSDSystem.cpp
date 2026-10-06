@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <iostream>
 #include <unordered_map>
+#include <vector>
+#include <cstdint>
 #include <map>
 #include <set>
 #include <chrono>
@@ -380,7 +382,16 @@ struct CachedText {
     SDL_Texture* outline_texture = nullptr;
     int width = 0;
     int height = 0;
+    uint64_t last_used = 0;   // g_text_cache_tick at the last lookup (eviction order)
 };
+
+// The text caches are keyed by the whole string, and the running timecode is one: every frame
+// of playback is a new entry with two textures. Nothing ever left the cache (only a renderer's
+// destruction cleared it), so it grew without bound — an hour at 25 fps is ~90 000 entries.
+// Keep at most kTextCacheMax per renderer and colour/font map; past that, drop the least
+// recently used half. Entries drawn this frame are the most recent, so they always stay.
+static constexpr size_t kTextCacheMax = 256;
+static uint64_t g_text_cache_tick = 0;
 
 // Cache for each renderer: renderer -> (char -> CachedGlyph)
 // Separate caches for different colors (yellow, gray, white)
@@ -537,11 +548,26 @@ static CachedText* GetCachedText(SDL_Renderer* renderer, const std::string& text
 
     auto it = renderer_cache.find(key);
     if (it != renderer_cache.end()) {
+        it->second.last_used = ++g_text_cache_tick;
         return &it->second; // Already in cache
+    }
+
+    if (renderer_cache.size() >= kTextCacheMax) {
+        std::vector<std::pair<uint64_t, std::string>> by_age;
+        by_age.reserve(renderer_cache.size());
+        for (const auto& entry : renderer_cache) by_age.emplace_back(entry.second.last_used, entry.first);
+        std::sort(by_age.begin(), by_age.end());
+        for (size_t i = 0; i < by_age.size() / 2; ++i) {
+            auto old = renderer_cache.find(by_age[i].second);
+            if (old->second.texture) SDL_DestroyTexture(old->second.texture);
+            if (old->second.outline_texture) SDL_DestroyTexture(old->second.outline_texture);
+            renderer_cache.erase(old);
+        }
     }
 
     // Create new texture for text
     CachedText cached;
+    cached.last_used = ++g_text_cache_tick;
 
     // Outline
     SDL_Surface* outline_surface = TTF_RenderText_Blended(font, text.c_str(), outline_color);
