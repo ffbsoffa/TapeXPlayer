@@ -42,6 +42,7 @@ Drives the player through its remote control (`/tmp/tapexplayer_control`) with
 powerprofilesctl launch -p power-saver python3 tools/bench/txp_bench.py phases clip.mp4 --betacam on
 python3 tools/bench/txp_bench.py reverse clip.mp4 --amplitude 20
 python3 tools/bench/txp_bench.py play-after-shuttle clip.mp4
+python3 tools/bench/txp_bench.py play clip.mp4 --speed 1 --seconds 30
 ```
 
 | Scenario | What it does | Watch |
@@ -49,6 +50,7 @@ python3 tools/bench/txp_bench.py play-after-shuttle clip.mp4
 | `phases` | pause 4 s, 1× 5 s, 0.5× 5 s, 8× 4 s, 24× 4 s, pause 3 s | `CPU`, `ui` (60/s = smooth), `new` pictures/s, `gap` (longest wait for a new picture), Betacam pass costs in ms and `fx cpu ms/s` |
 | `reverse` | mouse-shuttle sweeps +A → −A → +A | pictures/s and the longest gap each second (freezes at reversals) |
 | `play-after-shuttle` | 12× shuttle, stop, play | pictures/s and gaps in the first seconds after PLAY |
+| `play` | steady playback at `--speed` (negative = reverse, via the mouse shuttle) for `--seconds` | CPU over a realistic stretch, including the proxy's background segment prefetch that a 5 s phase may miss |
 
 - The player runs under its own HOME (`--home`, default `~/.cache/txp-bench-home`), so your
   settings, resume points and proxy cache are untouched. The first run on a clip builds its
@@ -60,7 +62,25 @@ python3 tools/bench/txp_bench.py play-after-shuttle clip.mp4
 - **Close any other TapeXPlayer first**: the remote-control file is shared, so the bench would
   steer that window too, and a second player skews the CPU numbers.
 - CPU % is per process and counts all cores (100% = one core busy); it includes decoding, so it
-  varies more between runs than the effect's own `fx cpu ms/s`.
+  varies more between runs than the effect's own `fx cpu ms/s`. On the Pentium one run's phase
+  CPU can differ from the next by 15 points: compare several runs (`compare_builds.py`), or the
+  per-second lines below.
+- Under each phase, `threads:` splits the CPU by thread name (the player's `🧵 [THREAD CPU]` line,
+  once a second): `main` / `fstp-render` draw, `fstp-fullres` decodes the original, `fstp-proxy`
+  the shuttle's tape head, `fstp-segment` and `exited` the proxy's segment prefetch, `fstp-audio-cb`
+  the sound. The log's `🎨 [RENDER PASSES]` line splits the render thread's own CPU into update /
+  texture (upload + Betacam) / osd / overlays / present.
+- Switches for A/B runs (`--env`): `FSTP_SHUTTLE_SEGMENTS=1` (old segment shuttle),
+  `FSTP_PROXY_HEAD_SW=1` (tape head on the CPU on Linux), `FSTP_PROXY_HEAD_GPU=1` (tape head on
+  VideoToolbox / D3D11VA, opt-in on macOS and Windows), `FSTP_SIMD_NO_AVX2=1` (SSE2 smear).
+- The bench works on macOS too, but there the render thread runs off the display's refresh: with
+  the display asleep nothing is drawn and the numbers are zeros.
+
+`compare_builds.py` runs `phases` for several builds side by side on one clip, alternating them:
+
+```sh
+python3 tools/bench/compare_builds.py clip.mp4 before=old/TapeXPlayer_linux after=builds/binaries/TapeXPlayer_linux --repeats 3
+```
 
 Reference, GPD Pocket 3 (Pentium Gold 7505), power-saver, 720p clip, Betacam on, 2026-10-06:
 

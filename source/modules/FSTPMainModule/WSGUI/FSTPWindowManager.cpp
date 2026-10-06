@@ -20,6 +20,9 @@
 #include <thread>
 #include <atomic>
 #include <cmath>
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
 
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
@@ -705,7 +708,37 @@ void HandleWindowEvents(SDL_Event* event) {
     }
 }
 
+// FSTP_RENDER_STATS=1: CPU (not wall) time of the render thread per pass of RenderAllWindows —
+// waits for vsync inside present don't count. One line a second:
+//   🎨 [RENDER PASSES] update=.. texture=.. osd=.. overlays=.. present=.. other=.. (ms of CPU per s)
+namespace {
+inline uint64_t RenderThreadCpuNs() {
+#if defined(__linux__) || defined(__APPLE__)
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+#else
+    return 0;
+#endif
+}
+struct RenderPassCpu {
+    uint64_t update = 0, texture = 0, osd = 0, overlays = 0, present = 0, total = 0;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+RenderPassCpu g_pass_cpu;
+const bool g_pass_cpu_on = std::getenv("FSTP_RENDER_STATS") != nullptr;
+}  // namespace
+
 void RenderAllWindows() {
+    const uint64_t pass_cpu_start = g_pass_cpu_on ? RenderThreadCpuNs() : 0;
+    uint64_t pass_mark = pass_cpu_start;
+    // Adds the CPU since the previous mark to a bucket (no-op unless FSTP_RENDER_STATS).
+    auto pass_lap = [&pass_mark](uint64_t& bucket) {
+        if (!g_pass_cpu_on) return;
+        const uint64_t now = RenderThreadCpuNs();
+        bucket += now - pass_mark;
+        pass_mark = now;
+    };
     // ============================================================
     // OPTIMIZATION FOR MULTIPLE INSTANCES:
     // Update video for each player INSIDE its rendering loop,
@@ -793,9 +826,11 @@ void RenderAllWindows() {
             // }
 
             // Update video for this player
+            pass_lap(g_pass_cpu.overlays);   // window bookkeeping before it: count with overlays
             if (player_id >= 0) {
                 UpdateVideoFrameForPlayer(player_id);
             }
+            pass_lap(g_pass_cpu.update);
 
             // While a Betacam dropout burst is showing, bypass the FPS-saving throttles below
             // (settled-pause skip + timestamp-skip) so the dropout re-applies and animates at
@@ -835,6 +870,7 @@ void RenderAllWindows() {
             // SINGLE RENDERING LOOP - ALL IN ONE PLACE
             // ============================================================
 
+            pass_lap(g_pass_cpu.overlays);
             // 1. Clear screen
             SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
             SDL_RenderClear(renderer);
@@ -1078,11 +1114,13 @@ void RenderAllWindows() {
             auto t_after_texture = std::chrono::high_resolution_clock::now();
             total_texture_update_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_texture - t_before_texture).count());
 
+            pass_lap(g_pass_cpu.texture);
             // 3. OSD ELEMENTS (all in one place)
             auto t_before_osd = std::chrono::high_resolution_clock::now();
             if (player_id >= 0) {
                 RenderOSDForPlayer(renderer, player_id);
             }
+            pass_lap(g_pass_cpu.osd);
             auto t_after_osd = std::chrono::high_resolution_clock::now();
             total_osd_render_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_osd - t_before_osd).count());
 
@@ -1114,6 +1152,7 @@ void RenderAllWindows() {
                 FSTPWelcome_Render(renderer, welcome_w, welcome_h);
             }
 
+            pass_lap(g_pass_cpu.overlays);
             // 4. Final Present
             auto t_before_present = std::chrono::high_resolution_clock::now();
 
@@ -1125,6 +1164,7 @@ void RenderAllWindows() {
 
             auto t_after_present = std::chrono::high_resolution_clock::now();
             total_render_present_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_present - t_before_present).count());
+            pass_lap(g_pass_cpu.present);
 
             perf_sample_count.fetch_add(1);
             // ============================================================
@@ -1319,6 +1359,21 @@ void RenderAllWindows() {
                 }
             }
             pres_done:;
+        }
+    }
+
+    if (g_pass_cpu_on) {
+        const uint64_t end = RenderThreadCpuNs();
+        g_pass_cpu.overlays += end - pass_mark;   // presentation window and anything after the windows
+        g_pass_cpu.total += end - pass_cpu_start;
+        const double window_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_pass_cpu.since).count();
+        if (window_s >= 1.0) {
+            auto ms = [window_s](uint64_t ns) { return ns / 1e6 / window_s; };
+            std::printf("🎨 [RENDER PASSES] update=%.1f texture=%.1f osd=%.1f overlays=%.1f present=%.1f total=%.1f (ms of CPU per s)\n",
+                        ms(g_pass_cpu.update), ms(g_pass_cpu.texture), ms(g_pass_cpu.osd),
+                        ms(g_pass_cpu.overlays), ms(g_pass_cpu.present), ms(g_pass_cpu.total));
+            std::fflush(stdout);
+            g_pass_cpu = RenderPassCpu{};
         }
     }
 }

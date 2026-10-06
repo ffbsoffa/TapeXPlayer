@@ -268,11 +268,38 @@ def play_after_shuttle(player, args):
     print(f"  (the first second's gap also holds the {args.pause:g} s stop before PLAY)")
 
 
+def play(player, args):
+    """Steady playback at one speed for a while: where the CPU goes over a realistic stretch,
+    including the proxy's background segment prefetch, which a 5 s phase may or may not catch."""
+    player.send(SEEK, args.start)
+    time.sleep(2)
+    if args.speed < 0:
+        player.send(MOUSE_SHUTTLE, args.speed)   # SET_SPEED takes no sign; the mouse shuttle does
+    else:
+        player.send(PLAY)
+        if args.speed != 1.0:
+            player.send(SET_SPEED, args.speed)
+    time.sleep(1.0)
+    offset = len(player.log())
+    cpu0, t0 = player.cpu_seconds(), time.time()
+    time.sleep(args.seconds)
+    cpu1, t1 = player.cpu_seconds(), time.time()
+    player.send(STOP)
+    segment = player.log()[offset:]
+    rows = render_stats(segment)
+    mean = lambda key: sum(float(r.get(key, 0)) for r in rows) / max(1, len(rows))
+    gap = max([int(float(r.get("max_picture_gap", 0))) for r in rows] or [0])
+    print(f"  play {args.speed:g}x for {args.seconds:g} s: CPU {100 * (cpu1 - cpu0) / (t1 - t0):.0f}% | "
+          f"ui {mean('loops/s'):.1f}/s new {mean('new_frames/s'):.1f}/s worst gap {gap} ms; "
+          f"segment loads: {segment.count('Segment [')}")
+    print(f"  threads: {format_threads(thread_cpu(segment, skip_first=False, top=10))}")
+
+
 def main():
     default_binary = os.path.join(REPO, "builds/binaries/TapeXPlayer" if platform.system() == "Darwin"
                                   else "builds/binaries/TapeXPlayer_linux")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("scenario", choices=["phases", "reverse", "play-after-shuttle"])
+    parser.add_argument("scenario", choices=["phases", "reverse", "play-after-shuttle", "play"])
     parser.add_argument("media", help="clip to play (needs an audio track)")
     parser.add_argument("--binary", default=default_binary, help=f"player binary (default {default_binary})")
     parser.add_argument("--home", default="~/.cache/txp-bench-home", help="HOME for the player under test")
@@ -288,6 +315,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=2, help="play-after-shuttle: runs")
     parser.add_argument("--pause", type=float, default=0.2,
                         help="play-after-shuttle: stop before PLAY, s (a quick stop/play by hand)")
+    parser.add_argument("--seconds", type=float, default=30.0, help="play: how long to measure")
+    parser.add_argument("--speed", type=float, default=1.0, help="play: tape speed (negative = reverse)")
     parser.add_argument("--env", action="append", default=[], metavar="K=V", help="extra player environment")
     args = parser.parse_args()
     if not os.path.exists(args.binary):
@@ -295,7 +324,8 @@ def main():
 
     player = Player(args)
     try:
-        {"phases": phases, "reverse": reverse, "play-after-shuttle": play_after_shuttle}[args.scenario](player, args)
+        {"phases": phases, "reverse": reverse, "play-after-shuttle": play_after_shuttle,
+         "play": play}[args.scenario](player, args)
     finally:
         player.stop()
 
