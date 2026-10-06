@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Bit-exactness test of the CPU-specific kernels in FSTPSIMDOptimizations (see tools/README.md).
-# x86-64 (Intel/AMD): runs the SSE2 path, the scalar fallback and the NEON code through
-# neon_shim/. arm64 (Apple M-series, Snapdragon, Raspberry Pi): runs the real NEON path.
+# x86-64 (Intel/AMD): runs the SSE2 path (with the AVX2 smear where the CPU has it, and once
+# more with FSTP_SIMD_NO_AVX2=1), the scalar fallback and the NEON code through neon_shim/.
+# arm64 (Apple M-series, Snapdragon, Raspberry Pi): runs the real NEON path.
 # Needs a C++23 compiler and FFmpeg's libavutil (found with pkg-config). Exit status 1 on any
 # mismatch.
 set -euo pipefail
@@ -27,7 +28,8 @@ run() {   # run <name> [extra flags...]
 case "$(uname -m)" in
     x86_64|amd64|AMD64)
         flags+=(-msse2 -msse4.1)   # the app's x86 baseline (makefile)
-        run sse2
+        run sse2                              # AVX2 smear where the CPU has it (run-time choice)
+        FSTP_SIMD_NO_AVX2=1 "$out/sse2"       # and the SSE2 smear on the same machine
         run scalar -DPATH_SCALAR
         run neon_shim -DPATH_NEON -I"$here/neon_shim"
         ;;

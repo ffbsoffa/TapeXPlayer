@@ -13,8 +13,9 @@ one code path for macOS, Windows and Linux, tuned on the weakest machine, decide
 
 All CPU-specific code lives in `source/modules/FSTPVideoModule/FSTPSIMDOptimizations` with an SSE2
 path (every x86-64 CPU, Intel and AMD), a NEON path (Apple M-series, Windows on Snapdragon,
-Raspberry Pi) and a scalar fallback. They must produce exactly the same pixels and samples, so
-the look and the sound never depend on the machine.
+Raspberry Pi) and a scalar fallback; the Betacam smear also has an AVX2 path, chosen at run time
+where the CPU has it (not on Windows builds). They must produce exactly the same pixels and
+samples, so the look and the sound never depend on the machine.
 
 ```sh
 tools/simd/run_simd_tests.sh
@@ -26,7 +27,8 @@ audio S32/float/planar-float → int16 — with the scalar loop it replaced, on 
 and edge-case inputs (odd sizes, NaN, ±∞, out-of-range floats).
 
 - On x86-64 it runs three builds: SSE2, scalar, and the NEON code through `simd/neon_shim/`, a
-  portable model of the NEON intrinsics. That shim is how NEON is checked on a machine with no ARM
+  portable model of the NEON intrinsics. The SSE2 build runs twice — with the AVX2 smear (on a CPU
+  that has AVX2) and with `FSTP_SIMD_NO_AVX2=1`. That shim is how NEON is checked on a machine with no ARM
   compiler; when a new NEON kernel uses another intrinsic, add it there with its exact semantics.
 - On arm64 (e.g. an M1 Mac) it runs the real NEON path — the check the shim can't replace.
 

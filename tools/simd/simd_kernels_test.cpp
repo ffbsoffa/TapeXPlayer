@@ -44,7 +44,9 @@ static void PlainSmear(uint8_t* p, int pitch, int rows, int n, int step, int pha
         for (int x = step; x < n * step; x += step) { int cur = (row[x] * (256 - k) + prev * k) >> 8; row[x] = (uint8_t)cur; prev = cur; } }
 }
 int main() {
-#if defined(FSTP_KERNEL_SSE2)
+#if defined(FSTP_KERNEL_AVX2)
+    const char* path = FSTP::UseSmearAvx2() ? "SSE2+AVX2" : "SSE2";   // AVX2: smear only, chosen at run time
+#elif defined(FSTP_KERNEL_SSE2)
     const char* path = "SSE2";
 #elif defined(FSTP_KERNEL_NEON) && defined(PATH_NEON)
     const char* path = "NEON (shim)";
