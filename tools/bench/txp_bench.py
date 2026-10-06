@@ -164,7 +164,15 @@ def phases(player, args):
         # reads as 1-5 pictures/s): leave it out of the mean as well as the gap.
         steady = rows[1:] or rows
         mean = lambda key: sum(float(r.get(key, 0)) for r in steady) / max(1, len(steady))
-        gap = max([int(float(r.get("max_picture_gap", 0))) for r in rows[1:]] or [0])
+        # A picture gap that ends the still period before the phase (pause -> PLAY: the first
+        # new picture comes ~6 s after the last one) is not a freeze: skip the gap of the first
+        # row with pictures when it follows a row without any, early in the phase.
+        gaps = []
+        for i, r in enumerate(rows[1:], start=1):
+            if i <= 2 and float(rows[i - 1].get("new_frames/s", 0)) == 0:
+                continue
+            gaps.append(int(float(r.get("max_picture_gap", 0))))
+        gap = max(gaps or [0])
         passes = {}
         for line in segment.splitlines():
             if "FX STATS" not in line:
