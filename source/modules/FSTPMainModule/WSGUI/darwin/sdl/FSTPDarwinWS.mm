@@ -22,6 +22,8 @@
 #include "FSTPWindowManager.h"
 #include "FSTPPixelBufferManager.h"
 #include "FSTPYUVRenderer.h"
+#include "FSTPThreadStats.h"
+#include "FSTPThreadName.h"
 #include "FSTPKeyboard.h"
 #include "FSTPOSDInstance.h"
 #include "FSTPToolsMenu.h"
@@ -1471,6 +1473,7 @@ void StartAutonomousRendering(SDL_Renderer* renderer) {
         // after each CVDisplayLink signal. Default priority causes 1–3ms scheduling
         // jitter that eats into the 16.67ms frame budget and causes dropped frames.
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        FSTPSetThreadName("fstp-render");
 
         // std::cout << "🎬 [RENDER THREAD] CVDisplayLink-based render thread started" << std::endl;
 
@@ -1516,6 +1519,7 @@ void StartAutonomousRendering(SDL_Renderer* renderer) {
                                 stats_loops / window_s, stats_loops ? stats_render_ms / stats_loops : 0.0,
                                 stats_max_loop_ms, uploads / window_s, distinct / window_s, max_gap);
                     std::fflush(stdout);
+                    FSTPPrintThreadCPU();
                     stats_start = t; stats_loops = 0; stats_render_ms = 0.0; stats_max_loop_ms = 0.0;
                 }
             }

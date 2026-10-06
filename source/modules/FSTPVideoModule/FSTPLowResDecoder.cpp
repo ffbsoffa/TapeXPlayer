@@ -1,4 +1,5 @@
 #include "FSTPLowResDecoder.h"
+#include "FSTPThreadName.h"
 #include "FSTPProxyConverter.h"
 
 #include "FSTPVideoFrame.h"
@@ -1538,6 +1539,13 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
         }
     };
 
+    // Worker threads (not the inline call for a handful of frames, which runs on the proxy
+    // manager's own thread): name them so per-thread CPU stats show the segment decode.
+    auto decodeInWorker = [&](int threadId, int threadStartFrame, int threadEndFrame) {
+        FSTPSetThreadName("fstp-segment");
+        decodeSegment(threadId, threadStartFrame, threadEndFrame);
+    };
+
     int totalFramesInRange = endFrame - startFrame + 1;
 
         if (totalFramesInRange <= 4) {
@@ -1574,8 +1582,8 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
 
             // STEP 1: Decode Part 3 (high priority - where playhead is)
             int part3Mid = part3Start + (endFrame - part3Start) / 2;
-            threads.emplace_back(decodeSegment, threadIdBase + 0, part3Start, part3Mid);
-            threads.emplace_back(decodeSegment, threadIdBase + 1, part3Mid + 1, endFrame);
+            threads.emplace_back(decodeInWorker, threadIdBase + 0, part3Start, part3Mid);
+            threads.emplace_back(decodeInWorker, threadIdBase + 1, part3Mid + 1, endFrame);
 
             // Wait for Part 3 to complete
             for (auto& t : threads) {
@@ -1584,8 +1592,8 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
             threads.clear();
 
             // STEP 2: Decode Part 1+2 (lower priority)
-            threads.emplace_back(decodeSegment, threadIdBase + 0, startFrame, part1End);
-            threads.emplace_back(decodeSegment, threadIdBase + 1, part1End + 1, part2End);
+            threads.emplace_back(decodeInWorker, threadIdBase + 0, startFrame, part1End);
+            threads.emplace_back(decodeInWorker, threadIdBase + 1, part1End + 1, part2End);
 
     } else {
         // ========== FORWARD: Normal decoding (works great) ==========
@@ -1597,7 +1605,7 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
             int threadEnd = (i == numThreads - 1) ? endFrame : std::min(endFrame, start + framesPerThread - 1);
             if (threadStart > threadEnd) break;
 
-            threads.emplace_back(decodeSegment, threadIdBase + i, threadStart, threadEnd);
+            threads.emplace_back(decodeInWorker, threadIdBase + i, threadStart, threadEnd);
             start = threadEnd + 1;
             if (start > endFrame) break;
         }

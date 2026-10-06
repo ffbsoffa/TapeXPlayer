@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include "../FSTPYUVRenderer.h"
+#include "../FSTPThreadStats.h"
 #include <iostream>
 #include <condition_variable>
 #include <mutex>
@@ -987,6 +988,7 @@ int RunMainUILoop() {
                             stats_loops / window_s, stats_loops ? stats_render_ms / stats_loops : 0.0,
                             stats_max_loop_ms, uploads / window_s, distinct / window_s, max_gap);
                 std::fflush(stdout);
+                FSTPPrintThreadCPU();
                 stats_start = now; stats_loops = 0; stats_render_ms = 0.0; stats_max_loop_ms = 0.0;
             }
         }

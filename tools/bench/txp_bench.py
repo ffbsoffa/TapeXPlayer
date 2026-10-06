@@ -144,6 +144,24 @@ class Player:
                 return
 
 
+def thread_cpu(text, skip_first=True, top=7):
+    """Mean CPU % of one core per thread name over the THREAD CPU lines in text (the player
+    prints one a second next to RENDER STATS). Returns [(name, pct)], busiest first."""
+    lines = [line for line in text.splitlines() if "THREAD CPU" in line]
+    if skip_first and len(lines) > 1:
+        lines = lines[1:]   # straddles the command that started the phase, like the stats rows
+    sums = {}
+    for line in lines:
+        for name, value in re.findall(r" ([^ =|]+?)(?:\(x[0-9]+\))?=([0-9.]+)%", line.split("|", 1)[-1]):
+            sums[name] = sums.get(name, 0.0) + float(value)
+    means = sorted(((n, v / len(lines)) for n, v in sums.items()), key=lambda kv: -kv[1])
+    return means[:top]
+
+
+def format_threads(means):
+    return "  ".join(f"{name} {pct:.0f}%" for name, pct in means if pct >= 0.5)
+
+
 def render_stats(text):
     return [dict(re.findall(r"([a-z_/]+)=([0-9.]+)", line))
             for line in text.splitlines() if "RENDER STATS" in line]
@@ -174,9 +192,8 @@ def phases(player, args):
             gaps.append(int(float(r.get("max_picture_gap", 0))))
         gap = max(gaps or [0])
         passes = {}
-        for line in segment.splitlines():
-            if "FX STATS" not in line:
-                continue
+        fx_lines = [line for line in segment.splitlines() if "FX STATS" in line]
+        for line in fx_lines[1:] or fx_lines:   # first one straddles the phase change
             for key, value in re.findall(r" ([a-z]+)=([0-9.]+)ms", line):
                 passes.setdefault(key, []).append(float(value))
             for label, pattern in (("updates/s", r"updates/s=([0-9.]+)"),
@@ -190,6 +207,9 @@ def phases(player, args):
               f"new {mean('new_frames/s'):4.1f}/s gap {gap:4d}ms")
         if detail:
             print(f"  {'':<11} {detail}", flush=True)
+        threads = format_threads(thread_cpu(segment))
+        if threads:
+            print(f"  {'':<11} threads: {threads}", flush=True)
 
     phase("pause", 4)
     player.send(PLAY); phase("play 1x", 5)

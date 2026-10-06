@@ -1495,6 +1495,13 @@ private:
                            const PaStreamCallbackTimeInfo* timeInfo, PaStreamCallbackFlags statusFlags, void* userData) {
         (void)inputBuffer; (void)timeInfo; (void)statusFlags;
 
+#if defined(__linux__)
+        // PortAudio's callback thread is unnamed on Linux (macOS: CoreAudio's IOThread is) — name it
+        // once so per-thread CPU (FSTP_RENDER_STATS, top -H) shows it as audio.
+        static thread_local bool thread_named = false;
+        if (!thread_named) { FSTPSetThreadName("fstp-audio-cb"); thread_named = true; }
+#endif
+
         // PROFILING AUDIO CALLBACK: Measure time of each call
         static std::atomic<uint64_t> total_callback_us{0};
         static std::atomic<int> callback_count{0};
