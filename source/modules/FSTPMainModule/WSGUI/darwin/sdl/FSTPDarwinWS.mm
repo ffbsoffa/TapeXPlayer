@@ -21,6 +21,7 @@
 #include "FSTPPlayerManager.h"
 #include "FSTPWindowManager.h"
 #include "FSTPPixelBufferManager.h"
+#include "FSTPYUVRenderer.h"
 #include "FSTPKeyboard.h"
 #include "FSTPOSDInstance.h"
 #include "FSTPToolsMenu.h"
@@ -1477,6 +1478,14 @@ void StartAutonomousRendering(SDL_Renderer* renderer) {
         int fps_counter = 0;
         auto fps_start = std::chrono::steady_clock::now();
 
+        // FSTP_RENDER_STATS=1: the same once-a-second line as the Linux loop (FSTPWaylandWS),
+        // so tools/bench/txp_bench.py measures macOS the same way.
+        const bool render_stats = std::getenv("FSTP_RENDER_STATS") != nullptr;
+        auto stats_start = fps_start;
+        auto loop_start = fps_start;
+        int stats_loops = 0;
+        double stats_render_ms = 0.0, stats_max_loop_ms = 0.0;
+
         while (g_renderThreadRunning.load()) {
             // Wait for signal from CVDisplayLink (VSync)
             {
@@ -1491,8 +1500,34 @@ void StartAutonomousRendering(SDL_Renderer* renderer) {
             // Adaptive FPS was disabled due to desync at 1x speed
             fps_counter++;
 
+            if (render_stats) {
+                auto t = std::chrono::steady_clock::now();
+                if (stats_loops > 0) {
+                    stats_max_loop_ms = std::max(stats_max_loop_ms,
+                        std::chrono::duration<double, std::milli>(t - loop_start).count());
+                }
+                loop_start = t;
+                double window_s = std::chrono::duration<double>(t - stats_start).count();
+                if (window_s >= 1.0) {
+                    int uploads = g_fstp_texture_uploads.exchange(0, std::memory_order_relaxed);
+                    int distinct = g_fstp_distinct_frames.exchange(0, std::memory_order_relaxed);
+                    int max_gap = g_fstp_max_picture_gap_ms.exchange(0, std::memory_order_relaxed);
+                    std::printf("📈 [RENDER STATS] loops/s=%.1f render_avg=%.2fms loop_max=%.1fms video_uploads/s=%.1f new_frames/s=%.1f max_picture_gap=%dms\n",
+                                stats_loops / window_s, stats_loops ? stats_render_ms / stats_loops : 0.0,
+                                stats_max_loop_ms, uploads / window_s, distinct / window_s, max_gap);
+                    std::fflush(stdout);
+                    stats_start = t; stats_loops = 0; stats_render_ms = 0.0; stats_max_loop_ms = 0.0;
+                }
+            }
+
             // Render frame synchronized with VSync
+            auto render_start = std::chrono::steady_clock::now();
             AutoRenderFrame();
+            if (render_stats) {
+                stats_render_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - render_start).count();
+                ++stats_loops;
+            }
 
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - fps_start).count() >= 1) {
