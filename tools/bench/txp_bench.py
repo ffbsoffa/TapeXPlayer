@@ -160,7 +160,10 @@ def phases(player, args):
         cpu1, t1 = player.cpu_seconds(), time.time()
         segment = player.log()[offset:]
         rows = render_stats(segment)
-        mean = lambda key: sum(float(r.get(key, 0)) for r in rows) / max(1, len(rows))
+        # The first per-second row straddles the phase change (a PLAY that lands late in it
+        # reads as 1-5 pictures/s): leave it out of the mean as well as the gap.
+        steady = rows[1:] or rows
+        mean = lambda key: sum(float(r.get(key, 0)) for r in steady) / max(1, len(steady))
         gap = max([int(float(r.get("max_picture_gap", 0))) for r in rows[1:]] or [0])
         passes = {}
         for line in segment.splitlines():
