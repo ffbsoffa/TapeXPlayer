@@ -67,7 +67,8 @@ class Player:
         self.proc = subprocess.Popen([args.binary, args.media], env=env, start_new_session=True,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         start = time.time()
-        while "Loading complete" not in self.log():
+        # Printed by the load path on all three platforms ("Loading complete" is Linux/Windows only).
+        while "File successfully loaded into player instance" not in self.log():
             if self.proc.poll() is not None:
                 sys.exit(f"player exited during load (code {self.proc.returncode})")
             if time.time() - start > args.load_timeout:
@@ -237,7 +238,8 @@ def play_after_shuttle(player, args):
 
 
 def main():
-    default_binary = os.path.join(REPO, "builds/binaries/TapeXPlayer_linux")
+    default_binary = os.path.join(REPO, "builds/binaries/TapeXPlayer" if platform.system() == "Darwin"
+                                  else "builds/binaries/TapeXPlayer_linux")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("scenario", choices=["phases", "reverse", "play-after-shuttle"])
     parser.add_argument("media", help="clip to play (needs an audio track)")
