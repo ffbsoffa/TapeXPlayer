@@ -68,6 +68,11 @@ static SDL_Rect ComputeAspectFitRect(int texture_width, int texture_height, int 
 }
 
 static SDL_Renderer* CreateRendererWithVSync(SDL_Window* window, int index, Uint32 flags) {
+    // Naming a driver (SDL_HINT_RENDER_DRIVER, as every caller does) makes SDL 2 switch draw-call
+    // batching OFF: it assumes the app may also talk to that API directly. TapeXPlayer draws only
+    // through SDL (the D3D11 device is used for the vblank wait, not for drawing), so ask for it
+    // back — without it every SDL_RenderCopy (each OSD text) went to the GPU as its own pass.
+    SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
 #ifdef _WIN32
     // On Windows the render thread is paced by a dedicated DXGI vblank thread (FSTPWindowsWS.cpp),
     // which wakes it once per vertical retrace — the macOS CVDisplayLink model. The present must
