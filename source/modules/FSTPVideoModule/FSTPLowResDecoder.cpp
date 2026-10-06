@@ -177,8 +177,11 @@ static bool ProxyContextUsesGpu(int threadId) {
     static const bool head_on_cpu = std::getenv("FSTP_PROXY_HEAD_SW") != nullptr;
     return threadId >= 2 && !head_on_cpu;
 #else
-    (void)threadId;
-    return false;   // macOS / Windows: not measured yet
+    // macOS / Windows: opt-in until measured in the player (FSTP_PROXY_HEAD_GPU=1). The same
+    // replay on an M1 with VideoToolbox: 1.6 -> 0.73 ms of CPU per picture, bit-exact, but
+    // 3.3 ms of latency per picture instead of 1.6; Intel Macs read VideoToolbox frames back slowly.
+    static const bool head_on_gpu = std::getenv("FSTP_PROXY_HEAD_GPU") != nullptr;
+    return threadId >= 2 && head_on_gpu;
 #endif
 }
 
