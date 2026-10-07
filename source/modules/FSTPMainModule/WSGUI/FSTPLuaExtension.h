@@ -57,6 +57,10 @@ void FSTPLua_Unload(const char* id);
 void FSTPLua_Render(SDL_Renderer* renderer, int player_id, double time_seconds,
                     int win_w, int win_h);
 
+// True while a loaded extension has an on_render callback (it may animate, so the render loop
+// must not throttle a still picture). False without Lua.
+bool FSTPLua_HasRenderCallbacks(void);
+
 // Drain actions scripts requested from the render thread (seek/play/screenshot/
 // markers) and run them. Call once per iteration of the main/event loop so these
 // run on the same thread as the keyboard/menu handlers. No-op without Lua.

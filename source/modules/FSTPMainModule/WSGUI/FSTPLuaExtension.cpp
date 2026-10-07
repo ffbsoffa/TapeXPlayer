@@ -395,6 +395,14 @@ void FSTPLua_Render(SDL_Renderer* renderer, int player_id, double time_seconds,
     g_ctx.r = nullptr;
 }
 
+bool FSTPLua_HasRenderCallbacks(void) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (const auto& entry : g_exts) {
+        if (entry.second.render_ref != LUA_NOREF) return true;
+    }
+    return false;
+}
+
 void FSTPLua_ProcessPending(void) {
     std::vector<std::function<void()>> todo;
     {
@@ -467,5 +475,6 @@ bool FSTPLua_Load(const char*, const char*, const char*) { return false; }
 void FSTPLua_Unload(const char*) {}
 void FSTPLua_Render(SDL_Renderer*, int, double, int, int) {}
 void FSTPLua_ProcessPending(void) {}
+bool FSTPLua_HasRenderCallbacks(void) { return false; }
 
 #endif // FSTP_HAVE_LUA

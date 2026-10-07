@@ -151,6 +151,30 @@ static std::mutex g_presentation_mutex;
 // the presentation functions never hold both, so there is no inversion.
 static std::mutex g_render_mutex;
 
+static uint64_t SteadyNowMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// When the last keyboard, mouse, touch or window event came in (steady ms). The still-picture
+// throttle in RenderAllWindows draws every frame for a moment after one, so a frame step, typed
+// timecode digit or hover shows at once. An SDL event watch sees every event as it is queued.
+static std::atomic<uint64_t> g_last_ui_event_ms{0};
+static int SDLCALL NoteUiEvent(void*, SDL_Event* event) {
+    switch (event->type) {
+        case SDL_KEYDOWN: case SDL_KEYUP: case SDL_TEXTINPUT: case SDL_TEXTEDITING:
+        case SDL_MOUSEMOTION: case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: case SDL_MOUSEWHEEL:
+        case SDL_FINGERDOWN: case SDL_FINGERUP: case SDL_FINGERMOTION: case SDL_MULTIGESTURE:
+        case SDL_WINDOWEVENT: case SDL_DROPFILE: case SDL_DROPTEXT: case SDL_DROPBEGIN:
+        case SDL_DROPCOMPLETE: case SDL_RENDER_TARGETS_RESET: case SDL_RENDER_DEVICE_RESET:
+            g_last_ui_event_ms.store(SteadyNowMs(), std::memory_order_relaxed);
+            break;
+        default:
+            break;
+    }
+    return 1;
+}
+
 int InitWindowManager() {
     if (g_window_manager_initialized) {
         std::cout << "Window manager already initialized" << std::endl;
@@ -168,6 +192,8 @@ int InitWindowManager() {
 
     SetBetacamEffectEnabled(GetBetacamEffectEnabled());
     SetBetacamReverseStripe(GetBetacamReverseStripe());
+
+    SDL_AddEventWatch(NoteUiEvent, nullptr);
 
     // Initialize array of windows
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -220,6 +246,8 @@ void ShutdownWindowManager() {
     }
 
     std::cout << "Shutting down window manager..." << std::endl;
+
+    SDL_DelEventWatch(NoteUiEvent, nullptr);
 
     // Shutdown pixel buffer manager
     if (g_pixel_buffer_manager) {
@@ -846,26 +874,40 @@ void RenderAllWindows() {
             bool grain_active = (player_id >= 0 && g_pixel_buffer_manager &&
                                  g_pixel_buffer_manager->IsFilmGrainActive());
 
-            // SETTLED PAUSE THROTTLE: when frame is aligned, betacam stripe gone,
-            // and zoom is not active — throttle full render cycle to ~5fps.
-            // SDL events and menus are processed independently on all platforms.
+            // STILL-PICTURE THROTTLE: while paused and nothing on screen would change, redraw
+            // every 200 ms only (Clear/Texture/OSD/Present skipped). "Nothing would change": the
+            // picture is the one already in the texture (by identity — see picture_serial), no
+            // keyboard/mouse/window event in the last 300 ms (frame steps, timecode entry, hover),
+            // no zoom, dropout or script overlay — and no effect animating: with the Betacam
+            // effect on, only once its pause stripe has settled (frame aligned + hold), as before.
+            // Without the effect this never applied, as it waited for that alignment: a pause
+            // redrew 60 times a second (Pentium Gold 7505: 7% of a core, 38 ms/s in present).
             {
                 FSTPZoomState* zs = GetZoomState(i);
                 bool zoom_active = (zs && zs->enabled && zs->factor > 1.0f) || IsZoomPanningActive();
-                bool settled = player_id >= 0 &&
-                               g_windows[i].last_frame_aligned &&
-                               g_windows[i].betacam_hold_frames == 0;
-
-                if (settled && !zoom_active && !dropout_active) {
-                    uint64_t now_ms = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                const uint64_t now_ms = SteadyNowMs();
+                static const bool throttle_off = std::getenv("FSTP_NO_STILL_THROTTLE") != nullptr;  // A/B
+                bool still = false;
+                if (!throttle_off && player_id >= 0 && !zoom_active && !dropout_active && g_pixel_buffer_manager) {
+                    const bool effect_quiet = g_pixel_buffer_manager->IsBetacamEffectEnabled()
+                        ? (g_windows[i].last_frame_aligned && g_windows[i].betacam_hold_frames == 0)
+                        : (!grain_active && std::fabs(GetInstanceActualSpeed(player_id)) < 0.05 &&
+                           !IsPlayerLoading(player_id));
+                    const FSTPPixelBufferManager::PixelBuffer* pb =
+                        effect_quiet ? g_pixel_buffer_manager->GetPixelBuffer(player_id) : nullptr;
+                    const int cb = g_windows[i].current_buffer_index;
+                    still = pb && g_windows[i].texture_buffer_valid[cb] &&
+                            g_windows[i].texture_buffer_serial[cb] == pb->picture_serial &&
+                            now_ms - g_last_ui_event_ms.load(std::memory_order_relaxed) > 300 &&
+                            !FSTPWelcome_IsActive() && !FSTPLua_HasRenderCallbacks();
+                }
+                if (still) {
                     if (now_ms - g_windows[i].last_settled_render_ms < 200) {
                         continue; // Nothing changed — skip Clear/Texture/OSD/Present
                     }
                     g_windows[i].last_settled_render_ms = now_ms;
                 } else {
-                    g_windows[i].last_settled_render_ms = 0; // Reset when leaving settled state
+                    g_windows[i].last_settled_render_ms = 0; // Reset when leaving the still state
                 }
             }
 
