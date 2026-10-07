@@ -368,12 +368,42 @@ def step_latency(player, args):
         print(f"  median {sorted(ok)[len(ok) // 2]:.0f} ms, worst {max(ok):.0f} ms, missing {len(lat) - len(ok)}")
 
 
+def speeds(player, args):
+    """A ladder of shuttle speeds (forward, then the same backward through the mouse shuttle),
+    4 s each: CPU, pictures/s, worst gap and the Betacam effect's per-second cost at each."""
+    for direction in (1, -1):
+        for sp in (3, 9, 14, 18, 24, 32):
+            # Room for 5 s at 32x (160 s of tape) either way: forward from --start,
+            # backward from --start + --span.
+            player.send(MOUSE_SHUTTLE, 0.1)
+            player.send(STOP)
+            player.send(SEEK, args.start if direction > 0 else args.start + args.span)
+            time.sleep(1.5)
+            player.send(MOUSE_SHUTTLE, direction * float(sp))
+            time.sleep(1.0)   # let the speed and the decoders settle
+            offset = len(player.log())
+            cpu0, t0 = player.cpu_seconds(), time.time()
+            time.sleep(4)
+            cpu1, t1 = player.cpu_seconds(), time.time()
+            seg = player.log()[offset:]
+            rows = render_stats(seg)
+            mean = lambda key: sum(float(r.get(key, 0)) for r in rows) / max(1, len(rows))
+            gap = max([int(float(r.get("max_picture_gap", 0))) for r in rows] or [0])
+            fx = [float(m) for m in re.findall(r"cpu/s=([0-9.]+)", seg)]
+            fxs = f"{sum(fx) / len(fx):.0f}" if fx else "-"
+            print(f"  {direction * sp:+4d}x  CPU {100 * (cpu1 - cpu0) / (t1 - t0):3.0f}% | new {mean('new_frames/s'):4.1f}/s "
+                  f"gap {gap:4d}ms | fx cpu {fxs} ms/s | {format_threads(thread_cpu(seg, skip_first=False, top=3))}",
+                  flush=True)
+    player.send(MOUSE_SHUTTLE, 0.1)
+    player.send(STOP)
+
+
 def main():
     default_binary = os.path.join(REPO, "builds/binaries/TapeXPlayer" if platform.system() == "Darwin"
                                   else "builds/binaries/TapeXPlayer_linux")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("scenario", choices=["phases", "reverse", "play-after-shuttle", "play", "after-stop",
-                                             "step-latency"])
+                                             "step-latency", "speeds"])
     parser.add_argument("media", help="clip to play (needs an audio track)")
     parser.add_argument("--binary", default=default_binary, help=f"player binary (default {default_binary})")
     parser.add_argument("--home", default="~/.cache/txp-bench-home", help="HOME for the player under test")
@@ -392,6 +422,7 @@ def main():
     parser.add_argument("--seconds", type=float, default=30.0, help="play: how long to measure")
     parser.add_argument("--speed", type=float, default=1.0, help="play: tape speed (negative = reverse)")
     parser.add_argument("--fps", type=float, default=50.0, help="step-latency: the clip's frame rate")
+    parser.add_argument("--span", type=float, default=250.0, help="speeds: backward runs start at --start + --span")
     parser.add_argument("--env", action="append", default=[], metavar="K=V", help="extra player environment")
     args = parser.parse_args()
     if not os.path.exists(args.binary):
@@ -400,7 +431,8 @@ def main():
     player = Player(args)
     try:
         {"phases": phases, "reverse": reverse, "play-after-shuttle": play_after_shuttle,
-         "play": play, "after-stop": after_stop, "step-latency": step_latency}[args.scenario](player, args)
+         "play": play, "after-stop": after_stop, "step-latency": step_latency,
+         "speeds": speeds}[args.scenario](player, args)
         if player.proc.poll() is not None:
             print(f"PLAYER DIED during the run (code {player.proc.returncode})", flush=True)
     finally:
