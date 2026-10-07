@@ -331,7 +331,9 @@ def after_stop(player, args):
         rows = render_stats(player.log()[offset:])
         cells = [f"{float(r.get('video_uploads/s', 0)):.0f}/{float(r.get('new_frames/s', 0)):.0f}/"
                  f"{int(float(r.get('shown_h', 0)))}" for r in rows]
-        print(f"  {label}: CPU {100 * (cpu1 - cpu0) / (t1 - t0):.0f}%   per second uploads/new/shown_h: "
+        rss = subprocess.run(["ps", "-o", "rss=", "-p", str(player.proc.pid)], capture_output=True, text=True).stdout.strip()
+        rss_mb = f"{int(rss) / 1024:.0f} MB" if rss else "?"
+        print(f"  {label}: CPU {100 * (cpu1 - cpu0) / (t1 - t0):.0f}%  RSS {rss_mb}   per second uploads/new/shown_h: "
               + "  ".join(cells), flush=True)
 
 
