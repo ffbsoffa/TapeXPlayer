@@ -158,6 +158,18 @@ def thread_cpu(text, skip_first=True, top=7):
     return means[:top]
 
 
+def render_passes(text):
+    """Mean of the 🎨 [RENDER PASSES] fields (ms of render-thread CPU per second) over text,
+    leaving out the first line (it straddles the phase change)."""
+    lines = [line for line in text.splitlines() if "RENDER PASSES" in line]
+    lines = lines[1:] or lines
+    sums = {}
+    for line in lines:
+        for key, value in re.findall(r" ([a-z]+)=([0-9.]+)", line):
+            sums[key] = sums.get(key, 0.0) + float(value)
+    return {k: v / len(lines) for k, v in sums.items()} if lines else {}
+
+
 def format_threads(means):
     return "  ".join(f"{name} {pct:.0f}%" for name, pct in means if pct >= 0.5)
 
@@ -210,6 +222,9 @@ def phases(player, args):
         threads = format_threads(thread_cpu(segment))
         if threads:
             print(f"  {'':<11} threads: {threads}", flush=True)
+        passes_ms = render_passes(segment)
+        if passes_ms:
+            print(f"  {'':<11} render ms/s: " + "  ".join(f"{k} {v:.0f}" for k, v in passes_ms.items()), flush=True)
 
     phase("pause", 4)
     player.send(PLAY); phase("play 1x", 5)
