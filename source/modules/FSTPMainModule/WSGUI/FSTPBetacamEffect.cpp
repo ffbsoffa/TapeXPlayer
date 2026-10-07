@@ -3,8 +3,10 @@
 #include "FSTPSIMDOptimizations.h"   // per-CPU kernels: smear, soft-edge row
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <tuple>
@@ -801,6 +803,26 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
             repeatLineDown(y0 - 1, y0, runH);  // hold the last good line above the run
         }
         effectApplied = true;
+    }
+
+    // === PHYSICAL SHUTTLE (fast speeds) ===
+    // From PhysicalShuttleFrom() up the picture comes from the Betacam SP model instead of the
+    // hand-tuned comb below (see ApplyPhysicalShuttle). FSTP_BETACAM_PHYS=0 brings the old comb back.
+    {
+        const double physFrom = PhysicalShuttleFrom();
+        if (physFrom > 0.0 && absPlaybackRate >= physFrom && !isSlowMotion && !isReverseNormalSpeed) {
+            const double signedRate = (currentPlaybackRate < 0.0 || metrics.is_reverse) ? -absPlaybackRate
+                                                                                      : absPlaybackRate;
+            const bool drew = ApplyPhysicalShuttle(state, frame_ctx, signedRate);
+            state.last_frame_number = frame_ctx.frame_number;
+            state.last_new_frame = frame_ctx.new_frame;
+            state.last_speed = absPlaybackRate;
+            if (!isNewFrame && state.hold_timer > 0) {
+                state.hold_timer = std::max(0, state.hold_timer - 1);
+            }
+            state.is_fast = (rawPlaybackRate >= fastThreshold);
+            return drew || effectApplied;
+        }
     }
 
     // Skip stripe generation ONLY if not fast AND not slow motion AND not 1× reverse.
@@ -1857,6 +1879,11 @@ bool FSTPBetacamEffect::ApplyRenderJitter(int player_id, RenderContext& render_c
     if (!isSlowMotion && !isFastShuttle) {
         return false;
     }
+    // The physical shuttle range: the deck's time-base corrector holds the raster still, only the
+    // bars move — no whole-picture jitter there.
+    if (PhysicalShuttleFrom() > 0.0 && absSpeed >= PhysicalShuttleFrom()) {
+        return false;
+    }
 
     SDL_Rect& dst = *render_ctx.dest_rect;
 
@@ -1961,6 +1988,475 @@ bool FSTPBetacamEffect::ApplyRenderJitter(int player_id, RenderContext& render_c
     }
 
     return modified;
+}
+
+// ========== PHYSICAL SHUTTLE (from the Betacam SP bench, txp-betacam-lab) ==========
+//
+// What a Betacam SP deck shows in fast shuttle, reduced to one decision per picture row:
+//  • In each field the Y head slides across the tape by (s − 1) track pitches. Where it rides over
+//    the neighbouring C track (opposite azimuth) its signal sinks below the dropout detector's
+//    threshold and the dropout compensator fills the line flat grey: |s − 1| bars per field,
+//    |s| + 1 in reverse (all Betacam Y heads share one azimuth, so every Y track is readable).
+//  • Where the bars stand is set by the tape position alone: one comb, all bars move together,
+//    still at whole speeds, wandering with the reel servo (above 2× the reels pull the tape).
+//  • Between the bars the picture is intact; each band comes from its own moment of the tape —
+//    top bands older, bottom ones newer — cut here from the shown frame and the one before it.
+//  • At a bar's edge the head's signal hovers at the threshold; the lower the carrier-to-noise
+//    (it falls with speed: the FM carriers drift out of the playback band), the more the edge
+//    breaks into short grey dashes and grain.
+// Geometry: SMPTE 229M / RP 144 (Y track 86 µm, C track 73 µm, pair pitch 165.7 µm, Y head 85 µm,
+// C head 11.75 lines behind plus 1 line of CTDM delay). Detector threshold (−8.5 dB) and the C/N
+// curve were set by eye on the bench (author, 07.10.2026: presets/author_20261007.json).
+namespace {
+constexpr double kPhysPitchUm = 165.7;
+constexpr double kPhysYTrackUm = 86.0, kPhysYHeadUm = 85.0;
+constexpr double kPhysCTrackUm = 73.0, kPhysCHeadUm = 73.0;
+// Dropout detector threshold (share of the on-track envelope) by |speed|, set by eye by the author:
+// −10 dB from 9× (where this path takes over), easing to −8.5 dB at 24× and beyond.
+double PhysDocThreshold(double a) {
+    const double db = a <= 9.0 ? -10.0 : a >= 24.0 ? -8.5 : -10.0 + 1.5 * (a - 9.0) / 15.0;
+    return std::pow(10.0, db / 20.0);
+}
+constexpr double kPhysCLagFields = 12.75 / 312.5;   // C head reads a row 12.75 lines after the Y head
+// A head off its track's centre by one pitch reads the picture this many field lines earlier: lines
+// lie at the same height on every track, and across a slanted track "sideways" is also "along".
+// Within a band the read-out runs at r(s) lines per line (24× → 0.6): the 32-line TBC repeats lines
+// to fill in (forward) or drops them (reverse), and over the bar the picture jumps ahead (bench:
+// lines_per_pitch(), 5.5).
+constexpr double kPhysLinesPerPitch = 5.5;
+// Where the TBC's repeats fall in forward shuttle. Each band is short of the same 5.5 field lines
+// (exactly the jump at the bar). Held right below the bar — the first line after it repeated until
+// the picture catches up — they make the smear the old comb drew (default); spread evenly through
+// the band they are only a faint stair (FSTP_BETACAM_TBC=spread). In reverse lines are dropped.
+// How much of each band the held line covers, by |speed|. Physically 5.5 field lines (the jump);
+// from 18× the author wants it stronger, and the TBC gives a reason: after each bar it re-locks to
+// the off-tape line rate, which drifts further from nominal with speed (18× → ×0.70, 24× → ×0.60,
+// 32× → ×0.45), so it holds longer. Share of the band: 0.30 at 18× (the physical value) → 0.70 at
+// 24× → 0.85 at 32×; never less than the physical hold.
+double PhysHoldShare(double a) {
+    if (a <= 18.0) return 0.0;
+    if (a <= 24.0) return 0.30 + 0.40 * (a - 18.0) / 6.0;
+    if (a <= 32.0) return 0.70 + 0.15 * (a - 24.0) / 8.0;
+    return 0.85;
+}
+
+bool PhysTbcHoldBelowBar() {
+    static const bool hold = [] {
+        const char* v = std::getenv("FSTP_BETACAM_TBC");
+        return !(v && std::strcmp(v, "spread") == 0);
+    }();
+    return hold;
+}
+constexpr double kPhysReelWander = 0.007;           // ±0.7 % speed wander of the reel drive
+constexpr uint8_t kPhysDocGrey = 119;               // 47 % of white, as on the reference shuttle frame
+constexpr int kPhysLutN = 1024;
+
+// Share of a head of width wh (pitches) over tracks of width wt repeating every pitch, for a head
+// centre u pitches away from a track centre.
+float PhysOverlap(double u, double wt, double wh) {
+    const double lo = u - wh / 2, hi = u + wh / 2;
+    double sum = 0.0;
+    for (int n = -2; n <= 2; ++n) {
+        sum += std::max(0.0, std::min(hi, n + wt / 2) - std::max(lo, n - wt / 2));
+    }
+    return static_cast<float>(sum / wh);
+}
+
+struct PhysLut { float y[kPhysLutN]; float c[kPhysLutN]; };
+const PhysLut& PhysHeads() {
+    static const PhysLut lut = [] {
+        PhysLut l{};
+        for (int i = 0; i < kPhysLutN; ++i) {
+            const double u = static_cast<double>(i) / kPhysLutN;
+            l.y[i] = PhysOverlap(u, kPhysYTrackUm / kPhysPitchUm, kPhysYHeadUm / kPhysPitchUm);
+            l.c[i] = PhysOverlap(u, kPhysCTrackUm / kPhysPitchUm, kPhysCHeadUm / kPhysPitchUm);
+        }
+        return l;
+    }();
+    return lut;
+}
+inline float PhysAt(const float* t, double v) {
+    const double f = v - std::floor(v);
+    return t[static_cast<int>(f * kPhysLutN) & (kPhysLutN - 1)];
+}
+
+// Carrier-to-noise at the head (dB) by |speed|: flat to 4×, then falling as the carriers leave
+// the playback band — 29 dB at 24×, 27 dB at 32× (author's table on the bench).
+double PhysCarrierToNoise(double a) {
+    if (a <= 4.0) return 58.0;
+    if (a <= 24.0) return 58.0 + (29.0 - 58.0) * (a - 4.0) / 20.0;
+    if (a <= 32.0) return 29.0 + (27.0 - 29.0) * (a - 24.0) / 8.0;
+    return 27.0 - 0.25 * (a - 32.0);
+}
+
+// FM grain: a row of noise with σ = 16 codes, read from a random offset; doubled so a row up to
+// kEdgeNoiseLen wide reads contiguously. A plain int8 row (not EdgeNoise's pairs) so the add loop
+// vectorises (NEON / SSE2).
+const int8_t* PhysGrainRow(uint32_t random) {
+    static const std::vector<int8_t> table = [] {
+        std::vector<int8_t> t(2 * kEdgeNoiseLen);
+        uint32_t x = 0x7F4A7C15u;
+        auto next = [&x] { x ^= x << 13; x ^= x >> 17; x ^= x << 5; return x; };
+        for (int i = 0; i < kEdgeNoiseLen; ++i) {
+            const int g = static_cast<int>(next() % 33) + static_cast<int>(next() % 33) + static_cast<int>(next() % 33) - 48;
+            t[i] = static_cast<int8_t>(g);      // Irwin–Hall of three: σ ≈ 16.5
+            t[i + kEdgeNoiseLen] = t[i];
+        }
+        return t;
+    }();
+    return table.data() + (random & (kEdgeNoiseLen - 1));
+}
+
+// Adds grain row gn·kq/256 to an 8-bit luma row, clamped to video range. Restrict pointers so it
+// vectorises (two byte pointers could otherwise alias).
+void PhysAddGrain(uint8_t* __restrict row, const int8_t* __restrict gn, int n, int kq) {
+    for (int x = 0; x < n; ++x) {
+        int o = row[x] + ((gn[x] * kq) >> 8);
+        o = o < 16 ? 16 : o;
+        o = o > 235 ? 235 : o;
+        row[x] = static_cast<uint8_t>(o);
+    }
+}
+
+// Head-to-tape flutter at the top shuttle speeds: the tape no longer lies flat against the drum,
+// so within a field the head's path wanders across the tracks a little and each bar shifts on its
+// own, field after field — the jumping bars the author keeps from the old comb (20–32×).
+// Amplitude in track pitches by |speed|.
+double PhysFlutterAmp(double a) {
+    if (a <= 20.0) return 0.0;
+    if (a <= 24.0) return 0.12 * (a - 20.0) / 4.0;
+    if (a <= 32.0) return 0.12 + 0.06 * (a - 24.0) / 8.0;
+    return 0.18;
+}
+// The wander along the pass of field k (≈ ±1): three waves with fresh phases every field, sampled
+// at kPhysFlutterN points over τ ∈ [0, 1.1] (the C head reads a little past the field's end).
+constexpr int kPhysFlutterN = 64;
+constexpr double kPhysFlutterSpan = 1.1;
+void PhysFlutterTable(int64_t k, float* table) {
+    static constexpr double f[3] = {2.3, 5.1, 9.7};      // cycles per pass
+    static constexpr double w[3] = {0.6, 0.5, 0.4};
+    double ph[3];
+    for (int i = 0; i < 3; ++i) {
+        uint32_t h = static_cast<uint32_t>(k) * 2654435761u ^ static_cast<uint32_t>(i + 1) * 40503u;
+        h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+        ph[i] = (h & 0xFFFF) * (kTwoPi / 65536.0);
+    }
+    for (int j = 0; j <= kPhysFlutterN; ++j) {
+        const double tau = kPhysFlutterSpan * j / kPhysFlutterN;
+        double e = 0.0;
+        for (int i = 0; i < 3; ++i) e += w[i] * std::sin(kTwoPi * f[i] * tau + ph[i]);
+        table[j] = static_cast<float>(e);
+    }
+}
+
+// Standard normal values for the detector's flicker, one byte of a random number each.
+const float* PhysGauss256() {
+    static const std::array<float, 256> t = [] {
+        std::array<float, 256> g{};
+        for (int i = 0; i < 256; ++i) {                    // inverse normal CDF at (i + 0.5) / 256 (Acklam)
+            const double p = (i + 0.5) / 256.0;
+            const double q = p < 0.5 ? p : 1.0 - p;
+            const double r = std::sqrt(-2.0 * std::log(q));
+            double x = r - (2.515517 + 0.802853 * r + 0.010328 * r * r) /
+                           (1.0 + 1.432788 * r + 0.189269 * r * r + 0.001308 * r * r * r);
+            g[i] = static_cast<float>(p < 0.5 ? -x : x);
+        }
+        return g;
+    }();
+    return t.data();
+}
+
+// Reel servo wander: slow waves 0.4–7 Hz, the low ones stronger; ≈ ±1 at k in fields.
+double PhysWow(int64_t k) {
+    static constexpr double f[7] = {0.43, 0.97, 1.6, 2.35, 3.4, 5.1, 7.3};
+    static constexpr double ph[7] = {0.3, 2.1, 4.4, 1.2, 5.6, 3.3, 0.8};
+    static const double norm = [] {
+        double e = 0.0;
+        for (double fi : f) e += 1.0 / fi;
+        return std::sqrt(2.0 / e);
+    }();
+    const double t = static_cast<double>(k) / 50.0;
+    double w = 0.0;
+    for (int i = 0; i < 7; ++i) w += std::sin(kTwoPi * f[i] * t + ph[i]) / std::sqrt(f[i]);
+    return w * norm;
+}
+}  // namespace
+
+double FSTPBetacamEffect::PhysicalShuttleFrom() {
+    static const double from = [] {
+        const char* off = std::getenv("FSTP_BETACAM_PHYS");
+        if (off && off[0] == '0') return -1.0;
+        const char* v = std::getenv("FSTP_BETACAM_PHYS_FROM");
+        const double f = v ? std::atof(v) : 0.0;
+        return f > 1.1 ? f : 9.0;
+    }();
+    return from;
+}
+
+bool FSTPBetacamEffect::ApplyPhysicalShuttle(PlayerState& state, FrameContext& fc, double rate) {
+    const uint32_t fmt = fc.pixel_format;
+    const bool planar = (fmt == SDL_PIXELFORMAT_IYUV || fmt == SDL_PIXELFORMAT_YV12);
+    const bool nv12 = (fmt == SDL_PIXELFORMAT_NV12);
+    const bool uyvy = (fmt == SDL_PIXELFORMAT_UYVY);
+    const int W = fc.width, H = fc.height;
+    uint8_t* const Yp = fc.planes[0];
+    const int yp = fc.linesize[0];
+    if (!(planar || nv12 || uyvy) || !Yp || yp <= 0 || W < 8 || H < 8) return false;
+    uint8_t* const Up = fc.planes[1];
+    uint8_t* const Vp = fc.planes[2];
+    const int up = fc.linesize[1], vp = fc.linesize[2];
+    const int CH = H / 2;
+    const bool chroma = planar ? (Up && Vp && up > 0 && vp > 0) : nv12 ? (Up && up > 0) : false;
+
+    // 1. Tape position, folded in field by field on a virtual 50 Hz clock: whole speeds keep the
+    //    comb's phase exactly, however the display is timed; the reels add their wander.
+    const double now_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t k_now = static_cast<int64_t>(std::floor(now_s * 50.0));
+    if (state.tape_field_clock < 0 || k_now < state.tape_field_clock || k_now - state.tape_field_clock > 25) {
+        state.tape_fields = 50.0 * (state.metrics.position_seconds - state.metrics.timecode_offset_seconds);
+        state.tape_field_clock = k_now;
+    }
+    const double reel = clamp_val(std::abs(rate) - 2.0, 0.0, 1.0) * kPhysReelWander;
+    for (int64_t k = state.tape_field_clock + 1; k <= k_now; ++k) {
+        state.tape_fields += rate * (1.0 + reel * PhysWow(k));
+    }
+    state.tape_field_clock = k_now;
+    const double X = state.tape_fields;
+    const double flutter = PhysFlutterAmp(std::abs(rate));
+    float flut[kPhysFlutterN + 1];
+    if (flutter > 0.0) PhysFlutterTable(k_now, flut);
+    const double pathBase = X;
+    const double pathSlope = rate - 1.0;
+    auto pathAt = [&](double tau) {                       // where the head is, in tracks, at τ
+        double v = pathBase + pathSlope * tau;
+        if (flutter > 0.0) {
+            const double f = std::clamp(tau, 0.0, kPhysFlutterSpan) * (kPhysFlutterN / kPhysFlutterSpan);
+            const int i = std::min(static_cast<int>(f), kPhysFlutterN - 1);
+            v += flutter * (flut[i] + (flut[i + 1] - flut[i]) * (f - i));
+        }
+        return v;
+    };
+
+    // 2. Clean copies of this frame and the previous one, for the bands from other moments.
+    const int planes = uyvy ? 1 : (planar ? 3 : 2);
+    const int rowsOf[3] = {H, CH, CH};
+    const int pitchOf[3] = {yp, up, vp};
+    uint8_t* const planeOf[3] = {Yp, Up, Vp};
+    bool same = state.shuttle_have_cur && state.shuttle_w == W && state.shuttle_h == H &&
+                state.shuttle_fmt == fmt;
+    for (int p = 0; p < planes && same; ++p) same = (state.shuttle_pitch[p] == pitchOf[p]);
+    if (fc.new_frame || !same) {                              // (rows are read from the copy below)
+        for (int p = 0; p < planes; ++p) {
+            if (same) std::swap(state.shuttle_cur[p], state.shuttle_prev[p]);
+            if (!planeOf[p] || pitchOf[p] <= 0) continue;
+            const size_t bytes = static_cast<size_t>(pitchOf[p]) * rowsOf[p];
+            state.shuttle_cur[p].resize(bytes);
+            std::memcpy(state.shuttle_cur[p].data(), planeOf[p], bytes);
+            state.shuttle_pitch[p] = pitchOf[p];
+        }
+        state.shuttle_have_prev = same;
+        state.shuttle_have_cur = true;
+        state.shuttle_w = W;
+        state.shuttle_h = H;
+        state.shuttle_fmt = fmt;
+    }
+    const bool mosaic = state.shuttle_have_prev;
+
+    auto xrand = [&]() -> uint32_t {
+        uint32_t x = state.xrng;
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        state.xrng = x;
+        return x;
+    };
+    // Grey (Y) and neutral chroma over [x0, x1) of row y.
+    auto greySpan = [&](int y, int x0, int x1) {
+        x0 = std::max(0, x0); x1 = std::min(W, x1);
+        if (x1 <= x0) return;
+        uint8_t* row = Yp + static_cast<size_t>(y) * yp;
+        if (uyvy) {
+            for (int i = x0 / 2; i < (x1 + 1) / 2; ++i) {
+                uint8_t* g = row + i * 4;
+                g[0] = 128; g[1] = kPhysDocGrey; g[2] = 128; g[3] = kPhysDocGrey;
+            }
+            return;
+        }
+        std::memset(row + x0, kPhysDocGrey, x1 - x0);
+        if (!chroma) return;
+        const int cy = y / 2, c0 = x0 / 2, c1 = (x1 + 1) / 2;
+        if (planar) {
+            std::memset(Up + static_cast<size_t>(cy) * up + c0, 128, c1 - c0);
+            std::memset(Vp + static_cast<size_t>(cy) * vp + c0, 128, c1 - c0);
+        } else {
+            std::memset(Up + static_cast<size_t>(cy) * up + 2 * c0, 128, 2 * (c1 - c0));
+        }
+    };
+    auto neutralChromaRow = [&](int cy) {
+        if (uyvy) {
+            for (int y = 2 * cy; y < std::min(H, 2 * cy + 2); ++y) {
+                uint8_t* row = Yp + static_cast<size_t>(y) * yp;
+                for (int i = 0; i < W / 2; ++i) { row[i * 4] = 128; row[i * 4 + 2] = 128; }
+            }
+        } else if (planar) {
+            std::memset(Up + static_cast<size_t>(cy) * up, 128, W / 2);
+            std::memset(Vp + static_cast<size_t>(cy) * vp, 128, W / 2);
+        } else if (chroma) {
+            std::memset(Up + static_cast<size_t>(cy) * up, 128, W);
+        }
+    };
+
+    const double cn = PhysCarrierToNoise(std::abs(rate));
+    const double sigEnv = std::pow(10.0, -cn / 20.0);         // envelope noise, share of on-track level
+    const double band = 3.0 * sigEnv;                         // rows where the detector flickers
+    const double thr = PhysDocThreshold(std::abs(rate));
+    const double linesToRows = H / 288.0;                     // output rows per field line
+    const double duDy = pathSlope / 312.5 / linesToRows;      // tracks crossed per output row
+    const bool holdBelowBar = PhysTbcHoldBelowBar();
+    bool haveBand = false;                                    // the band being drawn (held-repeat state)
+    double bandN = 0.0, bandHold = 0.0, bandStart = 0.0;
+    // Rows the first line of a band is held for: the physical jump (5.5 field lines), or more at the
+    // top speeds (PhysHoldShare of the band's height, 1 / duDy rows).
+    const double holdRows = duDy > 0.0 ? std::max(kPhysLinesPerPitch * linesToRows,
+                                                  PhysHoldShare(std::abs(rate)) / duDy)
+                                       : 0.0;
+    const double sigOnTrack = 219.0 * std::pow(10.0, -(cn + 9.9) / 20.0);
+    const bool colour = std::abs(rate) < 10.0;                // above 10× the picture is monochrome already
+    const int segLen = std::max(2, static_cast<int>(std::lround(W * 0.0115)));  // detector hold ≈ 0.6 µs
+    const PhysLut& L = PhysHeads();
+    static thread_local std::vector<uint8_t> solid;          // rows filled flat grey (for the snow)
+    solid.assign(H, 0);
+
+    for (int y = 0; y < H; ++y) {
+        const double tau = (22.0 + (y + 0.5) * 288.0 / H) / 312.5;   // where in the head's pass
+        const double vY = pathAt(tau);
+        const float a = PhysAt(L.y, vY);
+        uint8_t* row = Yp + static_cast<size_t>(y) * yp;
+
+        // Which line of which picture the head reads here. The band (the Y track being read) picks
+        // the moment — older ones near the top, cut from the previous shown frame — and the head's
+        // offset from that track's centre picks the line: the TBC's repeated lines (forward) and
+        // dropped ones (reverse) inside each band.
+        {
+            const double n = std::floor(vY + 0.5);
+            const double off = vY - n;                            // −½ … ½ of a pitch
+            const double half = 0.5 * kPhysLinesPerPitch * linesToRows;   // half the jump, in rows
+            double from = y - 2.0 * half * off;                   // repeats spread through the band
+            if (holdBelowBar && duDy > 0.0) {                     // …or held right below the bar
+                // A band starts where the head crosses onto the next track — the bar's middle line,
+                // found from the head's actual path (bars jump with the flutter, so must the smear).
+                // From there the band's first line is held until the picture catches up.
+                if (!haveBand || n != bandN) {
+                    bandStart = haveBand ? y : y - (off + 0.5) / duDy;           // band above the frame: estimate
+                    bandHold = haveBand ? from : bandStart + half;
+                    bandN = n;
+                    haveBand = true;
+                }
+                from = std::max(bandHold, bandHold + (y - bandStart) - holdRows);
+            }
+            const int src = clamp_val(static_cast<int>(std::lround(from)), 0, H - 1);
+            bool older = false;
+            if (mosaic) {
+                uint32_t h = static_cast<uint32_t>(static_cast<int64_t>(n)) * 2654435761u;
+                h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+                older = (h & 0xFFFF) * (1.0 / 65536.0) < 1.0 - (y + 0.5) / H;
+            }
+            const std::vector<uint8_t>* pic = older ? state.shuttle_prev : state.shuttle_cur;
+            if (src != y || older) {
+                std::memcpy(row, pic[0].data() + static_cast<size_t>(src) * yp, yp);
+                if (!uyvy && (y & 1) == 0 && chroma) {
+                    const int cy = y / 2, scy = std::min(src / 2, CH - 1);
+                    std::memcpy(Up + static_cast<size_t>(cy) * up, pic[1].data() + static_cast<size_t>(scy) * up, up);
+                    if (planar) {
+                        std::memcpy(Vp + static_cast<size_t>(cy) * vp, pic[2].data() + static_cast<size_t>(scy) * vp, vp);
+                    }
+                }
+            }
+        }
+
+        solid[y] = (a < thr - band);
+        if (solid[y]) {                                       // deep in the bar: flat grey
+            greySpan(y, 0, W);
+            continue;
+        }
+        if (a < thr + band) {                   // edge: the detector toggles along the line
+            const float* g = PhysGauss256();
+            uint32_t r = 0;
+            for (int x0 = 0, j = 0; x0 < W; x0 += segLen, ++j) {
+                if ((j & 3) == 0) r = xrand();
+                if (a + sigEnv * g[(r >> ((j & 3) * 8)) & 0xFF] < thr) greySpan(y, x0, x0 + segLen);
+            }
+        }
+        // FM grain where the signal is weak: σ = σ(on track) / a, in 8-bit codes (S/N = C/N + 9.9 dB).
+        // Below 4 codes it is lost under the picture's own grain — skipped (so on most rows).
+        const double sig = sigOnTrack / std::max(a, 1e-3f);
+        if (sig >= 4.0) {
+            const int8_t* gn = PhysGrainRow(xrand());
+            const int kq = static_cast<int>(std::lround(256.0 * sig / 16.5));
+            const int n = std::min(W, kEdgeNoiseLen);
+            if (uyvy) {
+                for (int x = 0; x < n; ++x) {
+                    uint8_t& v = row[(x / 2) * 4 + 1 + (x & 1) * 2];
+                    const int o = v + ((gn[x] * kq) >> 8);
+                    v = static_cast<uint8_t>(o < 16 ? 16 : (o > 235 ? 235 : o));
+                }
+            } else {
+                PhysAddGrain(row, gn, n, kq);
+            }
+        }
+    }
+
+    // Snow on each bar's edges — the old comb's look, kept as the author likes it, but where the
+    // physics puts it: FM clicks that slip through before the dropout detector fills the line, so
+    // on the rows right above and right below the solid grey (inside it the compensator has
+    // already replaced everything). A bright head and a tail fading right, back into the picture
+    // underneath (the click rides on the signal). Counts and lengths as before (authored at 360
+    // lines, scaled).
+    {
+        const double effectScale = H / 360.0;
+        const int thick = std::max(1, static_cast<int>(std::lround(effectScale)));
+        int perBar = std::max(8, W / 80);
+        if (std::abs(rate) > 10.0) perBar = perBar * 3 / 2;
+        const double speedFactor = std::sqrt(std::max(1.0, std::abs(rate)));
+        static thread_local std::vector<uint16_t> fade;           // share of the click left, 0…256
+        static thread_local double fadeScale = -1.0;
+        if (fadeScale != effectScale) { fade.clear(); fadeScale = effectScale; }
+        for (int y0 = 0; y0 < H;) {
+            if (!solid[y0]) { ++y0; continue; }
+            int y1 = y0;
+            while (y1 < H && solid[y1]) ++y1;
+            const int tailLen = std::max(1, static_cast<int>((10 + xrand() % 20 + speedFactor * 5.0) * effectScale));
+            while (static_cast<int>(fade.size()) < tailLen) {
+                const int k = static_cast<int>(fade.size());
+                fade.push_back(static_cast<uint16_t>(k == 0 ? 256 : std::lround(256.0 * std::exp(-0.15 * k / effectScale))));
+            }
+            for (int j = 0; j < perBar; ++j) {
+                const int sx = static_cast<int>(xrand() % static_cast<uint32_t>(W));
+                const uint32_t choice = xrand() % 3;
+                const bool above = choice == 0 || (choice == 2 && (j & 1) == 0);
+                const int sy = above ? y0 - thick : y1;              // the rows just outside the grey
+                for (int dy = 0; dy < thick; ++dy) {
+                    const int yy = sy + dy;
+                    if (yy < 0 || yy >= H || solid[yy]) continue;
+                    uint8_t* row = Yp + static_cast<size_t>(yy) * yp;
+                    for (int k = 0; k < tailLen && sx + k < W; ++k) {
+                        uint8_t& v = uyvy ? row[((sx + k) / 2) * 4 + 1 + ((sx + k) & 1) * 2] : row[sx + k];
+                        v = static_cast<uint8_t>(v + (((235 - v) * fade[k]) >> 8));
+                    }
+                }
+            }
+            y0 = y1;
+        }
+    }
+
+    // Colour speeds only: the C head loses its track 12.75 lines later than the Y head — those
+    // rows lose their colour (a desaturated band just above each grey bar).
+    if (colour && (chroma || uyvy)) {
+        for (int cy = 0; cy < CH; ++cy) {
+            const double tau = (22.0 + (2 * cy + 0.5) * 288.0 / H) / 312.5;
+            if (PhysAt(L.c, pathAt(tau + kPhysCLagFields)) < thr) neutralChromaRow(cy);
+        }
+    }
+    return true;
 }
 
 // ========== HSYNC LOSS EFFECT (Restored from original effects_renderer.mm) ==========
