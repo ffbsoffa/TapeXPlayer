@@ -100,6 +100,11 @@ public:
     int SteadyFrames() const { return steady_frames_.load(std::memory_order_relaxed); }
     // Whether the frames come off a hardware decoder (VideoToolbox / D3D11VA / VA-API surface).
     bool DecodesOnGPU() const { return gpu_frames_.load(std::memory_order_relaxed) > 0; }
+    // Where the pictures were brought to 8-bit 4:2:0 for the display, if they needed it:
+    // "the GPU" (FSTPHwTo8Bit), "the CPU" (FSTPConvertTo8Bit420), or nullptr.
+    const char* ConversionSite() const;
+    // The original's codec and pixel format ("hevc yuv420p10le"), for the log.
+    std::string SourceFormat() const;
 
 private:
     // Initialization
@@ -176,6 +181,7 @@ private:
     std::atomic<int> steady_frames_{0};
     std::atomic<int64_t> steady_busy_us_{0};
     std::atomic<int> gpu_frames_{0};
+    std::atomic<int> conversion_site_{0};   // 0 none, 1 GPU, 2 CPU (see ConversionSite)
 
     // STREAMING BUFFER (independent of frameIndex!)
     std::deque<StreamFrame> stream_buffer_;

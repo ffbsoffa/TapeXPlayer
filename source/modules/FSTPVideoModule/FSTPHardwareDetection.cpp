@@ -163,7 +163,9 @@ FSTPDecoderProfile FSTPHardwareDetection::DetermineDecoderProfile(const FSTPCPUI
     (void)cpu;
 
     if (gpu_info_.HasAnyHWAccel() && gpu_info_.hw_decode_score >= 50.0) {
-        std::cout << "  🎯 Decode plan: GPU for the original, CPU for the proxy"
+        // Since then the proxy moved to the GPU too where measured cheaper (Linux; the tape head on
+        // Apple Silicon) and each file's outcome is logged as "📋 [PROFILE]" — say only what's here.
+        std::cout << "  🎯 Decode plan: a hardware decoder is available — what runs where is decided per file"
                   << "  [" << (gpu_info_.model_name.empty() ? std::string("unnamed GPU")
                                                             : gpu_info_.model_name)
                   << ", hw_decode_score " << gpu_info_.hw_decode_score << "]" << std::endl;

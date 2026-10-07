@@ -809,13 +809,30 @@ bool FSTPFullResDecoderV2::DownscaleFrame(AVFrame* src, AVFrame* dst) {
     return false;
 }
 
+const char* FSTPFullResDecoderV2::ConversionSite() const {
+    switch (conversion_site_.load(std::memory_order_relaxed)) {
+        case 1: return "the GPU";
+        case 2: return "the CPU";
+        default: return nullptr;
+    }
+}
+
+std::string FSTPFullResDecoderV2::SourceFormat() const {
+    if (!codec_params_) return "?";
+    const char* pix = av_get_pix_fmt_name(static_cast<AVPixelFormat>(codec_params_->format));
+    return std::string(avcodec_get_name(codec_params_->codec_id)) + " " + (pix ? pix : "?");
+}
+
 int FSTPFullResDecoderV2::DownloadForDisplay(AVFrame* dst, const AVFrame* src) {
     if (hw_to8bit_.Applies(src)) {
         AVFrame* nv12 = av_frame_alloc();
         if (nv12 && hw_to8bit_.Convert(src, nv12)) {
             int ret = FSTPHwDownload(dst, nv12);
             av_frame_free(&nv12);
-            if (ret >= 0) return ret;
+            if (ret >= 0) {
+                conversion_site_.store(1, std::memory_order_relaxed);
+                return ret;
+            }
             av_frame_unref(dst);
         } else {
             av_frame_free(&nv12);
@@ -831,6 +848,7 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DisplayCopy(const AVFrame* frame)
     } else {
         copy = av_frame_alloc();
         if (copy && FSTPConvertTo8Bit420(copy, frame, &to8bit_ctx_) < 0) av_frame_free(&copy);
+        if (copy) conversion_site_.store(2, std::memory_order_relaxed);
     }
     if (!copy) return nullptr;
     return std::shared_ptr<AVFrame>(copy, [](AVFrame* f) { av_frame_free(&f); });

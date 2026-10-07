@@ -822,6 +822,7 @@ static constexpr double kFullResRealtimeMargin = 2.0;
 
 bool FSTPVideoModuleWrapper::StartFullResDecoder(double initial_time) {
     m_full_res_probed = true;
+    m_full_res_verdict = "did not open → proxy only";
     std::cout << "[VIDEO] Creating FSTPFullResDecoderV2 (streaming mode)" << std::endl;
     try {
         m_full_res_decoder = std::make_unique<FSTPFullResDecoderV2>(m_current_file, initial_time);
@@ -860,11 +861,55 @@ bool FSTPVideoModuleWrapper::StartFullResDecoder(double initial_time) {
               << kFullResRealtimeMargin << "×) → full-res " << (keep ? "ON" : "OFF, proxy only")
               << std::defaultfloat << std::endl;
 
+    {
+        std::ostringstream verdict;
+        verdict << (m_full_res_decoder->DecodesOnGPU() ? "GPU" : "CPU") << " " << std::fixed
+                << std::setprecision(1) << ratio << "× realtime";
+        if (!keep) verdict << " (needs " << kFullResRealtimeMargin << "×) → proxy only";
+        m_full_res_verdict = m_full_res_decoder->SourceFormat() + " " +
+                             std::to_string(m_full_res_decoder->GetNativeWidth()) + "x" +
+                             std::to_string(m_full_res_decoder->GetNativeHeight()) + ": " + verdict.str();
+    }
+
     if (!keep) {
         m_full_res_decoder->RequestStop();
         m_full_res_decoder.reset();
     }
     return keep;
+}
+
+// Where this file's work ended up. Every part decides for itself, by measuring or by what the
+// hardware takes (the original's 2× probe, the proxy contexts, the 8-bit conversion, the proxy
+// build's GPU → CPU fall-back chain); this line puts the outcome in one place:
+//   GPU        — the original and the proxy decode on the GPU, nothing converted on the CPU;
+//   GPU + CPU  — some of it on the CPU (a codec the GPU can't decode, a CPU 8-bit conversion);
+//   CPU        — no hardware decoding at all.
+// The Betacam effect and the picture upload run on the CPU in every profile.
+void FSTPVideoModuleWrapper::LogProfile() const {
+    bool any_gpu = false, any_cpu = false;
+    std::ostringstream os;
+    if (m_full_res_decoder) {
+        const bool gpu = m_full_res_decoder->DecodesOnGPU();
+        (gpu ? any_gpu : any_cpu) = true;
+        os << "original " << m_full_res_verdict;
+        if (const char* site = m_full_res_decoder->ConversionSite()) {
+            os << ", made 8-bit 4:2:0 on " << site;
+            if (std::strcmp(site, "the CPU") == 0) any_cpu = true;
+        }
+    } else if (m_use_original_as_proxy) {
+        os << "original used as the proxy";
+    } else {
+        os << "original " << (m_full_res_verdict.empty() ? std::string("not decoded → proxy only")
+                                                         : m_full_res_verdict);
+    }
+    const bool segments_gpu = FSTP::ProxyDecodesOnGpu(0);
+    const bool head_gpu = FSTP::ProxyDecodesOnGpu(2);
+    (segments_gpu ? any_gpu : any_cpu) = true;
+    (head_gpu ? any_gpu : any_cpu) = true;
+    os << " · proxy: segments on the " << (segments_gpu ? "GPU" : "CPU") << ", tape head on the "
+       << (head_gpu ? "GPU" : "CPU");
+    const char* profile = any_gpu ? (any_cpu ? "GPU + CPU" : "GPU") : "CPU";
+    std::cout << "📋 [PROFILE] " << profile << " — " << os.str() << " · Betacam effect on the CPU" << std::endl;
 }
 
 bool FSTPVideoModuleWrapper::InitializeDecoders(double initial_time, bool with_proxy) {
@@ -910,6 +955,7 @@ bool FSTPVideoModuleWrapper::InitializeDecoders(double initial_time, bool with_p
     UpdateOSDLoadingProgress(osdPlayerId, 98);
 
     m_decoders_active.store(true);
+    LogProfile();
     return true;
 }
 

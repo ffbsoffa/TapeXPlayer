@@ -311,6 +311,8 @@ static int BinarySearchFrameByTime(const std::vector<FSTP::FrameInfo>& frameInde
 
 } // namespace
 
+bool ProxyDecodesOnGpu(int threadId) { return ProxyContextUsesGpu(threadId); }
+
 LowResDecoder::LowResDecoder(const std::string& lowResFilename)
     : lowResFilename_(lowResFilename)
     , width_(0)

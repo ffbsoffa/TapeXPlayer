@@ -26,6 +26,10 @@ extern "C" {
 
 namespace FSTP {
 
+// Whether proxy decoder context `threadId` decodes on the GPU: 0/1 the segment prefetch, 2/3 the
+// shuttle's on-demand tape head (rules and measurements at ProxyContextUsesGpu in the .cpp).
+bool ProxyDecodesOnGpu(int threadId);
+
 class LowResDecoder {
 public:
     // Keyframe interval of every proxy (FSTPProxyConverter encodes with -g 4). The tape-head
