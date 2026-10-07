@@ -175,6 +175,28 @@ static int SDLCALL NoteUiEvent(void*, SDL_Event* event) {
     return 1;
 }
 
+// Linux: SDL window calls must stay on the thread that runs the event loop. With Wayland +
+// libdecor-gtk, SDL_SetWindowTitle redraws the title bar through GTK, and the file loader called
+// it from its own thread (CreatePlayerInstance -> UpdateWindowTitle): GTK on two threads, an
+// occasional SIGSEGV in pango while a clip loaded. Titles set off that thread wait here until
+// the loop applies them (ApplyPendingWindowTitles).
+static std::thread::id g_ui_thread;
+static std::mutex g_title_mutex;                 // window_title text + the dirty flags
+static bool g_title_dirty[MAX_WINDOWS] = {};
+static std::atomic<bool> g_title_pending{false};
+
+void ApplyPendingWindowTitles() {
+    if (!g_title_pending.exchange(false)) return;
+    std::lock_guard<std::mutex> lock(g_title_mutex);
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!g_title_dirty[i]) continue;
+        g_title_dirty[i] = false;
+        if (g_windows[i].is_active && g_windows[i].window) {
+            SDL_SetWindowTitle(g_windows[i].window, g_windows[i].window_title);
+        }
+    }
+}
+
 int InitWindowManager() {
     if (g_window_manager_initialized) {
         std::cout << "Window manager already initialized" << std::endl;
@@ -194,6 +216,7 @@ int InitWindowManager() {
     SetBetacamReverseStripe(GetBetacamReverseStripe());
 
     SDL_AddEventWatch(NoteUiEvent, nullptr);
+    g_ui_thread = std::this_thread::get_id();   // InitWindowManager runs on the event-loop thread
 
     // Initialize array of windows
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -1621,6 +1644,7 @@ void UpdateWindowTitle(int window_index, int instance_id, const char* filename) 
         return;
     }
 
+    std::unique_lock<std::mutex> title_lock(g_title_mutex);
     if (!filename || filename[0] == '\0') {
         // If no file, show only instance number
         snprintf(g_windows[window_index].window_title, sizeof(g_windows[window_index].window_title),
@@ -1648,8 +1672,16 @@ void UpdateWindowTitle(int window_index, int instance_id, const char* filename) 
         dispatch_async(dispatch_get_main_queue(), ^{
             SDL_SetWindowTitle(window, title_copy.c_str());
         });
+#elif defined(__linux__)
+        // Only on the event-loop thread; from the loader thread, leave it to the loop.
+        if (std::this_thread::get_id() == g_ui_thread) {
+            SDL_SetWindowTitle(g_windows[window_index].window, g_windows[window_index].window_title);
+        } else {
+            g_title_dirty[window_index] = true;
+            g_title_pending.store(true);
+        }
 #else
-        // On Linux/Windows - can update directly
+        // Windows: SetWindowText from another thread is marshalled to the window's thread by the OS
         SDL_SetWindowTitle(g_windows[window_index].window, g_windows[window_index].window_title);
 #endif
     }

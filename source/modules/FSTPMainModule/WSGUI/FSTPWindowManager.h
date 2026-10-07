@@ -97,6 +97,10 @@ void HandleWindowEvents(SDL_Event* event);
 // Render all active windows
 void RenderAllWindows();
 
+// Linux: apply window titles set from other threads (see UpdateWindowTitle). Call once per
+// iteration of the event loop, on its thread.
+void ApplyPendingWindowTitles();
+
 // Get number of active windows
 int GetActiveWindowCount();
 

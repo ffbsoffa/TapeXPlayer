@@ -1044,6 +1044,7 @@ int RunMainUILoop() {
         }
 
         // Process events with PollEvent (non-blocking)
+        ApplyPendingWindowTitles();
         while (SDL_PollEvent(&event)) {
             // Welcome overlay (first-run) intercepts its own clicks/keys — and
             // Esc to dismiss — before the loop treats Esc as "quit".
