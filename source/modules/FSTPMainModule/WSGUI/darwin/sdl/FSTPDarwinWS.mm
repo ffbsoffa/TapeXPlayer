@@ -1515,9 +1515,9 @@ void StartAutonomousRendering(SDL_Renderer* renderer) {
                     int uploads = g_fstp_texture_uploads.exchange(0, std::memory_order_relaxed);
                     int distinct = g_fstp_distinct_frames.exchange(0, std::memory_order_relaxed);
                     int max_gap = g_fstp_max_picture_gap_ms.exchange(0, std::memory_order_relaxed);
-                    std::printf("📈 [RENDER STATS] loops/s=%.1f render_avg=%.2fms loop_max=%.1fms video_uploads/s=%.1f new_frames/s=%.1f max_picture_gap=%dms\n",
+                    std::printf("📈 [RENDER STATS] loops/s=%.1f render_avg=%.2fms loop_max=%.1fms video_uploads/s=%.1f new_frames/s=%.1f max_picture_gap=%dms shown_h=%d\n",
                                 stats_loops / window_s, stats_loops ? stats_render_ms / stats_loops : 0.0,
-                                stats_max_loop_ms, uploads / window_s, distinct / window_s, max_gap);
+                                stats_max_loop_ms, uploads / window_s, distinct / window_s, max_gap, g_fstp_last_upload_height.load(std::memory_order_relaxed));
                     std::fflush(stdout);
                     FSTPPrintThreadCPU();
                     stats_start = t; stats_loops = 0; stats_render_ms = 0.0; stats_max_loop_ms = 0.0;

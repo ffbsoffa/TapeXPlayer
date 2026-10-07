@@ -288,7 +288,9 @@ def play(player, args):
     including the proxy's background segment prefetch, which a 5 s phase may or may not catch."""
     player.send(SEEK, args.start)
     time.sleep(2)
-    if args.speed < 0:
+    if args.speed == 0:
+        pass                                     # stay paused: what a still picture costs
+    elif args.speed < 0:
         player.send(MOUSE_SHUTTLE, args.speed)   # SET_SPEED takes no sign; the mouse shuttle does
     else:
         player.send(PLAY)
@@ -310,11 +312,66 @@ def play(player, args):
     print(f"  threads: {format_threads(thread_cpu(segment, skip_first=False, top=10))}")
 
 
+def after_stop(player, args):
+    """What the screen shows after a stop: shuttle (or play) for a few seconds, STOP, then second
+    by second — texture uploads, new pictures, the height of the last picture uploaded (the
+    proxy is 540 or less, the original more) and the process CPU."""
+    for label, speed in (("after 24x shuttle", 24.0), ("after 1x play", 1.0)):
+        player.send(SEEK, args.start)
+        time.sleep(2)
+        player.send(PLAY)
+        if speed != 1.0:
+            player.send(SET_SPEED, speed)
+        time.sleep(3)
+        player.send(STOP)
+        offset = len(player.log())
+        cpu0, t0 = player.cpu_seconds(), time.time()
+        time.sleep(args.seconds if args.seconds < 30 else 6)
+        cpu1, t1 = player.cpu_seconds(), time.time()
+        rows = render_stats(player.log()[offset:])
+        cells = [f"{float(r.get('video_uploads/s', 0)):.0f}/{float(r.get('new_frames/s', 0)):.0f}/"
+                 f"{int(float(r.get('shown_h', 0)))}" for r in rows]
+        print(f"  {label}: CPU {100 * (cpu1 - cpu0) / (t1 - t0):.0f}%   per second uploads/new/shown_h: "
+              + "  ".join(cells), flush=True)
+
+
+def step_latency(player, args):
+    """Frame steps while paused: every 0.4 s a SEEK one frame on (as a remote/jog step), and the
+    time from the command to the next video texture upload (FSTP_UPLOAD_TRACE). Steps 1-10 come
+    right after the pause; then the player stays paused 12 s (the Betacam effect settles its
+    stripe after 10 s) and steps 11-20 follow. Linux: both clocks are CLOCK_MONOTONIC."""
+    fps = args.fps
+    player.send(SEEK, args.start)
+    time.sleep(3)
+    sent = []
+    pos = args.start
+    for i in range(20):
+        if i == 10:
+            time.sleep(12)
+        pos += 1.0 / fps
+        sent.append(time.monotonic() * 1000.0)
+        player.send(SEEK, pos)
+        time.sleep(0.4)
+    time.sleep(0.5)
+    uploads = [float(m) for m in re.findall(r"\[UPLOAD\] ms=(\d+)", player.log())]
+    lat = []
+    for t in sent:
+        after = [u for u in uploads if u >= t]
+        lat.append(after[0] - t if after else float("nan"))
+    fmt = lambda xs: " ".join("-" if x != x else f"{x:.0f}" for x in xs)
+    print(f"  steps 1-10 (fresh pause)   ms to the next upload: {fmt(lat[:10])}")
+    print(f"  steps 11-20 (after 12 s)   ms to the next upload: {fmt(lat[10:])}")
+    ok = [x for x in lat if x == x]
+    if ok:
+        print(f"  median {sorted(ok)[len(ok) // 2]:.0f} ms, worst {max(ok):.0f} ms, missing {len(lat) - len(ok)}")
+
+
 def main():
     default_binary = os.path.join(REPO, "builds/binaries/TapeXPlayer" if platform.system() == "Darwin"
                                   else "builds/binaries/TapeXPlayer_linux")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("scenario", choices=["phases", "reverse", "play-after-shuttle", "play"])
+    parser.add_argument("scenario", choices=["phases", "reverse", "play-after-shuttle", "play", "after-stop",
+                                             "step-latency"])
     parser.add_argument("media", help="clip to play (needs an audio track)")
     parser.add_argument("--binary", default=default_binary, help=f"player binary (default {default_binary})")
     parser.add_argument("--home", default="~/.cache/txp-bench-home", help="HOME for the player under test")
@@ -332,6 +389,7 @@ def main():
                         help="play-after-shuttle: stop before PLAY, s (a quick stop/play by hand)")
     parser.add_argument("--seconds", type=float, default=30.0, help="play: how long to measure")
     parser.add_argument("--speed", type=float, default=1.0, help="play: tape speed (negative = reverse)")
+    parser.add_argument("--fps", type=float, default=50.0, help="step-latency: the clip's frame rate")
     parser.add_argument("--env", action="append", default=[], metavar="K=V", help="extra player environment")
     args = parser.parse_args()
     if not os.path.exists(args.binary):
@@ -340,7 +398,7 @@ def main():
     player = Player(args)
     try:
         {"phases": phases, "reverse": reverse, "play-after-shuttle": play_after_shuttle,
-         "play": play}[args.scenario](player, args)
+         "play": play, "after-stop": after_stop, "step-latency": step_latency}[args.scenario](player, args)
         if player.proc.poll() is not None:
             print(f"PLAYER DIED during the run (code {player.proc.returncode})", flush=True)
     finally:

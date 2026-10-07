@@ -1,4 +1,7 @@
 #include "FSTPYUVRenderer.h"
+#include <cstdlib>
+#include <cstdio>
+#include <chrono>
 #include "../../FSTPVideoModule/FSTPPerformanceProfiler.h"
 #include "../../FSTPVideoModule/FSTPCallCounter.h"
 #include <iostream>
@@ -7,6 +10,7 @@
 std::atomic<int> g_fstp_texture_uploads{0};
 std::atomic<int> g_fstp_distinct_frames{0};
 std::atomic<int> g_fstp_max_picture_gap_ms{0};
+std::atomic<int> g_fstp_last_upload_height{0};
 
 extern "C" {
 #include <libswscale/swscale.h>
@@ -232,6 +236,16 @@ bool FSTPYUVRenderer::UpdateYUVNative(const YUVPlanes& planes) {
     }
 
     g_fstp_texture_uploads.fetch_add(1, std::memory_order_relaxed);
+    g_fstp_last_upload_height.store(planes.height, std::memory_order_relaxed);
+    // FSTP_UPLOAD_TRACE=1: one line per video upload with the steady clock in ms (CLOCK_MONOTONIC
+    // on Linux, the clock Python's time.monotonic() reads), for latency measurements.
+    static const bool trace = std::getenv("FSTP_UPLOAD_TRACE") != nullptr;
+    if (trace) {
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::printf("🖼️ [UPLOAD] ms=%lld h=%d\n", ms, planes.height);
+        std::fflush(stdout);
+    }
     return true;
 }
 

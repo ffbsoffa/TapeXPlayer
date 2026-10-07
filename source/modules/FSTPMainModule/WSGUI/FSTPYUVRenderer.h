@@ -42,6 +42,8 @@ extern std::atomic<int> g_fstp_texture_uploads;
 extern std::atomic<int> g_fstp_distinct_frames;
 // Longest wait between two distinct pictures (ms) since the last render-stats line.
 extern std::atomic<int> g_fstp_max_picture_gap_ms;
+// FSTP_RENDER_STATS: height of the last picture uploaded to a video texture (0 = none yet).
+extern std::atomic<int> g_fstp_last_upload_height;
 
 class FSTPYUVRenderer {
 public:
