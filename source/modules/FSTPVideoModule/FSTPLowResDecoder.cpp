@@ -175,8 +175,13 @@ static enum AVPixelFormat SelectHWFormat(AVCodecContext* ctx, const AVPixelForma
 // bit-exact, so the picture is the same. FSTP_PROXY_HEAD_SW=1 keeps them on the CPU (A/B).
 static bool ProxyContextUsesGpu(int threadId) {
 #if defined(__linux__)
+    // Linux: the segment contexts (0/1) too. With FSTPHwDownload a 720x540 proxy frame costs
+    // ~0.4 ms of decode plus ~0.6 ms to bring back, against 2.5-2.8 ms of software decode, and the
+    // segment prefetch is the largest load of steady 1x playback. FSTP_PROXY_SEGMENTS_SW=1 /
+    // FSTP_PROXY_HEAD_SW=1 keep either on the CPU (A/B).
     static const bool head_on_cpu = std::getenv("FSTP_PROXY_HEAD_SW") != nullptr;
-    return threadId >= 2 && !head_on_cpu;
+    static const bool segments_on_cpu = std::getenv("FSTP_PROXY_SEGMENTS_SW") != nullptr;
+    return threadId >= 2 ? !head_on_cpu : !segments_on_cpu;
 #else
     // Apple Silicon: on by default. Measured in the player on an M1 (720x540 GOP-4 proxy, Betacam
     // on): fstp-proxy 9-16% -> 3-4% of a core at 8x-24x, the process 32-36% -> 27-32%; the same
