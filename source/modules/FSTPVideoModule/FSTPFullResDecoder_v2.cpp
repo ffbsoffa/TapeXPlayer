@@ -1144,6 +1144,11 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
         auto iteration_start = std::chrono::high_resolution_clock::now();
         double playback_time = current_playback_time_.load();
         bool is_high_fps = (frame_rate_ >= 55.0);  // ADAPTIVE FPS helper
+        // Paused: keep kPausedAhead ready, not the playback window. After every stop or seek the
+        // decoder used to fill (ahead + behind + 2 s) — ~385 frames of a 50 fps clip decoded and
+        // copied from the GPU, ~500 MB, for a picture that wasn't moving. Playback widens it again.
+        const bool paused = paused_.load(std::memory_order_relaxed);
+        const double ahead_window = paused ? kPausedAhead : buffer_window_ahead_;
 
         // PROFILING: Buffer check
         auto buffer_check_start = std::chrono::high_resolution_clock::now();
@@ -1170,8 +1175,8 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                 // CRITICAL: Buffer must be ahead of playback by at least 1.5s for high FPS!
                 // Otherwise it will stutter due to showing old frames
                 // Adaptive thresholds: high FPS needs larger buffers
-                double ahead_threshold = (frame_rate_ >= 55.0) ? 2.5 : 1.0;
-                double decode_start_threshold = (frame_rate_ >= 55.0) ? 3.0 : 2.0;
+                double ahead_threshold = paused ? kPausedAhead * 0.5 : ((frame_rate_ >= 55.0) ? 2.5 : 1.0);
+                double decode_start_threshold = paused ? kPausedAhead * 0.5 : ((frame_rate_ >= 55.0) ? 3.0 : 2.0);
                 
                 bool playback_near_end = (playback_time > bufferMaxTime - decode_start_threshold);  // Start decoding earlier for high FPS
 
@@ -1204,7 +1209,7 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
         if (needs_update) {
             // Decode frames to fill buffer
             double minTime = playback_time - buffer_window_behind_;
-            double maxTime = playback_time + buffer_window_ahead_;
+            double maxTime = playback_time + ahead_window;
 
             // CRITICAL CPU OPTIMIZATION: DO NOT SEEK if buffer exists!
             // Seek ALWAYS goes to keyframe back → duplicates 90%
@@ -1288,13 +1293,15 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                 int max_decode_batch = (frame_rate_ >= 55.0) ? 600 : 400;  // Increased max for 60fps
                 
                 int max_decode = near_eof ? 200 : min_decode_batch;
-                double desiredAheadTime = playback_time + buffer_window_ahead_;
+                double desiredAheadTime = playback_time + ahead_window;
 
                 if (bufferEmpty) {
                     // CRITICAL: After seek/shuttle, decode many frames immediately to minimize jitter
-                    // High FPS needs more frames to fill the same time window
-                    int desired_frames = static_cast<int>(std::ceil((buffer_window_ahead_ + buffer_window_behind_ + 2.0) / frameDuration));
-                    desired_frames = std::max(desired_frames, target_size * 3);
+                    // High FPS needs more frames to fill the same time window. Paused: the window
+                    // behind (backward steps) plus kPausedAhead, nothing more.
+                    int desired_frames = static_cast<int>(std::ceil(
+                        (ahead_window + buffer_window_behind_ + (paused ? 0.0 : 2.0)) / frameDuration));
+                    if (!paused) desired_frames = std::max(desired_frames, target_size * 3);
                     max_decode = std::min(max_decode_batch, std::max(max_decode, desired_frames));
                 } else {
                     if (bufferMaxForDecode < desiredAheadTime) {

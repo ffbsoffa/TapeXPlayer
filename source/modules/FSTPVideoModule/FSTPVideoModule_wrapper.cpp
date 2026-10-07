@@ -1589,7 +1589,9 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     // Guard: m_decoders_active is set to false as FIRST action in ShutdownDecoders,
     // so checking it here prevents accessing a partially-destroyed decoder.
     if (m_full_res_decoder && slow_or_normal_speed && m_decoders_active.load()) {
-        // Inform background thread of current playback time (lightweight operation)
+        // Inform background thread of current playback time (lightweight operation), and
+        // whether the tape is standing (it then keeps only a short stretch ahead decoded).
+        m_full_res_decoder->SetPaused(std::abs(actual_speed) < 0.05);
         m_full_res_decoder->SetPlaybackTime(timestamp);
         m_full_res_decoder->ClearStopRequest();
 

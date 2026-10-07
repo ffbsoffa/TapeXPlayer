@@ -47,6 +47,10 @@ public:
     // Set current playback time (background thread will update buffer)
     void SetPlaybackTime(double time_seconds);
 
+    // While paused only a short stretch ahead is kept decoded (kPausedAhead): enough for frame
+    // steps and the start of playback. The window behind (backward frame steps) is unchanged.
+    void SetPaused(bool paused) { paused_.store(paused, std::memory_order_relaxed); }
+
     // Get frame for given time (or nullptr if not in buffer)
     std::shared_ptr<AVFrame> GetFrameForTime(double time_seconds);
 
@@ -180,6 +184,8 @@ private:
     // Low FPS (<50): standard windows
     double buffer_window_ahead_ = 3.0;  // Decode at least 3.0 sec ahead
     double buffer_window_behind_ = 2.0; // Keep 2.0 sec behind (DO NOT aggressively remove frames!)
+    std::atomic<bool> paused_{false};
+    static constexpr double kPausedAhead = 0.5;   // seconds kept ahead while paused
     
     // FPS-adaptive helper
     void UpdateBufferWindowsForFPS();
