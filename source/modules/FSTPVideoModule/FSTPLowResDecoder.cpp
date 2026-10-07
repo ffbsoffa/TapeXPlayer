@@ -1,5 +1,6 @@
 #include "FSTPLowResDecoder.h"
 #include "FSTPThreadName.h"
+#include "FSTPHwDownload.h"
 #include "FSTPProxyConverter.h"
 
 #include "FSTPVideoFrame.h"
@@ -1172,7 +1173,7 @@ bool LowResDecoder::decodeLowResRange(std::vector<FrameInfo>& frameIndex,
                         if (is_hw_frame) {
                             auto t_before_hw_transfer = std::chrono::high_resolution_clock::now();
                             temp_hw_frame = av_frame_alloc();
-                            if (temp_hw_frame && av_hwframe_transfer_data(temp_hw_frame, frame, 0) >= 0) {
+                            if (temp_hw_frame && FSTPHwDownload(temp_hw_frame, frame) >= 0) {
                                 auto t_after_hw_transfer = std::chrono::high_resolution_clock::now();
                                 total_hw_transfer_us += std::chrono::duration_cast<std::chrono::microseconds>(t_after_hw_transfer - t_before_hw_transfer).count();
 

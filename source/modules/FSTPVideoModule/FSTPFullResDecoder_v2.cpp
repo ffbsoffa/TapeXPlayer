@@ -1,5 +1,6 @@
 #include "FSTPFullResDecoder_v2.h"
 #include "FSTPThreadName.h"
+#include "FSTPHwDownload.h"
 #include "FSTPPerformanceProfiler.h"
 #include "FSTPVideoOptimizations.h"
 #include "FSTPHardwareDetection.h"  // NEW: Unified hardware detection
@@ -741,7 +742,7 @@ bool FSTPFullResDecoderV2::DownscaleFrame(AVFrame* src, AVFrame* dst) {
         temp_hw_frame = av_frame_alloc();
         if (!temp_hw_frame) return false;
 
-        if (av_hwframe_transfer_data(temp_hw_frame, src, 0) < 0) {
+        if (FSTPHwDownload(temp_hw_frame, src) < 0) {
             av_frame_free(&temp_hw_frame);
             return false;
         }
@@ -902,7 +903,7 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
                     if (temp_hw_frame) {
                         // PROFILING: Measurement of av_hwframe_transfer_data (GPU→CPU copy)
                         auto transfer_start = std::chrono::high_resolution_clock::now();
-                        int transfer_result = av_hwframe_transfer_data(temp_hw_frame, decoded_frame, 0);
+                        int transfer_result = FSTPHwDownload(temp_hw_frame, decoded_frame);
                         auto transfer_end = std::chrono::high_resolution_clock::now();
                         total_hw_transfer_us += std::chrono::duration_cast<std::chrono::microseconds>(transfer_end - transfer_start).count();
 
@@ -1019,7 +1020,7 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
 
             if (is_hw_frame) {
                 temp_hw_frame = av_frame_alloc();
-                if (temp_hw_frame && av_hwframe_transfer_data(temp_hw_frame, decoded_frame, 0) >= 0) {
+                if (temp_hw_frame && FSTPHwDownload(temp_hw_frame, decoded_frame) >= 0) {
                     // CRITICAL: Copy ALL properties from hardware frame
                     av_frame_copy_props(temp_hw_frame, decoded_frame);
                     temp_hw_frame->pts = decoded_frame->pts;
