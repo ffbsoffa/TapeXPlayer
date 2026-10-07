@@ -53,6 +53,44 @@
 #include "../FSTPPlayerModule/FSTPPlayerManager.h"
 #include "../FSTPVideoModule/FSTPHardwareDetection.h"
 
+#ifndef _WIN32
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
+
+namespace {
+// A fatal signal (a crash, or glibc's abort on heap corruption) writes the stack to stderr —
+// which the session log shares (FSTPLog dup2s it onto the log file) — then dies as before.
+// Frames read "binary(+offset) [address]"; `addr2line -fCe <binary> <offset>` names them.
+void WriteCrashBacktrace(int sig) {
+    char head[96];
+    int n = 0;
+    const char* text = "\n[FATAL] signal ";
+    while (*text) head[n++] = *text++;
+    if (sig >= 10) head[n++] = static_cast<char>('0' + sig / 10);
+    head[n++] = static_cast<char>('0' + sig % 10);
+    text = " - backtrace:\n";
+    while (*text) head[n++] = *text++;
+    (void)!write(STDERR_FILENO, head, static_cast<size_t>(n));
+    void* frames[64];
+    const int count = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    std::signal(sig, SIG_DFL);   // SA_RESETHAND did this already; be explicit
+    std::raise(sig);
+}
+
+void InstallCrashBacktrace() {
+    void* warm[1];
+    backtrace(warm, 1);   // load the unwinder now, not inside the signal handler
+    struct sigaction sa {};
+    sa.sa_handler = WriteCrashBacktrace;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND;
+    for (int s : {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT}) sigaction(s, &sa, nullptr);
+}
+}  // namespace
+#endif
+
 int main(int argc, char* argv[]) {
     #ifdef _WIN32
     // Make the whole process handle non-ASCII paths BEFORE anything touches the filesystem.
@@ -122,6 +160,8 @@ int main(int argc, char* argv[]) {
     #endif
 
     #ifndef _WIN32
+    InstallCrashBacktrace();
+
     // CRITICAL: Set malloc arena limit BEFORE any allocations
     // Fixes glibc malloc arena corruption in PipeWire/PortAudio cleanup
     // Must be set at program start, cannot be changed later
