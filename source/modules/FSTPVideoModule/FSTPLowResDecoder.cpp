@@ -177,10 +177,21 @@ static bool ProxyContextUsesGpu(int threadId) {
     static const bool head_on_cpu = std::getenv("FSTP_PROXY_HEAD_SW") != nullptr;
     return threadId >= 2 && !head_on_cpu;
 #else
-    // macOS / Windows: opt-in until measured in the player (FSTP_PROXY_HEAD_GPU=1). The same
-    // replay on an M1 with VideoToolbox: 1.6 -> 0.73 ms of CPU per picture, bit-exact, but
-    // 3.3 ms of latency per picture instead of 1.6; Intel Macs read VideoToolbox frames back slowly.
-    static const bool head_on_gpu = std::getenv("FSTP_PROXY_HEAD_GPU") != nullptr;
+    // Apple Silicon: on by default. Measured in the player on an M1 (720x540 GOP-4 proxy, Betacam
+    // on): fstp-proxy 9-16% -> 3-4% of a core at 8x-24x, the process 32-36% -> 27-32%; the same
+    // 46-47 pictures/s, mouse-shuttle reversals 42.5-43.7 -> 44.2-44.3 pictures/s with the same
+    // 50 ms worst gap, play-after-shuttle unchanged. Intel Macs (their VideoToolbox readback was
+    // seen to be slow) and Windows: opt-in until measured there. FSTP_PROXY_HEAD_GPU=1 /
+    // FSTP_PROXY_HEAD_SW=1 force it either way.
+    static const bool head_on_gpu = [] {
+        if (std::getenv("FSTP_PROXY_HEAD_SW")) return false;
+        if (std::getenv("FSTP_PROXY_HEAD_GPU")) return true;
+#if defined(__APPLE__)
+        return g_hardware_detection != nullptr && g_hardware_detection->GetCPUInfo().is_apple_silicon;
+#else
+        return false;
+#endif
+    }();
     return threadId >= 2 && head_on_gpu;
 #endif
 }
