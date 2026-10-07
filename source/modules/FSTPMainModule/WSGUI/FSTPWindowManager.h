@@ -35,6 +35,7 @@ typedef struct {
     int texture_buffer_width[2];           // Sizes for each buffer
     int texture_buffer_height[2];
     double texture_buffer_timestamp[2];    // Timestamps
+    uint64_t texture_buffer_serial[2];     // PixelBuffer::picture_serial each texture holds
     bool texture_buffer_valid[2];          // Validity of each buffer
     int current_buffer_index;              // Current active buffer (0 or 1)
     int write_buffer_index;                // Buffer for writing (0 or 1)

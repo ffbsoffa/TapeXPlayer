@@ -211,6 +211,21 @@ bool FSTPPixelBufferManager::SubmitAVFrame(int player_id, std::shared_ptr<AVFram
         buffer.new_frame = true;
         buffer.is_valid = true;
 
+        SubmittedPicture& last = m_last_submitted[player_id];
+        const bool same_picture = last.frame == av_frame.get() && last.data == av_frame->data[0] &&
+                                  last.timestamp == timestamp && last.frame_number == frame_number &&
+                                  last.width == av_frame->width && last.height == av_frame->height;
+        if (!same_picture) {
+            last.frame = av_frame.get();
+            last.data = av_frame->data[0];
+            last.timestamp = timestamp;
+            last.frame_number = frame_number;
+            last.width = av_frame->width;
+            last.height = av_frame->height;
+            ++last.serial;
+        }
+        buffer.picture_serial = last.serial;
+
         // Detect full-res mode (resolution > 480p indicates full-resolution decoder)
         // Update OSD to show "LOCK" at 1× speed with full-res
         bool is_full_res = (av_frame->height > 480);
@@ -273,6 +288,8 @@ bool FSTPPixelBufferManager::SubmitPixelData(int player_id, const uint8_t* pixel
         buffer.current_time = metrics.position_seconds;
         buffer.total_duration = metrics.duration_seconds;
         buffer.frame_rate = metrics.frame_rate;
+        buffer.picture_serial = ++m_last_submitted[player_id].serial;   // copied data: always new
+        m_last_submitted[player_id].frame = nullptr;
         buffer.timestamp = timestamp;
         buffer.frame_number = frame_number;
         buffer.new_frame = true;

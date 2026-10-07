@@ -190,6 +190,8 @@ int InitWindowManager() {
         g_windows[i].texture_buffer_height[1] = 0;
         g_windows[i].texture_buffer_timestamp[0] = 0.0;
         g_windows[i].texture_buffer_timestamp[1] = 0.0;
+        g_windows[i].texture_buffer_serial[0] = 0;
+        g_windows[i].texture_buffer_serial[1] = 0;
         g_windows[i].texture_buffer_valid[0] = false;
         g_windows[i].texture_buffer_valid[1] = false;
         g_windows[i].current_buffer_index = 0;  // Start with buffer 0
@@ -919,10 +921,13 @@ void RenderAllWindows() {
                 if (pixel_buffer) {
                     int current_buf = g_windows[i].current_buffer_index;
 
-                    // OPTIMIZATION: skip texture update if timestamp didn't change
+                    // Skip the texture update when the texture already holds this picture. By
+                    // identity, not timestamp: the proxy and the full-res picture of a frame share
+                    // the timestamp, so after a stop the full-res one was never uploaded and the
+                    // paused picture stayed at proxy resolution (with the Betacam effect off).
                     bool need_update = true;
                     if (g_windows[i].texture_buffer_valid[current_buf] &&
-                        g_windows[i].texture_buffer_timestamp[current_buf] == pixel_buffer->timestamp) {
+                        g_windows[i].texture_buffer_serial[current_buf] == pixel_buffer->picture_serial) {
                         need_update = false;
                         // Debug log disabled for performance
                     }
@@ -976,6 +981,7 @@ void RenderAllWindows() {
                         g_windows[i].texture_buffer_width[current_buf] = pixel_buffer->width;
                         g_windows[i].texture_buffer_height[current_buf] = pixel_buffer->height;
                         g_windows[i].texture_buffer_timestamp[current_buf] = pixel_buffer->timestamp;
+                        g_windows[i].texture_buffer_serial[current_buf] = pixel_buffer->picture_serial;
 
                         // Render video with aspect ratio within window
                         // Use logical window size (NOT renderer output size) to avoid HiDPI scaling issues

@@ -43,6 +43,10 @@ public:
         double total_duration = 0.0;        // Total duration (seconds)
         double frame_rate = 25.0;           // Source FPS
         bool new_frame = false;             // True when freshly submitted
+        // Changes when a different picture is submitted, not when the same one is submitted
+        // again (a pause re-submits it every render tick). The proxy and the full-res picture of
+        // the same frame share a timestamp but not a serial.
+        uint64_t picture_serial = 0;
 
         // SAR (Sample Aspect Ratio) for anamorphic content
         // Used to compute display aspect ratio: DAR = SAR × (width / height)
@@ -68,6 +72,18 @@ private:
     std::atomic<int> m_write_buffer_index[MAX_PLAYERS]; // Write buffer index
     std::atomic<int> m_read_buffer_index[MAX_PLAYERS];  // Read buffer index
     std::atomic<bool> m_buffer_ready[MAX_PLAYERS];      // Buffer ready for reading
+
+    // Identity of the last picture submitted per player (PixelBuffer::picture_serial).
+    struct SubmittedPicture {
+        const void* frame = nullptr;
+        const void* data = nullptr;
+        double timestamp = -1.0;
+        int frame_number = -1;
+        int width = 0;
+        int height = 0;
+        uint64_t serial = 0;
+    };
+    std::array<SubmittedPicture, MAX_PLAYERS> m_last_submitted{};
 
     // Mutexes for buffer protection
     std::mutex m_buffer_mutex[MAX_PLAYERS];
