@@ -47,10 +47,15 @@ const VaApi& Va() {
     return api;
 }
 
-bool VaapiDownloadNV12(AVFrame* dst, const AVFrame* src) {
+// 8-bit NV12, or P010 (10-bit HEVC / VP9 / AV1): the same two-plane layout, 16-bit samples.
+bool VaapiDownload(AVFrame* dst, const AVFrame* src) {
     if (src->format != AV_PIX_FMT_VAAPI || !src->hw_frames_ctx) return false;
     const auto* frames = reinterpret_cast<const AVHWFramesContext*>(src->hw_frames_ctx->data);
-    if (frames->sw_format != AV_PIX_FMT_NV12) return false;
+    const AVPixelFormat sw = frames->sw_format;
+    uint32_t fourcc = 0;
+    if (sw == AV_PIX_FMT_NV12) fourcc = VA_FOURCC_NV12;
+    else if (sw == AV_PIX_FMT_P010) fourcc = VA_FOURCC_P010;
+    else return false;
     const VaApi& va = Va();
     if (!va.ok) return false;
 
@@ -63,9 +68,9 @@ bool VaapiDownloadNV12(AVFrame* dst, const AVFrame* src) {
     if (va.deriveImage(display, surface, &image) != VA_STATUS_SUCCESS) return false;
     bool done = false;
     void* mapped = nullptr;
-    if (image.format.fourcc == VA_FOURCC_NV12 && image.width >= src->width && image.height >= src->height &&
+    if (image.format.fourcc == fourcc && image.width >= src->width && image.height >= src->height &&
         va.mapBuffer(display, image.buf, &mapped) == VA_STATUS_SUCCESS) {
-        dst->format = AV_PIX_FMT_NV12;
+        dst->format = sw;
         dst->width = src->width;
         dst->height = src->height;
         if (av_frame_get_buffer(dst, 64) >= 0) {
@@ -74,7 +79,7 @@ bool VaapiDownloadNV12(AVFrame* dst, const AVFrame* src) {
             const ptrdiff_t src_pitch[4] = {static_cast<ptrdiff_t>(image.pitches[0]),
                                             static_cast<ptrdiff_t>(image.pitches[1]), 0, 0};
             const ptrdiff_t dst_pitch[4] = {dst->linesize[0], dst->linesize[1], 0, 0};
-            av_image_copy_uc_from(dst->data, dst_pitch, planes, src_pitch, AV_PIX_FMT_NV12, src->width, src->height);
+            av_image_copy_uc_from(dst->data, dst_pitch, planes, src_pitch, sw, src->width, src->height);
             done = true;
         } else {
             av_frame_unref(dst);
@@ -90,7 +95,7 @@ bool VaapiDownloadNV12(AVFrame* dst, const AVFrame* src) {
 
 int FSTPHwDownload(AVFrame* dst, const AVFrame* src) {
 #ifdef FSTP_VAAPI_FAST_DOWNLOAD
-    if (VaapiDownloadNV12(dst, src)) return 0;
+    if (VaapiDownload(dst, src)) return 0;
 #endif
     return av_hwframe_transfer_data(dst, src, 0);
 }

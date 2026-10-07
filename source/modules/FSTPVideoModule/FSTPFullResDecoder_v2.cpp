@@ -1,6 +1,7 @@
 #include "FSTPFullResDecoder_v2.h"
 #include "FSTPThreadName.h"
 #include "FSTPHwDownload.h"
+#include "FSTPTo8Bit420.h"
 #include "FSTPPerformanceProfiler.h"
 #include "FSTPVideoOptimizations.h"
 #include "FSTPHardwareDetection.h"  // NEW: Unified hardware detection
@@ -509,6 +510,10 @@ void FSTPFullResDecoderV2::Cleanup() {
     }
 
     // Free downscale context
+    if (to8bit_ctx_) {
+        sws_freeContext(to8bit_ctx_);
+        to8bit_ctx_ = nullptr;
+    }
     if (downscale_ctx_) {
         sws_freeContext(downscale_ctx_);
         downscale_ctx_ = nullptr;
@@ -804,6 +809,18 @@ bool FSTPFullResDecoderV2::DownscaleFrame(AVFrame* src, AVFrame* dst) {
     return false;
 }
 
+std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DisplayCopy(const AVFrame* frame) {
+    AVFrame* copy = nullptr;
+    if (FSTPIsDisplay420(frame->format)) {
+        copy = av_frame_clone(frame);
+    } else {
+        copy = av_frame_alloc();
+        if (copy && FSTPConvertTo8Bit420(copy, frame, &to8bit_ctx_) < 0) av_frame_free(&copy);
+    }
+    if (!copy) return nullptr;
+    return std::shared_ptr<AVFrame>(copy, [](AVFrame* f) { av_frame_free(&f); });
+}
+
 std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targetTime) {
     if (!format_ctx_ || !codec_ctx_) return nullptr;
 
@@ -930,10 +947,7 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
 
                 // Clone to shared_ptr (like in old working version)
                 auto clone_start = std::chrono::high_resolution_clock::now();
-                result = std::shared_ptr<AVFrame>(
-                    av_frame_clone(final_frame),
-                    [](AVFrame* f) { av_frame_free(&f); }
-                );
+                result = DisplayCopy(final_frame);
                 auto clone_end = std::chrono::high_resolution_clock::now();
                 total_clone_us += std::chrono::duration_cast<std::chrono::microseconds>(clone_end - clone_start).count();
 
@@ -1033,15 +1047,9 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
                 }
             }
 
-            // ZERO-COPY: Accept NV12/YUV420P directly without conversion!
-            // SDL supports both formats through SDL_UpdateNVTexture/SDL_UpdateYUVTexture
-            // (format conversion handled downstream if required)
-
-            // Clone to shared_ptr (like in old working version)
-            result = std::shared_ptr<AVFrame>(
-                av_frame_clone(final_frame),
-                [](AVFrame* f) { av_frame_free(&f); }
-            );
+            // NV12/YUV420P go to the buffer as they are (SDL_UpdateNVTexture/SDL_UpdateYUVTexture);
+            // anything else is brought to 8-bit 4:2:0 here, once (DisplayCopy).
+            result = DisplayCopy(final_frame);
 
             if (temp_hw_frame) av_frame_free(&temp_hw_frame);
 

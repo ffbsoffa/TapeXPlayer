@@ -112,6 +112,10 @@ private:
     // Decoding frame with downscaling
     std::shared_ptr<AVFrame> DecodeAndProcessFrame(double targetTime);
 
+    // The buffered copy of a decoded (and downloaded) picture, in a format the display takes
+    // (FSTPConvertTo8Bit420 for 10-bit / 4:2:2 originals, a reference otherwise).
+    std::shared_ptr<AVFrame> DisplayCopy(const AVFrame* frame);
+
     // Downscaling (4K → 720p)
     bool DownscaleFrame(AVFrame* src, AVFrame* dst);
 
@@ -150,6 +154,8 @@ private:
 
     // Downscaling context (cached)
     SwsContext* downscale_ctx_;
+    // FSTPConvertTo8Bit420's swscale fallback (cached)
+    SwsContext* to8bit_ctx_ = nullptr;
 
     // Output format FFmpeg settled on through GetHWFormat (-2 = not asked yet)
     std::atomic<int> chosen_pix_fmt_{-2};
