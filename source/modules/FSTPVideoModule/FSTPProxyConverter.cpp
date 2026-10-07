@@ -98,8 +98,8 @@ static int RunCommandWin(const std::string& utf8Command,
 
 // Encode pipeline modes, tried in order — the same shape on every platform: GPU encoder first,
 // libx264 when it fails. AME → Software → FullVT (macOS), NVENC → HWDecode → Software (Windows),
-// VAAPI → HWDecode → Software (Linux).
-enum class EncodeMode { FullVT, AME, Software, HWDecode, NVENC, VAAPI };
+// VAAPI → VAAPIUpload → HWDecode → Software (Linux).
+enum class EncodeMode { FullVT, AME, Software, HWDecode, NVENC, VAAPI, VAAPIUpload };
 
 // Build video filter + encoder flags for the chosen mode.
 //
@@ -111,6 +111,9 @@ enum class EncodeMode { FullVT, AME, Software, HWDecode, NVENC, VAAPI };
 //                  Frees all CPU cores for decode/scale; encode costs no CPU.
 // VAAPI   (Linux): decode → scale_vaapi → h264_vaapi, frames never leave the GPU (Intel/AMD).
 //                  BuildCommand adds -hwaccel vaapi -hwaccel_output_format vaapi.
+// VAAPIUpload (Linux): CPU decode → upload → scale_vaapi → h264_vaapi — the Linux counterpart of
+//                  AME, for originals the GPU can't decode (DV, ProRes, 4:2:2 10-bit H.264...).
+//                  BuildCommand adds -init_hw_device / -filter_hw_device instead of -hwaccel.
 // HWDecode (Win/Linux): GPU decode (D3D11VA / VA-API) → CPU scale → libx264.
 //                  Encode flags identical to Software; BuildCommand adds -hwaccel
 //                  on the input side. Offloads the decode half on weak CPUs
@@ -179,7 +182,7 @@ static std::string BuildEncodeFlags(const ProxyConverter::Params& p, EncodeMode 
     }
     (void)mode;
 #elif defined(__linux__)
-    if (mode == EncodeMode::VAAPI) {
+    if (mode == EncodeMode::VAAPI || mode == EncodeMode::VAAPIUpload) {
         // Linux GPU encode path (mirrors macOS AME / Windows NVENC), and the whole pipeline stays
         // on the GPU. Measured on the low-end reference (Pentium Gold 7505, UHD Graphics, 2 cores):
         // 1080p25 H.264 → this proxy at ~10× realtime vs ~2× for libx264, 1080p50 HEVC ~13× vs
@@ -192,6 +195,7 @@ static std::string BuildEncodeFlags(const ProxyConverter::Params& p, EncodeMode 
         // mode=default: closest to an area downscale (scale_vaapi's own default, hq, is sharper
         // and measurably further from it).
         std::string vfilter = "scale_vaapi=w=" + w + ":h=" + h + ":format=nv12:mode=default";
+        if (mode == EncodeMode::VAAPIUpload) vfilter = "format=nv12,hwupload," + vfilter;
         auto code = [](int v) { return std::to_string(v < 0 ? 2 : v); };   // 2 = "unspecified"
         std::string vui =
             "colour_primaries="          + code(av_color_primaries_from_name(p.colorPrimaries.c_str())) +
@@ -301,6 +305,14 @@ static std::string BuildCommand(const ProxyConverter::Params& p,
             cmd << " -hwaccel_device "
                 << g_hardware_detection->GetGPUInfo().vaapi_devices[0];
         }
+    }
+    if (mode == EncodeMode::VAAPIUpload) {
+        // Software decode; the filter graph's hwupload needs a device to upload to.
+        std::string device = "/dev/dri/renderD128";
+        if (g_hardware_detection && !g_hardware_detection->GetGPUInfo().vaapi_devices.empty()) {
+            device = g_hardware_detection->GetGPUInfo().vaapi_devices[0];
+        }
+        cmd << " -init_hw_device vaapi=va:" << device << " -filter_hw_device va";
     }
 #endif
 
@@ -626,6 +638,9 @@ bool ProxyConverter::ConvertSingle(const Params& params)
     // Linux fastest path: everything on the GPU (VA-API decode + scale + encode).
     if (VAAPIUsable()) {
         if (tryMode(EncodeMode::VAAPI, "VA-API (GPU decode + scale + encode)")) return true;
+        // Usually the GPU can't decode this original: decode it here and keep the encode there.
+        std::cerr << "[ProxyConverter] VA-API failed, trying CPU decode + VA-API encode..." << std::endl;
+        if (tryMode(EncodeMode::VAAPIUpload, "CPU decode + VA-API (scale + encode)")) return true;
         std::cerr << "[ProxyConverter] VA-API encode failed, falling back to libx264..." << std::endl;
     }
 #endif
@@ -757,7 +772,15 @@ bool ProxyConverter::ConvertParallel(const Params& params, int numSegments)
                     segProgress[i].store(100);
                     return;
                 }
-                std::cout << "⚠️  [Proxy seg" << i << "] VA-API failed, falling back to libx264..." << std::endl;
+                std::cout << "⚠️  [Proxy seg" << i << "] VA-API failed, trying CPU decode + VA-API encode..." << std::endl;
+                if (ExecuteFFmpeg(BuildCommand(params, segPaths[i], ss, dur, EncodeMode::VAAPIUpload),
+                                  segPaths[i], refDur, segReport)) {
+                    std::cout << "✅ [Proxy seg" << i << "] CPU decode + VA-API succeeded" << std::endl;
+                    results[i] = true;
+                    segProgress[i].store(100);
+                    return;
+                }
+                std::cout << "⚠️  [Proxy seg" << i << "] VA-API encode failed, falling back to libx264..." << std::endl;
             }
 #endif
             // Windows/Linux: GPU input decode + libx264; on failure, software below.
