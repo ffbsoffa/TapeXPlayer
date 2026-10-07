@@ -9,6 +9,8 @@
 #include <thread>
 #include <condition_variable>
 
+#include "FSTPHwTo8Bit.h"
+
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -116,6 +118,10 @@ private:
     // (FSTPConvertTo8Bit420 for 10-bit / 4:2:2 originals, a reference otherwise).
     std::shared_ptr<AVFrame> DisplayCopy(const AVFrame* frame);
 
+    // FSTPHwDownload of a hardware picture, made 8-bit on the GPU first where it can be
+    // (FSTPHwTo8Bit). Same contract as FSTPHwDownload.
+    int DownloadForDisplay(AVFrame* dst, const AVFrame* src);
+
     // Downscaling (4K → 720p)
     bool DownscaleFrame(AVFrame* src, AVFrame* dst);
 
@@ -156,6 +162,8 @@ private:
     SwsContext* downscale_ctx_;
     // FSTPConvertTo8Bit420's swscale fallback (cached)
     SwsContext* to8bit_ctx_ = nullptr;
+    // 10-bit hardware pictures → NV12 on the GPU before the download (DownloadForDisplay)
+    FSTPHwTo8Bit hw_to8bit_;
 
     // Output format FFmpeg settled on through GetHWFormat (-2 = not asked yet)
     std::atomic<int> chosen_pix_fmt_{-2};

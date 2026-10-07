@@ -809,6 +809,21 @@ bool FSTPFullResDecoderV2::DownscaleFrame(AVFrame* src, AVFrame* dst) {
     return false;
 }
 
+int FSTPFullResDecoderV2::DownloadForDisplay(AVFrame* dst, const AVFrame* src) {
+    if (hw_to8bit_.Applies(src)) {
+        AVFrame* nv12 = av_frame_alloc();
+        if (nv12 && hw_to8bit_.Convert(src, nv12)) {
+            int ret = FSTPHwDownload(dst, nv12);
+            av_frame_free(&nv12);
+            if (ret >= 0) return ret;
+            av_frame_unref(dst);
+        } else {
+            av_frame_free(&nv12);
+        }
+    }
+    return FSTPHwDownload(dst, src);
+}
+
 std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DisplayCopy(const AVFrame* frame) {
     AVFrame* copy = nullptr;
     if (FSTPIsDisplay420(frame->format)) {
@@ -920,7 +935,7 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
                     if (temp_hw_frame) {
                         // PROFILING: Measurement of av_hwframe_transfer_data (GPU→CPU copy)
                         auto transfer_start = std::chrono::high_resolution_clock::now();
-                        int transfer_result = FSTPHwDownload(temp_hw_frame, decoded_frame);
+                        int transfer_result = DownloadForDisplay(temp_hw_frame, decoded_frame);
                         auto transfer_end = std::chrono::high_resolution_clock::now();
                         total_hw_transfer_us += std::chrono::duration_cast<std::chrono::microseconds>(transfer_end - transfer_start).count();
 
@@ -1034,7 +1049,7 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
 
             if (is_hw_frame) {
                 temp_hw_frame = av_frame_alloc();
-                if (temp_hw_frame && FSTPHwDownload(temp_hw_frame, decoded_frame) >= 0) {
+                if (temp_hw_frame && DownloadForDisplay(temp_hw_frame, decoded_frame) >= 0) {
                     // CRITICAL: Copy ALL properties from hardware frame
                     av_frame_copy_props(temp_hw_frame, decoded_frame);
                     temp_hw_frame->pts = decoded_frame->pts;
