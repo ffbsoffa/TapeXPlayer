@@ -2071,6 +2071,10 @@ bool PhysTbcHoldBelowBar() {
 // as one at 9–32×, which read as faked tape motion; the bars' own movement is the flutter's.)
 constexpr double kPhysReelWander = 0.001;
 constexpr uint8_t kPhysDocGrey = 119;               // 47 % of white, as on the reference shuttle frame
+// The row right below each bar's solid grey: the compensator's fill, recirculated line after line
+// through its 1H delay for the whole bar, has drooped by the time the detector lets go — a darker
+// line under the grey (the old comb's head-switch line, Y 90 from 8× up).
+constexpr uint8_t kPhysDocDroop = 90;
 constexpr int kPhysLutN = 1024;
 
 // Share of a head of width wh (pitches) over tracks of width wt repeating every pitch, for a head
@@ -2438,6 +2442,18 @@ bool FSTPBetacamEffect::ApplyPhysicalShuttle(PlayerState& state, FrameContext& f
         }
     }
 
+    // The drooped fill under each bar (kPhysDocDroop): one row, luma only. Still the compensator's
+    // output, so the snow below a bar starts on the row after it.
+    for (int y = 1; y < H; ++y) {
+        if (!solid[y - 1] || solid[y]) continue;
+        uint8_t* row = Yp + static_cast<size_t>(y) * yp;
+        if (uyvy) {
+            for (int i = 0; i < W / 2; ++i) { row[i * 4 + 1] = kPhysDocDroop; row[i * 4 + 3] = kPhysDocDroop; }
+        } else {
+            std::memset(row, kPhysDocDroop, W);
+        }
+    }
+
     // Snow on each bar's edges — the old comb's look, kept as the author likes it, but where the
     // physics puts it: FM clicks that slip through before the dropout detector fills the line, so
     // on the rows right above and right below the solid grey (inside it the compensator has
@@ -2466,7 +2482,7 @@ bool FSTPBetacamEffect::ApplyPhysicalShuttle(PlayerState& state, FrameContext& f
                 const int sx = static_cast<int>(xrand() % static_cast<uint32_t>(W));
                 const uint32_t choice = xrand() % 3;
                 const bool above = choice == 0 || (choice == 2 && (j & 1) == 0);
-                const int sy = above ? y0 - thick : y1;              // the rows just outside the grey
+                const int sy = above ? y0 - thick : y1 + 1;          // just outside the grey and its droop
                 for (int dy = 0; dy < thick; ++dy) {
                     const int yy = sy + dy;
                     if (yy < 0 || yy >= H || solid[yy]) continue;
