@@ -2013,11 +2013,22 @@ namespace {
 constexpr double kPhysPitchUm = 165.7;
 constexpr double kPhysYTrackUm = 86.0, kPhysYHeadUm = 85.0;
 constexpr double kPhysCTrackUm = 73.0, kPhysCHeadUm = 73.0;
+// Piecewise-linear curve through n knots (x ascending), flat beyond the ends.
+double PhysKnots(double a, const double* x, const double* y, int n) {
+    if (a <= x[0]) return y[0];
+    for (int i = 1; i < n; ++i) {
+        if (a <= x[i]) return y[i - 1] + (y[i] - y[i - 1]) * (a - x[i - 1]) / (x[i] - x[i - 1]);
+    }
+    return y[n - 1];
+}
 // Dropout detector threshold (share of the on-track envelope) by |speed|, set by eye by the author:
-// −10 dB from 9× (where this path takes over), easing to −8.5 dB at 24× and beyond.
+// −10 dB from 9× (where this path takes over), easing to −9.1 dB at 18×, then lower again so the
+// bars thin out at the top speeds (author, 15.10.2026: a little thinner at 24×, a quarter thinner
+// again at 32×).
 double PhysDocThreshold(double a) {
-    const double db = a <= 9.0 ? -10.0 : a >= 24.0 ? -8.5 : -10.0 + 1.5 * (a - 9.0) / 15.0;
-    return std::pow(10.0, db / 20.0);
+    static constexpr double x[] = {9.0, 18.0, 24.0, 32.0};
+    static constexpr double db[] = {-10.0, -9.1, -9.4, -10.9};
+    return std::pow(10.0, PhysKnots(a, x, db, 4) / 20.0);
 }
 // The C head leaves its track at the same moment as the Y head: both ride the same drum and the
 // tape moves under both as one piece, so they are off their tracks by the same share of a pitch at
@@ -2034,12 +2045,14 @@ constexpr double kPhysLinesPerPitch = 5.5;
 // Where the TBC's repeats fall in forward shuttle. Each band is short of the same 5.5 field lines
 // (exactly the jump at the bar). Held right below the bar — the first line after it repeated until
 // the picture catches up — they make the smear the old comb drew (default); spread evenly through
-// the band they are only a faint stair (FSTP_BETACAM_TBC=spread). In reverse lines are dropped.
+// the band they are only a faint stair (FSTP_BETACAM_TBC=spread). In reverse the lines come in too
+// fast and are dropped, with nothing to fill in — but the re-lock hold below applies there too.
 // How much of each band the held line covers, by |speed|. Physically 5.5 field lines (the jump);
 // from 18× the author wants it stronger, and the TBC gives a reason: after each bar it re-locks to
 // the off-tape line rate, which drifts further from nominal with speed (18× → ×0.70, 24× → ×0.60,
 // 32× → ×0.45), so it holds longer. Share of the band: 0.30 at 18× (the physical value) → 0.70 at
-// 24× → 0.85 at 32×; never less than the physical hold.
+// 24× → 0.85 at 32×; never less than the physical hold. In reverse the line rate is off nominal as
+// far the other way (−24× → ×1.44, −32× → ×1.58), so the TBC holds the same share there.
 double PhysHoldShare(double a) {
     if (a <= 18.0) return 0.0;
     if (a <= 24.0) return 0.30 + 0.40 * (a - 18.0) / 6.0;
@@ -2145,25 +2158,37 @@ const float* PhysGauss256() {
 }
 
 // Head-to-tape flutter: in shuttle the tape rides on an air film and flutters across the drum, so
-// the head crosses from one track to the next a little early or late — each bar on its own, fresh
-// every field, the gaps between bars changing while the comb stays where the tape puts it. Only the
-// moment of each crossing shows (between crossings the head sits on its track), so the head's path
-// is shifted by one value per crossing: over the stretch from one track's centre to the next, the
-// stretch that holds the bar between them. RMS in track pitches by |speed|: faint at 9×, growing as
-// the tape lifts off the drum, ≈ 1 field line at 32× (a starting point, to be set by eye).
-double PhysFlutterAmp(double a) {
-    if (a <= 9.0) return 0.02;
-    if (a <= 24.0) return 0.02 + 0.06 * (a - 9.0) / 15.0;
-    if (a <= 32.0) return 0.08 + 0.03 * (a - 24.0) / 8.0;
-    return 0.11;
+// the head crosses from one track to the next a little early or late, and a little faster or
+// slower — each bar on its own, fresh every field: the gaps between bars and the bars' thickness
+// change while the comb stays where the tape puts it. Only the crossings show (between them the
+// head sits on its track), so the flutter is taken as two values per crossing, held over the
+// stretch from one track's centre to the next (the stretch that holds the bar between them):
+//  • shift — where the head is when it crosses: moves the bar;
+//  • stretch — how fast the flutter carries it across just then: the bar is 1 / (1 + stretch) as
+//    thick (the path is bent by stretch · x(1 − 4x²) around the bar's centre, x ∈ [−½, ½], so it
+//    still meets the next stretch's path at the track's centre).
+// RMS by |speed|, set by eye (author, 15.10.2026): faint at 9×, the bars clearly moving against
+// each other from 24× and harder still at 32×; thickness changes from 18× up.
+double PhysFlutterShiftAmp(double a) {                    // track pitches
+    static constexpr double x[] = {9.0, 18.0, 24.0, 32.0};
+    static constexpr double y[] = {0.02, 0.056, 0.11, 0.22};
+    return PhysKnots(a, x, y, 4);
 }
-// Shift of the head's path (pitches) over the stretch [j, j + 1) of field k: Gaussian, clamped so
-// the step at a track's centre stays clear of the detector (a head 0.25 pitch off its track still
-// gives 52 % of the signal, above the flicker band at every speed).
-double PhysFlutterShift(int64_t k, int64_t j, double amp, const float* gauss) {
+double PhysFlutterStretchAmp(double a) {                  // share of the crossing speed
+    static constexpr double x[] = {18.0, 24.0, 32.0};
+    static constexpr double y[] = {0.0, 0.15, 0.38};
+    return PhysKnots(a, x, y, 3);
+}
+struct PhysCrossing { double shift, stretch; };
+// The flutter over the stretch [j, j + 1) of field k: two Gaussians, clamped — the shift to
+// ±shiftLimit so the step at a track's centre stays clear of the detector, the stretch so the path
+// never turns back.
+PhysCrossing PhysFlutterAt(int64_t k, int64_t j, double shiftAmp, double shiftLimit, double stretchAmp,
+                           const float* gauss) {
     uint32_t h = static_cast<uint32_t>(j) * 2654435761u ^ static_cast<uint32_t>(k) * 2246822519u;
     h ^= h >> 15; h *= 2654435761u; h ^= h >> 13;
-    return std::clamp(amp * gauss[h & 0xFF], -0.25, 0.25);
+    return {std::clamp(shiftAmp * gauss[h & 0xFF], -shiftLimit, shiftLimit),
+            std::clamp(stretchAmp * gauss[(h >> 16) & 0xFF], -0.45, 0.45)};
 }
 
 // Reel servo wander: slow waves 0.4–7 Hz, the low ones stronger; ≈ ±1 at k in fields.
@@ -2223,13 +2248,27 @@ bool FSTPBetacamEffect::ApplyPhysicalShuttle(PlayerState& state, FrameContext& f
     }
     state.tape_field_clock = k_now;
     const double X = state.tape_fields;
-    const double flutter = PhysFlutterAmp(std::abs(rate));
+    const double shiftAmp = PhysFlutterShiftAmp(std::abs(rate));
+    const double stretchAmp = PhysFlutterStretchAmp(std::abs(rate));
     const float* const gauss = PhysGauss256();
+    const double cn = PhysCarrierToNoise(std::abs(rate));
+    const double sigEnv = std::pow(10.0, -cn / 20.0);         // envelope noise, share of on-track level
+    const double band = 3.0 * sigEnv;                         // rows where the detector flickers
+    const double thr = PhysDocThreshold(std::abs(rate));
+    // How far the flutter's shift may take a head off its track's centre (pitches): to just short of
+    // where the Y signal reaches the detector's flicker band or the C signal its threshold, so the
+    // step at a track's centre (PhysFlutterAt) never shows: about 0.27–0.28 of a pitch at 9–32×.
+    const double shiftLimit = std::min(
+        (0.5 * (kPhysYTrackUm + kPhysYHeadUm) - kPhysYHeadUm * (thr + band)) / kPhysPitchUm,
+        (0.5 * (kPhysCTrackUm + kPhysCHeadUm) - kPhysCHeadUm * thr) / kPhysPitchUm) - 0.02;
     const double pathBase = X;
     const double pathSlope = rate - 1.0;
     auto pathAt = [&](double tau) {                       // where the head is, in tracks, at τ
         const double v = pathBase + pathSlope * tau;
-        return v + PhysFlutterShift(k_now, static_cast<int64_t>(std::floor(v)), flutter, gauss);
+        const double j = std::floor(v);
+        const PhysCrossing c = PhysFlutterAt(k_now, static_cast<int64_t>(j), shiftAmp, shiftLimit, stretchAmp, gauss);
+        const double x = v - j - 0.5;                     // from the bar's centre
+        return v + c.shift + c.stretch * x * (1.0 - 4.0 * x * x);
     };
 
     // 2. Clean copies of this frame and the previous one, for the bands from other moments.
@@ -2299,19 +2338,17 @@ bool FSTPBetacamEffect::ApplyPhysicalShuttle(PlayerState& state, FrameContext& f
         }
     };
 
-    const double cn = PhysCarrierToNoise(std::abs(rate));
-    const double sigEnv = std::pow(10.0, -cn / 20.0);         // envelope noise, share of on-track level
-    const double band = 3.0 * sigEnv;                         // rows where the detector flickers
-    const double thr = PhysDocThreshold(std::abs(rate));
     const double linesToRows = H / 288.0;                     // output rows per field line
     const double duDy = pathSlope / 312.5 / linesToRows;      // tracks crossed per output row
     const bool holdBelowBar = PhysTbcHoldBelowBar();
     bool haveBand = false;                                    // the band being drawn (held-repeat state)
     double bandN = 0.0, bandHold = 0.0, bandStart = 0.0;
-    // Rows the first line of a band is held for: the physical jump (5.5 field lines), or more at the
-    // top speeds (PhysHoldShare of the band's height, 1 / duDy rows).
-    const double holdRows = duDy > 0.0 ? std::max(kPhysLinesPerPitch * linesToRows,
-                                                  PhysHoldShare(std::abs(rate)) / duDy)
+    // Rows the first line of a band is held for. Forward: the physical jump (5.5 field lines), or
+    // more at the top speeds (PhysHoldShare of the band's height, 1 / |duDy| rows). Reverse: only the
+    // TBC's re-lock hold, from 18×.
+    const double holdShare = PhysHoldShare(std::abs(rate));
+    const double holdRows = duDy > 0.0 ? std::max(kPhysLinesPerPitch * linesToRows, holdShare / duDy)
+                          : duDy < 0.0 ? holdShare / -duDy
                                        : 0.0;
     const double sigOnTrack = 219.0 * std::pow(10.0, -(cn + 9.9) / 20.0);
     const bool colour = std::abs(rate) < 10.0;                // above 10× the picture is monochrome already
@@ -2329,19 +2366,21 @@ bool FSTPBetacamEffect::ApplyPhysicalShuttle(PlayerState& state, FrameContext& f
         // Which line of which picture the head reads here. The band (the Y track being read) picks
         // the moment — older ones near the top, cut from the previous shown frame — and the head's
         // offset from that track's centre picks the line: the TBC's repeated lines (forward) and
-        // dropped ones (reverse) inside each band.
+        // dropped ones (reverse) inside each band, and its held line below each bar.
         {
             const double n = std::floor(vY + 0.5);
             const double off = vY - n;                            // −½ … ½ of a pitch
             const double half = 0.5 * kPhysLinesPerPitch * linesToRows;   // half the jump, in rows
             double from = y - 2.0 * half * off;                   // repeats spread through the band
-            if (holdBelowBar && duDy > 0.0) {                     // …or held right below the bar
+            if (holdBelowBar && holdRows > 0.0) {                 // …or held right below the bar
                 // A band starts where the head crosses onto the next track — the bar's middle line,
                 // found from the head's actual path (bars jump with the flutter, so must the smear).
-                // From there the band's first line is held until the picture catches up.
+                // From there the band's first line is held until the picture catches up. Across a band
+                // the head's offset runs −½ → ½ forward, ½ → −½ in reverse (the picture jumps back).
                 if (!haveBand || n != bandN) {
-                    bandStart = haveBand ? y : y - (off + 0.5) / duDy;           // band above the frame: estimate
-                    bandHold = haveBand ? from : bandStart + half;
+                    const double into = (duDy > 0.0 ? off + 0.5 : 0.5 - off) / std::abs(duDy);
+                    bandStart = haveBand ? y : y - into;                         // band above the frame: estimate
+                    bandHold = haveBand ? from : bandStart + (duDy > 0.0 ? half : -half);
                     bandN = n;
                     haveBand = true;
                 }
