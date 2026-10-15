@@ -1997,15 +1997,17 @@ bool FSTPBetacamEffect::ApplyRenderJitter(int player_id, RenderContext& render_c
 //    the neighbouring C track (opposite azimuth) its signal sinks below the dropout detector's
 //    threshold and the dropout compensator fills the line flat grey: |s − 1| bars per field,
 //    |s| + 1 in reverse (all Betacam Y heads share one azimuth, so every Y track is readable).
-//  • Where the bars stand is set by the tape position alone: one comb, all bars move together,
-//    still at whole speeds, wandering with the reel servo (above 2× the reels pull the tape).
+//  • Where the comb stands is set by the tape position: still at whole speeds, creeping slowly
+//    with the reel servo (above 2× the reels pull the tape). Each bar is moved on its own by the
+//    head-to-tape flutter at the moment the head crosses between those two tracks, so the gaps
+//    between bars change from field to field while the comb as a whole stays put.
 //  • Between the bars the picture is intact; each band comes from its own moment of the tape —
 //    top bands older, bottom ones newer — cut here from the shown frame and the one before it.
 //  • At a bar's edge the head's signal hovers at the threshold; the lower the carrier-to-noise
 //    (it falls with speed: the FM carriers drift out of the playback band), the more the edge
 //    breaks into short grey dashes and grain.
 // Geometry: SMPTE 229M / RP 144 (Y track 86 µm, C track 73 µm, pair pitch 165.7 µm, Y head 85 µm,
-// C head 11.75 lines behind plus 1 line of CTDM delay). Detector threshold (−8.5 dB) and the C/N
+// C head 73 µm, 1 line of CTDM delay). Detector threshold (−8.5 dB) and the C/N
 // curve were set by eye on the bench (author, 07.10.2026: presets/author_20261007.json).
 namespace {
 constexpr double kPhysPitchUm = 165.7;
@@ -2017,7 +2019,12 @@ double PhysDocThreshold(double a) {
     const double db = a <= 9.0 ? -10.0 : a >= 24.0 ? -8.5 : -10.0 + 1.5 * (a - 9.0) / 15.0;
     return std::pow(10.0, db / 20.0);
 }
-constexpr double kPhysCLagFields = 12.75 / 312.5;   // C head reads a row 12.75 lines after the Y head
+// The C head leaves its track at the same moment as the Y head: both ride the same drum and the
+// tape moves under both as one piece, so they are off their tracks by the same share of a pitch at
+// any instant, and each reads the line recorded together with the other's (the 11.75 lines that
+// part the heads on the drum part the two tracks' recorded lines just the same). Only the CTDM
+// decoder's one-line delay is left: a picture row's colour is read one line after its brightness.
+constexpr double kPhysCLagFields = 1.0 / 312.5;
 // A head off its track's centre by one pitch reads the picture this many field lines earlier: lines
 // lie at the same height on every track, and across a slanted track "sideways" is also "along".
 // Within a band the read-out runs at r(s) lines per line (24× → 0.6): the 32-line TBC repeats lines
@@ -2047,7 +2054,9 @@ bool PhysTbcHoldBelowBar() {
     }();
     return hold;
 }
-constexpr double kPhysReelWander = 0.007;           // ±0.7 % speed wander of the reel drive
+// ±0.1 % speed wander of the reel drive: the whole comb creeps slowly. (At ±0.7 % the comb swayed
+// as one at 9–32×, which read as faked tape motion; the bars' own movement is the flutter's.)
+constexpr double kPhysReelWander = 0.001;
 constexpr uint8_t kPhysDocGrey = 119;               // 47 % of white, as on the reference shuttle frame
 constexpr int kPhysLutN = 1024;
 
@@ -2118,37 +2127,6 @@ void PhysAddGrain(uint8_t* __restrict row, const int8_t* __restrict gn, int n, i
     }
 }
 
-// Head-to-tape flutter at the top shuttle speeds: the tape no longer lies flat against the drum,
-// so within a field the head's path wanders across the tracks a little and each bar shifts on its
-// own, field after field — the jumping bars the author keeps from the old comb (20–32×).
-// Amplitude in track pitches by |speed|.
-double PhysFlutterAmp(double a) {
-    if (a <= 20.0) return 0.0;
-    if (a <= 24.0) return 0.12 * (a - 20.0) / 4.0;
-    if (a <= 32.0) return 0.12 + 0.06 * (a - 24.0) / 8.0;
-    return 0.18;
-}
-// The wander along the pass of field k (≈ ±1): three waves with fresh phases every field, sampled
-// at kPhysFlutterN points over τ ∈ [0, 1.1] (the C head reads a little past the field's end).
-constexpr int kPhysFlutterN = 64;
-constexpr double kPhysFlutterSpan = 1.1;
-void PhysFlutterTable(int64_t k, float* table) {
-    static constexpr double f[3] = {2.3, 5.1, 9.7};      // cycles per pass
-    static constexpr double w[3] = {0.6, 0.5, 0.4};
-    double ph[3];
-    for (int i = 0; i < 3; ++i) {
-        uint32_t h = static_cast<uint32_t>(k) * 2654435761u ^ static_cast<uint32_t>(i + 1) * 40503u;
-        h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
-        ph[i] = (h & 0xFFFF) * (kTwoPi / 65536.0);
-    }
-    for (int j = 0; j <= kPhysFlutterN; ++j) {
-        const double tau = kPhysFlutterSpan * j / kPhysFlutterN;
-        double e = 0.0;
-        for (int i = 0; i < 3; ++i) e += w[i] * std::sin(kTwoPi * f[i] * tau + ph[i]);
-        table[j] = static_cast<float>(e);
-    }
-}
-
 // Standard normal values for the detector's flicker, one byte of a random number each.
 const float* PhysGauss256() {
     static const std::array<float, 256> t = [] {
@@ -2164,6 +2142,28 @@ const float* PhysGauss256() {
         return g;
     }();
     return t.data();
+}
+
+// Head-to-tape flutter: in shuttle the tape rides on an air film and flutters across the drum, so
+// the head crosses from one track to the next a little early or late — each bar on its own, fresh
+// every field, the gaps between bars changing while the comb stays where the tape puts it. Only the
+// moment of each crossing shows (between crossings the head sits on its track), so the head's path
+// is shifted by one value per crossing: over the stretch from one track's centre to the next, the
+// stretch that holds the bar between them. RMS in track pitches by |speed|: faint at 9×, growing as
+// the tape lifts off the drum, ≈ 1 field line at 32× (a starting point, to be set by eye).
+double PhysFlutterAmp(double a) {
+    if (a <= 9.0) return 0.02;
+    if (a <= 24.0) return 0.02 + 0.06 * (a - 9.0) / 15.0;
+    if (a <= 32.0) return 0.08 + 0.03 * (a - 24.0) / 8.0;
+    return 0.11;
+}
+// Shift of the head's path (pitches) over the stretch [j, j + 1) of field k: Gaussian, clamped so
+// the step at a track's centre stays clear of the detector (a head 0.25 pitch off its track still
+// gives 52 % of the signal, above the flicker band at every speed).
+double PhysFlutterShift(int64_t k, int64_t j, double amp, const float* gauss) {
+    uint32_t h = static_cast<uint32_t>(j) * 2654435761u ^ static_cast<uint32_t>(k) * 2246822519u;
+    h ^= h >> 15; h *= 2654435761u; h ^= h >> 13;
+    return std::clamp(amp * gauss[h & 0xFF], -0.25, 0.25);
 }
 
 // Reel servo wander: slow waves 0.4–7 Hz, the low ones stronger; ≈ ±1 at k in fields.
@@ -2224,18 +2224,12 @@ bool FSTPBetacamEffect::ApplyPhysicalShuttle(PlayerState& state, FrameContext& f
     state.tape_field_clock = k_now;
     const double X = state.tape_fields;
     const double flutter = PhysFlutterAmp(std::abs(rate));
-    float flut[kPhysFlutterN + 1];
-    if (flutter > 0.0) PhysFlutterTable(k_now, flut);
+    const float* const gauss = PhysGauss256();
     const double pathBase = X;
     const double pathSlope = rate - 1.0;
     auto pathAt = [&](double tau) {                       // where the head is, in tracks, at τ
-        double v = pathBase + pathSlope * tau;
-        if (flutter > 0.0) {
-            const double f = std::clamp(tau, 0.0, kPhysFlutterSpan) * (kPhysFlutterN / kPhysFlutterSpan);
-            const int i = std::min(static_cast<int>(f), kPhysFlutterN - 1);
-            v += flutter * (flut[i] + (flut[i + 1] - flut[i]) * (f - i));
-        }
-        return v;
+        const double v = pathBase + pathSlope * tau;
+        return v + PhysFlutterShift(k_now, static_cast<int64_t>(std::floor(v)), flutter, gauss);
     };
 
     // 2. Clean copies of this frame and the previous one, for the bands from other moments.
@@ -2448,8 +2442,8 @@ bool FSTPBetacamEffect::ApplyPhysicalShuttle(PlayerState& state, FrameContext& f
         }
     }
 
-    // Colour speeds only: the C head loses its track 12.75 lines later than the Y head — those
-    // rows lose their colour (a desaturated band just above each grey bar).
+    // Colour speeds only: the C head leaves its narrower track a little before the Y head and finds
+    // the next one a little after — a thin colourless rim around each grey bar, on the same path.
     if (colour && (chroma || uyvy)) {
         for (int cy = 0; cy < CH; ++cy) {
             const double tau = (22.0 + (2 * cy + 0.5) * 288.0 / H) / 312.5;
