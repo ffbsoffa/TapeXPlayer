@@ -244,13 +244,21 @@ void FSTPBetacamEffect::ApplyAnalogSmear(uint8_t* y_plane, int y_pitch,
                        ~PassTimer() { FSTPPassStats::Add(p, t); } } pass_timer{FSTPPassStats::Start(), FSTPPassStats::Smear};
     if (!m_enabled || !y_plane || width < 2 || height < 1) return;
     // One-pole IIR (out = in*(256-k)/256 + prev*k/256), trailing left→right. Chroma smears
-    // more than luma. Strength scales with resolution so the trail is a consistent fraction of
-    // width (a fixed k over-smears the low-res proxy). Calibrated at full-res (~1080).
-    double scale = std::max(0.30, std::min(1.0, height / 1080.0));
-    double rL = 0.575 * scale;  // was 1.15 — smear cut another 50% on owner's request
-    double rC = 1.425 * scale;  // was 2.85 — chroma smear cut to match
-    const int khLuma   = static_cast<int>(std::lround(256.0 * rL / (1.0 + rL)));
-    const int khChroma = static_cast<int>(std::lround(256.0 * rC / (1.0 + rC)));
+    // more than luma. The trail is a share of the picture WIDTH, as the owner calibrated it on a
+    // 1920-wide (1080p) picture: there the strengths were rL 0.575 and rC 1.425 (each already cut
+    // by half on the owner's request), a trail of ~0.99 px of 1920 for luma and ~1.88 px of 960
+    // for chroma. A one-pole trail of τ px has k = 256·e^(−1/τ). It was scaled by the height and
+    // capped at 1080, so the anamorphic 720-px proxy smeared about 1.8× more of the screen than a
+    // 1080p original, and a 4K one less (the author, 19.10). By width it is the same everywhere.
+    static const double kLumaTrailShare   = -1.0 / std::log(0.575 / 1.575) / 1920.0;
+    static const double kChromaTrailShare = -1.0 / std::log(1.425 / 2.425) / 960.0;
+    (void)height;
+    auto coefficient = [](double tau) -> int {
+        if (tau <= 0.0) return 0;
+        return std::clamp(static_cast<int>(std::lround(256.0 * std::exp(-1.0 / tau))), 0, 255);
+    };
+    const int khLuma   = coefficient(kLumaTrailShare * width);
+    const int khChroma = coefficient(kChromaTrailShare * (width / 2));
 
     // Kernel (SSE2 / NEON / scalar, bit-identical): FSTP::SIMDOptimizations::AnalogSmear.
     FSTP::SIMDOptimizations::AnalogSmear(y_plane, y_pitch, height, width, /*interleaved=*/false, khLuma);
