@@ -66,7 +66,7 @@ public:
     // True while the "tape head" mode runs (frames are read on demand under the playhead)
     bool headActive() const { return headActive_.load(std::memory_order_acquire); }
     // A new playhead: wake the head at once instead of at its next 4 ms poll
-    void wakeHead() { cv_.notify_all(); }
+    void wakeHead() { headWake_.store(true, std::memory_order_release); cv_.notify_all(); }
     // The display, slow, found the exact frame not read yet: wake the head and wait up to
     // `timeout` for `ready` (the frame is in its slot). The head reads one frame in ~1 ms (GPD),
     // a few on the Mac. True when it came in time.
@@ -141,6 +141,7 @@ private:
     double shuttleInstVelocity_ = 0.0;      // frames/s, signed, the last sample alone (no lag)
     std::atomic<int> shuttleShownSlot_{-1};
     std::atomic<bool> headActive_{false};
+    std::atomic<bool> headWake_{false};     // run a head step now, even if the playhead has not moved
     std::mutex headMtx_;                    // with headCv_: "a head frame was read"
     std::condition_variable headCv_;
     std::atomic<bool> segmentLoadInProgress_{false};

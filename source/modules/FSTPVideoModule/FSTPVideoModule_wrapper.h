@@ -116,6 +116,7 @@ private:
     int m_diag_logged_request = -1;
     int m_diag_logged_content = -1;
     bool m_diag_mismatch_open = false;                       // a logged mismatch not yet over
+    const void* m_diag_proxy_neighbours_checked = nullptr;   // the proxy picture last neighbour-logged
     std::chrono::steady_clock::time_point m_diag_mismatch_since{};
 
     // Auto-calibrated proxy↔original frame offset. On some sources the proxy's content lags

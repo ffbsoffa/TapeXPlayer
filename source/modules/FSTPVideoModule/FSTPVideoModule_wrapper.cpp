@@ -2441,6 +2441,49 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                     }
                     // If lock failed, skip this frame
                 }
+                // Slow or standing in the head mode, a missing neighbour is a moment away (the head
+                // reads N+1 and N−1 right after N): wait for it (below), so the
+                // picture goes on screen with the frame above the stripe it will keep. Otherwise
+                // the effect blends nothing first, then N+1 a moment later — the top jumps.
+                if ((!prev_frame || !next_frame) && proxy_mgr && proxy_mgr->headActive() &&
+                    std::abs(actual_speed_for_adjacent) < 1.05 && !m_file_reloading.load()) {
+                    const int size = static_cast<int>(frame_vector->size());
+                    auto slot_frame = [&](int idx) -> std::shared_ptr<AVFrame> {
+                        if (idx < 0 || idx >= size) return nullptr;
+                        std::unique_lock<std::mutex> l((*frame_vector)[idx].mutex, std::try_to_lock);
+                        if (!l.owns_lock()) return nullptr;
+                        std::shared_ptr<AVFrame> f = (*frame_vector)[idx].low_res_frame;
+                        return (f && f->data[0]) ? f : nullptr;
+                    };
+                    const bool want_prev = prev_idx >= 0 && !prev_frame;
+                    const bool want_next = next_idx < size && !next_frame;
+                    // Standing, a longer wait costs nothing (the picture is still); moving slowly, keep
+                    // it short. Measured: the neighbours come 16–33 ms after the stop on the GPD.
+                    const auto wait = (std::abs(actual_speed_for_adjacent) < 0.05) ? std::chrono::milliseconds(25)
+                                                                                   : std::chrono::milliseconds(4);
+                    proxy_mgr->waitHead([&] {
+                        return (!want_prev || slot_frame(prev_idx)) && (!want_next || slot_frame(next_idx));
+                    }, wait);
+                    if (!prev_frame) prev_frame = slot_frame(prev_idx);
+                    if (!next_frame) next_frame = slot_frame(next_idx);
+                    static const bool wait_log = std::getenv("FSTP_SWITCH_LOG") != nullptr;
+                    if (wait_log) {
+                        std::printf("⏳ [NEIGHBOURS] waited for proxy %d's neighbours at speed %.2f: previous %s, next %s\n",
+                                    proxy_base_slot, actual_speed_for_adjacent, prev_frame ? "there" : "missing",
+                                    next_frame ? "there" : "missing");
+                        std::fflush(stdout);
+                    }
+                }
+
+                // Standing on a proxy picture (once per picture): are its Betacam neighbours
+                // there? Without N+1 the proxy blends nothing above the stripe, and the full-res
+                // frame then brings N+1 in at the switch.
+                if (std::abs(actual_speed_for_adjacent) < 0.05 && frame.get() != m_diag_proxy_neighbours_checked) {
+                    m_diag_proxy_neighbours_checked = frame.get();
+                    std::printf("🔬 [NEIGHBOURS] standing on proxy frame %d: previous %s, next %s\n", proxy_base_slot,
+                                prev_frame ? "there" : "MISSING", next_frame ? "there" : "MISSING");
+                    std::fflush(stdout);
+                }
             } catch (...) {
                 prev_frame = nullptr;
                 next_frame = nullptr;

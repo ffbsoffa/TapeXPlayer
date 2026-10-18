@@ -209,7 +209,8 @@ void LowCachedDecoderManager::decodingLoop() {
             previousIsReverse_ = isReverse_.load();
             std::unique_lock<std::mutex> lock(mtx_);
             cv_.wait_for(lock, std::chrono::milliseconds(4), [&] {
-                return stopRequested_.load() || currentFrame_.load() != playhead;
+                return stopRequested_.load() || currentFrame_.load() != playhead ||
+                       headWake_.exchange(false, std::memory_order_acq_rel);
             });
             continue;
         }
@@ -440,7 +441,7 @@ void LowCachedDecoderManager::decodingLoop() {
 
 bool LowCachedDecoderManager::waitHead(const std::function<bool()>& ready,
                                        std::chrono::milliseconds timeout) {
-    cv_.notify_all();   // wake the head now
+    wakeHead();   // a head step now (the frame it waits for may be a neighbour, at the same playhead)
     std::unique_lock<std::mutex> lk(headMtx_);
     return headCv_.wait_for(lk, timeout, ready);
 }
@@ -494,6 +495,10 @@ void LowCachedDecoderManager::shuttleStep(int current) {
         }
         shuttleLastFrame_ = current;
         shuttleLastTime_ = now;
+    } else if (now - shuttleLastTime_ > std::chrono::milliseconds(30)) {
+        // The playhead stands: no motion, whatever the last sample said (after a fast shuttle it
+        // said fast, and the stop frame's neighbours were never read)
+        shuttleInstVelocity_ = 0.0;
     }
 
     for (int k = 0; k <= kShuttleLookahead && !stopRequested_.load(); ++k) {
@@ -545,6 +550,24 @@ void LowCachedDecoderManager::shuttleStep(int current) {
             if (std::find(shuttleSlots_.begin(), shuttleSlots_.end(), slot) != shuttleSlots_.end()) continue;
             if (decodeFrameNow(f)) {
                 shuttleSlots_.push_back(slot);   // not shown yet
+                { std::lock_guard<std::mutex> g(headMtx_); }
+                headCv_.notify_all();
+            }
+        }
+    }
+
+    // Slow or standing: the frame's two neighbours as well. The Betacam effect blends N+1 (or
+    // N−1) into a slow or standing picture above the stripe. After a sharp shuttle forward the
+    // head had read only frames up to the stop, so the proxy picture had no neighbour to blend;
+    // the full-res frame, which comes with its neighbours, then put frame N+1 above the stripe at
+    // the switch — the future frame jumped while the stripe stood (the author, 19.10).
+    if (speedFps < 120.0) {
+        for (int f : {current + 1, current - 1}) {
+            if (f < 0 || f > lastFrame || stopRequested_.load()) continue;
+            const int slot = toSlot(f);
+            if (std::find(shuttleSlots_.begin(), shuttleSlots_.end(), slot) != shuttleSlots_.end()) continue;
+            if (decodeFrameNow(f)) {
+                shuttleSlots_.push_back(slot);
                 { std::lock_guard<std::mutex> g(headMtx_); }
                 headCv_.notify_all();
             }
