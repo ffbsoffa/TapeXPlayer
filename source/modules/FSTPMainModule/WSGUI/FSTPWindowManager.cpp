@@ -156,6 +156,7 @@ static struct {
     int  display_index = -1;     // chosen external display (for re-apply)
     bool windowed      = false;  // true = separate window (cursor allowed on chrome)
     Uint32 window_id   = 0;      // for ENTER/LEAVE cursor handling
+    bool wanted_external = false;   // Settings asked for an external display (windowed = fallback)
 } g_presentation;
 
 // Serialises the render thread's presentation block against ClosePresentationWindow /
@@ -694,7 +695,78 @@ static void HandleAutoFreezeOnFocusChange(int focused_window_index, bool gained_
     }
 }
 
+// Opens the audience window again from Settings, keeping its source: after its display went
+// away or came back, or its GPU device was lost.
+static void ReopenPresentation(const char* why) {
+    std::cout << "🔁 [PRESENTATION] " << why << " - reopening as Settings say" << std::endl;
+    const int player = g_presentation.follow_focus ? -1 : g_presentation.pinned_player;
+    CreatePresentationWindow(player, GetPresentationOutputMode(), GetPresentationDisplayIndex());
+}
+
+// What can happen to the audience screen during a talk (main thread, from the platform event
+// loops):
+//   * its own close button: presentation ends, as with Shift+P;
+//   * the projector unplugged: the picture goes where Settings say, to another external display or
+//     into a separate window — never left on a display that is gone;
+//   * a projector plugged in while the output waits in a separate window for want of one: the
+//     picture moves to it;
+//   * the projector moved or changed resolution: the borderless window covers it again (SDL2 has
+//     no event of its own for a new resolution, so the size is looked at with every event);
+//   * the GPU reset (after sleep): the picture's texture is made again.
+static void HandlePresentationEvent(const SDL_Event* e) {
+    if (!g_presentation.active) return;
+    switch (e->type) {
+        case SDL_WINDOWEVENT:
+            if (e->window.event == SDL_WINDOWEVENT_CLOSE && e->window.windowID == g_presentation.window_id) {
+                ClosePresentationWindow();
+                std::cout << "✅ [PRESENTATION] Closed by its window's close button" << std::endl;
+                return;
+            }
+            break;
+        case SDL_DISPLAYEVENT:
+            if (e->display.event == SDL_DISPLAYEVENT_DISCONNECTED && !g_presentation.windowed) {
+                // SDL2 numbers the displays anew after one leaves: open again as Settings say
+                ReopenPresentation("a display was disconnected");
+                return;
+            }
+            if (e->display.event == SDL_DISPLAYEVENT_CONNECTED && g_presentation.windowed &&
+                g_presentation.wanted_external && SDL_GetNumVideoDisplays() > 1) {
+                ReopenPresentation("an external display was connected");
+                return;
+            }
+            break;
+        case SDL_RENDER_DEVICE_RESET: {
+            std::lock_guard<std::mutex> lock(g_presentation_mutex);
+            if (g_presentation.yuv_renderer) {   // textures are gone: made again on the next frame
+                g_presentation.yuv_renderer->Cleanup();
+                delete g_presentation.yuv_renderer;
+                g_presentation.yuv_renderer = nullptr;
+            }
+            g_presentation.yuv_w = g_presentation.yuv_h = 0;
+            g_presentation.yuv_fmt = 0;
+            std::cout << "🔁 [PRESENTATION] Render device reset - picture texture made again" << std::endl;
+            return;
+        }
+        default:
+            break;
+    }
+    if (!g_presentation.windowed && g_presentation.window) {
+        SDL_Rect db{};
+        int w = 0, h = 0, x = 0, y = 0;
+        if (SDL_GetDisplayBounds(g_presentation.display_index, &db) == 0) {
+            SDL_GetWindowSize(g_presentation.window, &w, &h);
+            SDL_GetWindowPosition(g_presentation.window, &x, &y);
+            if (w != db.w || h != db.h || x != db.x || y != db.y) {
+                SDL_SetWindowPosition(g_presentation.window, db.x, db.y);
+                SDL_SetWindowSize(g_presentation.window, db.w, db.h);
+                std::cout << "🔁 [PRESENTATION] Display changed - now " << db.w << "x" << db.h << std::endl;
+            }
+        }
+    }
+}
+
 void HandleWindowEvents(SDL_Event* event) {
+    HandlePresentationEvent(event);
     if (event->type == SDL_WINDOWEVENT) {
         // Presentation window: keep the surface clean — hide the cursor while the pointer is over
         // the video (the Betacam hardware-protection principle: nothing but picture on the output),
@@ -1278,15 +1350,16 @@ void RenderAllWindows() {
         int player_id = g_presentation.linked_player_id;
 
         if (!IsPlayerInstanceActive(player_id)) {
-            // Render thread must NOT call SDL_DestroyWindow (requires main thread).
-            // Just detach and go black; main thread will destroy via ClosePresentationWindow().
+            // The player it shows is gone (its window closed). Black, and still the presentation:
+            // following the focus, the next frame takes the player in front; pinned, the picture
+            // comes back when that player has a file again; Shift+P closes it as usual. It used
+            // to switch itself off here, leaving a black window nobody closed — the next Shift+P
+            // then opened a second one over it.
             if (g_presentation.renderer) {
                 SDL_SetRenderDrawColor(g_presentation.renderer, 0, 0, 0, 255);
                 SDL_RenderClear(g_presentation.renderer);
                 SDL_RenderPresent(g_presentation.renderer);
             }
-            g_presentation.active           = false;
-            g_presentation.linked_player_id = -1;
         } else if (g_presentation.renderer) {
             const FSTPPixelBufferManager::PixelBuffer* pb =
                 g_pixel_buffer_manager ? g_pixel_buffer_manager->GetPixelBuffer(player_id) : nullptr;
@@ -1812,6 +1885,7 @@ bool CreatePresentationWindow(int player_id, int output_mode, int display_index)
     g_presentation.display_index  = target_display;
     g_presentation.windowed       = windowed;
     g_presentation.window_id       = SDL_GetWindowID(g_presentation.window);
+    g_presentation.wanted_external = (output_mode == 0);
 
     // active must be set AFTER renderer is ready — render thread checks active first.
     // Initial linked player: explicit arg wins; otherwise follow-focus starts unbound (-1) and
