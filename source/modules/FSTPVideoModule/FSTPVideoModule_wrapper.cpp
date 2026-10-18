@@ -1721,6 +1721,27 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                 }
                 // Cache only genuinely-accepted V2 frames (not held ones), so the hold window
                 // stays anchored to the last real V2 hit.
+                // HANDOFF WITH ITS NEIGHBOURS: coming from the proxy, take the full-res frame only once
+                // its N−1 and N+1 are decoded too. The Betacam effect blends the neighbour into a slow
+                // or standing picture (above the stripe, by the playback phase). The proxy has its
+                // neighbours; a full-res frame fresh after a seek may not yet, and the upper part of
+                // the picture then showed frame N instead of N+1 for a moment and went back — the
+                // small jerk at the switch the author saw on the Mac after a shuttle. The proxy stays
+                // meanwhile, a few ms.
+                if (frame && !v2_held && !m_cached_adjacent_was_v2 && std::abs(actual_speed) <= 1.0) {
+                    std::shared_ptr<AVFrame> handoff_prev, handoff_next;
+                    m_full_res_decoder->GetNeighbours(frame.get(), handoff_prev, handoff_next);
+                    const int total_frames = static_cast<int>(m_frame_index->GetTotalFrames());
+                    const bool need_prev = clamped > 0;
+                    const bool need_next = clamped < total_frames - 1;
+                    if ((need_prev && !handoff_prev) || (need_next && !handoff_next)) {
+                        frame = nullptr;   // the proxy branch below keeps the picture
+                    } else {
+                        std::printf("🔀 [SHOWN] full resolution from frame %d, with its neighbours | speed %.2f\n",
+                                    clamped, actual_speed);
+                        std::fflush(stdout);
+                    }
+                }
                 if (frame && !v2_held) {
                     m_v2_cached_frame = frame;
                     m_v2_cached_timestamp = timestamp;
