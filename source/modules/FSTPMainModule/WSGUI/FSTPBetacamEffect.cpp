@@ -184,18 +184,29 @@ void FSTPBetacamEffect::ApplyEdgeFade(uint8_t* y_plane, int pitch, int width, in
     if (!m_enabled || !y_plane || pitch <= 0 || width <= 0 || height <= 0) {
         return;
     }
-    // Scale the fade width with resolution (authored at the 360-line proxy) so the soft border
-    // looks the same at full-res as it did on the proxy, instead of a 3 px sliver at 1080p.
-    double scale = height / 360.0;
-    int fadeL = std::max(1, static_cast<int>(std::lround(kEdgeFadeLeft  * scale)));
-    int fadeR = std::max(1, static_cast<int>(std::lround(kEdgeFadeRight * scale)));
+    // The fade is a share of the picture WIDTH: 3 px left and 2 px right of a 640-wide picture,
+    // where it was authored. It was scaled by height, and the proxy is often anamorphic (720×540
+    // shown 16:9): its border came out 5 px of 720, 0.69 % of the screen, against 6 px of 1280,
+    // 0.47 %, on a 720-line original — wider on the proxy and different for every resolution
+    // (the author, 19.10). By width, and without rounding to whole pixels, it covers the same part
+    // of the screen whatever the resolution or pixel shape.
+    const double fadeLF = kEdgeFadeLeft  * width / 640.0;
+    const double fadeRF = kEdgeFadeRight * width / 640.0;
+    const int fadeL = std::max(1, static_cast<int>(std::ceil(fadeLF)));
+    const int fadeR = std::max(1, static_cast<int>(std::ceil(fadeRF)));
     if (width <= fadeL + fadeR) {
         return;
     }
+    // Pixel x of the edge (0 = outermost) keeps this much of the picture: a straight ramp from
+    // the very edge to a fade width in, taken at the pixel's centre, so the ramp spans exactly
+    // that share of the width at any resolution
+    auto keep = [](int x, double fadeF) -> float {
+        return static_cast<float>(std::min(1.0, (x + 0.5) / std::max(0.5, fadeF)));
+    };
     for (int y = 0; y < height; ++y) {
         uint8_t* rowStart = y_plane + static_cast<size_t>(y) * pitch;
         for (int x = 0; x < fadeL; ++x) {
-            float fade = (fadeL > 1) ? static_cast<float>(x) / static_cast<float>(fadeL - 1) : 1.0f;
+            const float fade = keep(x, fadeLF);
             if (format == SDL_PIXELFORMAT_UYVY) {
                 int gi = x / 2, ig = x % 2;
                 uint8_t* group = rowStart + gi * 4;
@@ -210,7 +221,7 @@ void FSTPBetacamEffect::ApplyEdgeFade(uint8_t* y_plane, int pitch, int width, in
         }
         for (int x = 0; x < fadeR; ++x) {
             int realX = width - 1 - x;
-            float fade = (fadeR > 1) ? static_cast<float>(x) / static_cast<float>(fadeR - 1) : 1.0f;
+            const float fade = keep(x, fadeRF);
             if (format == SDL_PIXELFORMAT_UYVY) {
                 int gi = realX / 2, ig = realX % 2;
                 uint8_t* group = rowStart + gi * 4;
