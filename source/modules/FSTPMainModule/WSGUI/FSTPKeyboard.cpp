@@ -114,14 +114,22 @@ static int GetWindowIndexByPlayerID(int player_id) {
 }
 
 // Forward declaration (defined below)
-static void HandleSeekControl(int player_id, double seek_offset);
+static void HandleSeekTo(int player_id, double new_position);
 
-// The position box: go to that fraction of the clip, shown at once as a keyboard seek is
+// The position box: go to that fraction of the clip, shown at once as a keyboard seek is.
+// The time goes onto a frame boundary, as a timecode or the keyboard lands: a time inside a
+// frame leaves the Betacam stripe on a paused picture, since the pause aligns to a frame once.
 static void SeekToFraction(int player_id, double fraction) {
     double duration = GetInstanceDuration(player_id);
     if (duration <= 0) return;
     double target = std::max(0.0, std::min(duration, fraction * duration));
-    HandleSeekControl(player_id, target - GetInstancePosition(player_id));
+    double fps = GetInstanceVideoFPS(player_id);
+    if (fps > 0) {
+        double frame = std::round(target * fps);
+        if (frame / fps > duration) frame = std::floor(duration * fps);
+        target = frame / fps;
+    }
+    HandleSeekTo(player_id, target);
 }
 
 // Helper functions for player control
@@ -222,10 +230,13 @@ static void HandleSpeedControl(int player_id, double speed_change) {
 
 static void HandleSeekControl(int player_id, double seek_offset) {
     if (player_id < 0) return;
-    
-    double current_position = GetInstancePosition(player_id);
-    double new_position = current_position + seek_offset;
-    
+    HandleSeekTo(player_id, GetInstancePosition(player_id) + seek_offset);
+}
+
+// To an absolute time, so a frame-exact target stays exact
+static void HandleSeekTo(int player_id, double new_position) {
+    if (player_id < 0) return;
+
     // Clamp position within file bounds
     double duration = GetInstanceDuration(player_id);
     if (new_position < 0) new_position = 0;
