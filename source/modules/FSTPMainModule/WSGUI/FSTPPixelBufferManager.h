@@ -261,10 +261,12 @@ public:
                                     int u_pitch, int v_pitch, int width, int height, Uint32 format);
 
     /**
-     * @brief Fire a one-shot Betacam dropout-compensation burst (resume-from-pause = gentle form).
+     * @brief Ask for a one-shot Betacam dropout-compensation burst on going into play (the effect
+     * decides whether it comes). The full form — heavy bands ↔ thin lines: the gentle one (200 ms,
+     * one to three thin lines) was not seen at all on the Mac (the author, 19.10, build 1886).
      */
     void TriggerDropoutBurst(int player_id) {
-        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Gentle);
+        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Alternating);
     }
 
     /**
