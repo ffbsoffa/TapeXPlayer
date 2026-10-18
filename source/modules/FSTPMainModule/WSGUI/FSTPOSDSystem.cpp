@@ -12,6 +12,18 @@
 #include <vector>
 #include <cstdint>
 #include <map>
+#include <mutex>
+
+// Where each player's position box (bottom right) was last drawn, for the mouse: a click or a
+// drag in it seeks (FSTPOSD_PositionBoxFraction). Drawn on the render thread, read on the UI thread.
+namespace {
+struct PositionBox {
+    SDL_Rect track{};     // the span the playhead bar moves along
+    Uint64 drawn_ms = 0;
+};
+std::mutex g_position_box_mutex;
+std::map<int, PositionBox> g_position_boxes;  // per player_id
+}  // namespace
 #include <set>
 #include <chrono>
 
@@ -1258,6 +1270,11 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
 
         int indicatorX = windowWidth - INDICATOR_WIDTH - MARGIN_RIGHT;
         int indicatorY = windowHeight - 64 - (INDICATOR_HEIGHT / 2) + 10;
+        {
+            std::lock_guard<std::mutex> lock(g_position_box_mutex);
+            g_position_boxes[player_id] = {SDL_Rect{indicatorX + 2, indicatorY, INDICATOR_WIDTH - 4, INDICATOR_HEIGHT},
+                                           SDL_GetTicks()};
+        }
 
         // Black outline around indicator (like text with outline)
         SDL_Rect outlineRect = {indicatorX - 1, indicatorY - 1, INDICATOR_WIDTH + 2, INDICATOR_HEIGHT + 2};
@@ -1640,4 +1657,21 @@ extern "C" int CheckMenuBarClick(int mouse_x, int mouse_y, int window_width) {
     }
     
     return -1;  // Clicked in menu bar but not on any item
+}
+
+bool FSTPOSD_PositionBoxFraction(int player_id, float x, float y, bool inside, double* fraction) {
+    PositionBox box;
+    {
+        std::lock_guard<std::mutex> lock(g_position_box_mutex);
+        auto it = g_position_boxes.find(player_id);
+        if (it == g_position_boxes.end()) return false;
+        box = it->second;
+    }
+    if (SDL_GetTicks() - box.drawn_ms > 500) return false;  // not on screen lately
+    const SDL_Rect& r = box.track;
+    if (r.w <= 0) return false;
+    // The frame's 2 px border counts as inside, so the very start and end can be clicked
+    if (inside && (x < r.x - 2 || x >= r.x + r.w + 2 || y < r.y || y >= r.y + r.h)) return false;
+    *fraction = std::max(0.0, std::min(1.0, (x - r.x) / static_cast<double>(r.w)));
+    return true;
 }

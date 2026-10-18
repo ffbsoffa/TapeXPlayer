@@ -24,6 +24,12 @@
 #include <cstdio>
 #include <cstdlib>
 
+// Where each window's zoom thumbnail (top right) was last drawn, for the mouse: a click or a drag
+// in it moves the zoomed area (FSTP_ZoomThumbnailPoint). Drawn on the render thread, read on the
+// UI thread.
+static std::mutex g_thumbnail_mutex;
+static SDL_Rect g_thumbnail_rect[MAX_WINDOWS];
+
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
 #include "darwin/sdl/FSTPToolsMenu.h"  // RefreshMemoryLocationsWindowIfOpen()
@@ -1145,6 +1151,11 @@ void RenderAllWindows() {
                                 thumb_h
                             };
 
+                            {
+                                std::lock_guard<std::mutex> lock(g_thumbnail_mutex);
+                                g_thumbnail_rect[i] = thumb_dst;
+                            }
+
                             // Draw full image as thumbnail
                             SDL_RenderCopy(renderer, new_texture, nullptr, &thumb_dst);
 
@@ -1535,6 +1546,24 @@ FSTPWindow* FSTPGetActiveWindow() {
 
     // If no focused window, return main
     return GetMainWindow();
+}
+
+// The mouse in the zoom thumbnail: see g_thumbnail_rect
+bool FSTP_ZoomThumbnailPoint(int window_index, float x, float y, bool inside,
+                             float* frame_x, float* frame_y) {
+    if (window_index < 0 || window_index >= MAX_WINDOWS) return false;
+    FSTPZoomState* zoom = GetZoomState(window_index);
+    if (!zoom || !zoom->enabled || !zoom->show_thumbnail || zoom->factor <= 1.0f) return false;
+    SDL_Rect r;
+    {
+        std::lock_guard<std::mutex> lock(g_thumbnail_mutex);
+        r = g_thumbnail_rect[window_index];
+    }
+    if (r.w <= 0 || r.h <= 0) return false;
+    if (inside && (x < r.x || x >= r.x + r.w || y < r.y || y >= r.y + r.h)) return false;
+    *frame_x = std::max(0.0f, std::min(1.0f, (x - r.x) / static_cast<float>(r.w)));
+    *frame_y = std::max(0.0f, std::min(1.0f, (y - r.y) / static_cast<float>(r.h)));
+    return true;
 }
 
 int GetActivePlayerID() {

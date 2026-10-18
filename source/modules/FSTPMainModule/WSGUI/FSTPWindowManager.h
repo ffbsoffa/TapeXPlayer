@@ -116,6 +116,12 @@ int GetActivePlayerID();
 // Restore focus to main SDL window
 void RestoreFocusToMainWindow();
 
+// The zoom thumbnail (top right) of a window under the mouse: the point of the full frame at
+// (x, y), 0..1 each way. inside: only when (x, y) is in the thumbnail; otherwise clamped to it (a
+// drag that has left it). False when no thumbnail is shown. Window coordinates.
+bool FSTP_ZoomThumbnailPoint(int window_index, float x, float y, bool inside,
+                             float* frame_x, float* frame_y);
+
 // === Texture interface for video ===
 // Get SDL renderer for window (for texture interface initialization)
 SDL_Renderer* GetWindowRenderer(int window_index);
