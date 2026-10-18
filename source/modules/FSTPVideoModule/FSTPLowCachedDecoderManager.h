@@ -7,6 +7,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
 #include <atomic>
 #include <string>
 #include <memory> // For std::unique_ptr
@@ -61,6 +62,15 @@ public:
     // the exact frame under the playhead isn't decoded yet — like a VTR in shuttle shows whatever
     // the heads pick up — instead of holding a stale picture until an exact match turns up.
     int shuttleSlot() const { return shuttleShownSlot_.load(std::memory_order_acquire); }
+
+    // True while the "tape head" mode runs (frames are read on demand under the playhead)
+    bool headActive() const { return headActive_.load(std::memory_order_acquire); }
+    // A new playhead: wake the head at once instead of at its next 4 ms poll
+    void wakeHead() { cv_.notify_all(); }
+    // The display, slow, found the exact frame not read yet: wake the head and wait up to
+    // `timeout` for `ready` (the frame is in its slot). The head reads one frame in ~1 ms (GPD),
+    // a few on the Mac. True when it came in time.
+    bool waitHead(const std::function<bool()>& ready, std::chrono::milliseconds timeout);
 
     // Called when the tape speeds up into shuttle: aborts a segment prefetch in flight so the
     // tape-head mode can take over at once (the aborted segment is not marked loaded).
@@ -128,7 +138,11 @@ private:
     int shuttleLastFrame_ = -1;             // playhead at the last velocity sample
     std::chrono::steady_clock::time_point shuttleLastTime_{};
     double shuttleVelocity_ = 0.0;          // frames/s, signed (smoothed from observed motion)
+    double shuttleInstVelocity_ = 0.0;      // frames/s, signed, the last sample alone (no lag)
     std::atomic<int> shuttleShownSlot_{-1};
+    std::atomic<bool> headActive_{false};
+    std::mutex headMtx_;                    // with headCv_: "a head frame was read"
+    std::condition_variable headCv_;
     std::atomic<bool> segmentLoadInProgress_{false};
     std::chrono::steady_clock::time_point shuttleLastFast_{};   // last time the tape ran ≥ hold rate
     int shuttleLastPlayhead_ = -1;                               // playhead at the last loop pass

@@ -438,12 +438,21 @@ void LowCachedDecoderManager::decodingLoop() {
     isRunning_.store(false);
 }
 
+bool LowCachedDecoderManager::waitHead(const std::function<bool()>& ready,
+                                       std::chrono::milliseconds timeout) {
+    cv_.notify_all();   // wake the head now
+    std::unique_lock<std::mutex> lk(headMtx_);
+    return headCv_.wait_for(lk, timeout, ready);
+}
+
 void LowCachedDecoderManager::enterShuttleMode() {
     inShuttleMode_ = true;
+    headActive_.store(true, std::memory_order_release);
     shuttleLastPlayhead_ = currentFrame_.load();
     shuttleLastMove_ = std::chrono::steady_clock::now();
     shuttleLastFrame_ = -1;
     shuttleVelocity_ = 0.0;
+    shuttleInstVelocity_ = 0.0;
     shuttleLastFast_ = std::chrono::steady_clock::now();
     // Prefetched segments stay put: the segment window unloads whatever it no longer needs when
     // the head mode ends (freeing them here thrashed when the speed hovered around kShuttleRate).
@@ -451,6 +460,7 @@ void LowCachedDecoderManager::enterShuttleMode() {
 
 void LowCachedDecoderManager::exitShuttleMode() {
     inShuttleMode_ = false;
+    headActive_.store(false, std::memory_order_release);
     // Keep the last few head frames — the picture at the stop point. The display keeps showing
     // the head frame (shuttleSlot) until the exact frame or the full-res one is there, instead
     // of freezing on a stale picture while the segment and full-res buffers refill.
@@ -480,6 +490,7 @@ void LowCachedDecoderManager::shuttleStep(int current) {
         if (dt > 0.0) {
             double v = (current - shuttleLastFrame_) / dt;
             shuttleVelocity_ = (shuttleVelocity_ == 0.0) ? v : 0.6 * shuttleVelocity_ + 0.4 * v;
+            shuttleInstVelocity_ = v;
         }
         shuttleLastFrame_ = current;
         shuttleLastTime_ = now;
@@ -490,7 +501,11 @@ void LowCachedDecoderManager::shuttleStep(int current) {
         f = std::clamp(f, 0, lastFrame);
         if (k > 0 && f == current) break;   // no velocity yet
         const int slot = toSlot(f);
-        if (std::find(shuttleSlots_.begin(), shuttleSlots_.end(), slot) != shuttleSlots_.end()) continue;
+        if (std::find(shuttleSlots_.begin(), shuttleSlots_.end(), slot) != shuttleSlots_.end()) {
+            // Already read (ahead, below): it is the head's frame now
+            if (k == 0) shuttleShownSlot_.store(slot, std::memory_order_release);
+            continue;
+        }
         auto t0 = std::chrono::steady_clock::now();
         bool ok = decodeFrameNow(f);
         static const bool stats = std::getenv("FSTP_RENDER_STATS") != nullptr;
@@ -508,7 +523,31 @@ void LowCachedDecoderManager::shuttleStep(int current) {
         if (ok) {
             shuttleSlots_.push_back(slot);
             shuttleShownSlot_.store(slot, std::memory_order_release);
+            { std::lock_guard<std::mutex> g(headMtx_); }
+            headCv_.notify_all();   // a display waiting for this frame (waitHead)
             if (k == 0 && instanceId_ >= 0) NotifyVideoFrameUpdate(instanceId_);   // show it now
+        }
+    }
+
+    // Slow (below ~120 frames/s, about 2.4× at 50 fps): also read the next frames in the direction
+    // of travel, so each is there when the playhead reaches it. Read only on demand, it came 1–4
+    // frames late — 16–33 ms on the Mac (VideoToolbox), 1–2 frames on the GPD — and the picture
+    // lagged, then jumped, mostly while the tape ran down after a shuttle. Judged by the last
+    // sample, not the smoothed velocity: that one stays high for a while after a fast shuttle,
+    // just when the tape is slowing. Each frame is still read once (it stays in shuttleSlots_),
+    // so this costs nothing at a steady speed; faster, the display skips frames anyway.
+    const double speedFps = std::abs(shuttleInstVelocity_);
+    if (speedFps > 0.0 && speedFps < 120.0) {
+        const int dir = (shuttleInstVelocity_ > 0.0) ? 1 : -1;
+        for (int k = 1; k <= 3 && !stopRequested_.load(); ++k) {
+            const int f = std::clamp(current + dir * k, 0, lastFrame);
+            const int slot = toSlot(f);
+            if (std::find(shuttleSlots_.begin(), shuttleSlots_.end(), slot) != shuttleSlots_.end()) continue;
+            if (decodeFrameNow(f)) {
+                shuttleSlots_.push_back(slot);   // not shown yet
+                { std::lock_guard<std::mutex> g(headMtx_); }
+                headCv_.notify_all();
+            }
         }
     }
 

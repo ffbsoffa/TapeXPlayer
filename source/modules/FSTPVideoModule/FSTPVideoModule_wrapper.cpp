@@ -1511,6 +1511,10 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
 
     int clamped = std::max(0, std::min(frame_number, static_cast<int>(m_frame_index->GetTotalFrames()) - 1));
     m_current_index.store(clamped);
+    // The shuttle head reads the frame under the new playhead at once, not at its next poll
+    if (FSTP::LowCachedDecoderManager* head_mgr = ProxyManager()) {
+        if (head_mgr->headActive()) head_mgr->wakeHead();
+    }
 
     // Get frame info from simple index
     const SimpleFrameInfo* frame_info = m_frame_index->GetFrameInfo(clamped);
@@ -1821,6 +1825,20 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             std::shared_ptr<AVFrame> proxyFrame;
             if (proxy_off == 0) {
                 proxyFrame = info.low_res_frame;          // same slot — already locked above
+                // Slow, in the head mode, the exact frame is a millisecond or so away: wait for it
+                // (up to 6 ms) rather than show the head's previous frame, 1–2 frames short, and
+                // jump a moment later. The slot lock is let go meanwhile — the head writes there.
+                if ((!proxyFrame || !proxyFrame->data[0]) && proxy_mgr && proxy_mgr->headActive() &&
+                    std::abs(actual_speed) < 2.0) {
+                    auto& slot = info;
+                    lock.unlock();
+                    proxy_mgr->waitHead([&slot] {
+                        std::unique_lock<std::mutex> l(slot.mutex, std::try_to_lock);
+                        return l.owns_lock() && slot.low_res_frame && slot.low_res_frame->data[0];
+                    }, std::chrono::milliseconds(6));
+                    if (!lock.try_lock()) return;
+                    proxyFrame = info.low_res_frame;
+                }
             } else {
                 // Different slot → grab its frame under try_lock; the shared_ptr copy keeps it
                 // alive after the lock is released (no nested-lock lifetime issue).
