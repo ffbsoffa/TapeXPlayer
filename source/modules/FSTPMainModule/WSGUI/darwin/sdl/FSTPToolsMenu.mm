@@ -871,7 +871,7 @@ static void ShowMemoryLocationDialog(int active_player);
 }
 
 - (void)presentationModeAction:(id)sender {
-    ShowPresentationMode();
+    TogglePresentationMode();
 }
 
 - (void)showMemoryLocationsAction:(id)sender {
@@ -1174,43 +1174,6 @@ bool IsMemoryLocationDialogActive() {
 // PRESENTATION MODE
 // ============================================================================
 
-void ShowPresentationMode() {
-    if (IsPresentationWindowActive()) {
-        ClosePresentationWindow();
-        NSLog(@"✅ [PRESENTATION] Mode deactivated");
-        return;
-    }
-
-    // Settings drive everything — no per-launch modal (display/output-mode/focus are chosen once in
-    // Settings ▸ Presentation). Output is always clean (no OSD / indicators / cursor). External mode
-    // with no external display falls back to a separate window inside CreatePresentationWindow, so
-    // the user is never blocked by a "connect a display" wall.
-    int output_mode   = GetPresentationOutputMode();   // 0 = external, 1 = separate window
-    int display       = GetPresentationDisplayIndex(); // -1 = auto (first external)
-    int display_count = SDL_GetNumVideoDisplays();
-
-    if (CreatePresentationWindow(-1, output_mode, display)) {
-        if (output_mode == 0 && display_count > 1) {
-            NSLog(@"✅ [PRESENTATION] Activated on external display %d", (display >= 1 ? display : 1));
-        } else {
-            NSLog(@"✅ [PRESENTATION] Activated in windowed mode");
-        }
-    } else {
-        NSLog(@"❌ [PRESENTATION] Activation failed");
-    }
-}
-
-void TogglePresentationMode() {
-    if (IsPresentationWindowActive()) {
-        ClosePresentationWindow();
-        NSLog(@"✅ [PRESENTATION] Mode deactivated");
-    } else {
-        ShowPresentationMode();
-    }
-}
-
-bool IsPresentationModeActive() {
-    return IsPresentationWindowActive();
-}
+// Shift+P, the Tools menu item and the toggle live in FSTPWindowManager.cpp, shared with Linux.
 
 #endif // __APPLE__

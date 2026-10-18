@@ -1892,6 +1892,25 @@ const char* FSTP_GetPresentationDisplayName(int idx) {
     return name ? name : "Display";
 }
 
+// The same on every platform (it lived in the macOS menu code, and Shift+P did nothing on Linux).
+// No question per launch: Settings ▸ Presentation chose everything once. External output with no
+// second display opens a separate window (CreatePresentationWindow), so a single screen never
+// blocks it.
+void TogglePresentationMode(void) {
+    if (IsPresentationWindowActive()) {
+        ClosePresentationWindow();
+        std::cout << "✅ [PRESENTATION] Mode deactivated" << std::endl;
+        return;
+    }
+    if (!CreatePresentationWindow(-1, GetPresentationOutputMode(), GetPresentationDisplayIndex())) {
+        std::cerr << "❌ [PRESENTATION] Activation failed" << std::endl;
+    }
+}
+
+bool IsPresentationModeActive(void) {
+    return IsPresentationWindowActive();
+}
+
 void FSTP_ReapplyPresentationIfActive(void) {
     // Always refresh the follow/pin behaviour so the next activation honours the latest Settings.
     g_presentation.follow_focus  = GetPresentationFollowFocus() != 0;

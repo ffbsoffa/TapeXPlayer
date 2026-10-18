@@ -159,6 +159,10 @@ const char* FSTP_GetPresentationDisplayName(int idx);
 // Re-apply the presentation output target if presentation is currently active — called after a
 // Settings change so display/output-mode edits take effect live.
 void FSTP_ReapplyPresentationIfActive(void);
+// Shift+P and the menus, on every platform: on if off, off if on. Settings ▸ Presentation decides
+// the output, display and source.
+void TogglePresentationMode(void);
+bool IsPresentationModeActive(void);
 
 #ifdef __cplusplus
 }  // end extern "C"

@@ -636,13 +636,7 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                     // Shift+P - Presentation Mode. P itself does nothing: playback starts with
                     // Space only (the author's word, 18.10; P and Cmd+P used to start it too)
                     if (event.key.keysym.mod & KMOD_SHIFT) {
-#ifdef __APPLE__
-                        TogglePresentationMode();
-#else
-                        // TODO(linux/windows): presentation mode is implemented only
-                        // in the darwin backend (FSTPToolsMenu.mm) — without this stub
-                        // the Linux/Windows link failed.
-#endif
+                        TogglePresentationMode();   // shared (FSTPWindowManager.cpp)
                     }
                     break;
 
