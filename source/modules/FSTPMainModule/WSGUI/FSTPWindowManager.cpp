@@ -46,6 +46,23 @@ std::atomic<int> g_texture_skip_counter{0};
 // Debug control: set to true to enable verbose logging
 static constexpr bool ENABLE_WINDOW_MANAGER_DEBUG = false;
 
+// The part of a frame a zoom shows: the source rectangle, kept inside the frame. False when the
+// window shows the whole frame. The player window and the presentation output both draw it, so
+// the audience sees the close-up the operator sees.
+static bool ZoomSourceRect(const FSTPZoomState* zoom, int frame_w, int frame_h, SDL_Rect* out) {
+    if (!zoom || !zoom->enabled || zoom->factor <= 1.0f || frame_w <= 0 || frame_h <= 0) return false;
+    int src_w = (int)(frame_w / zoom->factor);
+    int src_h = (int)(frame_h / zoom->factor);
+    int src_x = (int)(frame_w * zoom->center_x) - src_w / 2;
+    int src_y = (int)(frame_h * zoom->center_y) - src_h / 2;
+    if (src_x < 0) src_x = 0;
+    if (src_y < 0) src_y = 0;
+    if (src_x + src_w > frame_w) src_x = frame_w - src_w;
+    if (src_y + src_h > frame_h) src_y = frame_h - src_h;
+    *out = {src_x, src_y, src_w, src_h};
+    return true;
+}
+
 // Counting rectangle with preserving aspect ratio (letterbox/pillarbox)
 static SDL_Rect ComputeAspectFitRect(int texture_width, int texture_height, int target_width, int target_height) {
     SDL_Rect dst = {0, 0, target_width, target_height};
@@ -1097,24 +1114,9 @@ void RenderAllWindows() {
                         // Apply zoom if enabled for this window
                         FSTPZoomState* zoom_state = GetZoomState(i);
                         SDL_Rect src_rect_for_zoom = {0, 0, pixel_buffer->width, pixel_buffer->height};
-                        SDL_Rect* src_rect_ptr = nullptr;
-
-                        if (zoom_state && zoom_state->enabled && zoom_state->factor > 1.0f) {
-                            // Calculate zoomed source rectangle for zooming
-                            int src_w = (int)(pixel_buffer->width / zoom_state->factor);
-                            int src_h = (int)(pixel_buffer->height / zoom_state->factor);
-                            int src_x = (int)(pixel_buffer->width * zoom_state->center_x) - src_w / 2;
-                            int src_y = (int)(pixel_buffer->height * zoom_state->center_y) - src_h / 2;
-
-                            // Clamp to texture bounds
-                            if (src_x < 0) src_x = 0;
-                            if (src_y < 0) src_y = 0;
-                            if (src_x + src_w > pixel_buffer->width) src_x = pixel_buffer->width - src_w;
-                            if (src_y + src_h > pixel_buffer->height) src_y = pixel_buffer->height - src_h;
-
-                            src_rect_for_zoom = {src_x, src_y, src_w, src_h};
-                            src_rect_ptr = &src_rect_for_zoom;
-                        }
+                        SDL_Rect* src_rect_ptr =
+                            ZoomSourceRect(zoom_state, pixel_buffer->width, pixel_buffer->height, &src_rect_for_zoom)
+                                ? &src_rect_for_zoom : nullptr;
 
                         // Try HSync loss effect rendering first (only when no zoom active)
                         bool hsync_rendered = false;
@@ -1420,6 +1422,18 @@ void RenderAllWindows() {
                     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
                     SDL_RenderClear(renderer);
 
+                    // The operator's close-up: the zoom of the player window this output follows (the
+                    // thumbnail with its red frame stays the operator's — service, never shown here)
+                    SDL_Rect zoom_src{};
+                    SDL_Rect* zoom_src_ptr = nullptr;
+                    for (int w = 0; w < MAX_WINDOWS; w++) {
+                        if (g_windows[w].is_active && !g_windows[w].is_closing &&
+                            g_windows[w].player_instance_id == player_id) {
+                            if (ZoomSourceRect(GetZoomState(w), pb->width, pb->height, &zoom_src)) zoom_src_ptr = &zoom_src;
+                            break;
+                        }
+                    }
+
                     bool hsync_applied = false;
                     if (g_pixel_buffer_manager) {
                         FSTPBetacamEffect::RenderContext rctx;
@@ -1431,11 +1445,14 @@ void RenderAllWindows() {
                         rctx.frame_number        = pb->frame_number;
                         rctx.new_frame           = false; // mirror: don't advance state
                         g_pixel_buffer_manager->ApplyRenderJitter(player_id, rctx);
-                        hsync_applied = g_pixel_buffer_manager->RenderWithHsync(
-                            player_id, renderer, tex, pb->width, pb->height, dst);
+                        // HSync loss draws the whole frame only, as in the player window
+                        if (!zoom_src_ptr) {
+                            hsync_applied = g_pixel_buffer_manager->RenderWithHsync(
+                                player_id, renderer, tex, pb->width, pb->height, dst);
+                        }
                     }
                     if (!hsync_applied)
-                        SDL_RenderCopy(renderer, tex, nullptr, &dst);
+                        SDL_RenderCopy(renderer, tex, zoom_src_ptr, &dst);
 
                     SDL_RenderPresent(renderer);
                     g_presentation.last_timestamp = pb->timestamp;
