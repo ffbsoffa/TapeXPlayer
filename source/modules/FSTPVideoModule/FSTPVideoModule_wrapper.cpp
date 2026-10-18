@@ -1589,6 +1589,10 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     // Whether the displayed frame came from the full-res V2 decoder (the ground truth used
     // by the proxy-offset auto-calibration further down).
     bool shown_is_v2 = false;
+    // FSTP_SWITCH_LOG: which source frame actually goes on screen, against the requested one
+    int diag_content = -1;
+    const char* diag_kind = "none";
+    const double diag_fps = (m_frame_rate > 0.0) ? m_frame_rate : 25.0;
 
     // Use the NOMINAL time of frame `clamped` (frame_number/fps from SimpleIndex) for the V2
     // query — the SAME reference the V2 sync-check validates against, and the same the proxy is
@@ -1648,6 +1652,8 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         if (actual_speed < 0.05 && same_timestamp && m_v2_cached_frame) {
             frame = m_v2_cached_frame;
             shown_is_v2 = true;
+            diag_content = static_cast<int>(std::lround(m_v2_cached_timestamp * diag_fps));
+            diag_kind = "full(pause cache)";
         } else {
             // Get shared_ptr copy from buffer (safe - extends frame lifetime)
             frame = m_full_res_decoder->GetFrameForTime(timestamp);
@@ -1697,6 +1703,8 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                             frame = m_v2_cached_frame;
                             v2_held = true;
                             shown_is_v2 = true;
+                            diag_content = static_cast<int>(std::lround(m_v2_cached_timestamp * diag_fps));
+                            diag_kind = "full(held)";
                         } else {
                             frame = nullptr;
                             m_v2_cached_frame = nullptr;
@@ -1710,6 +1718,9 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                     m_v2_cached_frame = frame;
                     m_v2_cached_timestamp = timestamp;
                     shown_is_v2 = true;
+                    const double t = m_full_res_decoder->GetLastFrameTime();
+                    diag_content = t >= 0.0 ? static_cast<int>(std::lround(t * diag_fps)) : -1;
+                    diag_kind = "full";
                 }
             }
         }
@@ -1823,7 +1834,16 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             if ((!proxyFrame || !proxyFrame->data[0]) && proxy_mgr && proxy_mgr->shuttleSlot() >= 0) {
                 const int head_slot = proxy_mgr->shuttleSlot();
                 const double fps = (m_frame_rate > 0.0) ? m_frame_rate : 25.0;
-                const int window = std::max(8, static_cast<int>(std::ceil(std::abs(actual_speed) * fps * 0.05)));
+                // Running fast, a head frame a few frames off is what motion looks like. Slow or
+                // standing, it is a wrong picture: a head frame 4–8 frames behind the stop showed for
+                // a moment and then jumped when the exact or the full-res frame came — the visible
+                // proxy→full-res shift after a sharp shuttle. There the head frame stands in only
+                // when it is the frame itself (standing) or its neighbour (slow); otherwise the
+                // previous picture stays until the exact one is decoded, a few ms later.
+                const double abs_speed_now = std::abs(actual_speed);
+                const int window = (abs_speed_now < 0.05) ? 0
+                                 : (abs_speed_now < 1.05) ? 1
+                                 : std::max(3, static_cast<int>(std::ceil(abs_speed_now * fps * 0.05)));
                 if (head_slot >= 0 && head_slot < static_cast<int>(frame_vector->size()) &&
                     std::abs(head_slot - actual_index) <= window) {
                     std::unique_lock<std::mutex> head_lock((*frame_vector)[head_slot].mutex, std::try_to_lock);
@@ -1872,6 +1892,13 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
 
                 if (pts_valid) {
                     frame = proxyFrame;
+                    if (shuttle_substitute) {
+                        diag_content = proxy_mgr->shuttleSlot();
+                        diag_kind = "proxy(head substitute)";
+                    } else {
+                        diag_content = frame_time >= 0.0 ? static_cast<int>(std::lround(frame_time * diag_fps)) : -1;
+                        diag_kind = "proxy";
+                    }
                     if (debug_call_count <= 5) {
                         std::cout << "[VIDEO] Using low_res_frame (proxy) for frame " << clamped
                                   << " (slot " << pidx << ", offset " << proxy_off << ")"
@@ -2372,6 +2399,13 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         if (prev_frame) m_cached_prev_adjacent = prev_frame;
         if (!next_frame) next_frame = m_cached_next_adjacent;
         if (!prev_frame) prev_frame = m_cached_prev_adjacent;
+    }
+
+    static const bool switch_log = std::getenv("FSTP_SWITCH_LOG") != nullptr;
+    if (switch_log && frame && diag_content >= 0 && diag_content != clamped && std::abs(actual_speed) < 1.5) {
+        std::printf("⚠️ [SHOWN] requested frame %d, on screen %s frame %d (%+d) | speed %.2f\n",
+                    clamped, diag_kind, diag_content, diag_content - clamped, actual_speed);
+        std::fflush(stdout);
     }
 
     // Submit real decoded frame to texture interface (with adjacent frames for compositing)

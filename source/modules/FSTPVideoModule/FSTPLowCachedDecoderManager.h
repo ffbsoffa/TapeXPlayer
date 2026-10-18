@@ -131,6 +131,8 @@ private:
     std::atomic<int> shuttleShownSlot_{-1};
     std::atomic<bool> segmentLoadInProgress_{false};
     std::chrono::steady_clock::time_point shuttleLastFast_{};   // last time the tape ran ≥ hold rate
+    int shuttleLastPlayhead_ = -1;                               // playhead at the last loop pass
+    std::chrono::steady_clock::time_point shuttleLastMove_{};   // last time the playhead moved
 
     // Private methods
     void loadSegment(int segmentIndex);   // Declaration added

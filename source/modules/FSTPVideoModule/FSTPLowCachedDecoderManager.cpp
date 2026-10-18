@@ -27,6 +27,12 @@ static constexpr double kShuttleRate = 2.0;        // from here up: decode what 
 // then had to wait out — the picture froze on every reversal and stop.
 static constexpr double kShuttleHoldRate = 1.05;
 static constexpr auto   kShuttleExitGrace = std::chrono::milliseconds(400);
+// ...and only once the playhead has stood still this long. After a sharp shuttle the tape runs
+// down for longer than the grace above (the requested speed is already 0, the tape still moves);
+// leaving the head mode then left its last frame 6–8 frames short of where the tape stopped, and
+// that frame stood on screen until the full-res one replaced it — the visible jump at the
+// proxy→full-res switch. Kept while the playhead moves, the head reads the stop frame itself.
+static constexpr auto   kShuttleSettle = std::chrono::milliseconds(150);
 static constexpr size_t kShuttleKeepOnExit = 8;    // last head frames kept to bridge the stop
 static constexpr int    kShuttleLookahead = 0;     // display ticks predicted ahead of the playhead
 static constexpr double kShuttleDisplayRate = 60.0;
@@ -183,8 +189,16 @@ void LowCachedDecoderManager::decodingLoop() {
         // FSTP_SHUTTLE_SEGMENTS=1 keeps the old segment prefetch at shuttle speed (A/B comparison).
         static const bool shuttle_on_demand = std::getenv("FSTP_SHUTTLE_SEGMENTS") == nullptr;
         const auto loopNow = std::chrono::steady_clock::now();
+        if (inShuttleMode_) {
+            const int playheadNow = currentFrame_.load();
+            if (playheadNow != shuttleLastPlayhead_) {
+                shuttleLastPlayhead_ = playheadNow;
+                shuttleLastMove_ = loopNow;
+            }
+        }
         const bool keepHead = inShuttleMode_ &&
-            (currentRate >= kShuttleHoldRate || loopNow - shuttleLastFast_ < kShuttleExitGrace);
+            (currentRate >= kShuttleHoldRate || loopNow - shuttleLastFast_ < kShuttleExitGrace ||
+             loopNow - shuttleLastMove_ < kShuttleSettle);
         if (shuttle_on_demand && (currentRate >= kShuttleRate || keepHead) &&
             currentRate < speed_threshold.load() && decoder_) {
             if (!inShuttleMode_) enterShuttleMode();
@@ -426,6 +440,8 @@ void LowCachedDecoderManager::decodingLoop() {
 
 void LowCachedDecoderManager::enterShuttleMode() {
     inShuttleMode_ = true;
+    shuttleLastPlayhead_ = currentFrame_.load();
+    shuttleLastMove_ = std::chrono::steady_clock::now();
     shuttleLastFrame_ = -1;
     shuttleVelocity_ = 0.0;
     shuttleLastFast_ = std::chrono::steady_clock::now();

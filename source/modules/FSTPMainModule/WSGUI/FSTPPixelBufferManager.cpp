@@ -216,6 +216,19 @@ bool FSTPPixelBufferManager::SubmitAVFrame(int player_id, std::shared_ptr<AVFram
                                   last.timestamp == timestamp && last.frame_number == frame_number &&
                                   last.width == av_frame->width && last.height == av_frame->height;
         if (!same_picture) {
+            // FSTP_SWITCH_LOG=1: each change between the proxy and the full picture, against the
+            // playback position. The frame numbers are the ones requested; what actually went on
+            // screen is logged by the video module ("[SHOWN]", FSTPVideoModule_wrapper.cpp).
+            static const bool switch_log = getenv("FSTP_SWITCH_LOG") != nullptr;
+            if (switch_log && last.height != 0 && last.height != av_frame->height) {
+                const double fps = metrics.frame_rate > 0 ? metrics.frame_rate : 25.0;
+                std::printf("🔀 [SWITCH] player %d %dp→%dp | requested before: frame %d ts %.4f | after: frame %d ts %.4f | "
+                            "position %.4f s = frame %.2f | speed %.2f\n",
+                            player_id, last.height, av_frame->height, last.frame_number, last.timestamp,
+                            frame_number, timestamp, metrics.position_seconds,
+                            metrics.position_seconds * fps, metrics.playback_rate);
+                std::fflush(stdout);
+            }
             last.frame = av_frame.get();
             last.data = av_frame->data[0];
             last.timestamp = timestamp;
