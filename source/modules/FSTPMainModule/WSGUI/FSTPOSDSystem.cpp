@@ -194,7 +194,13 @@ std::string generateTimecode(double currentTime, int player_id = 0) {
         } else {
             // For video files: HH:MM:SS:FF (frames) - use REAL file FPS!
             double fps = (data.fps > 0.0) ? data.fps : 25.0; // Use real FPS or fallback to PAL
-            int frames = (int)((currentTime - (int)currentTime) * fps);
+            // A millionth of a frame up, as marker timecodes do (SecondsToTimecode): an exact
+            // frame position like 29/25 s is stored as 1.1599999… and must not show frame 3
+            double t = currentTime + 1e-6 / fps;
+            hours = (int)(t / 3600);
+            minutes = (int)((t - hours * 3600) / 60);
+            seconds = (int)(t - hours * 3600 - minutes * 60);
+            int frames = (int)((t - (int)t) * fps);
             snprintf(timecode, sizeof(timecode), "%02d:%02d:%02d:%02d", hours, minutes, seconds, frames);
         }
     }
