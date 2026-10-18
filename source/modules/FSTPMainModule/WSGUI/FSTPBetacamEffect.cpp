@@ -156,10 +156,27 @@ void FSTPBetacamEffect::RequestDropoutBurst(int player_id, DropoutKind kind) {
     if (player_id < 0 || player_id >= kMaxPlayers) {
         return;
     }
+    // Play after a fast wind only, and not every time: a real deck shows dropouts as it locks
+    // into play after a fast wind. So the request is taken only when the tape ran ≥ 3× within
+    // the last 5 s, about one time in three, at most once in 3 s (the author, 19.10). Decided
+    // here, not on the effect thread: a queued request runs the effect at 1× for that frame.
+    PlayerState& s = m_players[player_id];
+    const auto now = std::chrono::steady_clock::now();
+    const bool after_shuttle = s.last_fast_shuttle.time_since_epoch().count() != 0 &&
+                               now - s.last_fast_shuttle < std::chrono::seconds(5);
+    const bool rested = s.last_doc_burst.time_since_epoch().count() == 0 ||
+                        now - s.last_doc_burst > std::chrono::seconds(3);
+    static std::minstd_rand rng{std::random_device{}()};   // the keyboard thread only
+    if (!after_shuttle || !rested || std::uniform_int_distribution<int>(1, 3)(rng) != 1) {
+        return;
+    }
+    s.last_doc_burst = now;
+    std::printf("🎞️ [BETACAM] dropout burst: playing after a fast shuttle\n");
+    std::fflush(stdout);
     // One-shot flag carrying the kind; the burst itself (alternation, rare extended duration,
     // RNG) is started inside ApplyPixelFX on the effect thread. Plain write — consistent with
     // the rest of PlayerState's cross-thread fields; a missed/duplicated trigger is harmless.
-    m_players[player_id].doc_request = static_cast<int>(kind);
+    s.doc_request = static_cast<int>(kind);
 }
 
 bool FSTPBetacamEffect::HasPendingDropout(int player_id) const {
@@ -326,6 +343,8 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
 
     const double currentPlaybackRate = metrics.playback_rate;
     const double rawPlaybackRate = std::abs(currentPlaybackRate);
+    // A fast shuttle (≥ 3×), for the dropout burst on playing after it (below)
+    if (rawPlaybackRate >= 3.0) state.last_fast_shuttle = std::chrono::steady_clock::now();
     // Use file-relative position: position_seconds includes timecode offset, duration_seconds does not.
     const double currentTime = metrics.position_seconds - metrics.timecode_offset_seconds;
     const double totalDuration = metrics.duration_seconds;
@@ -377,11 +396,12 @@ bool FSTPBetacamEffect::ApplyPixelFX(int player_id, FrameContext& frame_ctx) {
     state.was_slow_motion = isSlowMotion;
 
     // === DROPOUT-COMPENSATION (DOC) BURST ===
-    // Started via RequestDropoutBurst() from outside: the resume-from-pause key (spacebar)
-    // and proxy↔full-res source switches (both detected in FSTPPixelBufferManager, which sees
-    // every frame's resolution even at 1× where this effect is otherwise gated off). Each
-    // trigger alternates aggressive (heavy bands) ↔ light (thin lines), and RARELY produces an
-    // extended (longer-lived) dropout. Lifetime is wall-clock based so it's frame-rate independent.
+    // Started via RequestDropoutBurst() from outside: Space going into play after a fast wind
+    // (from pause, or straight from the wind), and only sometimes — RequestDropoutBurst decides.
+    // It used to fire on every resume, on every proxy↔full-res switch and every 2× crossing, so
+    // going back and forth in shuttle kept flashing it. Each burst alternates aggressive (heavy
+    // bands) ↔ light (thin lines), and RARELY produces an extended (longer-lived) dropout.
+    // Lifetime is wall-clock based so it's frame-rate independent.
     bool   docActive = false;
     double docIntensity = 0.0;
     {

@@ -299,6 +299,8 @@ private:
         bool doc_exit_heavy = true;                            // alternates heavy/light on switches
         bool doc_gentle = false;                               // true = soft form (pause-exit)
         int  doc_request = 0;                                  // one-shot kind (0 none / 1 gentle / 2 alt)
+        std::chrono::steady_clock::time_point last_fast_shuttle{};   // last time the tape ran ≥ 3×
+        std::chrono::steady_clock::time_point last_doc_burst{};      // last dropout burst started
 
         // Compositing direction tracking - prevents visual "flip" on rapid direction changes
         // Only updates when a new frame actually arrives, not on playback_rate sign change

@@ -693,25 +693,9 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                     bool speed_in_effect_range = (abs_rate < 0.9 || abs_rate >= 1.2) ||
                                                  (abs_rate >= 0.9 && abs_rate <= 1.1 && metrics.is_reverse);
 
-                    // EXPERIMENT: fire a DOC dropout on proxy↔full-res source switches. Detect
-                    // here — the manager sees every frame's resolution even at 1×, where the
-                    // effect is otherwise gated off — by the height crossing the proxy/full-res
-                    // boundary (proxy ≤480p, full-res >480p). Only at the flip; settled → nothing.
-                    int is_full_res = (buffer->height > 480) ? 1 : 0;
-                    if (m_last_full_res[player_id] >= 0 && is_full_res != m_last_full_res[player_id]) {
-                        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Alternating);
-                    }
-                    m_last_full_res[player_id] = is_full_res;
-
-                    // Start a touch EARLIER than the actual resolution flip: the full-res decoder
-                    // is stopped/resumed at the 2× boundary, so the proxy↔full-res switch happens
-                    // around there. Firing on the speed crossing 2× (either direction) makes the
-                    // dropout lead the visible switch slightly → a more graceful transition.
-                    int is_shuttle = (abs_rate >= 2.0) ? 1 : 0;
-                    if (m_last_shuttle[player_id] >= 0 && is_shuttle != m_last_shuttle[player_id]) {
-                        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Alternating);
-                    }
-                    m_last_shuttle[player_id] = is_shuttle;
+                    // No dropout bursts on proxy↔full-res switches or 2× crossings any more: going
+                    // back and forth in shuttle kept flashing them. A burst comes only on playing
+                    // after a fast shuttle (FSTPBetacamEffect, the DOC burst).
 
                     // Run the effect even at 1× while a DOC burst is queued/active, so dropouts
                     // are visible at normal speed too (otherwise speed_in_effect_range gates it off).

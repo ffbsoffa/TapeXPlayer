@@ -603,6 +603,10 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                                 SetInstanceSpeed(active_player_id, 1.0);
                                 HandleSpeedControl(active_player_id, 1.0);
                                 std::cout << "Player " << active_player_id << ": Speed reset to 1x during rewind" << std::endl;
+                                // Straight from a wind into play → maybe a dropout burst (the effect decides).
+                                if (auto* pbm = GetPixelBufferManager()) {
+                                    pbm->TriggerDropoutBurst(active_player_id);
+                                }
                             } else {
                                 // If speed = 1x - pause (second space)
                                 PauseInstance(active_player_id);
@@ -619,7 +623,7 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                                 // If speed = 1x - start playback
                                 PlayInstance(active_player_id);
                                 HandlePlaybackControl(active_player_id, "Playing");
-                                // Resume from pause → fire a Betacam dropout-compensation burst.
+                                // Resume from pause → maybe a dropout burst, if a fast wind came just before.
                                 if (auto* pbm = GetPixelBufferManager()) {
                                     pbm->TriggerDropoutBurst(active_player_id);
                                 }
