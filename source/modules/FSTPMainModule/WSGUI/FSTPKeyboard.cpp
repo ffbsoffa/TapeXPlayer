@@ -633,7 +633,8 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                     break;
 
                 case SDLK_p:
-                    // Shift+P - Presentation Mode
+                    // Shift+P - Presentation Mode. P itself does nothing: playback starts with
+                    // Space only (the author's word, 18.10; P and Cmd+P used to start it too)
                     if (event.key.keysym.mod & KMOD_SHIFT) {
 #ifdef __APPLE__
                         TogglePresentationMode();
@@ -642,10 +643,6 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                         // in the darwin backend (FSTPToolsMenu.mm) — without this stub
                         // the Linux/Windows link failed.
 #endif
-                    } else if (active_player_id >= 0) {
-                        // P - Play
-                        PlayInstance(active_player_id);
-                        HandlePlaybackControl(active_player_id, "Play");
                     }
                     break;
 
