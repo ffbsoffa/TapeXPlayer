@@ -1589,6 +1589,9 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     // Whether the displayed frame came from the full-res V2 decoder (the ground truth used
     // by the proxy-offset auto-calibration further down).
     bool shown_is_v2 = false;
+    // The proxy slot of the picture on screen (a head substitute is another slot): the Betacam
+    // neighbours are taken around it, not around the requested one
+    int proxy_base_slot = actual_index;
     // FSTP_SWITCH_LOG: which source frame actually goes on screen, against the requested one
     int diag_content = -1;
     const char* diag_kind = "none";
@@ -1895,6 +1898,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                     if (shuttle_substitute) {
                         diag_content = proxy_mgr->shuttleSlot();
                         diag_kind = "proxy(head substitute)";
+                        proxy_base_slot = diag_content;
                     } else {
                         diag_content = frame_time >= 0.0 ? static_cast<int>(std::lround(frame_time * diag_fps)) : -1;
                         diag_kind = "proxy";
@@ -2185,6 +2189,18 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     }
 
     if (!frame) {
+        // Nothing new to show: the previous picture stays. Standing, that is a wrong frame if it
+        // is not the requested one (the exact frame not decoded yet) — the 1-frame shift at the
+        // proxy→full-res switch would show here.
+        if (std::abs(actual_speed) < 0.05 && m_diag_on_screen >= 0 && m_diag_on_screen != clamped &&
+            (m_diag_logged_request != clamped || m_diag_logged_content != m_diag_on_screen)) {
+            m_diag_logged_request = clamped;
+            m_diag_logged_content = m_diag_on_screen;
+            if (!m_diag_mismatch_open) { m_diag_mismatch_open = true; m_diag_mismatch_since = std::chrono::steady_clock::now(); }
+            std::printf("⚠️ [SHOWN] requested frame %d, nothing new decoded: previous picture frame %d stays (%+d) | speed %.2f\n",
+                        clamped, m_diag_on_screen, m_diag_on_screen - clamped, actual_speed);
+            std::fflush(stdout);
+        }
         return;
     }
 
@@ -2292,9 +2308,14 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         m_cached_adjacent_frame_number = -1;
         m_cached_next_adjacent = nullptr;
         m_cached_prev_adjacent = nullptr;
-    } else if (clamped != m_cached_adjacent_frame_number || shown_is_v2 != m_cached_adjacent_was_v2) {
+    } else if (clamped != m_cached_adjacent_frame_number || shown_is_v2 != m_cached_adjacent_was_v2 ||
+               frame.get() != m_cached_adjacent_base) {
+        // ...or when the picture itself changed under the same frame number (a held full-res frame
+        // gave way to the real one, a head substitute to the exact proxy frame): its neighbours are
+        // not the old picture's
         m_cached_adjacent_frame_number = clamped;
         m_cached_adjacent_was_v2 = shown_is_v2;
+        m_cached_adjacent_base = frame.get();
         m_cached_next_adjacent = nullptr;
         m_cached_prev_adjacent = nullptr;
     }
@@ -2330,8 +2351,8 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
             // match, could return a mismatched set → the seam spike on each new frame).
             try {
                 if (!m_file_reloading.load()) {
-                    std::shared_ptr<AVFrame> triplet_now;
-                    m_full_res_decoder->GetFrameTriplet(timestamp, prev_frame, triplet_now, next_frame);
+                    // Around the frame on screen (it may be a held one), and only true neighbours
+                    m_full_res_decoder->GetNeighbours(frame.get(), prev_frame, next_frame);
                 }
 
                 // Guard against a buffer-edge duplicate (compositing a copy of the current frame
@@ -2357,7 +2378,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                 // are the correct pictures (slot N+offset holds logical frame N).
                 const int proxy_off_adj = m_proxy_frame_offset.load();
                 // Get previous frame (N-1)
-                int prev_idx = actual_index + proxy_off_adj - 1;
+                int prev_idx = proxy_base_slot + proxy_off_adj - 1;
                 if (prev_idx >= 0 && prev_idx < static_cast<int>(frame_vector->size()) && !m_file_reloading.load()) {
                     std::unique_lock<std::mutex> prev_lock((*frame_vector)[prev_idx].mutex, std::try_to_lock);
                     if (prev_lock.owns_lock()) {
@@ -2370,7 +2391,7 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                 }
 
                 // Get next frame (N+1) - use try_lock to avoid blocking
-                int next_idx = actual_index + proxy_off_adj + 1;
+                int next_idx = proxy_base_slot + proxy_off_adj + 1;
                 if (next_idx >= 0 && next_idx < static_cast<int>(frame_vector->size()) && !m_file_reloading.load()) {
                     std::unique_lock<std::mutex> next_lock((*frame_vector)[next_idx].mutex, std::try_to_lock);
                     if (next_lock.owns_lock()) {
@@ -2401,8 +2422,13 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
         if (!prev_frame) prev_frame = m_cached_prev_adjacent;
     }
 
-    static const bool switch_log = std::getenv("FSTP_SWITCH_LOG") != nullptr;
-    if (switch_log && frame && diag_content >= 0 && diag_content != clamped && std::abs(actual_speed) < 1.5) {
+    // Always on (it is quiet unless something is wrong): a picture on screen that is not the
+    // requested frame, slow or standing — what a diagnostic report needs to show a frame shift
+    if (frame && diag_content >= 0 && diag_content != clamped && std::abs(actual_speed) < 1.5 &&
+        (m_diag_logged_request != clamped || m_diag_logged_content != diag_content)) {
+        m_diag_logged_request = clamped;
+        m_diag_logged_content = diag_content;
+        if (!m_diag_mismatch_open) { m_diag_mismatch_open = true; m_diag_mismatch_since = std::chrono::steady_clock::now(); }
         std::printf("⚠️ [SHOWN] requested frame %d, on screen %s frame %d (%+d) | speed %.2f\n",
                     clamped, diag_kind, diag_content, diag_content - clamped, actual_speed);
         std::fflush(stdout);
@@ -2411,6 +2437,15 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
     // Submit real decoded frame to texture interface (with adjacent frames for compositing)
     if (SubmitFrameToTexture(frame, clamped, timestamp, prev_frame, next_frame)) {
         m_last_good_frame_number = clamped;
+        m_diag_on_screen = (diag_content >= 0) ? diag_content : clamped;
+        if (m_diag_mismatch_open && m_diag_on_screen == clamped) {
+            m_diag_mismatch_open = false;
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - m_diag_mismatch_since).count();
+            std::printf("✅ [SHOWN] frame %d on screen (%s) after %.0f ms\n", clamped,
+                        shown_is_v2 ? "full" : "proxy", ms);
+            std::fflush(stdout);
+        }
         if (debug_call_count <= 3) {
             std::cout << "[VIDEO] Submitted real decoded frame " << clamped
                       << " (time=" << std::fixed << std::setprecision(3) << timestamp << "s)"

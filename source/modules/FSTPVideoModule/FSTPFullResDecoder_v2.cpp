@@ -694,6 +694,24 @@ void FSTPFullResDecoderV2::GetFrameTriplet(double now_time,
     if (best + 1 < stream_buffer_.size())      next = stream_buffer_[best + 1].frame;
 }
 
+void FSTPFullResDecoderV2::GetNeighbours(const AVFrame* shown,
+                                         std::shared_ptr<AVFrame>& prev,
+                                         std::shared_ptr<AVFrame>& next) {
+    prev = next = nullptr;
+    if (!shown) return;
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    const double one_frame = (frame_rate_ > 0.0) ? (1.0 / frame_rate_) : 0.04;
+    double t = -1.0;
+    for (const auto& sf : stream_buffer_) {
+        if (sf.frame.get() == shown) { t = sf.time_seconds; break; }
+    }
+    if (t < 0.0) return;   // the shown frame is no longer buffered: no neighbours rather than wrong ones
+    for (const auto& sf : stream_buffer_) {
+        if (std::abs(sf.time_seconds - (t - one_frame)) < one_frame * 0.5) prev = sf.frame;
+        else if (std::abs(sf.time_seconds - (t + one_frame)) < one_frame * 0.5) next = sf.frame;
+    }
+}
+
 void FSTPFullResDecoderV2::ClearBuffer() {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
     stream_buffer_.clear();

@@ -109,6 +109,14 @@ private:
     std::shared_ptr<AVFrame> m_cached_prev_adjacent;
     int m_cached_adjacent_frame_number = -1;
     bool m_cached_adjacent_was_v2 = false;  // source of the cached neighbours (proxy vs full-res)
+    const void* m_cached_adjacent_base = nullptr;  // the picture they are the neighbours of
+    // What is on screen, for the "[SHOWN]" log line: the source frame of the last submitted
+    // picture, and the last mismatch logged (so a held mismatch is logged once, not 60 times/s)
+    int m_diag_on_screen = -1;
+    int m_diag_logged_request = -1;
+    int m_diag_logged_content = -1;
+    bool m_diag_mismatch_open = false;                       // a logged mismatch not yet over
+    std::chrono::steady_clock::time_point m_diag_mismatch_since{};
 
     // Auto-calibrated proxy↔original frame offset. On some sources the proxy's content lags
     // its index by an integer number of frames (e.g. start_time != 0 makes AVAssetReader add

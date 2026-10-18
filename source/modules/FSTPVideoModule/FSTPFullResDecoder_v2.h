@@ -67,6 +67,14 @@ public:
                          std::shared_ptr<AVFrame>& now,
                          std::shared_ptr<AVFrame>& next);
 
+    // The Betacam neighbours of the frame ON SCREEN: found by that frame's identity in the buffer
+    // (a held frame or a cache hit need not be the frame at the requested time), and only frames
+    // really one frame before / after it (after a seek or a catch-up drop the buffer has gaps, so
+    // the next buffer entry may be two frames on). Null when there is no such frame.
+    void GetNeighbours(const AVFrame* shown,
+                       std::shared_ptr<AVFrame>& prev,
+                       std::shared_ptr<AVFrame>& next);
+
     // Get actual timestamp of last frame returned by GetFrameForTime (-1 if none)
     double GetLastFrameTime() const {
         return cached_frame_time_.load(std::memory_order_relaxed);
