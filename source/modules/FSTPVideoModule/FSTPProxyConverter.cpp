@@ -325,8 +325,10 @@ static std::string BuildCommand(const ProxyConverter::Params& p,
     }
 #endif
 
-    if (ss >= 0.0) cmd << " -ss " << std::fixed << std::setprecision(3) << ss;
-    if (dur > 0.0) cmd << " -t "  << std::fixed << std::setprecision(3) << dur;
+    // Microseconds: segment bounds sit half a frame before a frame (ConvertParallel), and at 3
+    // decimals a 29.97 one could round onto a frame's own time
+    if (ss >= 0.0) cmd << " -ss " << std::fixed << std::setprecision(6) << ss;
+    if (dur > 0.0) cmd << " -t "  << std::fixed << std::setprecision(6) << dur;
 
     cmd << " -i \"" << p.inputFilename << "\"";
     cmd << BuildEncodeFlags(p, mode);
@@ -704,6 +706,36 @@ bool ProxyConverter::ConvertParallel(const Params& params, int numSegments)
               << totalDuration << "s" << std::endl;
 
     double segDur = totalDuration / numSegments;
+    // Segment bounds on frame bounds: segment i starts at frame k_i and takes frames k_i … k_{i+1}−1,
+    // its -ss half a frame before k_i and its -t ending half a frame before k_{i+1}. Cut at
+    // i × duration / N, rounded to a millisecond, a bound fell on no frame's edge: the frame at the
+    // bound went into both segments or into neither, and the proxy ran a frame off its original
+    // from there to the next bound — a jump at every proxy ↔ full-res switch and the wrong Betacam
+    // neighbour ("Берегись автомобиля": 46–70 min a frame early, 19.10). Half-fps proxies: k_i even,
+    // so every segment decimates from the same phase.
+    std::vector<double> segStart(numSegments, 0.0), segLen(numSegments, -1.0);
+    {
+        const double fps = params.sourceFps;
+        const long long totalFrames = (fps > 0.0) ? std::llround(totalDuration * fps) : 0;
+        if (totalFrames > numSegments * 2) {
+            std::vector<long long> k(numSegments + 1);
+            for (int i = 0; i <= numSegments; ++i) {
+                k[i] = (i == numSegments) ? totalFrames : (totalFrames * i) / numSegments;
+                if (params.proxyFps > 0.0 && i < numSegments) k[i] -= k[i] % 2;
+            }
+            for (int i = 0; i < numSegments; ++i) {
+                segStart[i] = (i == 0) ? 0.0 : (static_cast<double>(k[i]) - 0.5) / fps;
+                if (i < numSegments - 1) {
+                    segLen[i] = (static_cast<double>(k[i + 1]) - 0.5) / fps - segStart[i];
+                }
+            }
+        } else {
+            for (int i = 0; i < numSegments; ++i) {
+                segStart[i] = i * segDur;
+                segLen[i] = (i == numSegments - 1) ? -1.0 : segDur;
+            }
+        }
+    }
     fs::path tempDir = params.outputPath.parent_path() / "proxy_tmp";
     fs::create_directories(tempDir);
 
@@ -739,8 +771,8 @@ bool ProxyConverter::ConvertParallel(const Params& params, int numSegments)
 
     for (int i = 0; i < numSegments; ++i) {
         threads.emplace_back([&, i]() {
-            double ss     = i * segDur;
-            double dur    = (i == numSegments - 1) ? -1.0 : segDur;
+            double ss     = segStart[i];
+            double dur    = segLen[i];
             double refDur = (dur > 0.0) ? dur : (totalDuration - ss);
 
             // Progress callback for this segment: updates atomic, triggers aggregated report

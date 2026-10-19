@@ -96,7 +96,10 @@ void WriteProxyManifest(const fs::path& proxyPath, const std::string& source,
     //   9 = the source's colour labelled on its frames, not converted (FFmpeg 8+ turned an untagged
     //       original's pixels from BT.601 into BT.709 — a brighter, redder proxy). A schema-8 proxy of
     //       a source that tags its matrix was never converted and stays (ValidateProxyManifest)
-    f << "schema=9\n"
+    //  10 = parallel segments cut on frame bounds (ConvertParallel): cut anywhere, a stretch of the
+    //       proxy could run a frame off its original. A shorter source (< 2 min) is encoded in one
+    //       pass, so its schema-8/9 proxy stays
+    f << "schema=10\n"
       << "src_size="     << static_cast<long long>(sz) << "\n"
       << "src_mtime="    << mt << "\n"
       << "src_duration=" << srcDuration << "\n"
@@ -118,9 +121,12 @@ bool ValidateProxyManifest(const fs::path& proxyPath, const std::string& source)
     // older format/profile (gappy, 480p, half-fps, long-GOP, 432p, low-bitrate, square 540p) → rebuild.
     // Schema 8 differs from 9 only for a source with no colour matrix tag: its proxy's pixels were
     // converted 601 → 709 (see WriteProxyManifest) — rebuilt; any other schema-8 proxy is as 9 makes it
-    if (kv["schema"] == "8") {
-        if (SourceColourMatrixUntagged(source)) return false;
-    } else if (kv["schema"] != "9") {
+    if (kv["schema"] == "8" || kv["schema"] == "9") {
+        double dur = 0.0;
+        try { dur = std::stod(kv["src_duration"]); } catch (...) { return false; }
+        if (dur <= 0.0 || dur >= 120.0) return false;            // made in segments: rebuilt (schema 10)
+        if (kv["schema"] == "8" && SourceColourMatrixUntagged(source)) return false;
+    } else if (kv["schema"] != "10") {
         return false;
     }
 

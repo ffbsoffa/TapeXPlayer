@@ -1704,8 +1704,12 @@ void FSTPVideoModuleWrapper::DisplayFrame(int frame_number) {
                         // proxy). Only a large gap (a real seek) falls through to the proxy. The cache
                         // timestamp is NOT refreshed while holding, so the window stays anchored to the
                         // last genuine V2 frame and a truly stuck V2 still yields to the proxy.
-                        double holdWindow = 6.0 / (m_frame_rate > 0.0 ? m_frame_rate : 25.0);
-                        if (m_v2_cached_frame && m_v2_cached_timestamp >= 0.0 &&
+                        // Within a frame and a half, and only while the tape moves: standing, or off
+                        // by more, the exact proxy frame is the right picture. Six frames held a picture
+                        // 4 off after a stop and froze reverse 1× for frames at a time on long-GOP
+                        // sources, where full-res catches up slowly (the author, 19.10).
+                        double holdWindow = 1.5 / (m_frame_rate > 0.0 ? m_frame_rate : 25.0);
+                        if (m_v2_cached_frame && m_v2_cached_timestamp >= 0.0 && actual_speed >= 0.05 &&
                             std::abs(timestamp - m_v2_cached_timestamp) < holdWindow) {
                             frame = m_v2_cached_frame;
                             v2_held = true;
