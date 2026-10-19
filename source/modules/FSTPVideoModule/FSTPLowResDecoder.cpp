@@ -61,6 +61,19 @@ long long SourceMTimeSeconds(const std::string& source, std::error_code& ec) {
     return std::chrono::duration_cast<std::chrono::seconds>(mt.time_since_epoch()).count();
 }
 
+// The source's video stream says nothing of its colour matrix (or cannot be read)
+bool SourceColourMatrixUntagged(const std::string& source) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, source.c_str(), nullptr, nullptr) != 0) return true;
+    bool untagged = true;
+    if (avformat_find_stream_info(fmt, nullptr) >= 0) {
+        const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (v >= 0) untagged = fmt->streams[v]->codecpar->color_space == AVCOL_SPC_UNSPECIFIED;
+    }
+    avformat_close_input(&fmt);
+    return untagged;
+}
+
 void WriteProxyManifest(const fs::path& proxyPath, const std::string& source,
                         double srcDuration, double srcFps) {
     std::error_code ec;
@@ -80,7 +93,10 @@ void WriteProxyManifest(const fs::path& proxyPath, const std::string& source,
     //   6 = 540p @ ~4.5 kbps/kpx (sharper; Stage 2 seek-per-frame decouples quality from shuttle)
     //   7 = 540p @ ~8 kbps/kpx (higher bitrate to kill blockiness; GOP=4 wants the headroom)
     //   8 = anamorphic 4:3 pixel grid for wide sources (720×540 + DAR, ~25% fewer px → snappier)
-    f << "schema=8\n"
+    //   9 = the source's colour labelled on its frames, not converted (FFmpeg 8+ turned an untagged
+    //       original's pixels from BT.601 into BT.709 — a brighter, redder proxy). A schema-8 proxy of
+    //       a source that tags its matrix was never converted and stays (ValidateProxyManifest)
+    f << "schema=9\n"
       << "src_size="     << static_cast<long long>(sz) << "\n"
       << "src_mtime="    << mt << "\n"
       << "src_duration=" << srcDuration << "\n"
@@ -99,7 +115,14 @@ bool ValidateProxyManifest(const fs::path& proxyPath, const std::string& source)
         auto eq = line.find('=');
         if (eq != std::string::npos) kv[line.substr(0, eq)] = line.substr(eq + 1);
     }
-    if (kv["schema"] != "8") return false;   // older format/profile (gappy, 480p, half-fps, long-GOP, 432p, low-bitrate, square 540p) → rebuild
+    // older format/profile (gappy, 480p, half-fps, long-GOP, 432p, low-bitrate, square 540p) → rebuild.
+    // Schema 8 differs from 9 only for a source with no colour matrix tag: its proxy's pixels were
+    // converted 601 → 709 (see WriteProxyManifest) — rebuilt; any other schema-8 proxy is as 9 makes it
+    if (kv["schema"] == "8") {
+        if (SourceColourMatrixUntagged(source)) return false;
+    } else if (kv["schema"] != "9") {
+        return false;
+    }
 
     std::error_code ec;
     auto sz = fs::file_size(source, ec);

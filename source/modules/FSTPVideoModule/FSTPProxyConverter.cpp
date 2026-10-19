@@ -123,6 +123,15 @@ enum class EncodeMode { FullVT, AME, Software, HWDecode, NVENC, VAAPI, VAAPIUplo
 static std::string BuildEncodeFlags(const ProxyConverter::Params& p, EncodeMode mode) {
     const std::string w = std::to_string(p.proxyWidth);
     const std::string h = std::to_string(p.proxyHeight);
+    // The source's colour, written on its frames before anything else in the filter chain — a label,
+    // not a conversion. The output options below (-colorspace …) only tag the proxy, but FFmpeg 8+
+    // converts the pixels when the frames say something else: an untagged original (read as BT.601)
+    // tagged BT.709 got its pixels converted 601 → 709, while the player shows the original and the
+    // proxy with the same matrix — the proxy came out brighter and redder than the full picture, and
+    // the picture flickered in colour each time one replaced the other (19.10). On VideoToolbox frames
+    // (FullVT) that conversion could not even run: the whole pipeline failed.
+    const std::string label = "setparams=colorspace=" + p.colorSpace + ":color_primaries=" + p.colorPrimaries +
+                              ":color_trc=" + p.colorTrc + ":range=" + p.colorRange + ",";
     // Bitrate ≈ 8 kbps per 1000 px. Bumped 4.5×→8× to kill the blockiness directly (Stage 2
     // seek-per-frame decouples proxy quality from shuttle speed, and GOP=4 spreads bits less
     // efficiently, so it wants the headroom). At 540p (960×540) this gives ~4.1 Mbps. Floor keeps
@@ -137,7 +146,7 @@ static std::string BuildEncodeFlags(const ProxyConverter::Params& p, EncodeMode 
         // No CPU pixel-format conversion; no GPU↔CPU transfer.
         // scale_vt=W:H: VideoToolbox hardware scaler (FFmpeg lavfi filter).
         return
-            " -vf \"scale_vt=" + w + ":" + h + "\""
+            " -vf \"" + label + "scale_vt=" + w + ":" + h + "\""
             " -colorspace "      + p.colorSpace     +
             " -color_primaries " + p.colorPrimaries +
             " -color_trc "       + p.colorTrc       +
@@ -150,7 +159,7 @@ static std::string BuildEncodeFlags(const ProxyConverter::Params& p, EncodeMode 
         // CPU decode + scale → AME encode (independent chip, no CPU cost).
         // NV12: VideoToolbox native pixel format, avoids extra yuv420p→nv12 step.
         // neighbor: nearest-neighbour — fastest CPU downscale, fine for scrubbing proxy.
-        std::string vfilter = "scale=" + w + ":" + h + ":flags=neighbor,format=nv12";
+        std::string vfilter = label + "scale=" + w + ":" + h + ":flags=neighbor,format=nv12";
         return
             " -vf \""            + vfilter + "\""
             " -colorspace "      + p.colorSpace     +
@@ -169,7 +178,7 @@ static std::string BuildEncodeFlags(const ProxyConverter::Params& p, EncodeMode 
         // the CPU and is much faster on NVIDIA GPUs. Falls back to HWDecode/Software
         // automatically if this ffmpeg run exits non-zero (caller retries).
         // p010le/yuv420p: nvenc wants a supported input format after CPU download.
-        std::string vfilter = "scale=" + w + ":" + h + ":flags=neighbor,format=yuv420p";
+        std::string vfilter = label + "scale=" + w + ":" + h + ":flags=neighbor,format=yuv420p";
         return
             " -vf \""            + vfilter + "\""
             " -colorspace "      + p.colorSpace     +
@@ -225,7 +234,7 @@ static std::string BuildEncodeFlags(const ProxyConverter::Params& p, EncodeMode 
         ":keyint=4:min-keyint=4";
 
     // neighbor: nearest-neighbour downscale — fastest CPU option, fine for scrubbing proxy.
-    std::string vfilter = "scale=" + w + ":" + h + ":flags=neighbor,format=yuv420p";
+    std::string vfilter = label + "scale=" + w + ":" + h + ":flags=neighbor,format=yuv420p";
 
     return
         " -vf \""            + vfilter + "\""
