@@ -282,6 +282,9 @@ public:
 
     // Decoding progress
     std::atomic<size_t> decoded_samples{0};
+    // The file's real end (interleaved samples) once a decode has read to the end of the file,
+    // 0 until then: the buffer (total_samples) is 10% longer than the stated duration
+    std::atomic<size_t> end_samples{0};
     std::atomic<size_t> fast_buffer_samples{0}; // Fast buffer size
     std::atomic<bool> fast_buffer_ready{false};
     std::atomic<bool> full_buffer_ready{false};
@@ -1352,9 +1355,11 @@ public:
                     bwd = DecodeToBuffer(filepath, 0, resume_sample, false);
                 }
                 if (bwd > 0) {
-                    // The whole file is now decoded — reset range to full [0, total]
+                    // The whole file is now decoded: the range is [0, its real end]. Not
+                    // total_samples — the buffer is 10% longer than the file, and the play head,
+                    // held at decoded_samples, ran on past the end of picture and sound
                     decode_range_start.store(0);
-                    decoded_samples.store(total_samples);
+                    decoded_samples.store(zone_end + fwd);
                     full_buffer_ready.store(true);
                     std::cout << "[RESUME BG] Phase 2 done. Full buffer ready." << std::endl;
                 }
@@ -1390,6 +1395,7 @@ public:
         total_samples = 0;
         playback_position.store(0.0);
         decoded_samples.store(0);
+        end_samples.store(0);
         fast_buffer_samples.store(0);
         fast_buffer_ready.store(false);
         full_buffer_ready.store(false);
@@ -1711,6 +1717,10 @@ private:
                     }
                 }
             }
+            // Never past the file's real end once a decode has reached it: the buffer is 10%
+            // longer than the file, and the play head ran on there after picture and sound ended
+            const size_t file_end = impl->end_samples.load();
+            if (file_end > 0 && position >= file_end) position = static_cast<double>(file_end - 1);
         }
 
         // Peak Program Meter (PPM) calculation - quasi-peak behavior like Pro Tools/iZotope
@@ -2012,6 +2022,11 @@ private:
     }
 
     // ULTRA-FAST PCM decoder - reads packets directly without codec overhead
+    void NoteFileEnd(size_t end) {
+        if (channels > 1) end -= end % channels;
+        if (end > 0) end_samples.store(end);
+    }
+
     size_t DecodePCMFast(const std::string& filepath, size_t start_sample, size_t max_samples) {
         std::cout << "[PCM Fast] Starting direct packet read (no codec overhead)..." << std::endl;
 
@@ -2086,7 +2101,8 @@ private:
         size_t samples_skipped = 0;
 
         // Read packets directly - PCM data is in packet->data, no decoding needed!
-        while (av_read_frame(format_ctx, packet) >= 0 && current_sample < max_samples) {
+        int ret = 0;
+        while ((ret = av_read_frame(format_ctx, packet)) >= 0 && current_sample < max_samples) {
             packets_read++;
             if (packet->stream_index == audio_stream_index) {
                 audio_packets++;
@@ -2141,6 +2157,7 @@ private:
 
         av_packet_free(&packet);
         avformat_close_input(&format_ctx);
+        if (ret == AVERROR_EOF) NoteFileEnd(start_sample + current_sample);
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
@@ -2538,6 +2555,7 @@ private:
         av_packet_free(&packet);
         avcodec_free_context(&codec_ctx);
         avformat_close_input(&format_ctx);
+        if (ret == AVERROR_EOF) NoteFileEnd(start_sample + current_sample);
         return current_sample;
     }
 
