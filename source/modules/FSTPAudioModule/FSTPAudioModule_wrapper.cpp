@@ -2716,7 +2716,10 @@ bool FSTPAudioModuleWrapper::Stop() {
 
 void FSTPAudioModuleWrapper::SetSpeed(double speed) {
     m_speed.store(speed);
-    if (m_impl) {
+    // Paused, the tape stands: the speed is kept, the sound not set going. (A speed key in a
+    // pause used to run the sound on while the player still showed the pause, the meters empty.)
+    // Whatever starts the tape plays first and sets the speed after, as Play() starts at 1x.
+    if (m_impl && m_playing.load()) {
         // Use old system - simply set target speed
         m_impl->target_playback_speed.store(speed);
         std::cout << "SetSpeed(" << speed << "): setting target_playback_speed" << std::endl;
