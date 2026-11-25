@@ -1,6 +1,6 @@
 ; installer.nsi — TapeXPlayer Windows Setup (NSIS 3, MUI2)
 ;
-; Built by ./create_win_installer.sh (MSYS2, package mingw-w64-x86_64-nsis).
+; Built by ./create_win_installer.sh (MSYS2, package mingw-w64-ucrt-x86_64-nsis).
 ; Packages the contents of ../builds/win-bundle (exe + all DLLs after bundle_dlls.sh)
 ; plus extensions/ and licenses. makensis is an x86 tool, but the payload can be
 ; any architecture (ARM64/x64); on Windows ARM64 the installer itself runs via emulation.

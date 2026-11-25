@@ -241,8 +241,8 @@ if [ "$MISSING_REQUIRED" -ne 0 ]; then
     echo ""
     echo "════════════════════════════════════════════════════════════════"
     echo "❌  One or more required DLLs are missing."
-    echo "    Install them via MSYS2:  pacman -S mingw-w64-x86_64-ffmpeg"
-    echo "                             pacman -S mingw-w64-x86_64-SDL2"
+    echo "    Install them via MSYS2:  pacman -S ${MINGW_PACKAGE_PREFIX:-mingw-w64-ucrt-x86_64}-ffmpeg"
+    echo "    SDL2 / SDL2_ttf:         ./build_sdl2_win.sh"
     echo "════════════════════════════════════════════════════════════════"
     exit 1
 fi
