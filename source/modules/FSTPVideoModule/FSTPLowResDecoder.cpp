@@ -2038,6 +2038,15 @@ bool LowResDecoder::convertToLowRes(const std::string& filename,
     params.outputPath      = h264Path;
     params.proxyWidth      = proxy_width;
     params.proxyHeight     = proxy_height;
+    // A thin H.264 original (a 600x480 broadcast recording at 450 kbit/s) has no more detail than
+    // its own bits carry, and a proxy sized by pixels alone came out 4x its size. Twice the
+    // original's video rate holds it: PSNR 45 dB against that recording, where 2304 kbit/s gave
+    // 51 and 700 gave 43. Other codecs pack more into a bit — left to the picture size.
+    if (is_h264 && video_bitrate > 0) {
+        params.maxKbps = static_cast<int>(std::min<int64_t>(video_bitrate * 2 / 1000, 1000000));
+        std::cout << "📐 [Proxy] Original video " << video_bitrate / 1000 << " kbit/s — proxy at most "
+                  << params.maxKbps << " kbit/s (never under 700)" << std::endl;
+    }
     params.proxyDarNum     = orig_dar.num;   // display aspect = source DAR (stretches anamorphic px)
     params.proxyDarDen     = orig_dar.den;
     params.colorSpace      = cs_flag;

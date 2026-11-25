@@ -137,6 +137,7 @@ static std::string BuildEncodeFlags(const ProxyConverter::Params& p, EncodeMode 
     // efficiently, so it wants the headroom). At 540p (960×540) this gives ~4.1 Mbps. Floor keeps
     // tiny proxies from going blocky.
     int kbps = p.proxyWidth * p.proxyHeight * 16 / 2000;  // px × 8 / 1000
+    if (p.maxKbps > 0) kbps = std::min(kbps, p.maxKbps);   // a thin original: see convertToLowRes
     if (kbps < 700) kbps = 700;
     const std::string bv = std::to_string(kbps) + "k";
 
