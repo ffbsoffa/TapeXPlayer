@@ -180,9 +180,8 @@ Version: ${PACKAGE_VERSION}
 Section: video
 Priority: optional
 Architecture: ${ARCH}
-Depends: libsdl2-2.0-0 (>= 2.0.0), libsdl2-ttf-2.0-0, libportaudio2, libavformat61 | libavformat60 | libavformat59 | libavformat58, libavcodec61 | libavcodec60 | libavcodec59 | libavcodec58, libavutil59 | libavutil58 | libavutil57 | libavutil56, libswscale8 | libswscale7 | libswscale6 | libswscale5, libssl3 | libssl1.1, librtmidi7 | librtmidi6 | librtmidi4, libgtk-3-0, libglib2.0-0, libpango-1.0-0, libcairo2
+Depends: libsdl2-2.0-0 (>= 2.0.0), libsdl2-ttf-2.0-0, libportaudio2, libavformat61 | libavformat60 | libavformat59 | libavformat58, libavcodec61 | libavcodec60 | libavcodec59 | libavcodec58, libavfilter10 | libavfilter9 | libavfilter8 | libavfilter7, libavutil59 | libavutil58 | libavutil57 | libavutil56, libswscale8 | libswscale7 | libswscale6 | libswscale5, libssl3 | libssl1.1, librtmidi7 | librtmidi6 | librtmidi4, libgtk-3-0, libglib2.0-0, libpango-1.0-0, libcairo2, ffmpeg
 Recommends: vaapi-driver-all
-Suggests: ffmpeg
 Installed-Size: ${INSTALLED_SIZE}
 Maintainer: FFB_soffa <mail@ffbsoffa.org>
 Homepage: https://github.com/ffbsoffa/TapeXPlayer
