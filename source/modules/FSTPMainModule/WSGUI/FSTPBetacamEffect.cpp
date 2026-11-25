@@ -2037,7 +2037,8 @@ bool FSTPBetacamEffect::ApplyRenderJitter(int player_id, RenderContext& render_c
 //    threshold and the dropout compensator fills the line flat grey: |s − 1| bars per field,
 //    |s| + 1 in reverse (all Betacam Y heads share one azimuth, so every Y track is readable).
 //  • Where the comb stands is set by the tape position: still at whole speeds, creeping slowly
-//    with the reel servo (above 2× the reels pull the tape). Each bar is moved on its own by the
+//    with the reel servo (above 2× the reels pull the tape); from 9× to 18× it drifts one way.
+//    Each bar is moved on its own by the
 //    head-to-tape flutter at the moment the head crosses between those two tracks, so the gaps
 //    between bars change from field to field while the comb as a whole stays put.
 //  • Between the bars the picture is intact; each band comes from its own moment of the tape —
@@ -2109,6 +2110,26 @@ bool PhysTbcHoldBelowBar() {
 // ±0.1 % speed wander of the reel drive: the whole comb creeps slowly. (At ±0.7 % the comb swayed
 // as one at 9–32×, which read as faked tape motion; the bars' own movement is the flutter's.)
 constexpr double kPhysReelWander = 0.001;
+// From 9× to 18× the comb drifts instead, softly and one way: down going forward, up in reverse,
+// faster with speed (author, 25.11.2026: there the flutter hardly moves the bars and they read as
+// standing still; a swaying comb read as random). The pace is a unit of screen heights a second
+// per 1× of speed, times kPhysDrift set by eye: 10× → 0.34 and 18× → 0.60 screens a second. The
+// drift takes over from the reels' wander, and both hand back by 24×, where the bars' own movement
+// is enough. FSTP_BETACAM_DRIFT puts another number in place of kPhysDrift: 0 = off.
+constexpr double kPhysDriftPerSpeed = 0.005;
+constexpr double kPhysDrift = 6.7;                  // author, 25.11.2026: 6.4–7
+double PhysDriftShare(double a) { return std::clamp((24.0 - a) / (24.0 - 18.0), 0.0, 1.0); }
+// What the drift adds to the tape position each field, in pitches: negative either way — the
+// comb's slope turns over with the direction, and with it the way the bars move on screen.
+double PhysDriftPerField(double rate) {
+    static const double scale = [] {
+        const char* v = std::getenv("FSTP_BETACAM_DRIFT");
+        return v ? std::clamp(std::atof(v), 0.0, 10.0) : kPhysDrift;
+    }();
+    const double a = std::abs(rate);
+    const double screensPerSecond = scale * kPhysDriftPerSpeed * a * PhysDriftShare(a);
+    return -screensPerSecond * std::abs(rate - 1.0) * (288.0 / 312.5) / 50.0;   // the picture is 288 of 312.5 lines
+}
 constexpr uint8_t kPhysDocGrey = 119;               // 47 % of white, as on the reference shuttle frame
 // The row right below each bar's solid grey: the compensator's fill, recirculated line after line
 // through its 1H delay for the whole bar, has drooped by the time the detector lets go — a darker
@@ -2285,9 +2306,11 @@ bool FSTPBetacamEffect::ApplyPhysicalShuttle(PlayerState& state, FrameContext& f
         state.tape_fields = 50.0 * (state.metrics.position_seconds - state.metrics.timecode_offset_seconds);
         state.tape_field_clock = k_now;
     }
-    const double reel = clamp_val(std::abs(rate) - 2.0, 0.0, 1.0) * kPhysReelWander;
+    const double reel = clamp_val(std::abs(rate) - 2.0, 0.0, 1.0) * kPhysReelWander *
+                        (1.0 - PhysDriftShare(std::abs(rate)));
+    const double drift = PhysDriftPerField(rate);
     for (int64_t k = state.tape_field_clock + 1; k <= k_now; ++k) {
-        state.tape_fields += rate * (1.0 + reel * PhysWow(k));
+        state.tape_fields += rate * (1.0 + reel * PhysWow(k)) + drift;
     }
     state.tape_field_clock = k_now;
     const double X = state.tape_fields;
