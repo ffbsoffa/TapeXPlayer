@@ -64,6 +64,8 @@ mkdir -p "$RELEASE_CONTENT"
 # ── Copy exe + DLLs ───────────────────────────────────────────────────────────
 echo "2️⃣   Copying TapeXPlayer.exe and DLLs..."
 cp "$BUNDLE_DIR/TapeXPlayer.exe" "$RELEASE_CONTENT/"
+# The proxy converter runs these two by name (the installer takes the whole bundle)
+cp "$BUNDLE_DIR/ffmpeg.exe" "$BUNDLE_DIR/ffprobe.exe" "$RELEASE_CONTENT/"
 find "$BUNDLE_DIR" -maxdepth 1 -name "*.dll" -exec cp {} "$RELEASE_CONTENT/" \;
 DLL_COUNT=$(find "$RELEASE_CONTENT" -maxdepth 1 -name "*.dll" | wc -l | tr -d ' ')
 echo "   Copied $DLL_COUNT DLLs"
