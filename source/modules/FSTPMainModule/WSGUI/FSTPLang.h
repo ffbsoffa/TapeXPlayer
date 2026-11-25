@@ -21,7 +21,7 @@
 //     welcome.body  = ...
 //
 // Keys use a dotted namespace ("welcome.title", "settings.keyboard", ...).
-// The format is intentionally trivial so a human OR an AI can author a pack.
+// The format is intentionally trivial, so a pack is easy to author.
 // ---------------------------------------------------------------------------
 
 #ifdef __cplusplus
