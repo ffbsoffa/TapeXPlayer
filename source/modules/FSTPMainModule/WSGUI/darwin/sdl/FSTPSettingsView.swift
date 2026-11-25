@@ -220,8 +220,6 @@ struct AudioSettingsView: View {
                     Slider(value: $viewModel.masterVolume, in: 0...1)
                 }
 
-                Divider()
-
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle("Auto-Reduce Volume at High Speeds", isOn: $viewModel.volumeDuckingEnabled)
 
