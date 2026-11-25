@@ -212,7 +212,7 @@ if command -v ldd &>/dev/null; then
             fi
         done < <(ldd "$_bin" 2>/dev/null \
                  | awk '$3 ~ /\// {print $3}' \
-                 | grep -i "mingw" \
+                 | grep -iF "$MINGW_BIN/" \
                  | sort -u)
     done
     echo "   Added $LDD_ADDED additional DLLs via ldd"
@@ -262,30 +262,26 @@ fi
 
 DLL_COUNT=$(find "$OUT_DIR" -maxdepth 1 -name "*.dll" | wc -l | tr -d ' ')
 
-# ── Final dependency verification (ldd-based, fast) ──────────────────────────
-# Check that all DLLs needed by TapeXPlayer.exe are present in OUT_DIR.
-# Uses ldd on the ORIGINAL exe so results are not affected by OUT_DIR contents.
-if command -v ldd &>/dev/null; then
-    UNSATISFIED=0
-    while IFS= read -r dep_name; do
-        [ -z "$dep_name" ] && continue
-        _is_system_dll "$dep_name" && continue
-        if [ ! -f "$OUT_DIR/$dep_name" ]; then
-            echo "   !! UNSATISFIED: $dep_name"
-            UNSATISFIED=$((UNSATISFIED + 1))
-        fi
-    done < <(ldd "$EXE_PATH" 2>/dev/null \
-             | awk '{print $1}' \
-             | grep -iv "^ntdll\|^kernel\|^user32\|^msvcrt\|not$" \
-             | grep -i "\.dll$" \
-             | sort -u)
-    if [ "$UNSATISFIED" -gt 0 ]; then
-        echo "   !! $UNSATISFIED unsatisfied DLL dependencies."
-        echo "      Install missing packages via: pacman -S <package>"
-    else
-        echo "   All DLL imports satisfied."
+# ── Final dependency verification ────────────────────────────────────────────
+# Read the imports of every bundled binary: whatever the toolchain's bin directory
+# provides must be in the bundle too, or the player does not start on a machine
+# without MSYS2. Independent of how the DLLs were gathered above.
+command -v objdump &>/dev/null || { echo "❌  objdump not found — cannot verify the bundle"; exit 1; }
+UNSATISFIED=0
+while IFS= read -r dep_name; do
+    [ -z "$dep_name" ] && continue
+    _is_system_dll "$dep_name" && continue
+    if [ -f "$MINGW_BIN/$dep_name" ] && [ ! -f "$OUT_DIR/$dep_name" ]; then
+        echo "   !! UNSATISFIED: $dep_name"
+        UNSATISFIED=$((UNSATISFIED + 1))
     fi
+done < <(for f in "$OUT_DIR"/*.exe "$OUT_DIR"/*.dll; do objdump -p "$f"; done \
+         | awk '/DLL Name:/ {print $3}' | tr -d '\r' | sort -u)
+if [ "$UNSATISFIED" -gt 0 ]; then
+    echo "❌  $UNSATISFIED DLL dependencies are not in the bundle."
+    exit 1
 fi
+echo "   All DLL imports satisfied."
 
 echo "════════════════════════════════════════════════════════════════"
 echo "✅  DLL bundling complete!"
