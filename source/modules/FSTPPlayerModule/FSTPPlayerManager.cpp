@@ -782,6 +782,13 @@ float GetInstanceAudioPeakRight(int instance_id) {
 }
 
 // Getting audio module for frame number calculation
+// Every open player moves to the output device Settings name (those already on it stay as they are)
+void RestartAllAudioStreams() {
+    for (int i = 0; i < MAX_PLAYER_INSTANCES; i++) {
+        if (FSTPAudioModuleWrapper* audio = GetInstanceAudioModule(i)) audio->FollowChosenDevice();
+    }
+}
+
 FSTPAudioModuleWrapper* GetInstanceAudioModule(int instance_id) {
     if (instance_id < 0 || instance_id >= MAX_PLAYER_INSTANCES ||
         !g_manager_state.instances[instance_id].is_active) {

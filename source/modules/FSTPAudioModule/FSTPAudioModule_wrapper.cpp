@@ -297,6 +297,7 @@ public:
 
     // PortAudio
     PaStream* pa_stream = nullptr;
+    PaDeviceIndex pa_stream_device = paNoDevice;   // what pa_stream was opened on
     bool pa_initialized = false;
 
     // CRITICAL: Per-instance cached speed to eliminate race condition between players!
@@ -514,6 +515,7 @@ public:
 
         if (err == paNoError) {
             std::cout << "✅ [AUDIO START] Pa_OpenStream succeeded" << std::endl;
+            pa_stream_device = outputParameters.device;
             playback_speed.store(0.0); // Start with zero speed
 
             // CRITICAL PROTECTION: wrap Pa_StartStream in try-catch
@@ -1466,6 +1468,7 @@ public:
                                    paClipOff, AudioCallback, this);
 
         if (err == paNoError) {
+            pa_stream_device = outputParameters.device;
             playback_speed.store(0.0);
             err = Pa_StartStream(pa_stream);
             if (err != paNoError) {
@@ -1484,6 +1487,11 @@ public:
         // Stream continues working, but outputs silence
     }
     
+    // Settings chose another output device: this stream moves there now, not at the next file
+    void FollowChosenDevice() {
+        if (pa_stream && ResolvePreferredOutputDevice() != pa_stream_device) RestartStreamForFile();
+    }
+
     bool RestartAudioStream() {
         if (!pa_initialized || !fast_buffer_ready.load()) {
             return false;
@@ -2872,6 +2880,10 @@ float FSTPAudioModuleWrapper::GetAudioPeakRight() const {
         return 0.0f;
     }
     return m_impl->audio_peak_right.load();
+}
+
+void FSTPAudioModuleWrapper::FollowChosenDevice() {
+    if (m_impl && m_loaded) m_impl->FollowChosenDevice();
 }
 
 bool FSTPAudioModuleWrapper::RestartAudioStream() {

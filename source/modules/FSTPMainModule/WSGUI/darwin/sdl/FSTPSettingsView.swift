@@ -6,6 +6,7 @@ import AppKit
 class SettingsViewModel: ObservableObject {
     // Audio Settings
     @Published var audioDeviceIndex: Int = -1
+    private var loadedAudioDeviceIndex: Int = -1   // as shown when the page loaded
     @Published var masterVolume: Double = 1.0
     @Published var bufferSize: Int = 1024
     @Published var volumeDuckingEnabled: Bool = true
@@ -93,6 +94,14 @@ class SettingsViewModel: ObservableObject {
             }
         }
 
+        // A pinned device is known by its name: indices shift as devices come and go. Absent now,
+        // the default is shown and the pin is kept unless another device is picked.
+        let pinned = String(cString: GetAudioDeviceName())
+        if audioDeviceIndex >= 0 && !pinned.isEmpty {
+            audioDeviceIndex = audioDevices.first(where: { $0.index >= 0 && $0.name == pinned })?.index ?? -1
+        }
+        loadedAudioDeviceIndex = audioDeviceIndex
+
         // Load MIDI devices
         let midiInputCount = GetMIDIInputDeviceCount()
         midiInputDevices = ["(None)"]
@@ -136,7 +145,13 @@ class SettingsViewModel: ObservableObject {
         }
 
         // Update settings
-        settings.pointee.audio_device_index = Int32(audioDeviceIndex)
+        // Index and name together: with the old name left in place the player "healed" the new
+        // index back to the old device
+        if audioDeviceIndex != loadedAudioDeviceIndex {
+            let name = audioDeviceIndex < 0 ? "" : (audioDevices.first(where: { $0.index == audioDeviceIndex })?.name ?? "")
+            SetAudioDevice(Int32(audioDeviceIndex), name)
+            loadedAudioDeviceIndex = audioDeviceIndex
+        }
         settings.pointee.audio_master_volume = Float(masterVolume)
         settings.pointee.audio_buffer_size = Int32(bufferSize)
         settings.pointee.audio_volume_ducking_enabled = volumeDuckingEnabled ? 1 : 0
