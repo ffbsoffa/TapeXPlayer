@@ -7,7 +7,7 @@
 #
 # Env (set by the makefile):
 #   CHECK_PLATFORM  macos | linux | windows
-#   DEPS_PREFIX     where headers live on macOS (Homebrew prefix) and Windows (/mingw64)
+#   DEPS_PREFIX     where headers live on macOS (Homebrew prefix) and Windows (/ucrt64)
 #   CXX             compiler the makefile uses
 
 set -u
@@ -164,10 +164,10 @@ case "$PLATFORM" in
         ;;
     windows)
         case "${MSYSTEM:-}" in
-            MINGW64|CLANGARM64) ;;
+            UCRT64|MINGW64|CLANGARM64) ;;
             *)
-                printf "  %s %-12s MSYSTEM=%s → open the \"MSYS2 MINGW64\" shell\n" "$BAD" "MSYS2 shell" "${MSYSTEM:-unset}"
-                PROBLEMS+=("Wrong MSYS2 shell (${MSYSTEM:-unset}). Build from the \"MSYS2 MINGW64\" shell — the makefile links against /mingw64.")
+                printf "  %s %-12s MSYSTEM=%s → open the \"MSYS2 UCRT64\" shell\n" "$BAD" "MSYS2 shell" "${MSYSTEM:-unset}"
+                PROBLEMS+=("Wrong MSYS2 shell (${MSYSTEM:-unset}). Build from the \"MSYS2 UCRT64\" shell (MSYS2 no longer carries rtmidi for MINGW64).")
                 ;;
         esac
         command -v windres >/dev/null 2>&1 || fail "windres" compiler

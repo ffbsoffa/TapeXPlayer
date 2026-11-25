@@ -299,6 +299,8 @@ private:
         bool doc_exit_heavy = true;                            // alternates heavy/light on switches
         bool doc_gentle = false;                               // true = soft form (pause-exit)
         int  doc_request = 0;                                  // one-shot kind (0 none / 1 gentle / 2 alt)
+        std::chrono::steady_clock::time_point last_fast_shuttle{};   // last time the tape ran ≥ 3×
+        std::chrono::steady_clock::time_point last_doc_burst{};      // last dropout burst started
 
         // Compositing direction tracking - prevents visual "flip" on rapid direction changes
         // Only updates when a new frame actually arrives, not on playback_rate sign change
@@ -338,8 +340,31 @@ private:
         int prev_frame_uv_pitch = 0;
         int64_t prev_frame_number = -1;
 
+        // === Physical shuttle (fast speeds) — see ApplyPhysicalShuttle ===
+        // Tape position in fields, integrated on a virtual 50 Hz field clock from the speed (plus
+        // the reel servo's wander), so the bar comb's phase never depends on display timing.
+        double tape_fields = 0.0;
+        int64_t tape_field_clock = -1;     // last virtual field folded into tape_fields
+        // Clean copies of the shown frame and of the one before it: the bands between bars come
+        // from different moments of the tape and are cut from these two.
+        std::vector<uint8_t> shuttle_cur[3];
+        std::vector<uint8_t> shuttle_prev[3];
+        int shuttle_w = 0, shuttle_h = 0;
+        int shuttle_pitch[3] = {0, 0, 0};
+        uint32_t shuttle_fmt = 0;
+        bool shuttle_have_cur = false;
+        bool shuttle_have_prev = false;
+
         PlayerState();
     };
+
+    // Fast shuttle drawn from the Betacam SP model (bench: txp-betacam-lab): bars where the Y head
+    // has slid off its track onto the C track, a coherent comb whose phase is the tape position,
+    // intact picture between the bars. signed_rate < 0 = reverse. Returns true when it drew.
+    bool ApplyPhysicalShuttle(PlayerState& state, FrameContext& frame_ctx, double signed_rate);
+    // Speed from which the physical shuttle takes over: FSTP_BETACAM_PHYS_FROM (default 9×);
+    // negative when switched off with FSTP_BETACAM_PHYS=0 (the old comb everywhere).
+    static double PhysicalShuttleFrom();
 
     bool m_enabled = false;
     bool m_reverse_stripe_enabled = false;  // 1× reverse tracking stripe (opt-in; see SetReverseStripeEnabled)

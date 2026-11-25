@@ -1,4 +1,5 @@
 #include "FSTPPixelBufferManager.h"
+#include "FSTPPassStats.h"
 #include "FSTPOSDSystem.h"
 #include "../../FSTPVideoModule/FSTPPerformanceProfiler.h"
 #include "../../FSTPVideoModule/FSTPCallCounter.h"
@@ -24,6 +25,7 @@ FSTPPixelBufferManager::FSTPPixelBufferManager() {
         m_buffer_ready[i].store(false);
         m_use_yuv_mode[i] = false;
         m_last_effect_frame[i] = -1;
+        m_texture_scratch[i] = -1;
         m_last_full_res[i] = -1;
         m_last_shuttle[i] = -1;
         m_grain_phase[i] = 0x9E3779B9u ^ (static_cast<uint32_t>(i) * 2654435761u);
@@ -44,6 +46,82 @@ FSTPPixelBufferManager::ColorMetadata FSTPPixelBufferManager::GetColorMetadata(i
 
 FSTPPixelBufferManager::~FSTPPixelBufferManager() {
     Shutdown();
+    for (auto& player : m_processed) {
+        for (auto& slot : player) {
+            if (slot.view) av_frame_free(&slot.view);
+        }
+    }
+}
+
+// Smear and edge fade are row-local and the same for every frame, and the slow-motion composite
+// takes WHOLE rows from frame N+1 (above the seam) and N (below). So processing each source frame
+// once and compositing the processed rows gives exactly the picture that compositing first and
+// processing the composite on every render tick gave — but on a paused or slow-motion frame the
+// render loop re-runs the effect ~45×/s on the same frames, and smear alone was ~3 ms per run at
+// 720p on a Pentium Gold 7505. Now it is ~3 ms per source frame.
+const FSTPPixelBufferManager::ProcessedFrame* FSTPPixelBufferManager::GetProcessedFrame(
+        int player_id, const AVFrame* src, Uint32 format, int width, int height) {
+    if (!ValidatePlayerID(player_id) || !src || !src->data[0] || width <= 0 || height <= 0) {
+        return nullptr;
+    }
+    const bool nv12 = (format == SDL_PIXELFORMAT_NV12);
+    const bool planar = (format == SDL_PIXELFORMAT_IYUV || format == SDL_PIXELFORMAT_YV12);
+    if ((!nv12 && !planar) || !src->data[1] || (planar && !src->data[2]) || src->linesize[0] <= 0) {
+        return nullptr;
+    }
+    const int64_t pts = (src->best_effort_timestamp != AV_NOPTS_VALUE) ? src->best_effort_timestamp : src->pts;
+    auto& slots = m_processed[player_id];
+    const uint64_t now = ++m_processed_clock;
+    for (auto& slot : slots) {
+        if (slot.src == src && slot.pts == pts && slot.width == width && slot.height == height &&
+            slot.format == format) {
+            slot.last_use = now;
+            return &slot;
+        }
+    }
+    ProcessedFrame* slot = &slots[0];
+    for (auto& s : slots) {
+        if (s.last_use < slot->last_use) slot = &s;
+    }
+
+    const int chroma_height = height / 2;
+    const int rows[3] = {height, chroma_height, planar ? chroma_height : 0};
+    for (int p = 0; p < 3; ++p) {
+        slot->pitch[p] = (rows[p] > 0) ? src->linesize[p] : 0;
+        slot->plane[p].resize(static_cast<size_t>(slot->pitch[p]) * rows[p]);
+        for (int y = 0; y < rows[p]; ++y) {
+            std::memcpy(&slot->plane[p][static_cast<size_t>(y) * slot->pitch[p]],
+                        src->data[p] + static_cast<size_t>(y) * src->linesize[p], slot->pitch[p]);
+        }
+    }
+    uint8_t* p0 = slot->plane[0].data();
+    uint8_t* p1 = slot->plane[1].data();
+    uint8_t* p2 = planar ? slot->plane[2].data() : nullptr;
+    if (m_smear_enabled) {
+        m_betacam_effect.ApplyAnalogSmear(p0, slot->pitch[0], p1, p2, slot->pitch[1], slot->pitch[2],
+                                          width, height, format);
+    }
+    if (m_edgefade_enabled) {
+        m_betacam_effect.ApplyEdgeFade(p0, slot->pitch[0], width, height, format);
+    }
+
+    if (!slot->view) slot->view = av_frame_alloc();
+    if (slot->view) {
+        slot->view->data[0] = p0;
+        slot->view->data[1] = p1;
+        slot->view->data[2] = p2;
+        for (int p = 0; p < 3; ++p) slot->view->linesize[p] = slot->pitch[p];
+        slot->view->width = width;
+        slot->view->height = height;
+        slot->view->format = src->format;
+    }
+    slot->src = src;
+    slot->pts = pts;
+    slot->width = width;
+    slot->height = height;
+    slot->format = format;
+    slot->last_use = now;
+    return slot;
 }
 
 bool FSTPPixelBufferManager::Initialize() {
@@ -133,6 +211,34 @@ bool FSTPPixelBufferManager::SubmitAVFrame(int player_id, std::shared_ptr<AVFram
         buffer.new_frame = true;
         buffer.is_valid = true;
 
+        SubmittedPicture& last = m_last_submitted[player_id];
+        const bool same_picture = last.frame == av_frame.get() && last.data == av_frame->data[0] &&
+                                  last.timestamp == timestamp && last.frame_number == frame_number &&
+                                  last.width == av_frame->width && last.height == av_frame->height;
+        if (!same_picture) {
+            // FSTP_SWITCH_LOG=1: each change between the proxy and the full picture, against the
+            // playback position. The frame numbers are the ones requested; what actually went on
+            // screen is logged by the video module ("[SHOWN]", FSTPVideoModule_wrapper.cpp).
+            static const bool switch_log = getenv("FSTP_SWITCH_LOG") != nullptr;
+            if (switch_log && last.height != 0 && last.height != av_frame->height) {
+                const double fps = metrics.frame_rate > 0 ? metrics.frame_rate : 25.0;
+                std::printf("🔀 [SWITCH] player %d %dp→%dp | requested before: frame %d ts %.4f | after: frame %d ts %.4f | "
+                            "position %.4f s = frame %.2f | speed %.2f\n",
+                            player_id, last.height, av_frame->height, last.frame_number, last.timestamp,
+                            frame_number, timestamp, metrics.position_seconds,
+                            metrics.position_seconds * fps, metrics.playback_rate);
+                std::fflush(stdout);
+            }
+            last.frame = av_frame.get();
+            last.data = av_frame->data[0];
+            last.timestamp = timestamp;
+            last.frame_number = frame_number;
+            last.width = av_frame->width;
+            last.height = av_frame->height;
+            ++last.serial;
+        }
+        buffer.picture_serial = last.serial;
+
         // Detect full-res mode (resolution > 480p indicates full-resolution decoder)
         // Update OSD to show "LOCK" at 1× speed with full-res
         bool is_full_res = (av_frame->height > 480);
@@ -195,6 +301,8 @@ bool FSTPPixelBufferManager::SubmitPixelData(int player_id, const uint8_t* pixel
         buffer.current_time = metrics.position_seconds;
         buffer.total_duration = metrics.duration_seconds;
         buffer.frame_rate = metrics.frame_rate;
+        buffer.picture_serial = ++m_last_submitted[player_id].serial;   // copied data: always new
+        m_last_submitted[player_id].frame = nullptr;
         buffer.timestamp = timestamp;
         buffer.frame_number = frame_number;
         buffer.new_frame = true;
@@ -422,6 +530,47 @@ void FSTPPixelBufferManager::ApplyFilmGrain(int player_id, uint8_t* y_plane, int
 // compositing doesn't wipe it). The manager calls m_betacam_effect.ApplyAnalogSmear() for
 // the 1× path and passes frame_ctx.smear for the effect-active path.
 
+void FSTPPixelBufferManager::ChangedRows(const EffectScratch& a, const EffectScratch& b,
+                                        int& y, int& h) {
+    y = 0;
+    h = a.height;   // anything uncomparable → the whole picture
+    if (a.format != b.format || a.width != b.width || a.height != b.height ||
+        a.pitch[0] != b.pitch[0] || a.pitch[1] != b.pitch[1] || a.pitch[2] != b.pitch[2] ||
+        a.plane0.size() != b.plane0.size() || a.plane1.size() != b.plane1.size() ||
+        a.plane2.size() != b.plane2.size() || a.height <= 0) {
+        return;
+    }
+    const bool nv12 = (a.format == SDL_PIXELFORMAT_NV12);
+    const size_t luma_w = static_cast<size_t>(a.width);
+    const size_t chroma_w = nv12 ? luma_w : luma_w / 2;
+    const int bands = (a.height + 1) / 2;   // 2 luma rows + 1 chroma row (4:2:0)
+    auto band_equal = [&](int k) {
+        for (int r = 2 * k; r < std::min(2 * k + 2, a.height); ++r) {
+            const size_t o = static_cast<size_t>(r) * a.pitch[0];
+            if (std::memcmp(&a.plane0[o], &b.plane0[o], luma_w) != 0) return false;
+        }
+        if (!a.plane1.empty()) {
+            const size_t o = static_cast<size_t>(k) * a.pitch[1];
+            if (std::memcmp(&a.plane1[o], &b.plane1[o], chroma_w) != 0) return false;
+        }
+        if (!a.plane2.empty()) {
+            const size_t o = static_cast<size_t>(k) * a.pitch[2];
+            if (std::memcmp(&a.plane2[o], &b.plane2[o], chroma_w) != 0) return false;
+        }
+        return true;
+    };
+    int first = 0;
+    while (first < bands && band_equal(first)) ++first;
+    if (first == bands) {   // identical
+        h = 0;
+        return;
+    }
+    int last = bands - 1;
+    while (last > first && band_equal(last)) --last;
+    y = 2 * first;
+    h = std::min(2 * last + 2, a.height) - y;
+}
+
 SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Renderer* renderer, const PixelBuffer* buffer,
                                                           SDL_Texture* existing_texture) {
     FSTP_COUNT_CALL("CreateOrUpdateTexture");
@@ -490,6 +639,7 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
         }
 
         if (needs_recreation) {
+            m_texture_scratch[player_id] = -1;   // new texture holds nothing yet
            // std::cout << "🔧 [PIXEL BUFFER] Creating YUV renderer for player " << player_id
            //           << ", size=" << buffer->width << "x" << buffer->height << std::endl;
 
@@ -525,6 +675,8 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
             planes.width = buffer->width;
             planes.height = buffer->height;
 
+            int out_scratch = -1;   // scratch the planes below point into (-1 = source frame)
+
             if (buffer->av_frame) {
                 const uint8_t* y_plane = buffer->av_frame->data[0];
                 const uint8_t* u_plane = buffer->av_frame->data[1];
@@ -541,25 +693,9 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                     bool speed_in_effect_range = (abs_rate < 0.9 || abs_rate >= 1.2) ||
                                                  (abs_rate >= 0.9 && abs_rate <= 1.1 && metrics.is_reverse);
 
-                    // EXPERIMENT: fire a DOC dropout on proxy↔full-res source switches. Detect
-                    // here — the manager sees every frame's resolution even at 1×, where the
-                    // effect is otherwise gated off — by the height crossing the proxy/full-res
-                    // boundary (proxy ≤480p, full-res >480p). Only at the flip; settled → nothing.
-                    int is_full_res = (buffer->height > 480) ? 1 : 0;
-                    if (m_last_full_res[player_id] >= 0 && is_full_res != m_last_full_res[player_id]) {
-                        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Alternating);
-                    }
-                    m_last_full_res[player_id] = is_full_res;
-
-                    // Start a touch EARLIER than the actual resolution flip: the full-res decoder
-                    // is stopped/resumed at the 2× boundary, so the proxy↔full-res switch happens
-                    // around there. Firing on the speed crossing 2× (either direction) makes the
-                    // dropout lead the visible switch slightly → a more graceful transition.
-                    int is_shuttle = (abs_rate >= 2.0) ? 1 : 0;
-                    if (m_last_shuttle[player_id] >= 0 && is_shuttle != m_last_shuttle[player_id]) {
-                        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Alternating);
-                    }
-                    m_last_shuttle[player_id] = is_shuttle;
+                    // No dropout bursts on proxy↔full-res switches or 2× crossings any more: going
+                    // back and forth in shuttle kept flashing them. A burst comes only on playing
+                    // after a fast shuttle (FSTPBetacamEffect, the DOC burst).
 
                     // Run the effect even at 1× while a DOC burst is queued/active, so dropouts
                     // are visible at normal speed too (otherwise speed_in_effect_range gates it off).
@@ -589,15 +725,45 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                         }
 
                         if (have_planes) {
-                            EffectScratch& scratch = m_effect_scratch[player_id];
+                            // Row-local passes (smear, edge fade) come pre-applied from the
+                            // processed-frame cache when possible — for N, and for N+1 when the
+                            // effect composites it in. Fall back to applying them below if a
+                            // frame can't be cached.
+                            const ProcessedFrame* base = (m_smear_enabled || m_edgefade_enabled)
+                                ? GetProcessedFrame(player_id, buffer->av_frame.get(), buffer->format,
+                                                    buffer->width, buffer->height)
+                                : nullptr;
+                            const ProcessedFrame* next_processed = nullptr;
+                            if (base && candidate_effect && buffer->next_frame) {
+                                next_processed = GetProcessedFrame(player_id, buffer->next_frame.get(),
+                                                                   buffer->format, buffer->width, buffer->height);
+                                if (!next_processed) base = nullptr;   // keep N and N+1 consistent
+                            }
+                            const uint8_t* copy_src[3] = {
+                                base ? base->plane[0].data() : buffer->av_frame->data[0],
+                                base ? base->plane[1].data() : buffer->av_frame->data[1],
+                                base ? (base->plane[2].empty() ? nullptr : base->plane[2].data()) : buffer->av_frame->data[2]};
+                            const int copy_pitch[3] = {
+                                base ? base->pitch[0] : buffer->av_frame->linesize[0],
+                                base ? base->pitch[1] : buffer->av_frame->linesize[1],
+                                base ? base->pitch[2] : buffer->av_frame->linesize[2]};
+
+                            auto t_copy = FSTPPassStats::Start();
+                            // Write the scratch the texture does NOT hold; the other one is
+                            // the reference for the changed-rows upload below.
+                            const int si = (m_texture_scratch[player_id] == 0) ? 1 : 0;
+                            EffectScratch& scratch = m_effect_scratch[player_id][si];
                             scratch.format = buffer->format;
                             scratch.width = buffer->width;
                             scratch.height = buffer->height;
+                            scratch.pitch[0] = y_pitch;
+                            scratch.pitch[1] = u_pitch;
+                            scratch.pitch[2] = v_pitch;
 
                             scratch.plane0.resize(static_cast<size_t>(y_pitch) * buffer->height);
                             for (int y = 0; y < buffer->height; ++y) {
                                 std::memcpy(&scratch.plane0[y * y_pitch],
-                                            buffer->av_frame->data[0] + y * buffer->av_frame->linesize[0],
+                                            copy_src[0] + y * copy_pitch[0],
                                             y_pitch);
                             }
 
@@ -608,10 +774,10 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                                 scratch.plane2.resize(static_cast<size_t>(v_pitch) * chroma_height);
                                 for (int y = 0; y < chroma_height; ++y) {
                                     std::memcpy(&scratch.plane1[y * u_pitch],
-                                                buffer->av_frame->data[1] + y * buffer->av_frame->linesize[1],
+                                                copy_src[1] + y * copy_pitch[1],
                                                 u_pitch);
                                     std::memcpy(&scratch.plane2[y * v_pitch],
-                                                buffer->av_frame->data[2] + y * buffer->av_frame->linesize[2],
+                                                copy_src[2] + y * copy_pitch[2],
                                                 v_pitch);
                                 }
                             } else if (buffer->format == SDL_PIXELFORMAT_NV12) {
@@ -620,7 +786,7 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                                 scratch.plane2.clear();
                                 for (int y = 0; y < chroma_height; ++y) {
                                     std::memcpy(&scratch.plane1[y * u_pitch],
-                                                buffer->av_frame->data[1] + y * buffer->av_frame->linesize[1],
+                                                copy_src[1] + y * copy_pitch[1],
                                                 u_pitch);
                                 }
                             } else {
@@ -630,6 +796,7 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
 
                             uint8_t* su0 = scratch.plane1.empty() ? nullptr : scratch.plane1.data();
                             uint8_t* sv0 = scratch.plane2.empty() ? nullptr : scratch.plane2.data();
+                            FSTPPassStats::Add(FSTPPassStats::Copy, t_copy);
 
                             bool fx_applied = false;
                             if (candidate_effect) {
@@ -650,14 +817,17 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                                 // Adjacent frames for Betacam slow-motion compositing
                                 // Provided by decoder: prev_frame (N-1) and next_frame (N+1)
                                 frame_ctx.prev_source_frame = buffer->prev_frame.get();
-                                frame_ctx.next_source_frame = buffer->next_frame.get();
+                                frame_ctx.next_source_frame = next_processed ? next_processed->view
+                                                                             : buffer->next_frame.get();
                                 // Smear + edge fade applied INSIDE the effect (after compositing,
                                 // under the stripe): fixes both the left-edge flicker and the smear
                                 // being wiped by slow-mo compositing.
-                                frame_ctx.smear     = m_smear_enabled;
-                                frame_ctx.edge_fade = m_edgefade_enabled;
+                                frame_ctx.smear     = m_smear_enabled && !base;
+                                frame_ctx.edge_fade = m_edgefade_enabled && !base;
 
+                                auto t_fx = FSTPPassStats::Start();
                                 fx_applied = m_betacam_effect.ApplyPixelFX(player_id, frame_ctx);
+                                FSTPPassStats::Add(FSTPPassStats::Betacam, t_fx);
                                 m_last_effect_frame[player_id] = buffer->frame_number;
 
                                 // Post-effect SD softness: gently blur the hard horizontal
@@ -665,17 +835,20 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                                 // effect). Only on effect frames (slow/shuttle/pause) — clean
                                 // 1× playback stays sharp for frame-accurate analysis.
                                 if (fx_applied) {
+                                    auto t_soft = FSTPPassStats::Start();
                                     m_betacam_effect.ApplySoftEdges(scratch.plane0.data(), y_pitch,
                                                                     buffer->width, buffer->height, buffer->format);
+                                    FSTPPassStats::Add(FSTPPassStats::SoftEdges, t_soft);
                                 }
                             } else {
-                                // No effect this frame (e.g. 1×) → apply smear + soft border here.
-                                if (m_smear_enabled) {
+                                // No effect this frame (e.g. 1×) → apply smear + soft border here
+                                // (already done when the copy came from the processed cache).
+                                if (m_smear_enabled && !base) {
                                     m_betacam_effect.ApplyAnalogSmear(scratch.plane0.data(), y_pitch,
                                                                       su0, sv0, u_pitch, v_pitch,
                                                                       buffer->width, buffer->height, buffer->format);
                                 }
-                                if (m_edgefade_enabled) {
+                                if (m_edgefade_enabled && !base) {
                                     m_betacam_effect.ApplyEdgeFade(scratch.plane0.data(), y_pitch,
                                                                    buffer->width, buffer->height, buffer->format);
                                 }
@@ -684,15 +857,18 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                             // FINAL LAYER: subtle film grain over EVERYTHING (image + effect).
                             // Soft chroma noise + lighter luma noise, grain sized from a 576p base.
                             if (m_grain_enabled) {
+                                auto t_grain = FSTPPassStats::Start();
                                 EnsureGrainTile(player_id, buffer->width, buffer->height);
                                 ApplyFilmGrain(player_id, scratch.plane0.data(), y_pitch,
                                                su0, sv0, u_pitch, v_pitch,
                                                buffer->width, buffer->height, buffer->format);
+                                FSTPPassStats::Add(FSTPPassStats::Grain, t_grain);
                             }
 
                             // Point output at the scratch when it was actually modified (effect,
                             // smear, edge fade and/or grain); otherwise keep the zero-copy source.
                             if (fx_applied || m_grain_enabled || m_edgefade_enabled || m_smear_enabled) {
+                                out_scratch = si;
                                 y_plane = scratch.plane0.data();
                                 if (buffer->format == SDL_PIXELFORMAT_IYUV ||
                                     buffer->format == SDL_PIXELFORMAT_YV12) {
@@ -760,9 +936,36 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                 return existing_texture;
             }
 
+            // Upload only the rows that differ from what the texture already holds (the other
+            // scratch). A full upload at least once a second guards against a texture whose
+            // contents the driver dropped (e.g. a D3D device reset).
+            auto t_upload = FSTPPassStats::Start();   // the row diff counts as upload work
+            SDL_Texture* const own_texture = m_yuv_renderers[player_id]->GetTexture();
+            const int held = m_texture_scratch[player_id];
+            const auto now = std::chrono::steady_clock::now();
+            bool upload_needed = true;
+            if (out_scratch >= 0 && held >= 0 && held != out_scratch &&
+                m_texture_scratch_tex[player_id] == own_texture && existing_texture == own_texture &&
+                now - m_last_full_upload[player_id] < std::chrono::seconds(1)) {
+                ChangedRows(m_effect_scratch[player_id][out_scratch],
+                            m_effect_scratch[player_id][held], planes.update_y, planes.update_h);
+                upload_needed = (planes.update_h > 0);
+            }
+
             // Update YUV texture (SDL copies to GPU)
-            if (m_yuv_renderers[player_id]->UpdateYUVTexture(planes)) {
-                SDL_Texture* result_texture = m_yuv_renderers[player_id]->GetTexture();
+            const bool uploaded = upload_needed ? m_yuv_renderers[player_id]->UpdateYUVTexture(planes)
+                                                : true;
+            FSTPPassStats::Add(FSTPPassStats::Upload, t_upload);
+            FSTPPassStats::UploadedRows(!upload_needed ? 0 : (planes.update_h > 0 ? planes.update_h : planes.height),
+                                        planes.height);
+            FSTPPassStats::EndUpdate();
+            if (uploaded) {
+                m_texture_scratch[player_id] = out_scratch;
+                m_texture_scratch_tex[player_id] = own_texture;
+                if (upload_needed && (planes.update_h == 0 || planes.update_h >= planes.height)) {
+                    m_last_full_upload[player_id] = now;
+                }
+                SDL_Texture* result_texture = own_texture;
                 if (ENABLE_PIXEL_BUFFER_DEBUG) {
                     static int success_counter = 0;
                     if (++success_counter % 100 == 1) {
@@ -772,6 +975,7 @@ SDL_Texture* FSTPPixelBufferManager::CreateOrUpdateTexture(int player_id, SDL_Re
                 }
                 return result_texture;
             } else {
+                m_texture_scratch[player_id] = -1;
                 std::cerr << "❌ [ZERO-COPY] UpdateYUVTexture failed for player " << player_id << std::endl;
             }
         }
@@ -803,11 +1007,14 @@ void FSTPPixelBufferManager::ClearPlayerBuffers(int player_id) {
     }
 
     // Clear effect scratch buffers safely
-    m_effect_scratch[player_id].plane0.clear();
-    m_effect_scratch[player_id].plane1.clear();
-    m_effect_scratch[player_id].plane2.clear();
-    m_effect_scratch[player_id].width = 0;
-    m_effect_scratch[player_id].height = 0;
+    for (EffectScratch& scratch : m_effect_scratch[player_id]) {
+        scratch.plane0.clear();
+        scratch.plane1.clear();
+        scratch.plane2.clear();
+        scratch.width = 0;
+        scratch.height = 0;
+    }
+    m_texture_scratch[player_id] = -1;
 
     // Reset previous frame tracking
     m_prev_frame_number[player_id] = -1;

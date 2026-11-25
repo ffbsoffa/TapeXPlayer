@@ -30,9 +30,9 @@ TapeXPlayer is built with **C**,**C++**, **Objective-C**, **Swift** using indust
 
 | Platform | Status | Architecture | Build |
 |----------|--------|--------------|-------|
-| **macOS** | ✅ Available | Universal Binary (Intel + Apple Silicon) | Build 1866 |
-| **Linux** | ✅ Available (DEB) | x86_64 | Build 1866 |
-| **Windows** | ✅ Available | x86_64 | Builds 1866 |
+| **macOS** | ✅ Available | Universal Binary (Intel + Apple Silicon) | Build 1967 |
+| **Linux** | ✅ Available (DEB) | x86_64 | Build 1967 |
+| **Windows** | ✅ Available | x86_64 | Build 1967 |
 
 ---
 
@@ -167,24 +167,27 @@ Tested: Ubuntu 24.04 x86_64 (CI). Also expected to work on Ubuntu 22.04+ / Debia
 
 Tested: GitHub's `windows-latest` runner, x64 (CI). Windows builds use [MSYS2](https://www.msys2.org) with the MinGW-w64 toolchain.
 
-1. **Install MSYS2** from [msys2.org](https://www.msys2.org), then open the **MSYS2 MINGW64** shell from the Start Menu. Only this shell works: MSYS, UCRT64 and CLANG64 use different library folders, and the makefile links against `/mingw64`.
-2. **Quickest way:** the bootstrap script installs the toolchain and libraries, clones the repository, builds and bundles the DLLs.
+1. **Install MSYS2** from [msys2.org](https://www.msys2.org), then open the **MSYS2 UCRT64** shell from the Start Menu. Use this shell: it is what CI builds with. (MSYS2 no longer carries RtMidi for the older MINGW64 environment.)
+2. **Quickest way:** the bootstrap script installs the toolchain and libraries, clones the repository, builds SDL2, builds the player and bundles the DLLs.
    ```bash
    curl -fsSL https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/stable/source/bootstrap_win.sh -o bootstrap_win.sh
    bash bootstrap_win.sh
    ```
-   If `pacman` closes the window while updating, open **MSYS2 MINGW64** again and re-run the script.
+   If `pacman` closes the window while updating, open **MSYS2 UCRT64** again and re-run the script.
 3. **Or by hand:**
    ```bash
    pacman -Syu
    pacman -S --needed make git zip \
-       mingw-w64-x86_64-toolchain mingw-w64-x86_64-SDL2 mingw-w64-x86_64-SDL2_ttf \
-       mingw-w64-x86_64-portaudio mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-openssl \
-       mingw-w64-x86_64-rtmidi mingw-w64-x86_64-nsis
+       mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-freetype \
+       mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
+       mingw-w64-ucrt-x86_64-portaudio mingw-w64-ucrt-x86_64-ffmpeg \
+       mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-rtmidi mingw-w64-ucrt-x86_64-nsis
    git clone https://github.com/ffbsoffa/TapeXPlayer.git
    cd TapeXPlayer/source
+   ./build_sdl2_win.sh             # SDL2 and SDL2_ttf from source (see below)
    make -j$(nproc)                 # → ../builds/binaries/TapeXPlayer.exe
    ```
+   MSYS2 ships `sdl2-compat` (SDL2 API over SDL3) under the SDL2 name. `build_sdl2_win.sh` builds the real SDL2 over it, as the releases use; it replaces those files in your MSYS2 installation, and an update of `sdl2-compat` by `pacman` puts the shim back.
 4. **Make it run outside MSYS2.** The `.exe` needs its DLLs next to it:
    ```bash
    ./bundle_dlls.sh                # → ../builds/win-bundle/ (TapeXPlayer.exe + every DLL)
@@ -227,9 +230,9 @@ Tested: GitHub's `windows-latest` runner, x64 (CI). Windows builds use [MSYS2](h
 
 **macOS: a bundle you built crashes on another Mac with an SDL3 error** — Homebrew's `sdl2` is `sdl2-compat`, which needs SDL3 at run time. Fine on your own Mac; for an app you give to others, build real SDL2 as [`macos-build.yml`](.github/workflows/macos-build.yml) does.
 
-**Windows: `Wrong MSYS2 shell`** — close it and open **MSYS2 MINGW64**.
+**Windows: `Wrong MSYS2 shell`** — close it and open **MSYS2 UCRT64**.
 
-**Windows: `libSDL2.dll was not found` when starting the `.exe` from Explorer** — run `./bundle_dlls.sh` and start `../builds/win-bundle/TapeXPlayer.exe`.
+**Windows: a `.dll was not found` message when starting the `.exe` from Explorer** — run `./bundle_dlls.sh` and start `../builds/win-bundle/TapeXPlayer.exe`.
 
 **Linux: the release `.deb` won't install (unmet dependencies)** — it is built on Ubuntu 24.04; on older systems build from source.
 

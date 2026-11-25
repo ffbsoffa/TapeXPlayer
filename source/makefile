@@ -16,7 +16,7 @@
 #   make release  - Zip an existing bundle for GitHub Releases
 # Linux:
 #   make deb      - Create .deb package
-# Windows (MSYS2 MINGW64):
+# Windows (MSYS2 UCRT64):
 #   make win-release - Zip an existing win-bundle (run ./bundle_dlls.sh first)
 #
 # OPTIONS:
@@ -771,7 +771,7 @@ ifeq ($(UNAME_S),Linux)
 	@echo "  Objects:    $(OBJDIR)"
 	@echo "  DEB:        ../builds/binaries/deb/*.deb"
 else ifeq ($(PLATFORM),windows)
-	@echo "Windows targets (MSYS2 MINGW64 shell):"
+	@echo "Windows targets (MSYS2 UCRT64 shell):"
 	@echo "  make              - Build executable"
 	@echo "  make check        - Check compiler + libraries, print install command"
 	@echo "  make clean        - Clean build artifacts"

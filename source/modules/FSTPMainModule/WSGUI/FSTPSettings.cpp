@@ -1,4 +1,5 @@
 #include "FSTPSettings.h"
+#include "../../FSTPPlayerModule/FSTPPlayerManager.h"
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -319,6 +320,8 @@ void ApplyAudioSettings() {
     // Apply only volume and device (buffer size requires restart)
     // Main application happens in audio module via get functions
     std::cout << "Note: Buffer size changes require application restart" << std::endl;
+
+    RestartAllAudioStreams();   // open players move to a newly chosen output device at once
 }
 
 // Convenience functions for getting settings

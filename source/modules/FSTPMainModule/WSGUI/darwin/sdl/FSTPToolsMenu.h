@@ -42,10 +42,7 @@ bool IsMemoryLocationsWindowActive();
 // Check if Memory Location dialog is open (for player key blocking)
 bool IsMemoryLocationDialogActive();
 
-// Presentation mode
-void ShowPresentationMode();
-void TogglePresentationMode();
-bool IsPresentationModeActive();
+// Presentation mode: TogglePresentationMode / IsPresentationModeActive (FSTPWindowManager.h)
 
 #ifdef __cplusplus
 }

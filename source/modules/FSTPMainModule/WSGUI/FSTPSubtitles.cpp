@@ -39,6 +39,27 @@ std::atomic<bool> g_enabled{true};
 TTF_Font* g_font = nullptr;
 int g_font_px = 0;
 
+// The lines of the cue on screen, rendered once: a cue changes every few seconds, the screen 60
+// times a second, and each line used to be TTF-rendered and turned into a texture every frame.
+// Per (renderer, player): the textures belong to that renderer, and FSTPSubtitles_ForgetRenderer
+// frees them before the window's renderer is destroyed.
+struct CueTextures {
+    std::string text;
+    int px = 0;
+    std::vector<SDL_Texture*> texs;
+    std::vector<SDL_Rect> rects;
+    int max_w = 0;
+};
+std::mutex g_tex_mutex;
+std::map<std::pair<SDL_Renderer*, int>, CueTextures> g_cue_tex;
+
+void dropTextures(CueTextures& c) {
+    for (SDL_Texture* t : c.texs) {
+        if (t) SDL_DestroyTexture(t);
+    }
+    c = CueTextures{};
+}
+
 // ---- SRT parsing --------------------------------------------------------
 
 // "HH:MM:SS,mmm" (or '.') → seconds. Returns -1 on failure.
@@ -283,25 +304,32 @@ void FSTPSubtitles_Render(SDL_Renderer* renderer, int player_id,
     if (start_y < 8) start_y = 8;
 
     // Backing box behind the whole block, sized to the widest line.
-    int max_w = 0;
-    std::vector<SDL_Texture*> texs;
-    std::vector<SDL_Rect> rects;
-    texs.reserve(lines.size());
-    for (const auto& ln : lines) {
-        SDL_Texture* t = nullptr;
-        int tw = 0, th = line_h;
-        if (!ln.empty()) {
-            SDL_Surface* surf = TTF_RenderUTF8_Blended(g_font, ln.c_str(), fg);
-            if (surf) {
-                tw = surf->w; th = surf->h;
-                t = SDL_CreateTextureFromSurface(renderer, surf);
-                SDL_FreeSurface(surf);
+    std::lock_guard<std::mutex> tex_lock(g_tex_mutex);
+    CueTextures& cue = g_cue_tex[{renderer, player_id}];
+    if (cue.text != text || cue.px != px) {
+        dropTextures(cue);
+        cue.texs.reserve(lines.size());
+        for (const auto& ln : lines) {
+            SDL_Texture* t = nullptr;
+            int tw = 0, th = line_h;
+            if (!ln.empty()) {
+                SDL_Surface* surf = TTF_RenderUTF8_Blended(g_font, ln.c_str(), fg);
+                if (surf) {
+                    tw = surf->w; th = surf->h;
+                    t = SDL_CreateTextureFromSurface(renderer, surf);
+                    SDL_FreeSurface(surf);
+                }
             }
+            cue.texs.push_back(t);
+            cue.rects.push_back(SDL_Rect{ 0, 0, tw, th });
+            if (tw > cue.max_w) cue.max_w = tw;
         }
-        texs.push_back(t);
-        rects.push_back(SDL_Rect{ 0, 0, tw, th });
-        if (tw > max_w) max_w = tw;
+        cue.text = text;
+        cue.px = px;
     }
+    const int max_w = cue.max_w;
+    const std::vector<SDL_Texture*>& texs = cue.texs;
+    const std::vector<SDL_Rect>& rects = cue.rects;
 
     SDL_BlendMode prev;
     SDL_GetRenderDrawBlendMode(renderer, &prev);
@@ -318,10 +346,21 @@ void FSTPSubtitles_Render(SDL_Renderer* renderer, int player_id,
         if (texs[i]) {
             SDL_Rect d{ (win_w - rects[i].w) / 2, y, rects[i].w, rects[i].h };
             SDL_RenderCopy(renderer, texs[i], nullptr, &d);
-            SDL_DestroyTexture(texs[i]);
         }
         y += line_h;
     }
 
     SDL_SetRenderDrawBlendMode(renderer, prev);
+}
+
+void FSTPSubtitles_ForgetRenderer(SDL_Renderer* renderer) {
+    std::lock_guard<std::mutex> tex_lock(g_tex_mutex);
+    for (auto it = g_cue_tex.begin(); it != g_cue_tex.end();) {
+        if (it->first.first == renderer) {
+            dropTextures(it->second);
+            it = g_cue_tex.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }

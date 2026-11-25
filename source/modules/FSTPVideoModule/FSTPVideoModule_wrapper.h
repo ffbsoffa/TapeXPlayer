@@ -91,7 +91,12 @@ private:
 
     std::unique_ptr<FSTP::LowCachedDecoderManager> m_low_cached_manager;
     std::unique_ptr<FSTPFullResDecoderV2> m_full_res_decoder;  // V2: Streaming decoder
+    bool m_full_res_probed = false;  // StartFullResDecoder already ran for this load (kept or rejected)
+    std::string m_full_res_verdict;  // StartFullResDecoder's finding, for LogProfile
     bool m_full_res_stopped = false;  // SPEED OPT state (per-instance; hysteresis in SetSpeed)
+    // Last time the tape ran fast (>1.4×), steady-clock ms. The full-res decoder re-engages only
+    // once the tape has been slow for a while (see DisplayFrame) — not on every pass through 0×.
+    std::atomic<int64_t> m_last_fast_ms{0};
 
     // Pause-frame cache: avoid re-querying decoder when position hasn't changed
     std::shared_ptr<AVFrame> m_v2_cached_frame;
@@ -104,6 +109,15 @@ private:
     std::shared_ptr<AVFrame> m_cached_prev_adjacent;
     int m_cached_adjacent_frame_number = -1;
     bool m_cached_adjacent_was_v2 = false;  // source of the cached neighbours (proxy vs full-res)
+    const void* m_cached_adjacent_base = nullptr;  // the picture they are the neighbours of
+    // What is on screen, for the "[SHOWN]" log line: the source frame of the last submitted
+    // picture, and the last mismatch logged (so a held mismatch is logged once, not 60 times/s)
+    int m_diag_on_screen = -1;
+    int m_diag_logged_request = -1;
+    int m_diag_logged_content = -1;
+    bool m_diag_mismatch_open = false;                       // a logged mismatch not yet over
+    const void* m_diag_proxy_neighbours_checked = nullptr;   // the proxy picture last neighbour-logged
+    std::chrono::steady_clock::time_point m_diag_mismatch_since{};
 
     // Auto-calibrated proxy↔original frame offset. On some sources the proxy's content lags
     // its index by an integer number of frames (e.g. start_time != 0 makes AVAssetReader add
@@ -152,6 +166,12 @@ private:
     // with_proxy=false → V2-only start (tape threading); proxy decoder arrives later
     // via BackgroundProxyConversion → SetupProxyDecoder → m_proxy_ready publication.
     bool InitializeDecoders(double initial_time = 0.0, bool with_proxy = true);
+    // Starts the full-res decoder on the original and keeps it only if it MEASURES at least
+    // kFullResRealtimeMargin × the clip's frame rate here (GPU or CPU alike). Same rule on every
+    // platform — no CPU-name checks. Returns whether m_full_res_decoder is live afterwards.
+    bool StartFullResDecoder(double initial_time);
+    // One line in the log: where this file's work ended up — GPU, CPU or both (see the .cpp).
+    void LogProfile() const;
     void ShutdownDecoders();
     void NotifyDecodersOfFrameChange(int frame_number);
     bool SubmitFrameToTexture(const std::shared_ptr<AVFrame>& frame,

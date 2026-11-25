@@ -1,4 +1,7 @@
 #include "FSTPFullResDecoder_v2.h"
+#include "FSTPThreadName.h"
+#include "FSTPHwDownload.h"
+#include "FSTPTo8Bit420.h"
 #include "FSTPPerformanceProfiler.h"
 #include "FSTPVideoOptimizations.h"
 #include "FSTPHardwareDetection.h"  // NEW: Unified hardware detection
@@ -9,6 +12,10 @@
 #include <atomic>
 #include <thread>
 #include <pthread.h>
+
+extern "C" {
+#include <libavutil/pixdesc.h>
+}
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -23,6 +30,9 @@
 // Debug control: set to true to enable verbose logging
 static constexpr bool ENABLE_FULLRES_V2_DEBUG = false;
 static constexpr bool ENABLE_FULLRES_V2_PROFILING = false;  // CPU/Buffer statistics every 100 iterations
+
+// Frames left out of the throughput measurement at start-up (see MeasuredDecodeFps).
+static constexpr int kWarmupFrames = 5;
 
 // Global counter of active V2 decoders (for multi-instance adaptation)
 static std::atomic<int> g_active_decoder_count{0};
@@ -239,6 +249,37 @@ bool FSTPFullResDecoderV2::Initialize() {
         return false;
     }
 
+    // A hardware decoder that can't take this stream's profile hands it to software (GetHWFormat)
+    // — but inside a context tuned for the GPU, where LOW_DELAY switches off frame threading: a
+    // 4:2:2 10-bit H.264 original (XAVC-I, AVC-Intra) then decoded on ONE core — an XAVC-I-like
+    // 1080p25 runs 0.7× realtime that way on the Pentium Gold 7505, 2× on all four threads. Find
+    // out now, and if the stream went to software, reopen as a plain multi-threaded decoder.
+    if (hw_accel_enabled_ && !HardwareTakesThisStream()) {
+        std::cout << "🔄 [FULL-RES V2] Reopening as a multi-threaded software decoder" << std::endl;
+        avcodec_free_context(&codec_ctx_);
+        av_buffer_unref(&hw_device_ctx_);
+        hw_accel_enabled_ = false;
+        hw_pix_fmt_ = AV_PIX_FMT_NONE;
+
+        FSTPDecoderStrategy strategy = g_hardware_detection->GetDecoderStrategy(
+            codec_params_->width, codec_params_->height, codec_params_->codec_id, 1.0);
+        codec_ctx_ = avcodec_alloc_context3(codec);
+        if (!codec_ctx_ || avcodec_parameters_to_context(codec_ctx_, codec_params_) < 0) {
+            std::cerr << "❌ [FULL-RES V2] Failed to recreate codec context" << std::endl;
+            avcodec_free_context(&codec_ctx_);
+            avformat_close_input(&format_ctx_);
+            return false;
+        }
+        codec_ctx_->thread_count = strategy.thread_count;
+        codec_ctx_->thread_type = strategy.thread_type;
+        if (avcodec_open2(codec_ctx_, codec, nullptr) < 0) {
+            std::cerr << "❌ [FULL-RES V2] Failed to reopen codec" << std::endl;
+            avcodec_free_context(&codec_ctx_);
+            avformat_close_input(&format_ctx_);
+            return false;
+        }
+    }
+
     std::cout << "✅ [FULL-RES V2] Initialized successfully" << std::endl;
     std::cout << "   Native: " << native_width_ << "x" << native_height_ << std::endl;
     std::cout << "   Display: " << display_width_ << "x" << display_height_ << std::endl;
@@ -284,11 +325,11 @@ bool FSTPFullResDecoderV2::InitializeHardwareAcceleration(const AVCodec* codec) 
     // UNIFIED HARDWARE DETECTION (NEW!)
     // ========================================
     // Use centralized FSTPHardwareDetection instead of inline detection
-
-    if (codec_params_->codec_id != AV_CODEC_ID_H264 && codec_params_->codec_id != AV_CODEC_ID_HEVC) {
-        std::cout << "ℹ️  [FULL-RES V2] Codec doesn't support hardware acceleration, using software" << std::endl;
-        return false;
-    }
+    //
+    // No codec whitelist: every codec is offered to the hardware decoder, and FFmpeg only lists
+    // the hardware format for codecs/profiles the hwaccel can take (GetHWFormat falls back to
+    // software otherwise). Whether the result is fast enough is not predicted here — the wrapper
+    // measures it (MeasuredDecodeFps) and drops this decoder if it can't keep up.
 
     if (!g_hardware_detection) {
         std::cerr << "⚠️  [FULL-RES V2] g_hardware_detection not initialized, using software" << std::endl;
@@ -304,6 +345,11 @@ bool FSTPFullResDecoderV2::InitializeHardwareAcceleration(const AVCodec* codec) 
     );
 
     std::cout << "🎯 [FULL-RES V2] Strategy: " << strategy.strategy_reason << std::endl;
+
+    // Threads apply to the software path too: a software-decoded original used to run on
+    // libavcodec's default single thread, which alone could make it miss realtime.
+    codec_ctx_->thread_count = strategy.thread_count;
+    codec_ctx_->thread_type = strategy.thread_type;
 
     if (!strategy.use_hw_accel) {
         std::cout << "ℹ️  [FULL-RES V2] Strategy recommends software decode" << std::endl;
@@ -360,8 +406,7 @@ bool FSTPFullResDecoderV2::InitializeHardwareAcceleration(const AVCodec* codec) 
     // Apply decoder strategy settings
     codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
     codec_ctx_->get_format = FSTPFullResDecoderV2::GetHWFormat;
-    codec_ctx_->thread_count = strategy.thread_count;
-    codec_ctx_->thread_type = strategy.thread_type;
+    codec_ctx_->opaque = this;   // GetHWFormat reports its choice (HardwareTakesThisStream)
     codec_ctx_->flags |= strategy.codec_flags;
     codec_ctx_->flags2 |= strategy.codec_flags2;
 
@@ -369,17 +414,73 @@ bool FSTPFullResDecoderV2::InitializeHardwareAcceleration(const AVCodec* codec) 
 }
 
 AVPixelFormat FSTPFullResDecoderV2::GetHWFormat(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
+    auto* self = static_cast<FSTPFullResDecoderV2*>(ctx->opaque);
+    auto chosen = [self](AVPixelFormat f) {
+        if (self) self->chosen_pix_fmt_.store(f, std::memory_order_release);
+        return f;
+    };
     for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
 #ifdef __APPLE__
-        if (*p == AV_PIX_FMT_VIDEOTOOLBOX) return *p;
+        if (*p == AV_PIX_FMT_VIDEOTOOLBOX) return chosen(*p);
 #elif defined(__linux__)
-        if (*p == AV_PIX_FMT_VAAPI)         return *p;
+        if (*p == AV_PIX_FMT_VAAPI)         return chosen(*p);
 #elif defined(_WIN32)
         // D3D11 or DXVA2_VLD — whichever device was actually created (see init).
-        if (*p == g_win_hw_pix_fmt)         return *p;
+        if (*p == g_win_hw_pix_fmt)         return chosen(*p);
 #endif
     }
-    return AV_PIX_FMT_NONE;
+    // No hardware format on offer: the hwaccel can't take this codec/profile (4:2:2 or 10-bit
+    // H.264, ProRes on a GPU without it...). Decode in software instead of failing the stream —
+    // returning NONE here used to leave the full-res decoder producing nothing at all.
+    for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(*p);
+        if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+            std::cout << "ℹ️  [FULL-RES V2] Hardware decoder can't take this stream — software decode ("
+                      << desc->name << ")" << std::endl;
+            return chosen(*p);
+        }
+    }
+    return chosen(AV_PIX_FMT_NONE);
+}
+
+// Feeds packets only until FFmpeg settles the output format through GetHWFormat — which it does
+// as soon as it knows the stream's parameters, i.e. within the first picture, without waiting
+// for frames to come out (waiting for a frame cost 1.5 s on a 4K 4:2:2 file). Then rewinds the
+// demuxer and flushes the decoder so the decoding thread starts clean.
+bool FSTPFullResDecoderV2::HardwareTakesThisStream() {
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    for (int packets = 0; packet && frame && packets < 300 &&
+                          chosen_pix_fmt_.load(std::memory_order_acquire) == -2 &&
+                          av_read_frame(format_ctx_, packet) >= 0; ++packets) {
+        if (packet->stream_index == video_stream_index_ &&
+            avcodec_send_packet(codec_ctx_, packet) >= 0) {
+            while (avcodec_receive_frame(codec_ctx_, frame) == 0) av_frame_unref(frame);
+        }
+        av_packet_unref(packet);
+    }
+    av_packet_free(&packet);
+    av_frame_free(&frame);
+
+    const int64_t start = (video_stream_->start_time != AV_NOPTS_VALUE) ? video_stream_->start_time : 0;
+    av_seek_frame(format_ctx_, video_stream_index_, start, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(codec_ctx_);
+
+    const int fmt = chosen_pix_fmt_.load(std::memory_order_acquire);
+    return fmt == -2 || fmt == hw_pix_fmt_;   // undecided → keep the hardware setup as it was
+}
+
+double FSTPFullResDecoderV2::MeasuredDecodeFps() const {
+    // Steady-state rate once there is enough of it; otherwise (a clip that ends a few frames in)
+    // the pessimistic all-frames rate.
+    int frames = steady_frames_.load(std::memory_order_relaxed);
+    int64_t busy_us = steady_busy_us_.load(std::memory_order_relaxed);
+    if (frames < 3) {
+        frames = all_frames_.load(std::memory_order_relaxed);
+        busy_us = all_busy_us_.load(std::memory_order_relaxed);
+    }
+    if (frames <= 0 || busy_us <= 0) return 0.0;
+    return frames * 1000000.0 / static_cast<double>(busy_us);
 }
 
 void FSTPFullResDecoderV2::Cleanup() {
@@ -409,6 +510,10 @@ void FSTPFullResDecoderV2::Cleanup() {
     }
 
     // Free downscale context
+    if (to8bit_ctx_) {
+        sws_freeContext(to8bit_ctx_);
+        to8bit_ctx_ = nullptr;
+    }
     if (downscale_ctx_) {
         sws_freeContext(downscale_ctx_);
         downscale_ctx_ = nullptr;
@@ -589,6 +694,24 @@ void FSTPFullResDecoderV2::GetFrameTriplet(double now_time,
     if (best + 1 < stream_buffer_.size())      next = stream_buffer_[best + 1].frame;
 }
 
+void FSTPFullResDecoderV2::GetNeighbours(const AVFrame* shown,
+                                         std::shared_ptr<AVFrame>& prev,
+                                         std::shared_ptr<AVFrame>& next) {
+    prev = next = nullptr;
+    if (!shown) return;
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    const double one_frame = (frame_rate_ > 0.0) ? (1.0 / frame_rate_) : 0.04;
+    double t = -1.0;
+    for (const auto& sf : stream_buffer_) {
+        if (sf.frame.get() == shown) { t = sf.time_seconds; break; }
+    }
+    if (t < 0.0) return;   // the shown frame is no longer buffered: no neighbours rather than wrong ones
+    for (const auto& sf : stream_buffer_) {
+        if (std::abs(sf.time_seconds - (t - one_frame)) < one_frame * 0.5) prev = sf.frame;
+        else if (std::abs(sf.time_seconds - (t + one_frame)) < one_frame * 0.5) next = sf.frame;
+    }
+}
+
 void FSTPFullResDecoderV2::ClearBuffer() {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
     stream_buffer_.clear();
@@ -642,7 +765,7 @@ bool FSTPFullResDecoderV2::DownscaleFrame(AVFrame* src, AVFrame* dst) {
         temp_hw_frame = av_frame_alloc();
         if (!temp_hw_frame) return false;
 
-        if (av_hwframe_transfer_data(temp_hw_frame, src, 0) < 0) {
+        if (FSTPHwDownload(temp_hw_frame, src) < 0) {
             av_frame_free(&temp_hw_frame);
             return false;
         }
@@ -704,6 +827,51 @@ bool FSTPFullResDecoderV2::DownscaleFrame(AVFrame* src, AVFrame* dst) {
     return false;
 }
 
+const char* FSTPFullResDecoderV2::ConversionSite() const {
+    switch (conversion_site_.load(std::memory_order_relaxed)) {
+        case 1: return "the GPU";
+        case 2: return "the CPU";
+        default: return nullptr;
+    }
+}
+
+std::string FSTPFullResDecoderV2::SourceFormat() const {
+    if (!codec_params_) return "?";
+    const char* pix = av_get_pix_fmt_name(static_cast<AVPixelFormat>(codec_params_->format));
+    return std::string(avcodec_get_name(codec_params_->codec_id)) + " " + (pix ? pix : "?");
+}
+
+int FSTPFullResDecoderV2::DownloadForDisplay(AVFrame* dst, const AVFrame* src) {
+    if (hw_to8bit_.Applies(src)) {
+        AVFrame* nv12 = av_frame_alloc();
+        if (nv12 && hw_to8bit_.Convert(src, nv12)) {
+            int ret = FSTPHwDownload(dst, nv12);
+            av_frame_free(&nv12);
+            if (ret >= 0) {
+                conversion_site_.store(1, std::memory_order_relaxed);
+                return ret;
+            }
+            av_frame_unref(dst);
+        } else {
+            av_frame_free(&nv12);
+        }
+    }
+    return FSTPHwDownload(dst, src);
+}
+
+std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DisplayCopy(const AVFrame* frame) {
+    AVFrame* copy = nullptr;
+    if (FSTPIsDisplay420(frame->format)) {
+        copy = av_frame_clone(frame);
+    } else {
+        copy = av_frame_alloc();
+        if (copy && FSTPConvertTo8Bit420(copy, frame, &to8bit_ctx_) < 0) av_frame_free(&copy);
+        if (copy) conversion_site_.store(2, std::memory_order_relaxed);
+    }
+    if (!copy) return nullptr;
+    return std::shared_ptr<AVFrame>(copy, [](AVFrame* f) { av_frame_free(&f); });
+}
+
 std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targetTime) {
     if (!format_ctx_ || !codec_ctx_) return nullptr;
 
@@ -760,6 +928,28 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
 
                 if (receive_result != 0) break;
 
+                // CATCH-UP AFTER A SEEK: the decoder restarts at the previous keyframe, so with a
+                // long-GOP original it decodes up to a whole GOP (255 frames on a GOP-256 camera
+                // file) before reaching the target. Those frames fall outside the buffer window and
+                // were thrown away by the thread loop — but only AFTER the GPU→RAM copy below, the
+                // expensive part on an iGPU. Drop them here, as GPU surfaces, uncopied.
+                if (decoded_frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                    const int64_t start = (video_stream_->start_time != AV_NOPTS_VALUE) ? video_stream_->start_time : 0;
+                    const double t = av_q2d(video_stream_->time_base) *
+                                     static_cast<double>(decoded_frame->best_effort_timestamp - start);
+                    if (t < targetTime - buffer_window_behind_) {
+                        av_frame_unref(decoded_frame);
+                        // Abandon the catch-up if the target has moved on (a new seek/scrub):
+                        // the thread loop re-plans from the new position.
+                        if (std::abs(current_playback_time_.load() - targetTime) > 0.5) {
+                            av_packet_unref(packet);
+                            FSTP_PROFILE_DECODE_END("fullres_v2");
+                            goto decode_end;
+                        }
+                        continue;
+                    }
+                }
+
                 total_receive_frame_us += std::chrono::duration_cast<std::chrono::microseconds>(receive_end - receive_start).count();
                 // FFPLAY STYLE: Keep original resolution (without downscale)
                 // Handle hardware frame transfer if needed (VideoToolbox on macOS, VA-API on Linux)
@@ -781,11 +971,12 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
                     if (temp_hw_frame) {
                         // PROFILING: Measurement of av_hwframe_transfer_data (GPU→CPU copy)
                         auto transfer_start = std::chrono::high_resolution_clock::now();
-                        int transfer_result = av_hwframe_transfer_data(temp_hw_frame, decoded_frame, 0);
+                        int transfer_result = DownloadForDisplay(temp_hw_frame, decoded_frame);
                         auto transfer_end = std::chrono::high_resolution_clock::now();
                         total_hw_transfer_us += std::chrono::duration_cast<std::chrono::microseconds>(transfer_end - transfer_start).count();
 
                         if (transfer_result >= 0) {
+                            gpu_frames_.fetch_add(1, std::memory_order_relaxed);
                             // CRITICAL: Copy ALL properties from hardware frame
                             av_frame_copy_props(temp_hw_frame, decoded_frame);
                             temp_hw_frame->pts = decoded_frame->pts;
@@ -807,10 +998,7 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
 
                 // Clone to shared_ptr (like in old working version)
                 auto clone_start = std::chrono::high_resolution_clock::now();
-                result = std::shared_ptr<AVFrame>(
-                    av_frame_clone(final_frame),
-                    [](AVFrame* f) { av_frame_free(&f); }
-                );
+                result = DisplayCopy(final_frame);
                 auto clone_end = std::chrono::high_resolution_clock::now();
                 total_clone_us += std::chrono::duration_cast<std::chrono::microseconds>(clone_end - clone_start).count();
 
@@ -897,7 +1085,7 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
 
             if (is_hw_frame) {
                 temp_hw_frame = av_frame_alloc();
-                if (temp_hw_frame && av_hwframe_transfer_data(temp_hw_frame, decoded_frame, 0) >= 0) {
+                if (temp_hw_frame && DownloadForDisplay(temp_hw_frame, decoded_frame) >= 0) {
                     // CRITICAL: Copy ALL properties from hardware frame
                     av_frame_copy_props(temp_hw_frame, decoded_frame);
                     temp_hw_frame->pts = decoded_frame->pts;
@@ -910,15 +1098,9 @@ std::shared_ptr<AVFrame> FSTPFullResDecoderV2::DecodeAndProcessFrame(double targ
                 }
             }
 
-            // ZERO-COPY: Accept NV12/YUV420P directly without conversion!
-            // SDL supports both formats through SDL_UpdateNVTexture/SDL_UpdateYUVTexture
-            // (format conversion handled downstream if required)
-
-            // Clone to shared_ptr (like in old working version)
-            result = std::shared_ptr<AVFrame>(
-                av_frame_clone(final_frame),
-                [](AVFrame* f) { av_frame_free(&f); }
-            );
+            // NV12/YUV420P go to the buffer as they are (SDL_UpdateNVTexture/SDL_UpdateYUVTexture);
+            // anything else is brought to 8-bit 4:2:0 here, once (DisplayCopy).
+            result = DisplayCopy(final_frame);
 
             if (temp_hw_frame) av_frame_free(&temp_hw_frame);
 
@@ -989,6 +1171,7 @@ void FSTPFullResDecoderV2::ClearStopRequest() {
 }
 
 void FSTPFullResDecoderV2::DecodingThreadLoop() {
+    FSTPSetThreadName("fstp-fullres");
     std::cout << "🧵 [FULL-RES V2 THREAD] Decoding thread started" << std::endl;
 
     // Lower priority of decoding thread for multi-instance
@@ -1021,6 +1204,11 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
         auto iteration_start = std::chrono::high_resolution_clock::now();
         double playback_time = current_playback_time_.load();
         bool is_high_fps = (frame_rate_ >= 55.0);  // ADAPTIVE FPS helper
+        // Paused: keep kPausedAhead ready, not the playback window. After every stop or seek the
+        // decoder used to fill (ahead + behind + 2 s) — ~385 frames of a 50 fps clip decoded and
+        // copied from the GPU, ~500 MB, for a picture that wasn't moving. Playback widens it again.
+        const bool paused = paused_.load(std::memory_order_relaxed);
+        const double ahead_window = paused ? kPausedAhead : buffer_window_ahead_;
 
         // PROFILING: Buffer check
         auto buffer_check_start = std::chrono::high_resolution_clock::now();
@@ -1047,8 +1235,8 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                 // CRITICAL: Buffer must be ahead of playback by at least 1.5s for high FPS!
                 // Otherwise it will stutter due to showing old frames
                 // Adaptive thresholds: high FPS needs larger buffers
-                double ahead_threshold = (frame_rate_ >= 55.0) ? 2.5 : 1.0;
-                double decode_start_threshold = (frame_rate_ >= 55.0) ? 3.0 : 2.0;
+                double ahead_threshold = paused ? kPausedAhead * 0.5 : ((frame_rate_ >= 55.0) ? 2.5 : 1.0);
+                double decode_start_threshold = paused ? kPausedAhead * 0.5 : ((frame_rate_ >= 55.0) ? 3.0 : 2.0);
                 
                 bool playback_near_end = (playback_time > bufferMaxTime - decode_start_threshold);  // Start decoding earlier for high FPS
 
@@ -1081,7 +1269,7 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
         if (needs_update) {
             // Decode frames to fill buffer
             double minTime = playback_time - buffer_window_behind_;
-            double maxTime = playback_time + buffer_window_ahead_;
+            double maxTime = playback_time + ahead_window;
 
             // CRITICAL CPU OPTIMIZATION: DO NOT SEEK if buffer exists!
             // Seek ALWAYS goes to keyframe back → duplicates 90%
@@ -1165,13 +1353,15 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                 int max_decode_batch = (frame_rate_ >= 55.0) ? 600 : 400;  // Increased max for 60fps
                 
                 int max_decode = near_eof ? 200 : min_decode_batch;
-                double desiredAheadTime = playback_time + buffer_window_ahead_;
+                double desiredAheadTime = playback_time + ahead_window;
 
                 if (bufferEmpty) {
                     // CRITICAL: After seek/shuttle, decode many frames immediately to minimize jitter
-                    // High FPS needs more frames to fill the same time window
-                    int desired_frames = static_cast<int>(std::ceil((buffer_window_ahead_ + buffer_window_behind_ + 2.0) / frameDuration));
-                    desired_frames = std::max(desired_frames, target_size * 3);
+                    // High FPS needs more frames to fill the same time window. Paused: the window
+                    // behind (backward steps) plus kPausedAhead, nothing more.
+                    int desired_frames = static_cast<int>(std::ceil(
+                        (ahead_window + buffer_window_behind_ + (paused ? 0.0 : 2.0)) / frameDuration));
+                    if (!paused) desired_frames = std::max(desired_frames, target_size * 3);
                     max_decode = std::min(max_decode_batch, std::max(max_decode, desired_frames));
                 } else {
                     if (bufferMaxForDecode < desiredAheadTime) {
@@ -1213,7 +1403,16 @@ void FSTPFullResDecoderV2::DecodingThreadLoop() {
                     total_decode_us += std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count();
 
                     // Counter of REAL decoded frames (including nullptr - decoding attempts)
-                    if (decoded_frame) total_frames_decoded++;
+                    if (decoded_frame) {
+                        total_frames_decoded++;
+                        const int64_t busy_us =
+                            std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count();
+                        if (all_frames_.fetch_add(1, std::memory_order_relaxed) >= kWarmupFrames) {
+                            steady_frames_.fetch_add(1, std::memory_order_relaxed);
+                            steady_busy_us_.fetch_add(busy_us, std::memory_order_relaxed);
+                        }
+                        all_busy_us_.fetch_add(busy_us, std::memory_order_relaxed);
+                    }
 
                     if (!decoded_frame) {
                         reached_eof = true;

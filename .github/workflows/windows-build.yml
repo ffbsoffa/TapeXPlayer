@@ -1,6 +1,6 @@
 name: Windows x64 build
 
-# Build TapeXPlayer.exe on a GitHub-hosted windows-latest runner using MSYS2/MinGW64.
+# Build TapeXPlayer.exe on a GitHub-hosted windows-latest runner using MSYS2/UCRT64.
 # Produces a self-contained bundle (exe + DLLs) as a downloadable artifact, and —
 # when triggered by a version tag (v*) — attaches the release zip to a GitHub Release.
 
@@ -19,30 +19,36 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        shell: msys2 {0}    # every run: step executes inside the MSYS2 MINGW64 login shell
+        shell: msys2 {0}    # every run: step executes inside the MSYS2 UCRT64 login shell
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up MSYS2 (MINGW64)
+      # UCRT64: MSYS2 no longer carries rtmidi for the older MINGW64 environment
+      - name: Set up MSYS2 (UCRT64)
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           # Package list mirrors the makefile's LIBS + toolchain.
           install: >-
             make
             zip
             git
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-SDL2
-            mingw-w64-x86_64-SDL2_ttf
-            mingw-w64-x86_64-portaudio
-            mingw-w64-x86_64-ffmpeg
-            mingw-w64-x86_64-openssl
-            mingw-w64-x86_64-rtmidi
-            mingw-w64-x86_64-nsis
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-freetype
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-portaudio
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-rtmidi
+            mingw-w64-ucrt-x86_64-nsis
+
+      # Over MSYS2's sdl2-compat shim: the script says why. bootstrap_win.sh runs the same one.
+      - name: Build real SDL2 + SDL2_ttf from source
+        run: ./source/build_sdl2_win.sh
 
       - name: Show toolchain
         run: |

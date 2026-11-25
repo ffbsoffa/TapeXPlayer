@@ -4,8 +4,8 @@
 // ---------------------------------------------------------------------------
 // FSTPExtensions — the extension registry.
 //
-// Goal (Milestone 6): a clear, flexible extension system that a human OR an AI
-// can author against. An extension is described by a tiny text manifest, so no
+// Goal (Milestone 6): a clear, flexible extension system that is easy to author
+// against. An extension is described by a tiny text manifest, so no
 // recompilation is needed to add one and the format is trivial to generate.
 //
 // Two kinds of extension share one registry:

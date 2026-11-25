@@ -6,8 +6,8 @@
 #
 # This example declares a Lua extension. When the build has Lua (macOS:
 # `brew install lua`), an enabled type=lua extension is loaded at startup and its
-# main.lua runs. The format is intentionally trivial so a human or an AI can
-# author one. The player looks for extensions next to the executable, or in the
+# main.lua runs. The format is intentionally trivial, so one is easy to
+# write. The player looks for extensions next to the executable, or in the
 # directory named by the FSTP_EXT_DIR environment variable.
 
 id          = example-clock-overlay

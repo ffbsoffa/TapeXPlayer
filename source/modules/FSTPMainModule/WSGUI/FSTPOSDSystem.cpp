@@ -9,7 +9,21 @@
 #include <cstdio>
 #include <iostream>
 #include <unordered_map>
+#include <vector>
+#include <cstdint>
 #include <map>
+#include <mutex>
+
+// Where each player's position box (bottom right) was last drawn, for the mouse: a click or a
+// drag in it seeks (FSTPOSD_PositionBoxFraction). Drawn on the render thread, read on the UI thread.
+namespace {
+struct PositionBox {
+    SDL_Rect track{};     // the span the playhead bar moves along
+    Uint64 drawn_ms = 0;
+};
+std::mutex g_position_box_mutex;
+std::map<int, PositionBox> g_position_boxes;  // per player_id
+}  // namespace
 #include <set>
 #include <chrono>
 
@@ -192,7 +206,13 @@ std::string generateTimecode(double currentTime, int player_id = 0) {
         } else {
             // For video files: HH:MM:SS:FF (frames) - use REAL file FPS!
             double fps = (data.fps > 0.0) ? data.fps : 25.0; // Use real FPS or fallback to PAL
-            int frames = (int)((currentTime - (int)currentTime) * fps);
+            // A millionth of a frame up, as marker timecodes do (SecondsToTimecode): an exact
+            // frame position like 29/25 s is stored as 1.1599999… and must not show frame 3
+            double t = currentTime + 1e-6 / fps;
+            hours = (int)(t / 3600);
+            minutes = (int)((t - hours * 3600) / 60);
+            seconds = (int)(t - hours * 3600 - minutes * 60);
+            int frames = (int)((t - (int)t) * fps);
             snprintf(timecode, sizeof(timecode), "%02d:%02d:%02d:%02d", hours, minutes, seconds, frames);
         }
     }
@@ -366,21 +386,124 @@ static void ClearAllCaches();
 
 // === TEXTURE CACHING WITH MULTIPLE RENDERER SUPPORT ===
 
+// An OSD text or glyph with its outline, in one texture: the outline rendering (the text in the
+// outline colour) on the left, the text rendering on the right, kOutlineGutter transparent
+// columns between. DrawOutlined sends the five layers — the outline at four 1-px offsets, then
+// the text — to the GPU as one SDL_RenderGeometry call instead of five SDL_RenderCopy calls:
+// ~130 draw calls a frame for the OSD became ~35. The GPU blends a draw call's triangles in
+// submission order and the quads sample the same texels at 1:1, so the pixels are the same.
+static constexpr int kOutlineGutter = 2;
+
+struct OutlinedTexture {
+    SDL_Texture* texture = nullptr;
+    int width = 0, height = 0;          // drawn size (the outline rendering's, as before)
+    int text_x = 0;                     // where the text rendering starts in the texture
+    int text_w = 0, text_h = 0;         // its size
+    int tex_w = 0, tex_h = 0;           // the texture's size
+    bool has_outline = false;
+};
+
+static OutlinedTexture MakeOutlinedTexture(SDL_Renderer* renderer, TTF_Font* font, const char* text,
+                                           SDL_Color color, SDL_Color outline_color) {
+    OutlinedTexture out;
+    SDL_Surface* outline = TTF_RenderText_Blended(font, text, outline_color);
+    SDL_Surface* fill = TTF_RenderText_Blended(font, text, color);
+    if (fill) {
+        out.has_outline = (outline != nullptr);
+        out.width = outline ? outline->w : fill->w;
+        out.height = outline ? outline->h : fill->h;
+        out.text_x = outline ? outline->w + kOutlineGutter : 0;
+        out.text_w = fill->w;
+        out.text_h = fill->h;
+        out.tex_w = out.text_x + fill->w;
+        out.tex_h = std::max(outline ? outline->h : 0, fill->h);
+        SDL_Surface* both = SDL_CreateRGBSurfaceWithFormat(0, out.tex_w, out.tex_h, 32, fill->format->format);
+        if (both) {
+            SDL_FillRect(both, nullptr, 0);   // transparent; the blits below copy pixels as they are
+            if (outline) {
+                SDL_SetSurfaceBlendMode(outline, SDL_BLENDMODE_NONE);
+                SDL_Rect at = {0, 0, outline->w, outline->h};
+                SDL_BlitSurface(outline, nullptr, both, &at);
+            }
+            SDL_SetSurfaceBlendMode(fill, SDL_BLENDMODE_NONE);
+            SDL_Rect at = {out.text_x, 0, fill->w, fill->h};
+            SDL_BlitSurface(fill, nullptr, both, &at);
+            out.texture = SDL_CreateTextureFromSurface(renderer, both);   // BLEND, like the originals
+            SDL_FreeSurface(both);
+        }
+    }
+    if (outline) SDL_FreeSurface(outline);
+    if (fill) SDL_FreeSurface(fill);
+    return out;
+}
+
+static void DrawOutlined(SDL_Renderer* renderer, const OutlinedTexture& t, int x, int y) {
+    if (!t.texture) return;
+    static const int offsets[4][2] = {{0, -1}, {0, 1}, {-1, 0}, {1, 0}};
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+    SDL_Vertex v[20];
+    int idx[30];
+    int nv = 0, ni = 0;
+    const SDL_Color white = {255, 255, 255, 255};
+    auto quad = [&](int dx, int dy, int sx, int sw, int sh) {
+        const float x0 = static_cast<float>(x + dx), y0 = static_cast<float>(y + dy);
+        const float x1 = x0 + t.width, y1 = y0 + t.height;
+        const float u0 = static_cast<float>(sx) / t.tex_w, u1 = static_cast<float>(sx + sw) / t.tex_w;
+        const float v1 = static_cast<float>(sh) / t.tex_h;
+        v[nv + 0] = {{x0, y0}, white, {u0, 0.0f}};
+        v[nv + 1] = {{x1, y0}, white, {u1, 0.0f}};
+        v[nv + 2] = {{x1, y1}, white, {u1, v1}};
+        v[nv + 3] = {{x0, y1}, white, {u0, v1}};
+        const int b = nv;
+        const int tri[6] = {b, b + 1, b + 2, b, b + 2, b + 3};
+        for (int k = 0; k < 6; ++k) idx[ni++] = tri[k];
+        nv += 4;
+    };
+    if (t.has_outline) {
+        for (const auto& o : offsets) quad(o[0], o[1], 0, t.width, t.height);
+    }
+    quad(0, 0, t.text_x, t.text_w, t.text_h);
+    SDL_RenderGeometry(renderer, t.texture, v, nv, idx, ni);
+#else
+    if (t.has_outline) {
+        for (const auto& o : offsets) {
+            SDL_Rect src = {0, 0, t.width, t.height};
+            SDL_Rect dst = {x + o[0], y + o[1], t.width, t.height};
+            SDL_RenderCopy(renderer, t.texture, &src, &dst);
+        }
+    }
+    SDL_Rect src = {t.text_x, 0, t.text_w, t.text_h};
+    SDL_Rect dst = {x, y, t.width, t.height};
+    SDL_RenderCopy(renderer, t.texture, &src, &dst);
+#endif
+}
+
 // Structure for cached glyph
 struct CachedGlyph {
-    SDL_Texture* texture = nullptr;
-    SDL_Texture* outline_texture = nullptr;
+    SDL_Texture* texture = nullptr;          // OutlinedTexture::texture (outline + text)
+    SDL_Texture* outline_texture = nullptr;  // unused: the outline lives in `texture`
     int width = 0;
     int height = 0;
+    OutlinedTexture outlined;
 };
 
 // Structure for cached text
 struct CachedText {
-    SDL_Texture* texture = nullptr;
-    SDL_Texture* outline_texture = nullptr;
+    SDL_Texture* texture = nullptr;          // OutlinedTexture::texture (outline + text)
+    SDL_Texture* outline_texture = nullptr;  // unused: the outline lives in `texture`
     int width = 0;
     int height = 0;
+    uint64_t last_used = 0;   // g_text_cache_tick at the last lookup (eviction order)
+    OutlinedTexture outlined;
 };
+
+// The text caches are keyed by the whole string, and the running timecode is one: every frame
+// of playback is a new entry with two textures. Nothing ever left the cache (only a renderer's
+// destruction cleared it), so it grew without bound — an hour at 25 fps is ~90 000 entries.
+// Keep at most kTextCacheMax per renderer and colour/font map; past that, drop the least
+// recently used half. Entries drawn this frame are the most recent, so they always stay.
+static constexpr size_t kTextCacheMax = 256;
+static uint64_t g_text_cache_tick = 0;
 
 // Cache for each renderer: renderer -> (char -> CachedGlyph)
 // Separate caches for different colors (yellow, gray, white)
@@ -481,22 +604,10 @@ static CachedGlyph* GetCachedGlyph(SDL_Renderer* renderer, char c, SDL_Color col
     // Create new glyph
     char text[2] = {c, '\0'};
     CachedGlyph glyph;
-
-    // Outline
-    SDL_Surface* outline_surface = TTF_RenderText_Blended(font, text, outline_color);
-    if (outline_surface) {
-        glyph.outline_texture = SDL_CreateTextureFromSurface(renderer, outline_surface);
-        glyph.width = outline_surface->w;
-        glyph.height = outline_surface->h;
-        SDL_FreeSurface(outline_surface);
-    }
-
-    // Main text
-    SDL_Surface* surface = TTF_RenderText_Blended(font, text, color);
-    if (surface) {
-        glyph.texture = SDL_CreateTextureFromSurface(renderer, surface);
-        SDL_FreeSurface(surface);
-    }
+    glyph.outlined = MakeOutlinedTexture(renderer, font, text, color, outline_color);
+    glyph.texture = glyph.outlined.texture;
+    glyph.width = glyph.outlined.width;
+    glyph.height = glyph.outlined.height;
 
     renderer_cache[c] = glyph;
     return &renderer_cache[c];
@@ -537,27 +648,30 @@ static CachedText* GetCachedText(SDL_Renderer* renderer, const std::string& text
 
     auto it = renderer_cache.find(key);
     if (it != renderer_cache.end()) {
+        it->second.last_used = ++g_text_cache_tick;
         return &it->second; // Already in cache
+    }
+
+    if (renderer_cache.size() >= kTextCacheMax) {
+        std::vector<std::pair<uint64_t, std::string>> by_age;
+        by_age.reserve(renderer_cache.size());
+        for (const auto& entry : renderer_cache) by_age.emplace_back(entry.second.last_used, entry.first);
+        std::sort(by_age.begin(), by_age.end());
+        for (size_t i = 0; i < by_age.size() / 2; ++i) {
+            auto old = renderer_cache.find(by_age[i].second);
+            if (old->second.texture) SDL_DestroyTexture(old->second.texture);
+            if (old->second.outline_texture) SDL_DestroyTexture(old->second.outline_texture);
+            renderer_cache.erase(old);
+        }
     }
 
     // Create new texture for text
     CachedText cached;
-
-    // Outline
-    SDL_Surface* outline_surface = TTF_RenderText_Blended(font, text.c_str(), outline_color);
-    if (outline_surface) {
-        cached.outline_texture = SDL_CreateTextureFromSurface(renderer, outline_surface);
-        cached.width = outline_surface->w;
-        cached.height = outline_surface->h;
-        SDL_FreeSurface(outline_surface);
-    }
-
-    // Main text
-    SDL_Surface* surface = TTF_RenderText_Blended(font, text.c_str(), color);
-    if (surface) {
-        cached.texture = SDL_CreateTextureFromSurface(renderer, surface);
-        SDL_FreeSurface(surface);
-    }
+    cached.last_used = ++g_text_cache_tick;
+    cached.outlined = MakeOutlinedTexture(renderer, font, text.c_str(), color, outline_color);
+    cached.texture = cached.outlined.texture;
+    cached.width = cached.outlined.width;
+    cached.height = cached.outlined.height;
 
     renderer_cache[key] = cached;
     return &renderer_cache[key];
@@ -567,38 +681,14 @@ static CachedText* GetCachedText(SDL_Renderer* renderer, const std::string& text
 static void RenderCachedText(SDL_Renderer* renderer, const std::string& text, int x, int y, SDL_Color color, SDL_Color outline_color, TTF_Font* font) {
     CachedText* cached = GetCachedText(renderer, text, color, outline_color, font);
     if (!cached || !cached->texture) return;
-
-    // Draw outline in 4 directions
-    if (cached->outline_texture) {
-        static const int offsets[4][2] = {{0, -1}, {0, 1}, {-1, 0}, {1, 0}};
-        for (int i = 0; i < 4; i++) {
-            SDL_Rect outline_rect = {x + offsets[i][0], y + offsets[i][1], cached->width, cached->height};
-            SDL_RenderCopy(renderer, cached->outline_texture, nullptr, &outline_rect);
-        }
-    }
-
-    // Draw main text
-    SDL_Rect dst_rect = {x, y, cached->width, cached->height};
-    SDL_RenderCopy(renderer, cached->texture, nullptr, &dst_rect);
+    DrawOutlined(renderer, cached->outlined, x, y);   // outline at 4 offsets, then the text
 }
 
 // Render cached glyph (returns width for positioning)
 static int RenderCachedGlyph(SDL_Renderer* renderer, char c, int x, int y, SDL_Color color, SDL_Color outline_color, TTF_Font* font) {
     CachedGlyph* glyph = GetCachedGlyph(renderer, c, color, outline_color, font);
     if (!glyph || !glyph->texture) return 0;
-
-    // Draw outline in 4 directions
-    if (glyph->outline_texture) {
-        static const int offsets[4][2] = {{0, -1}, {0, 1}, {-1, 0}, {1, 0}};
-        for (int i = 0; i < 4; i++) {
-            SDL_Rect outline_rect = {x + offsets[i][0], y + offsets[i][1], glyph->width, glyph->height};
-            SDL_RenderCopy(renderer, glyph->outline_texture, nullptr, &outline_rect);
-        }
-    }
-
-    // Draw main text
-    SDL_Rect dst_rect = {x, y, glyph->width, glyph->height};
-    SDL_RenderCopy(renderer, glyph->texture, nullptr, &dst_rect);
+    DrawOutlined(renderer, glyph->outlined, x, y);   // outline at 4 offsets, then the glyph
     return glyph->width;
 }
 
@@ -916,8 +1006,15 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
                 currentX += charWidth;
             }
         } else {
-            // Normal mode - render the whole string
-            RenderCachedText(renderer, timecode, timecodeX, timecodeY, textColor, shadowColor, g_large_font);
+            // Normal mode: glyph by glyph from the glyph cache, like seek mode. The running
+            // timecode is a new string every frame, so drawing it whole meant two TTF renders and
+            // two new textures per frame. The OSD font is fixed-width (Iosevka Fixed): the glyph-
+            // by-glyph picture is pixel-identical to the whole string (checked with SDL_ttf 2.24
+            // on macOS and Ubuntu's on Linux, sizes 32 and 16, text and outline colours).
+            int currentX = timecodeX;
+            for (char c : timecode) {
+                currentX += RenderCachedGlyph(renderer, c, currentX, timecodeY, textColor, shadowColor, g_large_font);
+            }
         }
 
         // auto timecode_end = std::chrono::high_resolution_clock::now();
@@ -1173,6 +1270,11 @@ void RenderOSDForPlayer(SDL_Renderer* renderer, int player_id) {
 
         int indicatorX = windowWidth - INDICATOR_WIDTH - MARGIN_RIGHT;
         int indicatorY = windowHeight - 64 - (INDICATOR_HEIGHT / 2) + 10;
+        {
+            std::lock_guard<std::mutex> lock(g_position_box_mutex);
+            g_position_boxes[player_id] = {SDL_Rect{indicatorX + 2, indicatorY, INDICATOR_WIDTH - 4, INDICATOR_HEIGHT},
+                                           SDL_GetTicks()};
+        }
 
         // Black outline around indicator (like text with outline)
         SDL_Rect outlineRect = {indicatorX - 1, indicatorY - 1, INDICATOR_WIDTH + 2, INDICATOR_HEIGHT + 2};
@@ -1555,4 +1657,21 @@ extern "C" int CheckMenuBarClick(int mouse_x, int mouse_y, int window_width) {
     }
     
     return -1;  // Clicked in menu bar but not on any item
+}
+
+bool FSTPOSD_PositionBoxFraction(int player_id, float x, float y, bool inside, double* fraction) {
+    PositionBox box;
+    {
+        std::lock_guard<std::mutex> lock(g_position_box_mutex);
+        auto it = g_position_boxes.find(player_id);
+        if (it == g_position_boxes.end()) return false;
+        box = it->second;
+    }
+    if (SDL_GetTicks() - box.drawn_ms > 500) return false;  // not on screen lately
+    const SDL_Rect& r = box.track;
+    if (r.w <= 0) return false;
+    // The frame's 2 px border counts as inside, so the very start and end can be clicked
+    if (inside && (x < r.x - 2 || x >= r.x + r.w + 2 || y < r.y || y >= r.y + r.h)) return false;
+    *fraction = std::max(0.0, std::min(1.0, (x - r.x) / static_cast<double>(r.w)));
+    return true;
 }

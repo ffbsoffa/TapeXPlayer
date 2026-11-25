@@ -43,6 +43,10 @@ public:
         double total_duration = 0.0;        // Total duration (seconds)
         double frame_rate = 25.0;           // Source FPS
         bool new_frame = false;             // True when freshly submitted
+        // Changes when a different picture is submitted, not when the same one is submitted
+        // again (a pause re-submits it every render tick). The proxy and the full-res picture of
+        // the same frame share a timestamp but not a serial.
+        uint64_t picture_serial = 0;
 
         // SAR (Sample Aspect Ratio) for anamorphic content
         // Used to compute display aspect ratio: DAR = SAR × (width / height)
@@ -69,6 +73,18 @@ private:
     std::atomic<int> m_read_buffer_index[MAX_PLAYERS];  // Read buffer index
     std::atomic<bool> m_buffer_ready[MAX_PLAYERS];      // Buffer ready for reading
 
+    // Identity of the last picture submitted per player (PixelBuffer::picture_serial).
+    struct SubmittedPicture {
+        const void* frame = nullptr;
+        const void* data = nullptr;
+        double timestamp = -1.0;
+        int frame_number = -1;
+        int width = 0;
+        int height = 0;
+        uint64_t serial = 0;
+    };
+    std::array<SubmittedPicture, MAX_PLAYERS> m_last_submitted{};
+
     // Mutexes for buffer protection
     std::mutex m_buffer_mutex[MAX_PLAYERS];
 
@@ -79,6 +95,25 @@ private:
     std::atomic<size_t> m_total_bytes_processed{0};
     std::atomic<size_t> m_total_frames_processed{0};
 
+    // Source frames with the row-local passes (smear, edge fade) already applied — see
+    // GetProcessedFrame. A small per-player LRU: the base frame N and its neighbour N+1.
+    struct ProcessedFrame {
+        const AVFrame* src = nullptr;   // identity of the source (pool frames are reused,
+        int64_t pts = 0;                //  so the timestamp is part of the key)
+        int width = 0;
+        int height = 0;
+        Uint32 format = 0;
+        int pitch[3] = {0, 0, 0};
+        std::vector<uint8_t> plane[3];
+        AVFrame* view = nullptr;        // shell over plane[], handed to the effect as N+1
+        uint64_t last_use = 0;
+    };
+    static constexpr int kProcessedSlots = 3;
+    std::array<std::array<ProcessedFrame, kProcessedSlots>, MAX_PLAYERS> m_processed{};
+    uint64_t m_processed_clock = 0;
+    const ProcessedFrame* GetProcessedFrame(int player_id, const AVFrame* src, Uint32 format,
+                                            int width, int height);
+
     struct EffectScratch {
         std::vector<uint8_t> plane0;
         std::vector<uint8_t> plane1;
@@ -86,11 +121,24 @@ private:
         Uint32 format = SDL_PIXELFORMAT_IYUV;
         int width = 0;
         int height = 0;
+        int pitch[3] = {0, 0, 0};
     };
+    // Even-aligned row range where scratch a and b differ → [y, y + h); h == 0 if identical.
+    static void ChangedRows(const EffectScratch& a, const EffectScratch& b, int& y, int& h);
+    std::array<std::chrono::steady_clock::time_point, MAX_PLAYERS> m_last_full_upload{};
 
     FSTPBetacamEffect m_betacam_effect;
     std::array<FSTPBetacamEffect::PlaybackMetrics, MAX_PLAYERS> m_playback_metrics{};
-    std::array<EffectScratch, MAX_PLAYERS> m_effect_scratch{};
+    // Two scratches per player, used alternately: the one not being written still holds what
+    // the YUV texture shows, so the new picture is compared row by row and only the rows that
+    // changed are uploaded. A Betacam pause re-renders every tick to animate the noise bar
+    // while the rest of the picture stays put — this cuts its ~1.3 ms 720p upload to the bar.
+    std::array<std::array<EffectScratch, 2>, MAX_PLAYERS> m_effect_scratch{};
+    std::array<int, MAX_PLAYERS> m_scratch_index{};
+    // Scratch whose pixels the texture holds (-1 = unknown) and that texture: a recreated
+    // renderer or a zero-copy upload in between invalidates the comparison.
+    std::array<int, MAX_PLAYERS> m_texture_scratch{};
+    std::array<SDL_Texture*, MAX_PLAYERS> m_texture_scratch_tex{};
     std::array<int, MAX_PLAYERS> m_last_effect_frame{};
     std::array<int, MAX_PLAYERS> m_last_full_res{};   // last frame proxy(≤480)/full-res(>480), -1=unknown
     std::array<int, MAX_PLAYERS> m_last_shuttle{};    // last frame shuttle(≥2×)/not, -1=unknown
@@ -107,7 +155,11 @@ private:
     };
     std::array<GrainTile, MAX_PLAYERS> m_grain{};
     std::array<uint32_t, MAX_PLAYERS> m_grain_phase{};  // xorshift phase for per-frame scroll offset
-    bool m_grain_enabled = true;
+    // Film grain (soft luma/chroma noise over everything) is OFF: it cost ~3.5 ms per frame at
+    // 720p on a Pentium Gold 7505 and, to shimmer, forced the whole effect chain to re-run on
+    // every render tick (~55×/s) even on a still frame. The owner chose to drop it for
+    // responsiveness on low-end hardware; the code is kept dormant behind this flag.
+    bool m_grain_enabled = false;
     bool m_edgefade_enabled = true;   // soft L/R border on every frame (incl. 1×)
     bool m_smear_enabled = true;      // subtle horizontal analog smear (limited bandwidth)
     void EnsureGrainTile(int player_id, int width, int height);
@@ -209,10 +261,12 @@ public:
                                     int u_pitch, int v_pitch, int width, int height, Uint32 format);
 
     /**
-     * @brief Fire a one-shot Betacam dropout-compensation burst (resume-from-pause = gentle form).
+     * @brief Ask for a one-shot Betacam dropout-compensation burst on going into play (the effect
+     * decides whether it comes). The full form — heavy bands ↔ thin lines: the gentle one (200 ms,
+     * one to three thin lines) was not seen at all on the Mac (the author, 19.10, build 1886).
      */
     void TriggerDropoutBurst(int player_id) {
-        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Gentle);
+        m_betacam_effect.RequestDropoutBurst(player_id, FSTPBetacamEffect::DropoutKind::Alternating);
     }
 
     /**

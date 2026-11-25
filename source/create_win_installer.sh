@@ -1,7 +1,7 @@
 #!/bin/bash
 # create_win_installer.sh — Build TapeXPlayer-Setup-<arch>-build<N>.exe via NSIS
 #
-# Requirements (MSYS2):  pacman -S mingw-w64-x86_64-nsis
+# Requirements (MSYS2):  pacman -S mingw-w64-ucrt-x86_64-nsis
 # The bundle must exist first:  make && ./bundle_dlls.sh
 #
 # Usage: ./create_win_installer.sh [arm64|x64] [bundle-dir]
@@ -27,7 +27,7 @@ fi
 # makensis lives in /mingw64 even when building the ARM64 installer
 MAKENSIS="$(command -v makensis || echo /mingw64/bin/makensis)"
 if [ ! -x "$MAKENSIS" ]; then
-    echo "❌  makensis not found:  pacman -S mingw-w64-x86_64-nsis"
+    echo "❌  makensis not found:  pacman -S ${MINGW_PACKAGE_PREFIX:-mingw-w64-ucrt-x86_64}-nsis"
     exit 1
 fi
 

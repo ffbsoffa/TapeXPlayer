@@ -212,7 +212,7 @@ if command -v ldd &>/dev/null; then
             fi
         done < <(ldd "$_bin" 2>/dev/null \
                  | awk '$3 ~ /\// {print $3}' \
-                 | grep -i "mingw" \
+                 | grep -iF "$MINGW_BIN/" \
                  | sort -u)
     done
     echo "   Added $LDD_ADDED additional DLLs via ldd"
@@ -241,8 +241,8 @@ if [ "$MISSING_REQUIRED" -ne 0 ]; then
     echo ""
     echo "════════════════════════════════════════════════════════════════"
     echo "❌  One or more required DLLs are missing."
-    echo "    Install them via MSYS2:  pacman -S mingw-w64-x86_64-ffmpeg"
-    echo "                             pacman -S mingw-w64-x86_64-SDL2"
+    echo "    Install them via MSYS2:  pacman -S ${MINGW_PACKAGE_PREFIX:-mingw-w64-ucrt-x86_64}-ffmpeg"
+    echo "    SDL2 / SDL2_ttf:         ./build_sdl2_win.sh"
     echo "════════════════════════════════════════════════════════════════"
     exit 1
 fi
@@ -260,32 +260,31 @@ if [ "$VERIFY_FAILED" -ne 0 ]; then
     exit 1
 fi
 
+# ── Final dependency pass ────────────────────────────────────────────────────
+# Read the imports of every bundled binary: whatever the toolchain's bin directory
+# provides must be in the bundle too, or the player does not start on a machine
+# without MSYS2. ldd alone is not enough: for a DLL that also sits in System32 on
+# the build machine (vulkan-1.dll) it reports that copy.
+command -v objdump &>/dev/null || { echo "❌  objdump not found — cannot verify the bundle"; exit 1; }
+missing_deps() {
+    for f in "$OUT_DIR"/*.exe "$OUT_DIR"/*.dll; do objdump -p "$f"; done \
+        | awk '/DLL Name:/ {print $3}' | tr -d '\r' | sort -u \
+        | while IFS= read -r dep_name; do
+              if [ -n "$dep_name" ] && ! _is_system_dll "$dep_name" \
+                 && [ -f "$MINGW_BIN/$dep_name" ] && [ ! -f "$OUT_DIR/$dep_name" ]; then
+                  echo "$dep_name"
+              fi
+          done
+}
+# Repeat: a DLL added here has imports of its own
+while MISSING="$(missing_deps)"; [ -n "$MISSING" ]; do
+    for dep_name in $MISSING; do
+        cp "$MINGW_BIN/$dep_name" "$OUT_DIR/$dep_name"
+        echo "   + by imports: $dep_name"
+    done
+done
+echo "   All DLL imports satisfied."
 DLL_COUNT=$(find "$OUT_DIR" -maxdepth 1 -name "*.dll" | wc -l | tr -d ' ')
-
-# ── Final dependency verification (ldd-based, fast) ──────────────────────────
-# Check that all DLLs needed by TapeXPlayer.exe are present in OUT_DIR.
-# Uses ldd on the ORIGINAL exe so results are not affected by OUT_DIR contents.
-if command -v ldd &>/dev/null; then
-    UNSATISFIED=0
-    while IFS= read -r dep_name; do
-        [ -z "$dep_name" ] && continue
-        _is_system_dll "$dep_name" && continue
-        if [ ! -f "$OUT_DIR/$dep_name" ]; then
-            echo "   !! UNSATISFIED: $dep_name"
-            UNSATISFIED=$((UNSATISFIED + 1))
-        fi
-    done < <(ldd "$EXE_PATH" 2>/dev/null \
-             | awk '{print $1}' \
-             | grep -iv "^ntdll\|^kernel\|^user32\|^msvcrt\|not$" \
-             | grep -i "\.dll$" \
-             | sort -u)
-    if [ "$UNSATISFIED" -gt 0 ]; then
-        echo "   !! $UNSATISFIED unsatisfied DLL dependencies."
-        echo "      Install missing packages via: pacman -S <package>"
-    else
-        echo "   All DLL imports satisfied."
-    fi
-fi
 
 echo "════════════════════════════════════════════════════════════════"
 echo "✅  DLL bundling complete!"

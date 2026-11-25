@@ -9,6 +9,8 @@
 #include <thread>
 #include <condition_variable>
 
+#include "FSTPHwTo8Bit.h"
+
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -47,6 +49,10 @@ public:
     // Set current playback time (background thread will update buffer)
     void SetPlaybackTime(double time_seconds);
 
+    // While paused only a short stretch ahead is kept decoded (kPausedAhead): enough for frame
+    // steps and the start of playback. The window behind (backward frame steps) is unchanged.
+    void SetPaused(bool paused) { paused_.store(paused, std::memory_order_relaxed); }
+
     // Get frame for given time (or nullptr if not in buffer)
     std::shared_ptr<AVFrame> GetFrameForTime(double time_seconds);
 
@@ -60,6 +66,14 @@ public:
                          std::shared_ptr<AVFrame>& prev,
                          std::shared_ptr<AVFrame>& now,
                          std::shared_ptr<AVFrame>& next);
+
+    // The Betacam neighbours of the frame ON SCREEN: found by that frame's identity in the buffer
+    // (a held frame or a cache hit need not be the frame at the requested time), and only frames
+    // really one frame before / after it (after a seek or a catch-up drop the buffer has gaps, so
+    // the next buffer entry may be two frames on). Null when there is no such frame.
+    void GetNeighbours(const AVFrame* shown,
+                       std::shared_ptr<AVFrame>& prev,
+                       std::shared_ptr<AVFrame>& next);
 
     // Get actual timestamp of last frame returned by GetFrameForTime (-1 if none)
     double GetLastFrameTime() const {
@@ -82,6 +96,23 @@ public:
     int GetNativeWidth() const { return native_width_; }
     int GetNativeHeight() const { return native_height_; }
     double GetDuration() const { return duration_; }
+    double GetFrameRate() const { return frame_rate_; }
+
+    // MEASURED, not guessed: frames this decoder actually produces per second of its own busy
+    // time on this file and this machine (decode + GPU→RAM copy included). The wrapper keeps the
+    // full-res decoder only if this clears realtime with margin — one rule on every platform,
+    // instead of recognising the CPU by name.
+    double MeasuredDecodeFps() const;
+    int MeasuredFrames() const { return all_frames_.load(std::memory_order_relaxed); }
+    // Frames measured after the start-up frames (see kWarmupFrames in the .cpp).
+    int SteadyFrames() const { return steady_frames_.load(std::memory_order_relaxed); }
+    // Whether the frames come off a hardware decoder (VideoToolbox / D3D11VA / VA-API surface).
+    bool DecodesOnGPU() const { return gpu_frames_.load(std::memory_order_relaxed) > 0; }
+    // Where the pictures were brought to 8-bit 4:2:0 for the display, if they needed it:
+    // "the GPU" (FSTPHwTo8Bit), "the CPU" (FSTPConvertTo8Bit420), or nullptr.
+    const char* ConversionSite() const;
+    // The original's codec and pixel format ("hevc yuv420p10le"), for the log.
+    std::string SourceFormat() const;
 
 private:
     // Initialization
@@ -91,9 +122,18 @@ private:
     // Hardware acceleration
     bool InitializeHardwareAcceleration(const AVCodec* codec);
     static AVPixelFormat GetHWFormat(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts);
+    bool HardwareTakesThisStream();
 
     // Decoding frame with downscaling
     std::shared_ptr<AVFrame> DecodeAndProcessFrame(double targetTime);
+
+    // The buffered copy of a decoded (and downloaded) picture, in a format the display takes
+    // (FSTPConvertTo8Bit420 for 10-bit / 4:2:2 originals, a reference otherwise).
+    std::shared_ptr<AVFrame> DisplayCopy(const AVFrame* frame);
+
+    // FSTPHwDownload of a hardware picture, made 8-bit on the GPU first where it can be
+    // (FSTPHwTo8Bit). Same contract as FSTPHwDownload.
+    int DownloadForDisplay(AVFrame* dst, const AVFrame* src);
 
     // Downscaling (4K → 720p)
     bool DownscaleFrame(AVFrame* src, AVFrame* dst);
@@ -133,6 +173,23 @@ private:
 
     // Downscaling context (cached)
     SwsContext* downscale_ctx_;
+    // FSTPConvertTo8Bit420's swscale fallback (cached)
+    SwsContext* to8bit_ctx_ = nullptr;
+    // 10-bit hardware pictures → NV12 on the GPU before the download (DownloadForDisplay)
+    FSTPHwTo8Bit hw_to8bit_;
+
+    // Output format FFmpeg settled on through GetHWFormat (-2 = not asked yet)
+    std::atomic<int> chosen_pix_fmt_{-2};
+
+    // Throughput measurement (see MeasuredDecodeFps): everything, and the steady part after the
+    // start-up frames — those carry decoder init and, with frame threading, the pipeline fill,
+    // and made a 3×-realtime 4K HEVC decode measure 2.0× on the Pentium Gold 7505.
+    std::atomic<int> all_frames_{0};
+    std::atomic<int64_t> all_busy_us_{0};
+    std::atomic<int> steady_frames_{0};
+    std::atomic<int64_t> steady_busy_us_{0};
+    std::atomic<int> gpu_frames_{0};
+    std::atomic<int> conversion_site_{0};   // 0 none, 1 GPU, 2 CPU (see ConversionSite)
 
     // STREAMING BUFFER (independent of frameIndex!)
     std::deque<StreamFrame> stream_buffer_;
@@ -155,6 +212,8 @@ private:
     // Low FPS (<50): standard windows
     double buffer_window_ahead_ = 3.0;  // Decode at least 3.0 sec ahead
     double buffer_window_behind_ = 2.0; // Keep 2.0 sec behind (DO NOT aggressively remove frames!)
+    std::atomic<bool> paused_{false};
+    static constexpr double kPausedAhead = 0.5;   // seconds kept ahead while paused
     
     // FPS-adaptive helper
     void UpdateBufferWindowsForFPS();

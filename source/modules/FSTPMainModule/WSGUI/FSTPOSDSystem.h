@@ -111,6 +111,11 @@ bool ShouldThrottleRendering(int player_id);
 // Menu bar rendering (Linux)
 void RenderMenuBar(SDL_Renderer* renderer, int window_width, int window_height);
 
+// The position box (bottom right) under the mouse: the fraction of the clip at x. inside: only when
+// (x, y) is in the box; otherwise x is clamped to it (a drag that has left the box). False when the
+// box was not drawn lately (OSD hidden, nothing loaded). Window coordinates.
+bool FSTPOSD_PositionBoxFraction(int player_id, float x, float y, bool inside, double* fraction);
+
 // Check if mouse click is on menu bar
 // Returns: -1 = no menu, 0 = File, 1 = Edit, 2 = View
 int CheckMenuBarClick(int mouse_x, int mouse_y, int window_width);

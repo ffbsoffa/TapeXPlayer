@@ -2,6 +2,7 @@
 #include "FSTPHardwareDetection.h"  // NEW: Use unified hardware detection
 #include <iostream>
 #include <algorithm>
+#include <cstdlib>
 
 extern "C" {
 #include <libavutil/opt.h>
@@ -343,6 +344,560 @@ void SIMDOptimizations::ProcessPlane_AVX512(uint8_t* plane, int width, int heigh
     // Function kept for API compatibility but does nothing
     (void)plane; (void)width; (void)height; (void)stride;
     return;
+}
+
+// ========================================
+// BETACAM EFFECT KERNELS
+// ========================================
+// SSE2 is in every x86-64 CPU and NEON in every AArch64 CPU, so unlike the AVX2 paths above
+// these need no runtime check. Every path is bit-identical to the scalar code.
+#if defined(FSTP_SIMD_X86) && (defined(__SSE2__) || defined(_M_X64))
+#define FSTP_KERNEL_SSE2 1
+#elif defined(FSTP_SIMD_ARM_NEON)
+#define FSTP_KERNEL_NEON 1
+#endif
+
+namespace {
+
+// --- Analog smear ---
+// Each row is a serial IIR chain, so the vectors run ACROSS rows: an 8×8 block of 16-bit
+// samples is transposed, its 8 columns are stepped with one lane per row, and transposed back.
+// The step is rewritten as  in + floor(k·(prev−in)/256)  (exact in integers); with
+// d = (prev−in)·128, |d| ≤ 32640 fits int16 and the floor term is the high half of a 16-bit
+// product: _mm_mulhi_epi16(d, 2k) on SSE2, vqdmulhq_s16(d, k) on NEON.
+// 720p NV12 on a Pentium Gold 7505 in power-saver: 2.1 → 1.1 ms per frame.
+
+inline int SmearStep(int in, int prev, int k) { return ((in << 8) + k * (prev - in)) >> 8; }
+
+// Scalar: eight rows advanced side by side (independent chains the core overlaps). Samples
+// are `step` bytes apart starting at byte `phase` (step 2 = one channel of NV12 UV).
+inline void SmearScalarRows(uint8_t* plane, int pitch, int rows, int samples, int step, int phase, int k) {
+    const int end = samples * step;
+    int yy = 0;
+    for (; yy + 8 <= rows; yy += 8) {
+        uint8_t* r0 = plane + static_cast<size_t>(yy) * pitch + phase;
+        uint8_t* r1 = r0 + pitch; uint8_t* r2 = r1 + pitch; uint8_t* r3 = r2 + pitch;
+        uint8_t* r4 = r3 + pitch; uint8_t* r5 = r4 + pitch; uint8_t* r6 = r5 + pitch; uint8_t* r7 = r6 + pitch;
+        int p0 = r0[0], p1 = r1[0], p2 = r2[0], p3 = r3[0], p4 = r4[0], p5 = r5[0], p6 = r6[0], p7 = r7[0];
+        for (int x = step; x < end; x += step) {
+            p0 = SmearStep(r0[x], p0, k); r0[x] = static_cast<uint8_t>(p0);
+            p1 = SmearStep(r1[x], p1, k); r1[x] = static_cast<uint8_t>(p1);
+            p2 = SmearStep(r2[x], p2, k); r2[x] = static_cast<uint8_t>(p2);
+            p3 = SmearStep(r3[x], p3, k); r3[x] = static_cast<uint8_t>(p3);
+            p4 = SmearStep(r4[x], p4, k); r4[x] = static_cast<uint8_t>(p4);
+            p5 = SmearStep(r5[x], p5, k); r5[x] = static_cast<uint8_t>(p5);
+            p6 = SmearStep(r6[x], p6, k); r6[x] = static_cast<uint8_t>(p6);
+            p7 = SmearStep(r7[x], p7, k); r7[x] = static_cast<uint8_t>(p7);
+        }
+    }
+    for (; yy < rows; ++yy) {
+        uint8_t* row = plane + static_cast<size_t>(yy) * pitch + phase;
+        int prev = row[0];
+        for (int x = step; x < end; x += step) {
+            prev = SmearStep(row[x], prev, k);
+            row[x] = static_cast<uint8_t>(prev);
+        }
+    }
+}
+
+#if defined(FSTP_KERNEL_SSE2)
+using SmearVec = __m128i;
+inline SmearVec SmearCoef(int k) { return _mm_set1_epi16(static_cast<short>(2 * k)); }
+inline SmearVec SmearStepVec(SmearVec in, SmearVec prev, SmearVec coef) {
+    const SmearVec d = _mm_slli_epi16(_mm_sub_epi16(prev, in), 7);
+    return _mm_add_epi16(in, _mm_mulhi_epi16(d, coef));
+}
+inline SmearVec SmearLoad8(const uint8_t* p) {
+    return _mm_unpacklo_epi8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)), _mm_setzero_si128());
+}
+inline void SmearStore8(uint8_t* p, SmearVec v) {
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(p), _mm_packus_epi16(v, v));
+}
+inline void SmearLoadUV(const uint8_t* p, SmearVec& u, SmearVec& v) {
+    const SmearVec x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    u = _mm_and_si128(x, _mm_set1_epi16(0x00FF));
+    v = _mm_srli_epi16(x, 8);
+}
+inline void SmearStoreUV(uint8_t* p, SmearVec u, SmearVec v) {
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(p), _mm_or_si128(u, _mm_slli_epi16(v, 8)));
+}
+inline SmearVec SmearFromLanes(const int16_t* lanes) {
+    return _mm_loadu_si128(reinterpret_cast<const __m128i*>(lanes));
+}
+inline void SmearToLanes(int16_t* lanes, SmearVec v) { _mm_storeu_si128(reinterpret_cast<__m128i*>(lanes), v); }
+inline void Transpose8x8(SmearVec* r) {
+    const SmearVec t0 = _mm_unpacklo_epi16(r[0], r[1]), t1 = _mm_unpackhi_epi16(r[0], r[1]);
+    const SmearVec t2 = _mm_unpacklo_epi16(r[2], r[3]), t3 = _mm_unpackhi_epi16(r[2], r[3]);
+    const SmearVec t4 = _mm_unpacklo_epi16(r[4], r[5]), t5 = _mm_unpackhi_epi16(r[4], r[5]);
+    const SmearVec t6 = _mm_unpacklo_epi16(r[6], r[7]), t7 = _mm_unpackhi_epi16(r[6], r[7]);
+    const SmearVec u0 = _mm_unpacklo_epi32(t0, t2), u1 = _mm_unpackhi_epi32(t0, t2);
+    const SmearVec u2 = _mm_unpacklo_epi32(t1, t3), u3 = _mm_unpackhi_epi32(t1, t3);
+    const SmearVec u4 = _mm_unpacklo_epi32(t4, t6), u5 = _mm_unpackhi_epi32(t4, t6);
+    const SmearVec u6 = _mm_unpacklo_epi32(t5, t7), u7 = _mm_unpackhi_epi32(t5, t7);
+    r[0] = _mm_unpacklo_epi64(u0, u4); r[1] = _mm_unpackhi_epi64(u0, u4);
+    r[2] = _mm_unpacklo_epi64(u1, u5); r[3] = _mm_unpackhi_epi64(u1, u5);
+    r[4] = _mm_unpacklo_epi64(u2, u6); r[5] = _mm_unpackhi_epi64(u2, u6);
+    r[6] = _mm_unpacklo_epi64(u3, u7); r[7] = _mm_unpackhi_epi64(u3, u7);
+}
+#elif defined(FSTP_KERNEL_NEON)
+using SmearVec = int16x8_t;
+inline SmearVec SmearCoef(int k) { return vdupq_n_s16(static_cast<int16_t>(k)); }   // vqdmulh doubles
+inline SmearVec SmearStepVec(SmearVec in, SmearVec prev, SmearVec coef) {
+    const SmearVec d = vshlq_n_s16(vsubq_s16(prev, in), 7);
+    return vaddq_s16(in, vqdmulhq_s16(d, coef));
+}
+inline SmearVec SmearLoad8(const uint8_t* p) { return vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p))); }
+inline void SmearStore8(uint8_t* p, SmearVec v) { vst1_u8(p, vqmovun_s16(v)); }
+inline void SmearLoadUV(const uint8_t* p, SmearVec& u, SmearVec& v) {
+    const uint8x8x2_t x = vld2_u8(p);
+    u = vreinterpretq_s16_u16(vmovl_u8(x.val[0]));
+    v = vreinterpretq_s16_u16(vmovl_u8(x.val[1]));
+}
+inline void SmearStoreUV(uint8_t* p, SmearVec u, SmearVec v) {
+    uint8x8x2_t x;
+    x.val[0] = vqmovun_s16(u);
+    x.val[1] = vqmovun_s16(v);
+    vst2_u8(p, x);
+}
+inline SmearVec SmearFromLanes(const int16_t* lanes) { return vld1q_s16(lanes); }
+inline void SmearToLanes(int16_t* lanes, SmearVec v) { vst1q_s16(lanes, v); }
+inline void Transpose8x8(SmearVec* r) {
+    const int16x8_t t0 = vtrn1q_s16(r[0], r[1]), t1 = vtrn2q_s16(r[0], r[1]);
+    const int16x8_t t2 = vtrn1q_s16(r[2], r[3]), t3 = vtrn2q_s16(r[2], r[3]);
+    const int16x8_t t4 = vtrn1q_s16(r[4], r[5]), t5 = vtrn2q_s16(r[4], r[5]);
+    const int16x8_t t6 = vtrn1q_s16(r[6], r[7]), t7 = vtrn2q_s16(r[6], r[7]);
+    const int32x4_t u0 = vtrn1q_s32(vreinterpretq_s32_s16(t0), vreinterpretq_s32_s16(t2));
+    const int32x4_t u2 = vtrn2q_s32(vreinterpretq_s32_s16(t0), vreinterpretq_s32_s16(t2));
+    const int32x4_t u1 = vtrn1q_s32(vreinterpretq_s32_s16(t1), vreinterpretq_s32_s16(t3));
+    const int32x4_t u3 = vtrn2q_s32(vreinterpretq_s32_s16(t1), vreinterpretq_s32_s16(t3));
+    const int32x4_t u4 = vtrn1q_s32(vreinterpretq_s32_s16(t4), vreinterpretq_s32_s16(t6));
+    const int32x4_t u6 = vtrn2q_s32(vreinterpretq_s32_s16(t4), vreinterpretq_s32_s16(t6));
+    const int32x4_t u5 = vtrn1q_s32(vreinterpretq_s32_s16(t5), vreinterpretq_s32_s16(t7));
+    const int32x4_t u7 = vtrn2q_s32(vreinterpretq_s32_s16(t5), vreinterpretq_s32_s16(t7));
+    auto lo = [](int32x4_t a, int32x4_t b) {
+        return vreinterpretq_s16_s64(vtrn1q_s64(vreinterpretq_s64_s32(a), vreinterpretq_s64_s32(b)));
+    };
+    auto hi = [](int32x4_t a, int32x4_t b) {
+        return vreinterpretq_s16_s64(vtrn2q_s64(vreinterpretq_s64_s32(a), vreinterpretq_s64_s32(b)));
+    };
+    r[0] = lo(u0, u4); r[4] = hi(u0, u4);
+    r[1] = lo(u1, u5); r[5] = hi(u1, u5);
+    r[2] = lo(u2, u6); r[6] = hi(u2, u6);
+    r[3] = lo(u3, u7); r[7] = hi(u3, u7);
+}
+#endif
+
+#if defined(FSTP_KERNEL_SSE2) || defined(FSTP_KERNEL_NEON)
+// Eight steps on N independent 8-row blocks: c[n][j] = column j of block n, one lane per row.
+// Two blocks in flight hide the multiply latency of the serial chain.
+template <int N>
+inline void SmearColumns(SmearVec (*c)[8], SmearVec* prev, SmearVec coef) {
+    for (int j = 0; j < 8; ++j) {
+        for (int n = 0; n < N; ++n) {
+            prev[n] = SmearStepVec(c[n][j], prev[n], coef);
+            c[n][j] = prev[n];
+        }
+    }
+}
+
+// Continues each row's chain over the columns the vector loop left (fewer than 8).
+inline void SmearTailRows(uint8_t* const* rows, const int16_t* prev, int count, int from, int samples,
+                          int step, int k) {
+    for (int i = 0; i < count; ++i) {
+        uint8_t* row = rows[i];
+        int p = prev[i];
+        for (int x = from; x < samples; ++x) {
+            p = SmearStep(row[x * step], p, k);
+            row[x * step] = static_cast<uint8_t>(p);
+        }
+    }
+}
+
+// 8·N consecutive rows of one channel.
+template <int N>
+void SmearPlanarGroup(uint8_t* base, int pitch, int samples, int k) {
+    const SmearVec coef = SmearCoef(k);
+    uint8_t* r[8 * N];
+    int16_t lanes[8 * N];
+    for (int i = 0; i < 8 * N; ++i) {
+        r[i] = base + static_cast<size_t>(i) * pitch;
+        lanes[i] = r[i][0];
+    }
+    SmearVec prev[N];
+    for (int n = 0; n < N; ++n) prev[n] = SmearFromLanes(lanes + 8 * n);
+    int x = 1;
+    for (; x + 8 <= samples; x += 8) {
+        SmearVec c[N][8];
+        for (int n = 0; n < N; ++n) {
+            for (int i = 0; i < 8; ++i) c[n][i] = SmearLoad8(r[8 * n + i] + x);
+            Transpose8x8(c[n]);
+        }
+        SmearColumns<N>(c, prev, coef);
+        for (int n = 0; n < N; ++n) {
+            Transpose8x8(c[n]);
+            for (int i = 0; i < 8; ++i) SmearStore8(r[8 * n + i] + x, c[n][i]);
+        }
+    }
+    if (x < samples) {
+        for (int n = 0; n < N; ++n) SmearToLanes(lanes + 8 * n, prev[n]);
+        SmearTailRows(r, lanes, 8 * N, x, samples, 1, k);
+    }
+}
+
+// 8 rows of two channels in alternate bytes (NV12 UV): U and V are the two blocks.
+void SmearInterleavedGroup(uint8_t* base, int pitch, int samples, int k) {
+    const SmearVec coef = SmearCoef(k);
+    uint8_t* r[8];
+    uint8_t* rv[8];
+    int16_t lanes[2][8];
+    for (int i = 0; i < 8; ++i) {
+        r[i] = base + static_cast<size_t>(i) * pitch;
+        rv[i] = r[i] + 1;
+        lanes[0][i] = r[i][0];
+        lanes[1][i] = r[i][1];
+    }
+    SmearVec prev[2] = {SmearFromLanes(lanes[0]), SmearFromLanes(lanes[1])};
+    int s = 1;
+    for (; s + 8 <= samples; s += 8) {
+        SmearVec c[2][8];
+        for (int i = 0; i < 8; ++i) SmearLoadUV(r[i] + 2 * s, c[0][i], c[1][i]);
+        Transpose8x8(c[0]);
+        Transpose8x8(c[1]);
+        SmearColumns<2>(c, prev, coef);
+        Transpose8x8(c[0]);
+        Transpose8x8(c[1]);
+        for (int i = 0; i < 8; ++i) SmearStoreUV(r[i] + 2 * s, c[0][i], c[1][i]);
+    }
+    if (s < samples) {
+        SmearToLanes(lanes[0], prev[0]);
+        SmearToLanes(lanes[1], prev[1]);
+        SmearTailRows(r, lanes[0], 8, s, samples, 2, k);
+        SmearTailRows(rv, lanes[1], 8, s, samples, 2, k);
+    }
+}
+#endif
+
+#if defined(FSTP_KERNEL_SSE2) && !defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
+// AVX2: two 8-row blocks per register, one in each 128-bit half. AVX2's unpack instructions
+// work within each half, so the SSE2 transpose sequence transposes both blocks at once: 16 rows
+// per vector instead of 8, for the same serial chain. Chosen at run time (UseSmearAvx2); the
+// SSE2 groups above take the rows that remain. Not on Windows: MinGW GCC doesn't realign the
+// stack for 32-byte locals (GCC bug 54412). Same arithmetic per lane — bit-identical.
+// 720p NV12 on a Pentium Gold 7505 in power-saver: see tools/simd (run_simd_tests.sh).
+#define FSTP_KERNEL_AVX2 1
+#define FSTP_AVX2 __attribute__((target("avx2")))
+
+inline bool UseSmearAvx2() {
+    static const bool use = __builtin_cpu_supports("avx2") && std::getenv("FSTP_SIMD_NO_AVX2") == nullptr;
+    return use;
+}
+
+using SmearVec2 = __m256i;
+FSTP_AVX2 inline SmearVec2 SmearCoef2(int k) { return _mm256_set1_epi16(static_cast<short>(2 * k)); }
+FSTP_AVX2 inline SmearVec2 SmearStepVec2(SmearVec2 in, SmearVec2 prev, SmearVec2 coef) {
+    const SmearVec2 d = _mm256_slli_epi16(_mm256_sub_epi16(prev, in), 7);
+    return _mm256_add_epi16(in, _mm256_mulhi_epi16(d, coef));
+}
+// 8 bytes of row `lo` -> lanes 0-7 (low half), 8 bytes of row `hi` -> lanes 8-15 (high half).
+FSTP_AVX2 inline SmearVec2 SmearLoad8x2(const uint8_t* lo, const uint8_t* hi) {
+    const __m128i a = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(lo));
+    const __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(hi));
+    return _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(a, b));
+}
+FSTP_AVX2 inline void SmearStore8x2(uint8_t* lo, uint8_t* hi, SmearVec2 v) {
+    const __m256i p = _mm256_packus_epi16(v, v);   // per half: its 8 bytes, twice
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(lo), _mm256_castsi256_si128(p));
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(hi), _mm256_extracti128_si256(p, 1));
+}
+// 8 UV pairs of row `lo` -> low half, of row `hi` -> high half; split into U and V.
+FSTP_AVX2 inline void SmearLoadUVx2(const uint8_t* lo, const uint8_t* hi, SmearVec2& u, SmearVec2& v) {
+    const __m256i x = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(lo))),
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(hi)), 1);
+    u = _mm256_and_si256(x, _mm256_set1_epi16(0x00FF));
+    v = _mm256_srli_epi16(x, 8);
+}
+FSTP_AVX2 inline void SmearStoreUVx2(uint8_t* lo, uint8_t* hi, SmearVec2 u, SmearVec2 v) {
+    const __m256i x = _mm256_or_si256(u, _mm256_slli_epi16(v, 8));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(lo), _mm256_castsi256_si128(x));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(hi), _mm256_extracti128_si256(x, 1));
+}
+FSTP_AVX2 inline void Transpose8x8x2(SmearVec2* r) {
+    const SmearVec2 t0 = _mm256_unpacklo_epi16(r[0], r[1]), t1 = _mm256_unpackhi_epi16(r[0], r[1]);
+    const SmearVec2 t2 = _mm256_unpacklo_epi16(r[2], r[3]), t3 = _mm256_unpackhi_epi16(r[2], r[3]);
+    const SmearVec2 t4 = _mm256_unpacklo_epi16(r[4], r[5]), t5 = _mm256_unpackhi_epi16(r[4], r[5]);
+    const SmearVec2 t6 = _mm256_unpacklo_epi16(r[6], r[7]), t7 = _mm256_unpackhi_epi16(r[6], r[7]);
+    const SmearVec2 u0 = _mm256_unpacklo_epi32(t0, t2), u1 = _mm256_unpackhi_epi32(t0, t2);
+    const SmearVec2 u2 = _mm256_unpacklo_epi32(t1, t3), u3 = _mm256_unpackhi_epi32(t1, t3);
+    const SmearVec2 u4 = _mm256_unpacklo_epi32(t4, t6), u5 = _mm256_unpackhi_epi32(t4, t6);
+    const SmearVec2 u6 = _mm256_unpacklo_epi32(t5, t7), u7 = _mm256_unpackhi_epi32(t5, t7);
+    r[0] = _mm256_unpacklo_epi64(u0, u4); r[1] = _mm256_unpackhi_epi64(u0, u4);
+    r[2] = _mm256_unpacklo_epi64(u1, u5); r[3] = _mm256_unpackhi_epi64(u1, u5);
+    r[4] = _mm256_unpacklo_epi64(u2, u6); r[5] = _mm256_unpackhi_epi64(u2, u6);
+    r[6] = _mm256_unpacklo_epi64(u3, u7); r[7] = _mm256_unpackhi_epi64(u3, u7);
+}
+template <int N>
+FSTP_AVX2 inline void SmearColumnsAvx2(SmearVec2 (*c)[8], SmearVec2* prev, SmearVec2 coef) {
+    for (int j = 0; j < 8; ++j) {
+        for (int n = 0; n < N; ++n) {
+            prev[n] = SmearStepVec2(c[n][j], prev[n], coef);
+            c[n][j] = prev[n];
+        }
+    }
+}
+
+// 16·N consecutive rows of one channel. Vector n: rows 16n..16n+7 in the low half, 16n+8..16n+15
+// in the high half (lane i = row 16n+i, as the rows' first samples are loaded below).
+template <int N>
+FSTP_AVX2 void SmearPlanarGroupAvx2(uint8_t* base, int pitch, int samples, int k) {
+    const SmearVec2 coef = SmearCoef2(k);
+    uint8_t* r[16 * N];
+    alignas(32) int16_t lanes[16 * N];
+    for (int i = 0; i < 16 * N; ++i) {
+        r[i] = base + static_cast<size_t>(i) * pitch;
+        lanes[i] = r[i][0];
+    }
+    SmearVec2 prev[N];
+    for (int n = 0; n < N; ++n) prev[n] = _mm256_load_si256(reinterpret_cast<const __m256i*>(lanes + 16 * n));
+    int x = 1;
+    for (; x + 8 <= samples; x += 8) {
+        SmearVec2 c[N][8];
+        for (int n = 0; n < N; ++n) {
+            for (int i = 0; i < 8; ++i) c[n][i] = SmearLoad8x2(r[16 * n + i] + x, r[16 * n + 8 + i] + x);
+            Transpose8x8x2(c[n]);
+        }
+        SmearColumnsAvx2<N>(c, prev, coef);
+        for (int n = 0; n < N; ++n) {
+            Transpose8x8x2(c[n]);
+            for (int i = 0; i < 8; ++i) SmearStore8x2(r[16 * n + i] + x, r[16 * n + 8 + i] + x, c[n][i]);
+        }
+    }
+    if (x < samples) {
+        for (int n = 0; n < N; ++n) _mm256_store_si256(reinterpret_cast<__m256i*>(lanes + 16 * n), prev[n]);
+        SmearTailRows(r, lanes, 16 * N, x, samples, 1, k);
+    }
+}
+
+// 16 rows of NV12 UV: U and V are the two vectors, rows 0-7 in the low half, 8-15 in the high.
+FSTP_AVX2 void SmearInterleavedGroupAvx2(uint8_t* base, int pitch, int samples, int k) {
+    const SmearVec2 coef = SmearCoef2(k);
+    uint8_t* r[16];
+    uint8_t* rv[16];
+    alignas(32) int16_t lanes[2][16];
+    for (int i = 0; i < 16; ++i) {
+        r[i] = base + static_cast<size_t>(i) * pitch;
+        rv[i] = r[i] + 1;
+        lanes[0][i] = r[i][0];
+        lanes[1][i] = r[i][1];
+    }
+    SmearVec2 prev[2] = {_mm256_load_si256(reinterpret_cast<const __m256i*>(lanes[0])),
+                         _mm256_load_si256(reinterpret_cast<const __m256i*>(lanes[1]))};
+    int s = 1;
+    for (; s + 8 <= samples; s += 8) {
+        SmearVec2 c[2][8];
+        for (int i = 0; i < 8; ++i) SmearLoadUVx2(r[i] + 2 * s, r[i + 8] + 2 * s, c[0][i], c[1][i]);
+        Transpose8x8x2(c[0]);
+        Transpose8x8x2(c[1]);
+        SmearColumnsAvx2<2>(c, prev, coef);
+        Transpose8x8x2(c[0]);
+        Transpose8x8x2(c[1]);
+        for (int i = 0; i < 8; ++i) SmearStoreUVx2(r[i] + 2 * s, r[i + 8] + 2 * s, c[0][i], c[1][i]);
+    }
+    if (s < samples) {
+        _mm256_store_si256(reinterpret_cast<__m256i*>(lanes[0]), prev[0]);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(lanes[1]), prev[1]);
+        SmearTailRows(r, lanes[0], 16, s, samples, 2, k);
+        SmearTailRows(rv, lanes[1], 16, s, samples, 2, k);
+    }
+}
+#endif
+
+} // namespace
+
+void SIMDOptimizations::AnalogSmear(uint8_t* plane, int pitch, int rows, int samples, bool interleaved, int k) {
+    if (!plane) return;
+    int yy = 0;
+#if defined(FSTP_KERNEL_SSE2) || defined(FSTP_KERNEL_NEON)
+    if (samples >= 2) {
+        if (interleaved) {
+#if defined(FSTP_KERNEL_AVX2)
+            if (UseSmearAvx2()) {
+                for (; yy + 16 <= rows; yy += 16)
+                    SmearInterleavedGroupAvx2(plane + static_cast<size_t>(yy) * pitch, pitch, samples, k);
+            }
+#endif
+            for (; yy + 8 <= rows; yy += 8)
+                SmearInterleavedGroup(plane + static_cast<size_t>(yy) * pitch, pitch, samples, k);
+        } else {
+#if defined(FSTP_KERNEL_AVX2)
+            if (UseSmearAvx2()) {
+                for (; yy + 32 <= rows; yy += 32)
+                    SmearPlanarGroupAvx2<2>(plane + static_cast<size_t>(yy) * pitch, pitch, samples, k);
+                for (; yy + 16 <= rows; yy += 16)
+                    SmearPlanarGroupAvx2<1>(plane + static_cast<size_t>(yy) * pitch, pitch, samples, k);
+            }
+#endif
+            for (; yy + 16 <= rows; yy += 16)
+                SmearPlanarGroup<2>(plane + static_cast<size_t>(yy) * pitch, pitch, samples, k);
+            for (; yy + 8 <= rows; yy += 8)
+                SmearPlanarGroup<1>(plane + static_cast<size_t>(yy) * pitch, pitch, samples, k);
+        }
+    }
+#endif
+    if (yy < rows) {
+        uint8_t* rest = plane + static_cast<size_t>(yy) * pitch;
+        SmearScalarRows(rest, pitch, rows - yy, samples, interleaved ? 2 : 1, 0, k);
+        if (interleaved) SmearScalarRows(rest, pitch, rows - yy, samples, 2, 1, k);
+    }
+}
+
+// 16 pixels per step in 16-bit lanes — the same integer arithmetic as the scalar tail.
+// ~8× faster than the scalar loop.
+void SIMDOptimizations::SoftEdgeRow(uint8_t* dst, const uint8_t* above, const uint8_t* cur,
+                                    const uint8_t* below, int width, int mix) {
+    int x = 0;
+#if defined(FSTP_KERNEL_SSE2)
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i vmix = _mm_set1_epi16(static_cast<short>(mix));
+    for (; x + 16 <= width; x += 16) {
+        const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(above + x));
+        const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(cur + x));
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(below + x));
+        __m128i out[2];
+        for (int half = 0; half < 2; ++half) {
+            const __m128i a16 = half ? _mm_unpackhi_epi8(a, zero) : _mm_unpacklo_epi8(a, zero);
+            const __m128i c16 = half ? _mm_unpackhi_epi8(c, zero) : _mm_unpacklo_epi8(c, zero);
+            const __m128i b16 = half ? _mm_unpackhi_epi8(b, zero) : _mm_unpacklo_epi8(b, zero);
+            const __m128i blur = _mm_srli_epi16(_mm_add_epi16(_mm_add_epi16(a16, b16), _mm_slli_epi16(c16, 1)), 2);
+            const __m128i delta = _mm_srai_epi16(_mm_mullo_epi16(_mm_sub_epi16(blur, c16), vmix), 8);
+            out[half] = _mm_add_epi16(c16, delta);
+        }
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x), _mm_packus_epi16(out[0], out[1]));
+    }
+#elif defined(FSTP_KERNEL_NEON)
+    const int16x8_t vmix = vdupq_n_s16(static_cast<int16_t>(mix));
+    for (; x + 16 <= width; x += 16) {
+        const uint8x16_t a = vld1q_u8(above + x), c = vld1q_u8(cur + x), b = vld1q_u8(below + x);
+        int16x8_t out[2];
+        for (int half = 0; half < 2; ++half) {
+            const int16x8_t a16 = vreinterpretq_s16_u16(vmovl_u8(half ? vget_high_u8(a) : vget_low_u8(a)));
+            const int16x8_t c16 = vreinterpretq_s16_u16(vmovl_u8(half ? vget_high_u8(c) : vget_low_u8(c)));
+            const int16x8_t b16 = vreinterpretq_s16_u16(vmovl_u8(half ? vget_high_u8(b) : vget_low_u8(b)));
+            const int16x8_t blur = vshrq_n_s16(vaddq_s16(vaddq_s16(a16, b16), vshlq_n_s16(c16, 1)), 2);
+            const int16x8_t delta = vshrq_n_s16(vmulq_s16(vsubq_s16(blur, c16), vmix), 8);
+            out[half] = vaddq_s16(c16, delta);
+        }
+        vst1q_u8(dst + x, vcombine_u8(vqmovun_s16(out[0]), vqmovun_s16(out[1])));
+    }
+#endif
+    for (; x < width; ++x) {
+        const int blurred = (above[x] + 2 * cur[x] + below[x]) >> 2;
+        dst[x] = static_cast<uint8_t>(cur[x] + (((blurred - cur[x]) * mix) >> 8));
+    }
+}
+
+// ========================================
+// AUDIO SAMPLE CONVERSION
+// ========================================
+// Decoded samples → the int16 playback buffer. The vector paths reproduce the scalar rule
+// exactly: std::min(1.0f, s) keeps 1 for NaN, like _mm_min_ps(s, 1) and NEON's FMINNM; the
+// float → int conversion truncates toward zero (_mm_cvttps_epi32 / FCVTZS); values are in
+// int16 range after the clamp, so the saturating packs never clip.
+
+namespace {
+inline int16_t FloatSampleToS16(float s) {
+    s = std::max(-1.0f, std::min(1.0f, s));
+    return static_cast<int16_t>(s * 32767.0f);
+}
+
+#if defined(FSTP_KERNEL_SSE2)
+// 8 float samples → 8 int16 samples.
+inline __m128i FloatToS16x8(const float* src) {
+    const __m128i lo = _mm_cvttps_epi32(_mm_mul_ps(
+        _mm_max_ps(_mm_min_ps(_mm_loadu_ps(src), _mm_set1_ps(1.0f)), _mm_set1_ps(-1.0f)), _mm_set1_ps(32767.0f)));
+    const __m128i hi = _mm_cvttps_epi32(_mm_mul_ps(
+        _mm_max_ps(_mm_min_ps(_mm_loadu_ps(src + 4), _mm_set1_ps(1.0f)), _mm_set1_ps(-1.0f)), _mm_set1_ps(32767.0f)));
+    return _mm_packs_epi32(lo, hi);
+}
+#elif defined(FSTP_KERNEL_NEON)
+inline int16x8_t FloatToS16x8(const float* src) {
+    const float32x4_t one = vdupq_n_f32(1.0f), minus_one = vdupq_n_f32(-1.0f), scale = vdupq_n_f32(32767.0f);
+    const int32x4_t lo = vcvtq_s32_f32(vmulq_f32(vmaxnmq_f32(vminnmq_f32(vld1q_f32(src), one), minus_one), scale));
+    const int32x4_t hi = vcvtq_s32_f32(vmulq_f32(vmaxnmq_f32(vminnmq_f32(vld1q_f32(src + 4), one), minus_one), scale));
+    return vcombine_s16(vqmovn_s32(lo), vqmovn_s32(hi));
+}
+#endif
+} // namespace
+
+void SIMDOptimizations::AudioS32ToS16(const int32_t* src, int16_t* dst, size_t count) {
+    size_t i = 0;
+#if defined(FSTP_KERNEL_SSE2)
+    for (; i + 8 <= count; i += 8) {
+        const __m128i lo = _mm_srai_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i)), 16);
+        const __m128i hi = _mm_srai_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i + 4)), 16);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), _mm_packs_epi32(lo, hi));
+    }
+#elif defined(FSTP_KERNEL_NEON)
+    for (; i + 8 <= count; i += 8) {
+        const int16x4_t lo = vmovn_s32(vshrq_n_s32(vld1q_s32(src + i), 16));
+        const int16x4_t hi = vmovn_s32(vshrq_n_s32(vld1q_s32(src + i + 4), 16));
+        vst1q_s16(dst + i, vcombine_s16(lo, hi));
+    }
+#endif
+    for (; i < count; ++i) {
+        dst[i] = static_cast<int16_t>(src[i] >> 16);
+    }
+}
+
+void SIMDOptimizations::AudioFloatToS16(const float* src, int16_t* dst, size_t count) {
+    size_t i = 0;
+#if defined(FSTP_KERNEL_SSE2)
+    for (; i + 8 <= count; i += 8) {
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), FloatToS16x8(src + i));
+    }
+#elif defined(FSTP_KERNEL_NEON)
+    for (; i + 8 <= count; i += 8) {
+        vst1q_s16(dst + i, FloatToS16x8(src + i));
+    }
+#endif
+    for (; i < count; ++i) {
+        dst[i] = FloatSampleToS16(src[i]);
+    }
+}
+
+void SIMDOptimizations::AudioFloatPlanarToS16(const float* const* planes, int channels, size_t frames,
+                                              int16_t* dst) {
+    if (channels <= 0) return;
+    if (channels == 1) {
+        AudioFloatToS16(planes[0], dst, frames);
+        return;
+    }
+    size_t i = 0;
+#if defined(FSTP_KERNEL_SSE2) || defined(FSTP_KERNEL_NEON)
+    if (channels == 2) {   // stereo: convert both planes 8 frames at a time and interleave
+        const float* left = planes[0];
+        const float* right = planes[1];
+#if defined(FSTP_KERNEL_SSE2)
+        for (; i + 8 <= frames; i += 8) {
+            const __m128i l = FloatToS16x8(left + i), r = FloatToS16x8(right + i);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * i), _mm_unpacklo_epi16(l, r));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * i + 8), _mm_unpackhi_epi16(l, r));
+        }
+#else
+        for (; i + 8 <= frames; i += 8) {
+            int16x8x2_t lr;
+            lr.val[0] = FloatToS16x8(left + i);
+            lr.val[1] = FloatToS16x8(right + i);
+            vst2q_s16(dst + 2 * i, lr);
+        }
+#endif
+    }
+#endif
+    for (; i < frames; ++i) {
+        for (int ch = 0; ch < channels; ++ch) {
+            dst[i * channels + ch] = FloatSampleToS16(planes[ch][i]);
+        }
+    }
 }
 
 } // namespace FSTP

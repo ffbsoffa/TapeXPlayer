@@ -12,6 +12,7 @@
 #include "FSTPHardwareDetection.h"
 #include <iostream>
 #include <cmath>
+#include <algorithm>
 #include <cstdlib>
 
 extern "C" {
@@ -38,6 +39,11 @@ static auto mouse_shuttle_click_time = std::chrono::steady_clock::now();
 
 // Zoom Panning variables (for increased FPS during active panning)
 static bool zoom_panning_active = false;
+// A plain drag that began in the zoom thumbnail (moves the zoomed area) or in the position box
+// (seeks); -1 when none. The thumbnail drag keeps a window index, the box drag a player id.
+static int thumbnail_drag_window = -1;
+static int position_drag_player = -1;
+static int position_drag_last_step = -1;
 
 // ALT shuttle state
 static bool g_alt_shuttle_active = false;
@@ -105,6 +111,25 @@ static int GetWindowIndexByPlayerID(int player_id) {
         }
     }
     return -1;
+}
+
+// Forward declaration (defined below)
+static void HandleSeekTo(int player_id, double new_position);
+
+// The position box: go to that fraction of the clip, shown at once as a keyboard seek is.
+// The time goes onto a frame boundary, as a timecode or the keyboard lands: a time inside a
+// frame leaves the Betacam stripe on a paused picture, since the pause aligns to a frame once.
+static void SeekToFraction(int player_id, double fraction) {
+    double duration = GetInstanceDuration(player_id);
+    if (duration <= 0) return;
+    double target = std::max(0.0, std::min(duration, fraction * duration));
+    double fps = GetInstanceVideoFPS(player_id);
+    if (fps > 0) {
+        double frame = std::round(target * fps);
+        if (frame / fps > duration) frame = std::floor(duration * fps);
+        target = frame / fps;
+    }
+    HandleSeekTo(player_id, target);
 }
 
 // Helper functions for player control
@@ -205,10 +230,13 @@ static void HandleSpeedControl(int player_id, double speed_change) {
 
 static void HandleSeekControl(int player_id, double seek_offset) {
     if (player_id < 0) return;
-    
-    double current_position = GetInstancePosition(player_id);
-    double new_position = current_position + seek_offset;
-    
+    HandleSeekTo(player_id, GetInstancePosition(player_id) + seek_offset);
+}
+
+// To an absolute time, so a frame-exact target stays exact
+static void HandleSeekTo(int player_id, double new_position) {
+    if (player_id < 0) return;
+
     // Clamp position within file bounds
     double duration = GetInstanceDuration(player_id);
     if (new_position < 0) new_position = 0;
@@ -575,6 +603,10 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                                 SetInstanceSpeed(active_player_id, 1.0);
                                 HandleSpeedControl(active_player_id, 1.0);
                                 std::cout << "Player " << active_player_id << ": Speed reset to 1x during rewind" << std::endl;
+                                // Straight from a wind into play → maybe a dropout burst (the effect decides).
+                                if (auto* pbm = GetPixelBufferManager()) {
+                                    pbm->TriggerDropoutBurst(active_player_id);
+                                }
                             } else {
                                 // If speed = 1x - pause (second space)
                                 PauseInstance(active_player_id);
@@ -591,7 +623,7 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                                 // If speed = 1x - start playback
                                 PlayInstance(active_player_id);
                                 HandlePlaybackControl(active_player_id, "Playing");
-                                // Resume from pause → fire a Betacam dropout-compensation burst.
+                                // Resume from pause → maybe a dropout burst, if a fast wind came just before.
                                 if (auto* pbm = GetPixelBufferManager()) {
                                     pbm->TriggerDropoutBurst(active_player_id);
                                 }
@@ -601,19 +633,10 @@ bool HandleKeyboardEvents(SDL_Event& event) {
                     break;
 
                 case SDLK_p:
-                    // Shift+P - Presentation Mode
+                    // Shift+P - Presentation Mode. P itself does nothing: playback starts with
+                    // Space only (the author's word, 18.10; P and Cmd+P used to start it too)
                     if (event.key.keysym.mod & KMOD_SHIFT) {
-#ifdef __APPLE__
-                        TogglePresentationMode();
-#else
-                        // TODO(linux/windows): presentation mode is implemented only
-                        // in the darwin backend (FSTPToolsMenu.mm) — without this stub
-                        // the Linux/Windows link failed.
-#endif
-                    } else if (active_player_id >= 0) {
-                        // P - Play
-                        PlayInstance(active_player_id);
-                        HandlePlaybackControl(active_player_id, "Play");
+                        TogglePresentationMode();   // shared (FSTPWindowManager.cpp)
                     }
                     break;
 
@@ -1021,28 +1044,53 @@ bool HandleKeyboardEvents(SDL_Event& event) {
             bool is_compact = (g_hardware_detection && g_hardware_detection->IsCompactDevice());
 
             if (event.button.button == SDL_BUTTON_LEFT) {
-                if (is_compact) {
+                // The zoom thumbnail (top right) and the position box (bottom right) take a plain
+                // click and drag first: in the thumbnail it moves the zoomed area (the red frame),
+                // in the box it seeks to that point of the clip.
+                FSTPWindow* clicked = GetWindowBySDLID(event.button.windowID);
+                if (clicked && clicked->player_instance_id >= 0) {
+                    const int player = clicked->player_instance_id;
+                    const int window_idx = GetWindowIndexByPlayerID(player);
+                    float frame_x = 0.5f, frame_y = 0.5f;
+                    double fraction = 0.0;
+                    if (FSTP_ZoomThumbnailPoint(window_idx, event.button.x, event.button.y, true,
+                                                &frame_x, &frame_y)) {
+                        thumbnail_drag_window = window_idx;
+                        SetZoomCenter(window_idx, frame_x, frame_y);
+                        break;
+                    }
+                    if (FSTPOSD_PositionBoxFraction(player, event.button.x, event.button.y, true, &fraction)) {
+                        position_drag_player = player;
+                        position_drag_last_step = static_cast<int>(fraction * 1000);
+                        SeekToFraction(player, fraction);
+                        break;
+                    }
+                }
+
+                const SDL_Keymod mods = SDL_GetModState();
+                const bool shift = mods & KMOD_SHIFT;
+                const bool ctrl = mods & KMOD_CTRL;
+                if (shift && !ctrl) {
+                    // Shift+drag (any device) = Zoom Panning, only while zoomed. It was Shift+Alt;
+                    // Shift+Alt still works.
+                    int active_window = GetActivePlayerID();
+                    int window_idx = GetWindowIndexByPlayerID(active_window);
+                    if (window_idx >= 0) {
+                        FSTPZoomState* zoom = GetZoomState(window_idx);
+                        if (zoom && zoom->enabled) {
+                            zoom_panning_active = true;
+                        }
+                    }
+                } else if (is_compact) {
                     // For compact devices: LEFT CLICK starts mouse shuttle after small delay
                     // Store click position and time - will activate shuttle on motion
                     mouse_shuttle_start_x = event.button.x;
                     mouse_shuttle_start_y = event.button.y;
                     mouse_shuttle_click_time = std::chrono::steady_clock::now();
                     // Don't activate immediately - wait for drag motion
-                } else if (SDL_GetModState() & KMOD_SHIFT) {
+                } else if (shift && ctrl) {
                     // Standard devices: Shift+Ctrl+Click = Mouse Shuttle
-                    if (SDL_GetModState() & KMOD_CTRL) {
-                        StartMouseShuttle(event.button.x, event.button.y);
-                    } else if (SDL_GetModState() & KMOD_ALT) {
-                        // Shift+Alt+Click = Zoom Panning (only if zoom is active!)
-                        int active_window = GetActivePlayerID();
-                        int window_idx = GetWindowIndexByPlayerID(active_window);
-                        if (window_idx >= 0) {
-                            FSTPZoomState* zoom = GetZoomState(window_idx);
-                            if (zoom && zoom->enabled) {
-                                zoom_panning_active = true;
-                            }
-                        }
-                    }
+                    StartMouseShuttle(event.button.x, event.button.y);
                 }
             } else if (event.button.button == SDL_BUTTON_MIDDLE && is_compact) {
                 // GPD Pocket: Middle Mouse Button = Zoom Panning (no modifiers needed)
@@ -1061,6 +1109,9 @@ bool HandleKeyboardEvents(SDL_Event& event) {
 
         case SDL_MOUSEBUTTONUP:
             if (event.button.button == SDL_BUTTON_LEFT) {
+                thumbnail_drag_window = -1;
+                position_drag_player = -1;
+                position_drag_last_step = -1;
                 if (mouse_shuttle_active) {
                     StopMouseShuttle();
                 }
@@ -1087,6 +1138,28 @@ bool HandleKeyboardEvents(SDL_Event& event) {
             break;
 
         case SDL_MOUSEMOTION:
+            if (thumbnail_drag_window >= 0) {
+                // Dragging in the zoom thumbnail: the zoomed area follows (clamped to the frame)
+                float frame_x = 0.5f, frame_y = 0.5f;
+                if (FSTP_ZoomThumbnailPoint(thumbnail_drag_window, event.motion.x, event.motion.y,
+                                            false, &frame_x, &frame_y)) {
+                    SetZoomCenter(thumbnail_drag_window, frame_x, frame_y);
+                }
+                break;
+            }
+            if (position_drag_player >= 0) {
+                // Dragging in the position box: a seek per visible step, not per motion event
+                double fraction = 0.0;
+                if (FSTPOSD_PositionBoxFraction(position_drag_player, event.motion.x, event.motion.y,
+                                                false, &fraction)) {
+                    int step = static_cast<int>(fraction * 1000);
+                    if (step != position_drag_last_step) {
+                        position_drag_last_step = step;
+                        SeekToFraction(position_drag_player, fraction);
+                    }
+                }
+                break;
+            }
             if (mouse_shuttle_active) {
                 UpdateMouseShuttle(event.motion.x);
             } else if (zoom_panning_active) {

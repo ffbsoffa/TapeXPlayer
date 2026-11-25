@@ -35,6 +35,7 @@ typedef struct {
     int texture_buffer_width[2];           // Sizes for each buffer
     int texture_buffer_height[2];
     double texture_buffer_timestamp[2];    // Timestamps
+    uint64_t texture_buffer_serial[2];     // PixelBuffer::picture_serial each texture holds
     bool texture_buffer_valid[2];          // Validity of each buffer
     int current_buffer_index;              // Current active buffer (0 or 1)
     int write_buffer_index;                // Buffer for writing (0 or 1)
@@ -96,6 +97,10 @@ void HandleWindowEvents(SDL_Event* event);
 // Render all active windows
 void RenderAllWindows();
 
+// Linux: apply window titles set from other threads (see UpdateWindowTitle). Call once per
+// iteration of the event loop, on its thread.
+void ApplyPendingWindowTitles();
+
 // Get number of active windows
 int GetActiveWindowCount();
 
@@ -110,6 +115,12 @@ int GetActivePlayerID();
 
 // Restore focus to main SDL window
 void RestoreFocusToMainWindow();
+
+// The zoom thumbnail (top right) of a window under the mouse: the point of the full frame at
+// (x, y), 0..1 each way. inside: only when (x, y) is in the thumbnail; otherwise clamped to it (a
+// drag that has left it). False when no thumbnail is shown. Window coordinates.
+bool FSTP_ZoomThumbnailPoint(int window_index, float x, float y, bool inside,
+                             float* frame_x, float* frame_y);
 
 // === Texture interface for video ===
 // Get SDL renderer for window (for texture interface initialization)
@@ -148,6 +159,10 @@ const char* FSTP_GetPresentationDisplayName(int idx);
 // Re-apply the presentation output target if presentation is currently active — called after a
 // Settings change so display/output-mode edits take effect live.
 void FSTP_ReapplyPresentationIfActive(void);
+// Shift+P and the menus, on every platform: on if off, off if on. Settings ▸ Presentation decides
+// the output, display and source.
+void TogglePresentationMode(void);
+bool IsPresentationModeActive(void);
 
 #ifdef __cplusplus
 }  // end extern "C"

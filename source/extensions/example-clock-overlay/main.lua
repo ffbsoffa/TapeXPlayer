@@ -1,13 +1,13 @@
 -- Example TapeXPlayer extension (type = lua).
 --
--- Demonstrates the `fstp` host API. A human or an AI can author an extension by
--- editing this file and the manifest next to it. See FSTPLuaExtension.h for the
+-- Demonstrates the `fstp` host API. To write an extension of your own, start from
+-- this file and the manifest next to it. See FSTPLuaExtension.h for the
 -- full API. This is a read-only overlay; it never changes playback.
 --
 -- The same API also lets an extension DRIVE the player and export findings
 -- (fstp.seek/play/pause/set_speed/step, fstp.screenshot, fstp.add_marker,
 -- fstp.export_csv) — the foundation for scientific automation or an external
--- MCP/AI bridge.
+-- tool.
 
 fstp.log("clock-overlay: loaded")
 

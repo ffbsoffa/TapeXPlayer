@@ -20,6 +20,15 @@
 #include <thread>
 #include <atomic>
 #include <cmath>
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
+
+// Where each window's zoom thumbnail (top right) was last drawn, for the mouse: a click or a drag
+// in it moves the zoomed area (FSTP_ZoomThumbnailPoint). Drawn on the render thread, read on the
+// UI thread.
+static std::mutex g_thumbnail_mutex;
+static SDL_Rect g_thumbnail_rect[MAX_WINDOWS];
 
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
@@ -36,6 +45,23 @@ std::atomic<int> g_texture_skip_counter{0};
 
 // Debug control: set to true to enable verbose logging
 static constexpr bool ENABLE_WINDOW_MANAGER_DEBUG = false;
+
+// The part of a frame a zoom shows: the source rectangle, kept inside the frame. False when the
+// window shows the whole frame. The player window and the presentation output both draw it, so
+// the audience sees the close-up the operator sees.
+static bool ZoomSourceRect(const FSTPZoomState* zoom, int frame_w, int frame_h, SDL_Rect* out) {
+    if (!zoom || !zoom->enabled || zoom->factor <= 1.0f || frame_w <= 0 || frame_h <= 0) return false;
+    int src_w = (int)(frame_w / zoom->factor);
+    int src_h = (int)(frame_h / zoom->factor);
+    int src_x = (int)(frame_w * zoom->center_x) - src_w / 2;
+    int src_y = (int)(frame_h * zoom->center_y) - src_h / 2;
+    if (src_x < 0) src_x = 0;
+    if (src_y < 0) src_y = 0;
+    if (src_x + src_w > frame_w) src_x = frame_w - src_w;
+    if (src_y + src_h > frame_h) src_y = frame_h - src_h;
+    *out = {src_x, src_y, src_w, src_h};
+    return true;
+}
 
 // Counting rectangle with preserving aspect ratio (letterbox/pillarbox)
 static SDL_Rect ComputeAspectFitRect(int texture_width, int texture_height, int target_width, int target_height) {
@@ -68,6 +94,11 @@ static SDL_Rect ComputeAspectFitRect(int texture_width, int texture_height, int 
 }
 
 static SDL_Renderer* CreateRendererWithVSync(SDL_Window* window, int index, Uint32 flags) {
+    // Naming a driver (SDL_HINT_RENDER_DRIVER, as every caller does) makes SDL 2 switch draw-call
+    // batching OFF: it assumes the app may also talk to that API directly. TapeXPlayer draws only
+    // through SDL (the D3D11 device is used for the vblank wait, not for drawing), so ask for it
+    // back — without it every SDL_RenderCopy (each OSD text) went to the GPU as its own pass.
+    SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
 #ifdef _WIN32
     // On Windows the render thread is paced by a dedicated DXGI vblank thread (FSTPWindowsWS.cpp),
     // which wakes it once per vertical retrace — the macOS CVDisplayLink model. The present must
@@ -125,6 +156,7 @@ static struct {
     int  display_index = -1;     // chosen external display (for re-apply)
     bool windowed      = false;  // true = separate window (cursor allowed on chrome)
     Uint32 window_id   = 0;      // for ENTER/LEAVE cursor handling
+    bool wanted_external = false;   // Settings asked for an external display (windowed = fallback)
 } g_presentation;
 
 // Serialises the render thread's presentation block against ClosePresentationWindow /
@@ -143,6 +175,52 @@ static std::mutex g_presentation_mutex;
 // the presentation functions never hold both, so there is no inversion.
 static std::mutex g_render_mutex;
 
+static uint64_t SteadyNowMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// When the last keyboard, mouse, touch or window event came in (steady ms). The still-picture
+// throttle in RenderAllWindows draws every frame for a moment after one, so a frame step, typed
+// timecode digit or hover shows at once. An SDL event watch sees every event as it is queued.
+static std::atomic<uint64_t> g_last_ui_event_ms{0};
+static int SDLCALL NoteUiEvent(void*, SDL_Event* event) {
+    switch (event->type) {
+        case SDL_KEYDOWN: case SDL_KEYUP: case SDL_TEXTINPUT: case SDL_TEXTEDITING:
+        case SDL_MOUSEMOTION: case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: case SDL_MOUSEWHEEL:
+        case SDL_FINGERDOWN: case SDL_FINGERUP: case SDL_FINGERMOTION: case SDL_MULTIGESTURE:
+        case SDL_WINDOWEVENT: case SDL_DROPFILE: case SDL_DROPTEXT: case SDL_DROPBEGIN:
+        case SDL_DROPCOMPLETE: case SDL_RENDER_TARGETS_RESET: case SDL_RENDER_DEVICE_RESET:
+            g_last_ui_event_ms.store(SteadyNowMs(), std::memory_order_relaxed);
+            break;
+        default:
+            break;
+    }
+    return 1;
+}
+
+// Linux: SDL window calls must stay on the thread that runs the event loop. With Wayland +
+// libdecor-gtk, SDL_SetWindowTitle redraws the title bar through GTK, and the file loader called
+// it from its own thread (CreatePlayerInstance -> UpdateWindowTitle): GTK on two threads, an
+// occasional SIGSEGV in pango while a clip loaded. Titles set off that thread wait here until
+// the loop applies them (ApplyPendingWindowTitles).
+static std::thread::id g_ui_thread;
+static std::mutex g_title_mutex;                 // window_title text + the dirty flags
+static bool g_title_dirty[MAX_WINDOWS] = {};
+static std::atomic<bool> g_title_pending{false};
+
+void ApplyPendingWindowTitles() {
+    if (!g_title_pending.exchange(false)) return;
+    std::lock_guard<std::mutex> lock(g_title_mutex);
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!g_title_dirty[i]) continue;
+        g_title_dirty[i] = false;
+        if (g_windows[i].is_active && g_windows[i].window) {
+            SDL_SetWindowTitle(g_windows[i].window, g_windows[i].window_title);
+        }
+    }
+}
+
 int InitWindowManager() {
     if (g_window_manager_initialized) {
         std::cout << "Window manager already initialized" << std::endl;
@@ -160,6 +238,9 @@ int InitWindowManager() {
 
     SetBetacamEffectEnabled(GetBetacamEffectEnabled());
     SetBetacamReverseStripe(GetBetacamReverseStripe());
+
+    SDL_AddEventWatch(NoteUiEvent, nullptr);
+    g_ui_thread = std::this_thread::get_id();   // InitWindowManager runs on the event-loop thread
 
     // Initialize array of windows
     for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -182,6 +263,8 @@ int InitWindowManager() {
         g_windows[i].texture_buffer_height[1] = 0;
         g_windows[i].texture_buffer_timestamp[0] = 0.0;
         g_windows[i].texture_buffer_timestamp[1] = 0.0;
+        g_windows[i].texture_buffer_serial[0] = 0;
+        g_windows[i].texture_buffer_serial[1] = 0;
         g_windows[i].texture_buffer_valid[0] = false;
         g_windows[i].texture_buffer_valid[1] = false;
         g_windows[i].current_buffer_index = 0;  // Start with buffer 0
@@ -210,6 +293,8 @@ void ShutdownWindowManager() {
     }
 
     std::cout << "Shutting down window manager..." << std::endl;
+
+    SDL_DelEventWatch(NoteUiEvent, nullptr);
 
     // Shutdown pixel buffer manager
     if (g_pixel_buffer_manager) {
@@ -489,6 +574,7 @@ void FSTPCloseWindow(int window_index) {
         // CRITICAL: Clear OSD cache BEFORE destroying renderer
         // Otherwise ShutdownOSDSystem will try to delete textures of already destroyed renderer → CRASH
         ClearOSDCacheForRenderer(g_windows[window_index].renderer);
+        FSTPSubtitles_ForgetRenderer(g_windows[window_index].renderer);
 
         SDL_DestroyRenderer(g_windows[window_index].renderer);
         g_windows[window_index].renderer = nullptr;
@@ -609,7 +695,78 @@ static void HandleAutoFreezeOnFocusChange(int focused_window_index, bool gained_
     }
 }
 
+// Opens the audience window again from Settings, keeping its source: after its display went
+// away or came back, or its GPU device was lost.
+static void ReopenPresentation(const char* why) {
+    std::cout << "🔁 [PRESENTATION] " << why << " - reopening as Settings say" << std::endl;
+    const int player = g_presentation.follow_focus ? -1 : g_presentation.pinned_player;
+    CreatePresentationWindow(player, GetPresentationOutputMode(), GetPresentationDisplayIndex());
+}
+
+// What can happen to the audience screen during a talk (main thread, from the platform event
+// loops):
+//   * its own close button: presentation ends, as with Shift+P;
+//   * the projector unplugged: the picture goes where Settings say, to another external display or
+//     into a separate window — never left on a display that is gone;
+//   * a projector plugged in while the output waits in a separate window for want of one: the
+//     picture moves to it;
+//   * the projector moved or changed resolution: the borderless window covers it again (SDL2 has
+//     no event of its own for a new resolution, so the size is looked at with every event);
+//   * the GPU reset (after sleep): the picture's texture is made again.
+static void HandlePresentationEvent(const SDL_Event* e) {
+    if (!g_presentation.active) return;
+    switch (e->type) {
+        case SDL_WINDOWEVENT:
+            if (e->window.event == SDL_WINDOWEVENT_CLOSE && e->window.windowID == g_presentation.window_id) {
+                ClosePresentationWindow();
+                std::cout << "✅ [PRESENTATION] Closed by its window's close button" << std::endl;
+                return;
+            }
+            break;
+        case SDL_DISPLAYEVENT:
+            if (e->display.event == SDL_DISPLAYEVENT_DISCONNECTED && !g_presentation.windowed) {
+                // SDL2 numbers the displays anew after one leaves: open again as Settings say
+                ReopenPresentation("a display was disconnected");
+                return;
+            }
+            if (e->display.event == SDL_DISPLAYEVENT_CONNECTED && g_presentation.windowed &&
+                g_presentation.wanted_external && SDL_GetNumVideoDisplays() > 1) {
+                ReopenPresentation("an external display was connected");
+                return;
+            }
+            break;
+        case SDL_RENDER_DEVICE_RESET: {
+            std::lock_guard<std::mutex> lock(g_presentation_mutex);
+            if (g_presentation.yuv_renderer) {   // textures are gone: made again on the next frame
+                g_presentation.yuv_renderer->Cleanup();
+                delete g_presentation.yuv_renderer;
+                g_presentation.yuv_renderer = nullptr;
+            }
+            g_presentation.yuv_w = g_presentation.yuv_h = 0;
+            g_presentation.yuv_fmt = 0;
+            std::cout << "🔁 [PRESENTATION] Render device reset - picture texture made again" << std::endl;
+            return;
+        }
+        default:
+            break;
+    }
+    if (!g_presentation.windowed && g_presentation.window) {
+        SDL_Rect db{};
+        int w = 0, h = 0, x = 0, y = 0;
+        if (SDL_GetDisplayBounds(g_presentation.display_index, &db) == 0) {
+            SDL_GetWindowSize(g_presentation.window, &w, &h);
+            SDL_GetWindowPosition(g_presentation.window, &x, &y);
+            if (w != db.w || h != db.h || x != db.x || y != db.y) {
+                SDL_SetWindowPosition(g_presentation.window, db.x, db.y);
+                SDL_SetWindowSize(g_presentation.window, db.w, db.h);
+                std::cout << "🔁 [PRESENTATION] Display changed - now " << db.w << "x" << db.h << std::endl;
+            }
+        }
+    }
+}
+
 void HandleWindowEvents(SDL_Event* event) {
+    HandlePresentationEvent(event);
     if (event->type == SDL_WINDOWEVENT) {
         // Presentation window: keep the surface clean — hide the cursor while the pointer is over
         // the video (the Betacam hardware-protection principle: nothing but picture on the output),
@@ -700,7 +857,37 @@ void HandleWindowEvents(SDL_Event* event) {
     }
 }
 
+// FSTP_RENDER_STATS=1: CPU (not wall) time of the render thread per pass of RenderAllWindows —
+// waits for vsync inside present don't count. One line a second:
+//   🎨 [RENDER PASSES] update=.. texture=.. osd=.. overlays=.. present=.. other=.. (ms of CPU per s)
+namespace {
+inline uint64_t RenderThreadCpuNs() {
+#if defined(__linux__) || defined(__APPLE__)
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+#else
+    return 0;
+#endif
+}
+struct RenderPassCpu {
+    uint64_t update = 0, texture = 0, osd = 0, overlays = 0, present = 0, total = 0;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+RenderPassCpu g_pass_cpu;
+const bool g_pass_cpu_on = std::getenv("FSTP_RENDER_STATS") != nullptr;
+}  // namespace
+
 void RenderAllWindows() {
+    const uint64_t pass_cpu_start = g_pass_cpu_on ? RenderThreadCpuNs() : 0;
+    uint64_t pass_mark = pass_cpu_start;
+    // Adds the CPU since the previous mark to a bucket (no-op unless FSTP_RENDER_STATS).
+    auto pass_lap = [&pass_mark](uint64_t& bucket) {
+        if (!g_pass_cpu_on) return;
+        const uint64_t now = RenderThreadCpuNs();
+        bucket += now - pass_mark;
+        pass_mark = now;
+    };
     // ============================================================
     // OPTIMIZATION FOR MULTIPLE INSTANCES:
     // Update video for each player INSIDE its rendering loop,
@@ -788,9 +975,11 @@ void RenderAllWindows() {
             // }
 
             // Update video for this player
+            pass_lap(g_pass_cpu.overlays);   // window bookkeeping before it: count with overlays
             if (player_id >= 0) {
                 UpdateVideoFrameForPlayer(player_id);
             }
+            pass_lap(g_pass_cpu.update);
 
             // While a Betacam dropout burst is showing, bypass the FPS-saving throttles below
             // (settled-pause skip + timestamp-skip) so the dropout re-applies and animates at
@@ -803,26 +992,40 @@ void RenderAllWindows() {
             bool grain_active = (player_id >= 0 && g_pixel_buffer_manager &&
                                  g_pixel_buffer_manager->IsFilmGrainActive());
 
-            // SETTLED PAUSE THROTTLE: when frame is aligned, betacam stripe gone,
-            // and zoom is not active — throttle full render cycle to ~5fps.
-            // SDL events and menus are processed independently on all platforms.
+            // STILL-PICTURE THROTTLE: while paused and nothing on screen would change, redraw
+            // every 200 ms only (Clear/Texture/OSD/Present skipped). "Nothing would change": the
+            // picture is the one already in the texture (by identity — see picture_serial), no
+            // keyboard/mouse/window event in the last 300 ms (frame steps, timecode entry, hover),
+            // no zoom, dropout or script overlay — and no effect animating: with the Betacam
+            // effect on, only once its pause stripe has settled (frame aligned + hold), as before.
+            // Without the effect this never applied, as it waited for that alignment: a pause
+            // redrew 60 times a second (Pentium Gold 7505: 7% of a core, 38 ms/s in present).
             {
                 FSTPZoomState* zs = GetZoomState(i);
                 bool zoom_active = (zs && zs->enabled && zs->factor > 1.0f) || IsZoomPanningActive();
-                bool settled = player_id >= 0 &&
-                               g_windows[i].last_frame_aligned &&
-                               g_windows[i].betacam_hold_frames == 0;
-
-                if (settled && !zoom_active && !dropout_active) {
-                    uint64_t now_ms = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                const uint64_t now_ms = SteadyNowMs();
+                static const bool throttle_off = std::getenv("FSTP_NO_STILL_THROTTLE") != nullptr;  // A/B
+                bool still = false;
+                if (!throttle_off && player_id >= 0 && !zoom_active && !dropout_active && g_pixel_buffer_manager) {
+                    const bool effect_quiet = g_pixel_buffer_manager->IsBetacamEffectEnabled()
+                        ? (g_windows[i].last_frame_aligned && g_windows[i].betacam_hold_frames == 0)
+                        : (!grain_active && std::fabs(GetInstanceActualSpeed(player_id)) < 0.05 &&
+                           !IsPlayerLoading(player_id));
+                    const FSTPPixelBufferManager::PixelBuffer* pb =
+                        effect_quiet ? g_pixel_buffer_manager->GetPixelBuffer(player_id) : nullptr;
+                    const int cb = g_windows[i].current_buffer_index;
+                    still = pb && g_windows[i].texture_buffer_valid[cb] &&
+                            g_windows[i].texture_buffer_serial[cb] == pb->picture_serial &&
+                            now_ms - g_last_ui_event_ms.load(std::memory_order_relaxed) > 300 &&
+                            !FSTPWelcome_IsActive() && !FSTPLua_HasRenderCallbacks();
+                }
+                if (still) {
                     if (now_ms - g_windows[i].last_settled_render_ms < 200) {
                         continue; // Nothing changed — skip Clear/Texture/OSD/Present
                     }
                     g_windows[i].last_settled_render_ms = now_ms;
                 } else {
-                    g_windows[i].last_settled_render_ms = 0; // Reset when leaving settled state
+                    g_windows[i].last_settled_render_ms = 0; // Reset when leaving the still state
                 }
             }
 
@@ -830,6 +1033,7 @@ void RenderAllWindows() {
             // SINGLE RENDERING LOOP - ALL IN ONE PLACE
             // ============================================================
 
+            pass_lap(g_pass_cpu.overlays);
             // 1. Clear screen
             SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
             SDL_RenderClear(renderer);
@@ -877,10 +1081,13 @@ void RenderAllWindows() {
                 if (pixel_buffer) {
                     int current_buf = g_windows[i].current_buffer_index;
 
-                    // OPTIMIZATION: skip texture update if timestamp didn't change
+                    // Skip the texture update when the texture already holds this picture. By
+                    // identity, not timestamp: the proxy and the full-res picture of a frame share
+                    // the timestamp, so after a stop the full-res one was never uploaded and the
+                    // paused picture stayed at proxy resolution (with the Betacam effect off).
                     bool need_update = true;
                     if (g_windows[i].texture_buffer_valid[current_buf] &&
-                        g_windows[i].texture_buffer_timestamp[current_buf] == pixel_buffer->timestamp) {
+                        g_windows[i].texture_buffer_serial[current_buf] == pixel_buffer->picture_serial) {
                         need_update = false;
                         // Debug log disabled for performance
                     }
@@ -892,7 +1099,10 @@ void RenderAllWindows() {
                     // BETACAM EFFECT: Always update at slow motion or shuttle speeds.
                     // During pure pause: force until IsFrameAligned fires, then hold 30 frames.
                     // Once frame_aligned and hold_frames == 0 — stripe gone, allow frame skip.
-                    bool betacam_speed = (absPlaybackRate < 0.9 || absPlaybackRate > 1.1);
+                    // Only while the effect is on: with it off, re-applying meant re-uploading the
+                    // same picture every render (a full-frame texture upload 60×/s in pause).
+                    bool betacam_speed = g_pixel_buffer_manager->IsBetacamEffectEnabled() &&
+                                         (absPlaybackRate < 0.9 || absPlaybackRate > 1.1);
                     bool pause_settled = is_pure_pause && frame_aligned && g_windows[i].betacam_hold_frames == 0;
                     if (betacam_speed && !pause_settled) {
                         need_update = true;
@@ -931,6 +1141,7 @@ void RenderAllWindows() {
                         g_windows[i].texture_buffer_width[current_buf] = pixel_buffer->width;
                         g_windows[i].texture_buffer_height[current_buf] = pixel_buffer->height;
                         g_windows[i].texture_buffer_timestamp[current_buf] = pixel_buffer->timestamp;
+                        g_windows[i].texture_buffer_serial[current_buf] = pixel_buffer->picture_serial;
 
                         // Render video with aspect ratio within window
                         // Use logical window size (NOT renderer output size) to avoid HiDPI scaling issues
@@ -975,24 +1186,9 @@ void RenderAllWindows() {
                         // Apply zoom if enabled for this window
                         FSTPZoomState* zoom_state = GetZoomState(i);
                         SDL_Rect src_rect_for_zoom = {0, 0, pixel_buffer->width, pixel_buffer->height};
-                        SDL_Rect* src_rect_ptr = nullptr;
-
-                        if (zoom_state && zoom_state->enabled && zoom_state->factor > 1.0f) {
-                            // Calculate zoomed source rectangle for zooming
-                            int src_w = (int)(pixel_buffer->width / zoom_state->factor);
-                            int src_h = (int)(pixel_buffer->height / zoom_state->factor);
-                            int src_x = (int)(pixel_buffer->width * zoom_state->center_x) - src_w / 2;
-                            int src_y = (int)(pixel_buffer->height * zoom_state->center_y) - src_h / 2;
-
-                            // Clamp to texture bounds
-                            if (src_x < 0) src_x = 0;
-                            if (src_y < 0) src_y = 0;
-                            if (src_x + src_w > pixel_buffer->width) src_x = pixel_buffer->width - src_w;
-                            if (src_y + src_h > pixel_buffer->height) src_y = pixel_buffer->height - src_h;
-
-                            src_rect_for_zoom = {src_x, src_y, src_w, src_h};
-                            src_rect_ptr = &src_rect_for_zoom;
-                        }
+                        SDL_Rect* src_rect_ptr =
+                            ZoomSourceRect(zoom_state, pixel_buffer->width, pixel_buffer->height, &src_rect_for_zoom)
+                                ? &src_rect_for_zoom : nullptr;
 
                         // Try HSync loss effect rendering first (only when no zoom active)
                         bool hsync_rendered = false;
@@ -1028,6 +1224,11 @@ void RenderAllWindows() {
                                 thumb_w,
                                 thumb_h
                             };
+
+                            {
+                                std::lock_guard<std::mutex> lock(g_thumbnail_mutex);
+                                g_thumbnail_rect[i] = thumb_dst;
+                            }
 
                             // Draw full image as thumbnail
                             SDL_RenderCopy(renderer, new_texture, nullptr, &thumb_dst);
@@ -1070,11 +1271,13 @@ void RenderAllWindows() {
             auto t_after_texture = std::chrono::high_resolution_clock::now();
             total_texture_update_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_texture - t_before_texture).count());
 
+            pass_lap(g_pass_cpu.texture);
             // 3. OSD ELEMENTS (all in one place)
             auto t_before_osd = std::chrono::high_resolution_clock::now();
             if (player_id >= 0) {
                 RenderOSDForPlayer(renderer, player_id);
             }
+            pass_lap(g_pass_cpu.osd);
             auto t_after_osd = std::chrono::high_resolution_clock::now();
             total_osd_render_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_osd - t_before_osd).count());
 
@@ -1106,6 +1309,7 @@ void RenderAllWindows() {
                 FSTPWelcome_Render(renderer, welcome_w, welcome_h);
             }
 
+            pass_lap(g_pass_cpu.overlays);
             // 4. Final Present
             auto t_before_present = std::chrono::high_resolution_clock::now();
 
@@ -1117,6 +1321,7 @@ void RenderAllWindows() {
 
             auto t_after_present = std::chrono::high_resolution_clock::now();
             total_render_present_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(t_after_present - t_before_present).count());
+            pass_lap(g_pass_cpu.present);
 
             perf_sample_count.fetch_add(1);
             // ============================================================
@@ -1145,15 +1350,16 @@ void RenderAllWindows() {
         int player_id = g_presentation.linked_player_id;
 
         if (!IsPlayerInstanceActive(player_id)) {
-            // Render thread must NOT call SDL_DestroyWindow (requires main thread).
-            // Just detach and go black; main thread will destroy via ClosePresentationWindow().
+            // The player it shows is gone (its window closed). Black, and still the presentation:
+            // following the focus, the next frame takes the player in front; pinned, the picture
+            // comes back when that player has a file again; Shift+P closes it as usual. It used
+            // to switch itself off here, leaving a black window nobody closed — the next Shift+P
+            // then opened a second one over it.
             if (g_presentation.renderer) {
                 SDL_SetRenderDrawColor(g_presentation.renderer, 0, 0, 0, 255);
                 SDL_RenderClear(g_presentation.renderer);
                 SDL_RenderPresent(g_presentation.renderer);
             }
-            g_presentation.active           = false;
-            g_presentation.linked_player_id = -1;
         } else if (g_presentation.renderer) {
             const FSTPPixelBufferManager::PixelBuffer* pb =
                 g_pixel_buffer_manager ? g_pixel_buffer_manager->GetPixelBuffer(player_id) : nullptr;
@@ -1289,6 +1495,18 @@ void RenderAllWindows() {
                     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
                     SDL_RenderClear(renderer);
 
+                    // The operator's close-up: the zoom of the player window this output follows (the
+                    // thumbnail with its red frame stays the operator's — service, never shown here)
+                    SDL_Rect zoom_src{};
+                    SDL_Rect* zoom_src_ptr = nullptr;
+                    for (int w = 0; w < MAX_WINDOWS; w++) {
+                        if (g_windows[w].is_active && !g_windows[w].is_closing &&
+                            g_windows[w].player_instance_id == player_id) {
+                            if (ZoomSourceRect(GetZoomState(w), pb->width, pb->height, &zoom_src)) zoom_src_ptr = &zoom_src;
+                            break;
+                        }
+                    }
+
                     bool hsync_applied = false;
                     if (g_pixel_buffer_manager) {
                         FSTPBetacamEffect::RenderContext rctx;
@@ -1300,17 +1518,35 @@ void RenderAllWindows() {
                         rctx.frame_number        = pb->frame_number;
                         rctx.new_frame           = false; // mirror: don't advance state
                         g_pixel_buffer_manager->ApplyRenderJitter(player_id, rctx);
-                        hsync_applied = g_pixel_buffer_manager->RenderWithHsync(
-                            player_id, renderer, tex, pb->width, pb->height, dst);
+                        // HSync loss draws the whole frame only, as in the player window
+                        if (!zoom_src_ptr) {
+                            hsync_applied = g_pixel_buffer_manager->RenderWithHsync(
+                                player_id, renderer, tex, pb->width, pb->height, dst);
+                        }
                     }
                     if (!hsync_applied)
-                        SDL_RenderCopy(renderer, tex, nullptr, &dst);
+                        SDL_RenderCopy(renderer, tex, zoom_src_ptr, &dst);
 
                     SDL_RenderPresent(renderer);
                     g_presentation.last_timestamp = pb->timestamp;
                 }
             }
             pres_done:;
+        }
+    }
+
+    if (g_pass_cpu_on) {
+        const uint64_t end = RenderThreadCpuNs();
+        g_pass_cpu.overlays += end - pass_mark;   // presentation window and anything after the windows
+        g_pass_cpu.total += end - pass_cpu_start;
+        const double window_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_pass_cpu.since).count();
+        if (window_s >= 1.0) {
+            auto ms = [window_s](uint64_t ns) { return ns / 1e6 / window_s; };
+            std::printf("🎨 [RENDER PASSES] update=%.1f texture=%.1f osd=%.1f overlays=%.1f present=%.1f total=%.1f (ms of CPU per s)\n",
+                        ms(g_pass_cpu.update), ms(g_pass_cpu.texture), ms(g_pass_cpu.osd),
+                        ms(g_pass_cpu.overlays), ms(g_pass_cpu.present), ms(g_pass_cpu.total));
+            std::fflush(stdout);
+            g_pass_cpu = RenderPassCpu{};
         }
     }
 }
@@ -1400,6 +1636,24 @@ FSTPWindow* FSTPGetActiveWindow() {
 
     // If no focused window, return main
     return GetMainWindow();
+}
+
+// The mouse in the zoom thumbnail: see g_thumbnail_rect
+bool FSTP_ZoomThumbnailPoint(int window_index, float x, float y, bool inside,
+                             float* frame_x, float* frame_y) {
+    if (window_index < 0 || window_index >= MAX_WINDOWS) return false;
+    FSTPZoomState* zoom = GetZoomState(window_index);
+    if (!zoom || !zoom->enabled || !zoom->show_thumbnail || zoom->factor <= 1.0f) return false;
+    SDL_Rect r;
+    {
+        std::lock_guard<std::mutex> lock(g_thumbnail_mutex);
+        r = g_thumbnail_rect[window_index];
+    }
+    if (r.w <= 0 || r.h <= 0) return false;
+    if (inside && (x < r.x || x >= r.x + r.w || y < r.y || y >= r.y + r.h)) return false;
+    *frame_x = std::max(0.0f, std::min(1.0f, (x - r.x) / static_cast<float>(r.w)));
+    *frame_y = std::max(0.0f, std::min(1.0f, (y - r.y) / static_cast<float>(r.h)));
+    return true;
 }
 
 int GetActivePlayerID() {
@@ -1509,6 +1763,7 @@ void UpdateWindowTitle(int window_index, int instance_id, const char* filename) 
         return;
     }
 
+    std::unique_lock<std::mutex> title_lock(g_title_mutex);
     if (!filename || filename[0] == '\0') {
         // If no file, show only instance number
         snprintf(g_windows[window_index].window_title, sizeof(g_windows[window_index].window_title),
@@ -1536,8 +1791,16 @@ void UpdateWindowTitle(int window_index, int instance_id, const char* filename) 
         dispatch_async(dispatch_get_main_queue(), ^{
             SDL_SetWindowTitle(window, title_copy.c_str());
         });
+#elif defined(__linux__)
+        // Only on the event-loop thread; from the loader thread, leave it to the loop.
+        if (std::this_thread::get_id() == g_ui_thread) {
+            SDL_SetWindowTitle(g_windows[window_index].window, g_windows[window_index].window_title);
+        } else {
+            g_title_dirty[window_index] = true;
+            g_title_pending.store(true);
+        }
 #else
-        // On Linux/Windows - can update directly
+        // Windows: SetWindowText from another thread is marshalled to the window's thread by the OS
         SDL_SetWindowTitle(g_windows[window_index].window, g_windows[window_index].window_title);
 #endif
     }
@@ -1622,6 +1885,7 @@ bool CreatePresentationWindow(int player_id, int output_mode, int display_index)
     g_presentation.display_index  = target_display;
     g_presentation.windowed       = windowed;
     g_presentation.window_id       = SDL_GetWindowID(g_presentation.window);
+    g_presentation.wanted_external = (output_mode == 0);
 
     // active must be set AFTER renderer is ready — render thread checks active first.
     // Initial linked player: explicit arg wins; otherwise follow-focus starts unbound (-1) and
@@ -1717,6 +1981,25 @@ int FSTP_GetPresentationDisplayCount(void) {
 const char* FSTP_GetPresentationDisplayName(int idx) {
     const char* name = SDL_GetDisplayName(idx);
     return name ? name : "Display";
+}
+
+// The same on every platform (it lived in the macOS menu code, and Shift+P did nothing on Linux).
+// No question per launch: Settings ▸ Presentation chose everything once. External output with no
+// second display opens a separate window (CreatePresentationWindow), so a single screen never
+// blocks it.
+void TogglePresentationMode(void) {
+    if (IsPresentationWindowActive()) {
+        ClosePresentationWindow();
+        std::cout << "✅ [PRESENTATION] Mode deactivated" << std::endl;
+        return;
+    }
+    if (!CreatePresentationWindow(-1, GetPresentationOutputMode(), GetPresentationDisplayIndex())) {
+        std::cerr << "❌ [PRESENTATION] Activation failed" << std::endl;
+    }
+}
+
+bool IsPresentationModeActive(void) {
+    return IsPresentationWindowActive();
 }
 
 void FSTP_ReapplyPresentationIfActive(void) {

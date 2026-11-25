@@ -56,6 +56,7 @@ public:
 
     // Restart audio stream with new settings
     bool RestartAudioStream();
+    void FollowChosenDevice();   // reopens the output if Settings now name another device
 
     // Video sync: set frame rate for frame alignment on prolonged pause
     void SetVideoFrameRate(double fps);

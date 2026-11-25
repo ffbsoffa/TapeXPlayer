@@ -26,6 +26,9 @@ public:
         int proxyWidth  = 640;
         int proxyHeight = 360;
 
+        // The most the proxy's video may take, kbit/s; 0 → by the picture size alone.
+        int maxKbps = 0;
+
         // Display aspect ratio written into the proxy stream (-aspect). When the proxy is encoded on
         // an anamorphic 4:3 pixel grid for wide sources, this stretches it back to the source aspect
         // on screen. 0:0 → don't set (square pixels).

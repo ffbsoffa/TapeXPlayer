@@ -1,11 +1,11 @@
 #!/bin/bash
 # bootstrap_win.sh — one-shot setup for building TapeXPlayer (x64) on Windows.
 #
-# Run this INSIDE the "MSYS2 MINGW64" shell (NOT the plain "MSYS2" / "UCRT64" shell).
-# It installs the MinGW-w64 toolchain + all runtime dependencies, then builds
-# TapeXPlayer.exe and bundles its DLLs.
+# Run this INSIDE the "MSYS2 UCRT64" shell (NOT the plain "MSYS2" / "MINGW64" shell).
+# It installs the MinGW-w64 toolchain + all runtime dependencies, builds SDL2 and
+# SDL2_ttf from source (build_sdl2_win.sh), then builds TapeXPlayer.exe and bundles its DLLs.
 #
-#   Usage (from anywhere inside MSYS2 MINGW64):
+#   Usage (from anywhere inside MSYS2 UCRT64):
 #     curl -fsSL https://raw.githubusercontent.com/ffbsoffa/TapeXPlayer/stable/source/bootstrap_win.sh -o bootstrap_win.sh
 #     bash bootstrap_win.sh
 #
@@ -21,43 +21,41 @@ set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/ffbsoffa/TapeXPlayer}"
 
-# ── Sanity: must be the MINGW64 environment ───────────────────────────────────
-if [ "${MSYSTEM:-}" != "MINGW64" ]; then
+# ── Sanity: must be the UCRT64 environment ────────────────────────────────────
+if [ "${MSYSTEM:-}" != "UCRT64" ]; then
     echo "❌  Wrong shell: MSYSTEM='${MSYSTEM:-unset}'"
-    echo "    Open the 'MSYS2 MINGW64' shell (blue icon) and re-run this script."
-    echo "    The makefile links against /mingw64 libraries and needs this environment."
+    echo "    Open the 'MSYS2 UCRT64' shell and re-run this script."
+    echo "    MSYS2 no longer carries RtMidi for the older MINGW64 environment."
     exit 1
 fi
 
 echo "════════════════════════════════════════════════════════════════"
-echo "  TapeXPlayer — Windows build bootstrap (MSYS2 / MINGW64, x86_64)"
+echo "  TapeXPlayer — Windows build bootstrap (MSYS2 / UCRT64, x86_64)"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
 
 # ── 1. Update the package database & core packages ────────────────────────────
 # Note: a first `pacman -Syu` may ask to close the terminal. If so, reopen the
-# MINGW64 shell and run this script again — it is safe to re-run (idempotent).
+# UCRT64 shell and run this script again — it is safe to re-run (idempotent).
 echo "1️⃣   Updating MSYS2 package database..."
 pacman -Syu --noconfirm
 
 # ── 2. Install toolchain + dependencies ───────────────────────────────────────
-# Package list derived from the makefile's LIBS:
-#   SDL2, SDL2_ttf, portaudio, ffmpeg (avformat/avcodec/avfilter/avutil/swscale),
-#   openssl (ssl/crypto), rtmidi.  Plus g++ (c++23), make, windres, nsis, zip, git.
+# The same list as .github/workflows/windows-build.yml. SDL2 and SDL2_ttf are not in
+# it: they are built from source in step 4.
 echo ""
 echo "2️⃣   Installing toolchain and runtime dependencies..."
 pacman -S --needed --noconfirm \
-    mingw-w64-x86_64-toolchain \
-    mingw-w64-x86_64-gcc \
-    make \
-    mingw-w64-x86_64-SDL2 \
-    mingw-w64-x86_64-SDL2_ttf \
-    mingw-w64-x86_64-portaudio \
-    mingw-w64-x86_64-ffmpeg \
-    mingw-w64-x86_64-openssl \
-    mingw-w64-x86_64-rtmidi \
-    mingw-w64-x86_64-nsis \
-    zip git
+    mingw-w64-ucrt-x86_64-toolchain \
+    mingw-w64-ucrt-x86_64-freetype \
+    mingw-w64-ucrt-x86_64-cmake \
+    mingw-w64-ucrt-x86_64-ninja \
+    mingw-w64-ucrt-x86_64-portaudio \
+    mingw-w64-ucrt-x86_64-ffmpeg \
+    mingw-w64-ucrt-x86_64-openssl \
+    mingw-w64-ucrt-x86_64-rtmidi \
+    mingw-w64-ucrt-x86_64-nsis \
+    make zip git
 
 echo ""
 echo "   Toolchain versions:"
@@ -77,7 +75,12 @@ if [ "${SKIP_CLONE:-0}" != "1" ]; then
     fi
 fi
 
-# ── 4. Build ──────────────────────────────────────────────────────────────────
+# ── 4. SDL2 ───────────────────────────────────────────────────────────────────
+echo ""
+echo "4️⃣   Building SDL2 and SDL2_ttf from source..."
+./build_sdl2_win.sh
+
+# ── 5. Build ──────────────────────────────────────────────────────────────────
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
     echo ""
     echo "✅  Dependencies installed. Skipping build (SKIP_BUILD=1)."
@@ -86,11 +89,11 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
 fi
 
 echo ""
-echo "4️⃣   Building TapeXPlayer.exe ..."
+echo "5️⃣   Building TapeXPlayer.exe ..."
 make -j"$(nproc)"
 
 echo ""
-echo "5️⃣   Bundling runtime DLLs ..."
+echo "6️⃣   Bundling runtime DLLs ..."
 ./bundle_dlls.sh
 
 echo ""

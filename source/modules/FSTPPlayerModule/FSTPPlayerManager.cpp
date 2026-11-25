@@ -1,4 +1,5 @@
 #include "FSTPPlayerManager.h"
+#include "FSTPThreadName.h"
 #include "FSTPPlayerInstance.h"
 #include "FSTPRemote.h"
 #include "../FSTPMainModule/WSGUI/FSTPOSDSystem.h"
@@ -41,6 +42,7 @@ static struct {
 
 // Autonomous video update function (ADAPTIVE FPS - synchronized with video file)
 static void VideoUpdateLoop() {
+    FSTPSetThreadName("fstp-vupdate");
     std::cout << "🎥 [VIDEO THREAD] Autonomous video update thread started (ADAPTIVE FPS)" << std::endl;
 
     // FIXED: Use 50 FPS for better synchronization with 25 FPS PAL video
@@ -780,6 +782,13 @@ float GetInstanceAudioPeakRight(int instance_id) {
 }
 
 // Getting audio module for frame number calculation
+// Every open player moves to the output device Settings name (those already on it stay as they are)
+void RestartAllAudioStreams() {
+    for (int i = 0; i < MAX_PLAYER_INSTANCES; i++) {
+        if (FSTPAudioModuleWrapper* audio = GetInstanceAudioModule(i)) audio->FollowChosenDevice();
+    }
+}
+
 FSTPAudioModuleWrapper* GetInstanceAudioModule(int instance_id) {
     if (instance_id < 0 || instance_id >= MAX_PLAYER_INSTANCES ||
         !g_manager_state.instances[instance_id].is_active) {

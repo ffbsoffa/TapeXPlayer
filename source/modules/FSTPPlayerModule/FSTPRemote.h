@@ -38,7 +38,8 @@ struct RemoteCommand {
         STOP = 3,
         SET_SPEED = 4,
         ADJUST_SPEED = 5,
-        SEEK_TIMECODE = 6
+        SEEK_TIMECODE = 6,
+        MOUSE_SHUTTLE = 7   // signed speed (negative = reverse), applied instantly like the mouse shuttle
     };
 
     Type command_type;      // 4 bytes
