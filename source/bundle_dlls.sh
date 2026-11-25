@@ -260,28 +260,31 @@ if [ "$VERIFY_FAILED" -ne 0 ]; then
     exit 1
 fi
 
-DLL_COUNT=$(find "$OUT_DIR" -maxdepth 1 -name "*.dll" | wc -l | tr -d ' ')
-
-# ── Final dependency verification ────────────────────────────────────────────
+# ── Final dependency pass ────────────────────────────────────────────────────
 # Read the imports of every bundled binary: whatever the toolchain's bin directory
 # provides must be in the bundle too, or the player does not start on a machine
-# without MSYS2. Independent of how the DLLs were gathered above.
+# without MSYS2. ldd alone is not enough: for a DLL that also sits in System32 on
+# the build machine (vulkan-1.dll) it reports that copy.
 command -v objdump &>/dev/null || { echo "❌  objdump not found — cannot verify the bundle"; exit 1; }
-UNSATISFIED=0
-while IFS= read -r dep_name; do
-    [ -z "$dep_name" ] && continue
-    _is_system_dll "$dep_name" && continue
-    if [ -f "$MINGW_BIN/$dep_name" ] && [ ! -f "$OUT_DIR/$dep_name" ]; then
-        echo "   !! UNSATISFIED: $dep_name"
-        UNSATISFIED=$((UNSATISFIED + 1))
-    fi
-done < <(for f in "$OUT_DIR"/*.exe "$OUT_DIR"/*.dll; do objdump -p "$f"; done \
-         | awk '/DLL Name:/ {print $3}' | tr -d '\r' | sort -u)
-if [ "$UNSATISFIED" -gt 0 ]; then
-    echo "❌  $UNSATISFIED DLL dependencies are not in the bundle."
-    exit 1
-fi
+missing_deps() {
+    for f in "$OUT_DIR"/*.exe "$OUT_DIR"/*.dll; do objdump -p "$f"; done \
+        | awk '/DLL Name:/ {print $3}' | tr -d '\r' | sort -u \
+        | while IFS= read -r dep_name; do
+              if [ -n "$dep_name" ] && ! _is_system_dll "$dep_name" \
+                 && [ -f "$MINGW_BIN/$dep_name" ] && [ ! -f "$OUT_DIR/$dep_name" ]; then
+                  echo "$dep_name"
+              fi
+          done
+}
+# Repeat: a DLL added here has imports of its own
+while MISSING="$(missing_deps)"; [ -n "$MISSING" ]; do
+    for dep_name in $MISSING; do
+        cp "$MINGW_BIN/$dep_name" "$OUT_DIR/$dep_name"
+        echo "   + by imports: $dep_name"
+    done
+done
 echo "   All DLL imports satisfied."
+DLL_COUNT=$(find "$OUT_DIR" -maxdepth 1 -name "*.dll" | wc -l | tr -d ' ')
 
 echo "════════════════════════════════════════════════════════════════"
 echo "✅  DLL bundling complete!"
